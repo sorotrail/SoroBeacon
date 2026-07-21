@@ -25,7 +25,7 @@
 * [Email (SMTP)](channels/email.md)
 * [Generic webhook](channels/webhook.md)
 
-## 🛠 Reference
+## 🛠️ Reference
 
 * [Architecture](reference/architecture.md)
 * [HTTP API](reference/api.md)
