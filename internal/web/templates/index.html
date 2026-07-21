@@ -1,0 +1,27 @@
+{{define "content"}}
+<h1>Overview</h1>
+<div class="stats">
+  <div class="stat"><b>{{.Stats.Monitors}}</b> monitors</div>
+  <div class="stat"><b>{{.Stats.Rules}}</b> rules</div>
+  <div class="stat"><b>{{.Stats.Channels}}</b> channels</div>
+  <div class="stat"><b>{{.Stats.AlertsLast24}}</b> alerts (24h)</div>
+  <div class="stat"><b>{{.Stats.LastLedger}}</b> last ledger</div>
+</div>
+<p class="muted">Last poll checkpoint: {{.Stats.LastPollAt.Format "2006-01-02 15:04:05 MST"}}</p>
+
+<h2>Recent alerts</h2>
+{{if .Alerts}}
+<table>
+  <tr><th>ID</th><th>Monitor</th><th>Rule</th><th>Event</th><th>At</th></tr>
+  {{range .Alerts}}
+  <tr>
+    <td>{{.ID}}</td>
+    <td>{{index $.MonitorNames .MonitorID}}</td>
+    <td>#{{.RuleID}}</td>
+    <td><code>{{.EventID}}</code></td>
+    <td>{{.CreatedAt.Format "2006-01-02 15:04:05"}}</td>
+  </tr>
+  {{end}}
+</table>
+{{else}}<p class="muted">No alerts yet.</p>{{end}}
+{{end}}

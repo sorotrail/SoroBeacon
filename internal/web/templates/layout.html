@@ -1,0 +1,51 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}} · SoroBeacon</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12" crossorigin="anonymous"></script>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, sans-serif; margin: 0; line-height: 1.5; }
+    header { display: flex; gap: 1.5rem; align-items: baseline; padding: .75rem 1.5rem;
+             border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent); }
+    header .brand { font-weight: 700; font-size: 1.1rem; }
+    header a { text-decoration: none; color: inherit; opacity: .8; }
+    header a:hover { opacity: 1; }
+    main { padding: 1.5rem; max-width: 70rem; margin: 0 auto; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+    th, td { text-align: left; padding: .4rem .6rem;
+             border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+    th { font-size: .85rem; text-transform: uppercase; opacity: .7; }
+    form.inline { display: inline; }
+    fieldset { border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+               border-radius: .5rem; margin: 1rem 0; padding: 1rem; max-width: 40rem; }
+    label { display: block; margin: .5rem 0 .15rem; font-size: .9rem; }
+    input[type=text], textarea, select { width: 100%; box-sizing: border-box; padding: .35rem; }
+    textarea { font-family: monospace; }
+    button { cursor: pointer; padding: .3rem .8rem; }
+    .muted { opacity: .65; font-size: .9rem; }
+    .pill { padding: .1rem .5rem; border-radius: 1rem; font-size: .8rem; }
+    .on  { background: #14532d; color: #dcfce7; }
+    .off { background: #7f1d1d; color: #fee2e2; }
+    .stats { display: flex; gap: 1rem; flex-wrap: wrap; }
+    .stat { border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+            border-radius: .5rem; padding: .75rem 1.25rem; min-width: 8rem; }
+    .stat b { display: block; font-size: 1.5rem; }
+    code { font-size: .85em; word-break: break-all; }
+  </style>
+</head>
+<body>
+<header>
+  <span class="brand">📡 SoroBeacon</span>
+  <a href="/">Overview</a>
+  <a href="/monitors">Monitors</a>
+  <a href="/channels">Channels</a>
+  <a href="/alerts">Alerts</a>
+</header>
+<main>
+{{template "content" .}}
+</main>
+</body>
+</html>{{end}}

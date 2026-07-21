@@ -1,0 +1,32 @@
+{{define "content"}}
+<h1>Monitors</h1>
+{{if .Monitors}}
+<table>
+  <tr><th>ID</th><th>Name</th><th>Contracts</th><th>Status</th><th></th></tr>
+  {{range .Monitors}}
+  <tr>
+    <td>{{.ID}}</td>
+    <td><a href="/monitors/{{.ID}}">{{.Name}}</a></td>
+    <td>{{range .ContractIDs}}<code>{{.}}</code><br>{{end}}</td>
+    <td>{{if .Enabled}}<span class="pill on">enabled</span>{{else}}<span class="pill off">disabled</span>{{end}}</td>
+    <td>
+      <form class="inline" method="post" action="/monitors/{{.ID}}/toggle"><button>{{if .Enabled}}Disable{{else}}Enable{{end}}</button></form>
+      <form class="inline" method="post" action="/monitors/{{.ID}}/delete"
+            onsubmit="return confirm('Delete monitor {{.Name}}?')"><button>Delete</button></form>
+    </td>
+  </tr>
+  {{end}}
+</table>
+{{else}}<p class="muted">No monitors yet — create one below.</p>{{end}}
+
+<fieldset>
+  <legend>New monitor</legend>
+  <form method="post" action="/monitors">
+    <label for="name">Name</label>
+    <input type="text" id="name" name="name" required>
+    <label for="contract_ids">Contract IDs (one per line)</label>
+    <textarea id="contract_ids" name="contract_ids" rows="3" required placeholder="CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"></textarea>
+    <p><button>Create</button></p>
+  </form>
+</fieldset>
+{{end}}

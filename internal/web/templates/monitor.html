@@ -1,0 +1,49 @@
+{{define "content"}}
+<h1>{{.Monitor.Name}}
+  {{if .Monitor.Enabled}}<span class="pill on">enabled</span>{{else}}<span class="pill off">disabled</span>{{end}}
+</h1>
+<p class="muted">Contracts: {{range .Monitor.ContractIDs}}<code>{{.}}</code> {{end}}</p>
+
+<h2>Rules</h2>
+{{if .Rules}}
+<table>
+  <tr><th>ID</th><th>Type</th><th>Params</th><th>Status</th><th></th></tr>
+  {{range .Rules}}
+  <tr>
+    <td>{{.ID}}</td>
+    <td>{{.Type}}</td>
+    <td><code>{{printf "%s" .Params}}</code></td>
+    <td>{{if .Enabled}}<span class="pill on">enabled</span>{{else}}<span class="pill off">disabled</span>{{end}}</td>
+    <td><form class="inline" method="post" action="/monitors/{{$.Monitor.ID}}/rules/{{.ID}}/delete"><button>Delete</button></form></td>
+  </tr>
+  {{end}}
+</table>
+{{else}}<p class="muted">No rules yet.</p>{{end}}
+
+<fieldset>
+  <legend>Add rule</legend>
+  <form method="post" action="/monitors/{{.Monitor.ID}}/rules">
+    <label for="type">Type</label>
+    <select id="type" name="type">
+      {{range .RuleTypes}}<option value="{{.}}">{{.}}</option>{{end}}
+    </select>
+    <label for="params">Params (JSON)</label>
+    <textarea id="params" name="params" rows="4">{"event_name": "transfer"}</textarea>
+    <p><button>Add rule</button></p>
+  </form>
+</fieldset>
+
+<h2>Channels</h2>
+<fieldset>
+  <legend>Alert to</legend>
+  <form method="post" action="/monitors/{{.Monitor.ID}}/channels">
+    {{range .Channels}}
+    <label><input type="checkbox" name="channel_ids" value="{{.ID}}"
+      {{if index $.Attached .ID}}checked{{end}}> {{.Name}} ({{.Type}})</label>
+    {{else}}
+    <p class="muted">No channels configured yet — <a href="/channels">create one</a>.</p>
+    {{end}}
+    {{if .Channels}}<p><button>Save</button></p>{{end}}
+  </form>
+</fieldset>
+{{end}}

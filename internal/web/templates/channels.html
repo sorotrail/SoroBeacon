@@ -1,0 +1,37 @@
+{{define "content"}}
+<h1>Channels</h1>
+{{if .Channels}}
+<table>
+  <tr><th>ID</th><th>Name</th><th>Type</th><th>Status</th><th></th></tr>
+  {{range .Channels}}
+  <tr>
+    <td>{{.ID}}</td>
+    <td>{{.Name}}</td>
+    <td>{{.Type}}</td>
+    <td>{{if .Enabled}}<span class="pill on">enabled</span>{{else}}<span class="pill off">disabled</span>{{end}}</td>
+    <td>
+      <button hx-post="/channels/{{.ID}}/test" hx-target="#test-result-{{.ID}}" hx-swap="innerHTML">Send test</button>
+      <span id="test-result-{{.ID}}" class="muted"></span>
+      <form class="inline" method="post" action="/channels/{{.ID}}/delete"
+            onsubmit="return confirm('Delete channel {{.Name}}?')"><button>Delete</button></form>
+    </td>
+  </tr>
+  {{end}}
+</table>
+{{else}}<p class="muted">No channels yet — create one below.</p>{{end}}
+
+<fieldset>
+  <legend>New channel</legend>
+  <form method="post" action="/channels">
+    <label for="name">Name</label>
+    <input type="text" id="name" name="name" required>
+    <label for="type">Type</label>
+    <select id="type" name="type">
+      {{range .ChannelTypes}}<option value="{{.}}">{{.}}</option>{{end}}
+    </select>
+    <label for="config">Config (JSON — secrets are stored, never displayed)</label>
+    <textarea id="config" name="config" rows="4">{"webhook_url": "https://..."}</textarea>
+    <p><button>Create</button></p>
+  </form>
+</fieldset>
+{{end}}

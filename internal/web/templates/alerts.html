@@ -1,0 +1,27 @@
+{{define "content"}}
+<h1>Alerts</h1>
+<form method="get" action="/alerts">
+  <select name="monitor_id" onchange="this.form.submit()">
+    <option value="">All monitors</option>
+    {{range .Monitors}}
+    <option value="{{.ID}}" {{if eq .ID $.SelectedMonitor}}selected{{end}}>{{.Name}}</option>
+    {{end}}
+  </select>
+</form>
+{{if .Alerts}}
+<table>
+  <tr><th>ID</th><th>Monitor</th><th>Rule</th><th>Event</th><th>Payload</th><th>At</th></tr>
+  {{range .Alerts}}
+  <tr>
+    <td>{{.ID}}</td>
+    <td>{{index $.MonitorNames .MonitorID}}</td>
+    <td>#{{.RuleID}}</td>
+    <td><code>{{.EventID}}</code></td>
+    <td><details><summary>view</summary><code>{{printf "%s" .Payload}}</code></details></td>
+    <td>{{.CreatedAt.Format "2006-01-02 15:04:05"}}</td>
+  </tr>
+  {{end}}
+</table>
+{{if .NextCursor}}<p><a href="/alerts?cursor={{.NextCursor}}{{if .SelectedMonitor}}&monitor_id={{.SelectedMonitor}}{{end}}">Older →</a></p>{{end}}
+{{else}}<p class="muted">No alerts.</p>{{end}}
+{{end}}

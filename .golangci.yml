@@ -1,0 +1,27 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - misspell
+    - unconvert
+    - gocritic
+    - revive
+  settings:
+    errcheck:
+      exclude-functions:
+        - (io.ReadCloser).Close
+        - fmt.Fprint
+        - fmt.Fprintf
+    revive:
+      rules:
+        - name: package-comments
+          disabled: true
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck

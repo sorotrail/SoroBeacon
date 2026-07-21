@@ -1,0 +1,34 @@
+services:
+  sorobeacon:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://sorobeacon:sorobeacon@postgres:5432/sorobeacon?sslmode=disable
+      RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
+      POLL_INTERVAL: ${POLL_INTERVAL:-5s}
+      HTTP_ADDR: ":8080"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sorobeacon
+      POSTGRES_PASSWORD: sorobeacon
+      POSTGRES_DB: sorobeacon
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sorobeacon"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+volumes:
+  pgdata:

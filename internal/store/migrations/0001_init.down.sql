@@ -1,0 +1,7 @@
+DROP TABLE IF EXISTS ingest_state;
+DROP TABLE IF EXISTS delivery_attempts;
+DROP TABLE IF EXISTS alerts;
+DROP TABLE IF EXISTS monitor_channels;
+DROP TABLE IF EXISTS channels;
+DROP TABLE IF EXISTS rules;
+DROP TABLE IF EXISTS monitors;
