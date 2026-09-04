@@ -51,8 +51,8 @@ func Load() (Config, error) {
 	if err != nil || !rpcURL.IsAbs() || rpcURL.Host == "" ||
 		(rpcURL.Scheme != "http" && rpcURL.Scheme != "https") {
 		return cfg, fmt.Errorf(
-		"invalid RPC_URL %q: must be an absolute http or https URL",
-		cfg.RPCURL,
+			"invalid RPC_URL %q: must be an absolute http or https URL",
+			cfg.RPCURL,
 		)
 	}
 
