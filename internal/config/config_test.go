@@ -41,6 +41,59 @@ func TestLoadOverrides(t *testing.T) {
 	assert.Equal(t, slog.LevelDebug, cfg.LogLevel)
 }
 
+func TestLoadAcceptsHTTPAndHTTPSRPCURLs(t *testing.T) {
+	for _, rpcURL := range []string{
+		"http://localhost:8000",
+		"https://mainnet.example",
+	} {
+		t.Run(rpcURL, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://x")
+			t.Setenv("RPC_URL", rpcURL)
+
+			cfg, err := Load()
+
+			require.NoError(t, err)
+			assert.Equal(t, rpcURL, cfg.RPCURL)
+		})
+	}
+}
+
+func TestLoadRejectsInvalidRPCURL(t *testing.T) {
+	tests := []struct {
+		name   string
+		rpcURL string
+	}{
+		{
+			name:   "unsupported scheme",
+			rpcURL: "ftp://example.com",
+		},
+		{
+			name:   "missing scheme",
+			rpcURL: "example.com",
+		},
+		{
+			name:   "missing host",
+			rpcURL: "https:",
+		},
+		{
+			name:   "misspelled scheme",
+			rpcURL: "htps://example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://x")
+			t.Setenv("RPC_URL", tt.rpcURL)
+
+			_, err := Load()
+
+			assert.ErrorContains(t, err, "RPC_URL")
+			assert.ErrorContains(t, err, "absolute http or https URL")
+		})
+	}
+}
+
 func TestLoadRejectsBadValues(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://x")
 
