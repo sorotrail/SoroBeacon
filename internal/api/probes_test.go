@@ -141,3 +141,28 @@ func TestReadyzReportsWhichDependencyFailed(t *testing.T) {
 		t.Fatal("rpc check should still be healthy — one bad dependency must not fail the rest")
 	}
 }
+
+func TestVersionEndpoint(t *testing.T) {
+	// Pin the real values, not overrides, so a broken ldflags path shows
+	// up as "dev"/"none" rather than silently passing.
+	srv := httptest.NewServer(newProbeServer(&fakeStore{}, &fakeRPC{}))
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("version = %d, want 200", res.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"version", "commit", "build_date"} {
+		if body[key] == "" {
+			t.Fatalf("version response missing %q: %+v", key, body)
+		}
+	}
+}

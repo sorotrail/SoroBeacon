@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/sorotrail/sorobeacon/internal/buildinfo"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
@@ -69,6 +70,7 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/health", s.health)
 	r.Get("/livez", s.livez)
 	r.Get("/readyz", s.readyz)
+	r.Get("/version", s.version)
 	r.Get("/stats", s.stats)
 
 	return r
@@ -127,6 +129,14 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		out["rpc_latest_ledger"] = h.LatestLedger
 	}
 	writeJSON(w, status, out)
+}
+
+func (s *Server) version(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, buildinfo.Info{
+		Version: buildinfo.Version,
+		Commit:  buildinfo.Commit,
+		Date:    buildinfo.Date,
+	})
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
