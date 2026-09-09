@@ -3,18 +3,50 @@
 One Go process, three pipeline stages, Postgres for state:
 
 ```
-Stellar RPC ──getEvents──▶ poller ─▶ decoder ─▶ rules engine ─▶ alerts ─▶ dispatcher ─▶ channels
-                              │                                    │                       │
-                              └── ingest_state ──── Postgres ──────┴── delivery_attempts ──┘
+EventSource ──page──▶ poller ─▶ rules engine ─▶ alerts ─▶ dispatcher ─▶ channels
+ (RPC or SoroTrail)        │                              │                   │
+                           └── ingest_state ── Postgres ──┴── delivery_attempts ─┘
 ```
+
+## Event sources (`internal/poller`, `internal/sorotrail`)
+
+The poller knows only the `EventSource` interface — `LatestLedger` plus a
+stateless, cursor-paged `FetchEvents` returning already-decoded events —
+so the ingest loop is identical regardless of backend:
+
+* **`rpc` (default)** — polls a Stellar RPC node's `getEvents` and decodes
+  locally. The RPC's caps (5 filters × 5 contract IDs per filter) are
+  absorbed by the source, which encodes batch position in its opaque
+  cursors.
+* **`sorotrail` (upstream)** — reads a [SoroTrail](https://github.com/sorotrail/SoroTrail)
+  indexer's `/api/v1/events`. SoroTrail stores events durably past the
+  RPC's ~1-7 day retention window, so monitoring covers history the RPC
+  has already dropped; events arrive already decoded; the indexer's
+  cursor passes through untouched.
+
+Contributors: a new backend is an implementation of the interface plus one
+line in `cmd/sorobeacon`'s mode switch. Nothing in the poller changes.
 
 ## Ingestion (`internal/poller`)
 
-* Every `POLL_INTERVAL`, the poller collects the contract IDs of all **enabled** monitors and calls `getEvents` on the RPC.
-* The RPC caps requests at **5 filters × 5 contract IDs per filter**, so contracts are batched across filters and, past 25, across multiple requests.
-* Pagination cursors are followed until a page comes back short; then the checkpoint (`ingest_state.last_ledger`) advances to the node's `latestLedger`.
-* **Cold start** begins at the current tip (the RPC retains only ~1–7 days of events, so deep backfill is impossible). **Warm start** resumes at `last_ledger + 1`.
-* RPC failures back off exponentially, capped at 10× the poll interval.
+* Every `POLL_INTERVAL`, the poller collects the contract IDs of all **enabled** monitors and pages its event source from the checkpoint.
+* The source's cursors are followed until it reports no more events; then the checkpoint (`ingest_state.last_ledger`) advances to the minimum `latestLedger` the source reported.
+* **Cold start** begins at the source's tip (an RPC retains only ~1–7 days of events, so deep backfill is impossible there; an indexer holds everything, but a fresh monitor has no reason to replay the past). **Warm start** resumes at `last_ledger + 1`.
+* Source failures back off exponentially, capped at 10× the poll interval.
+* In `rpc` mode the poller verifies the RPC's network passphrase at startup
+  against the configured one and refuses to start on mismatch.
+
+## Observability (`internal/metrics`, `internal/reqid`, `internal/buildinfo`)
+
+* `/metrics` — Prometheus: poll outcomes/duration, lag behind the tip,
+  seconds since last poll, the scanned→matched→alerted funnel, deliveries
+  per channel and outcome, HTTP duration by route pattern.
+* `/api/v1/livez`, `/api/v1/readyz` — liveness checks nothing (restart
+  loops otherwise); readiness checks the database and the event source
+  concurrently, bounded per check, with per-dependency detail.
+* `/api/v1/version` — version, commit and build date via `-ldflags`.
+* Every request carries an `X-Request-ID`; error bodies and log lines echo
+  it, so a reported error maps to one request in the logs.
 
 ## Decoding (`internal/stellar`)
 

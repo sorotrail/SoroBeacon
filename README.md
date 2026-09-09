@@ -59,11 +59,51 @@ All configuration comes from environment variables:
 
 | Variable        | Default                                | Description                                  |
 |-----------------|----------------------------------------|----------------------------------------------|
-| `RPC_URL`       | `https://soroban-testnet.stellar.org`  | Stellar RPC endpoint (set a mainnet URL here)|
+| `SOURCE_MODE`   | `rpc`                                  | `rpc` (standalone) or `sorotrail` (upstream) |
+| `SOROTRAIL_URL` | —                                      | SoroTrail indexer base URL (upstream mode)   |
+| `NETWORK`       | `testnet`                              | `testnet` \| `mainnet` \| `futurenet` \| `custom` |
+| `RPC_URL`       | per network                            | Stellar RPC endpoint; overrides the preset   |
+| `NETWORK_PASSPHRASE` | per network                       | Overrides the network passphrase             |
 | `DATABASE_URL`  | *(required)*                           | Postgres connection string                   |
 | `POLL_INTERVAL` | `5s`                                   | How often to poll `getEvents` (min `1s`)     |
 | `HTTP_ADDR`     | `:8080`                                | API + dashboard listen address               |
 | `LOG_LEVEL`     | `info`                                 | `debug` \| `info` \| `warn` \| `error`       |
+
+### Networks
+
+A Stellar network's passphrase is its identity. `NETWORK` selects a preset
+(`testnet`, `mainnet`, `futurenet` — each carrying its public RPC endpoint
+and passphrase); `NETWORK=custom` takes `RPC_URL` + `NETWORK_PASSPHRASE`
+for private standalone networks. At startup SoroBeacon asks the RPC which
+network it belongs to and **refuses to start on a mismatch**, so a mainnet
+endpoint behind testnet configuration fails fast instead of silently
+evaluating every monitor against the wrong chain.
+
+### Operating modes
+
+- **`rpc` (default)** — SoroBeacon polls the Stellar RPC node itself.
+- **`sorotrail`** — SoroBeacon reads events from a
+  [SoroTrail](https://github.com/sorotrail/SoroTrail) indexer instead.
+  SoroTrail stores events durably past the RPC's ~1-7 day retention window,
+  so upstream monitoring covers history the RPC has already dropped — and
+  several SoroBeacon instances can share one indexer.
+
+The ingest loop knows only an `EventSource` interface; adding a backend is
+implementing two methods. See
+[CONTRIBUTING](CONTRIBUTING.md) and the
+[architecture reference](docs/reference/architecture.md).
+
+### Observability
+
+`/metrics` serves Prometheus instrumentation: poll outcomes and duration,
+poll lag behind the chain tip, seconds since the last poll, the
+events-scanned → events-matched → alerts-fired funnel, deliveries by
+channel and outcome, and HTTP request duration by route pattern.
+`/api/v1/livez` and `/api/v1/readyz` are orchestration probes (liveness
+checks nothing; readiness checks the database and the event source with
+per-dependency detail). `/api/v1/version` reports the version, commit and
+build date baked in at compile time. Every response carries an
+`X-Request-ID` correlation header, echoed in error bodies and log lines.
 
 Channel secrets (webhook URLs, bot tokens, SMTP credentials) live in each
 channel's `config` JSON in the database. They are never logged and never
@@ -97,7 +137,7 @@ curl -s -X DELETE localhost:8080/api/v1/monitors/1
 
 ### Rules
 
-Two rule types ship with the MVP:
+Three rule types ship:
 
 **`event_emitted`** — match on event name (the first topic, by Soroban
 convention) and/or exact topic values:
@@ -130,6 +170,23 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 ```
 
 `comparison` is one of `gt`, `gte`, `lt`, `lte`, `eq`, `neq`.
+
+**`token_event`** — SEP-41 token events, with the interface's topic layout
+built in. `event` is one of `transfer`, `mint`, `burn`, `clawback`,
+`set_admin`, or `*` for any of them; `from`/`to` match the semantic address
+slots (from is the holder on burn/clawback, the sender on transfer), and
+`min_amount`/`max_amount` are inclusive i128 bounds as decimal strings:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "token_event",
+  "params": {
+    "event": "transfer",
+    "from": "GDW6...SENDER",
+    "min_amount": "1000000000"
+  }
+}'
+```
 
 ```sh
 curl -s localhost:8080/api/v1/monitors/1/rules

@@ -16,6 +16,7 @@
 
 * [event\_emitted](rules/event-emitted.md)
 * [value\_threshold](rules/value-threshold.md)
+* [token\_event](rules/token-event.md)
 
 ## 📣 Channel reference
 

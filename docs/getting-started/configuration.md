@@ -4,7 +4,11 @@ All configuration comes from environment variables. `.env.example` in the repo i
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `RPC_URL` | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint (JSON-RPC 2.0). Set a mainnet URL for production. |
+| `SOURCE_MODE` | `rpc` | `rpc` (standalone: poll the RPC) or `sorotrail` (upstream: read a SoroTrail indexer). |
+| `SOROTRAIL_URL` | — | SoroTrail indexer base URL. Required when `SOURCE_MODE=sorotrail`. |
+| `NETWORK` | `testnet` | `testnet` \| `mainnet` \| `futurenet` \| `custom`. Selects the network preset (RPC endpoint + passphrase). |
+| `RPC_URL` | per `NETWORK` | Stellar RPC endpoint (JSON-RPC 2.0). Overrides the preset. |
+| `NETWORK_PASSPHRASE` | per `NETWORK` | Overrides the preset passphrase. Required with `NETWORK=custom`. |
 | `DATABASE_URL` | _(required)_ | Postgres connection string, e.g. `postgres://user:pass@host:5432/sorobeacon?sslmode=disable` |
 | `POLL_INTERVAL` | `5s` | How often the poller calls `getEvents`. Minimum `1s`. |
 | `HTTP_ADDR` | `:8080` | Listen address for the API and dashboard. |
