@@ -11,10 +11,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/sorobeacon/sorobeacon/internal/notify"
-	"github.com/sorobeacon/sorobeacon/internal/rules"
-	"github.com/sorobeacon/sorobeacon/internal/stellar"
-	"github.com/sorobeacon/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/notify"
+	"github.com/sorotrail/sorobeacon/internal/rules"
+	"github.com/sorotrail/sorobeacon/internal/stellar"
+	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
 // contractID builds a valid contract strkey from a seed byte; the poller

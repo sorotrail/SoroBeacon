@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/sorobeacon/sorobeacon/internal/stellar"
+	"github.com/sorotrail/sorobeacon/internal/stellar"
 )
 
 func transferEvent(amount int64) *stellar.DecodedEvent {

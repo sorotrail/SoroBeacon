@@ -8,10 +8,10 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/sorobeacon/sorobeacon/internal/notify"
-	"github.com/sorobeacon/sorobeacon/internal/rules"
-	"github.com/sorobeacon/sorobeacon/internal/stellar"
-	"github.com/sorobeacon/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/notify"
+	"github.com/sorotrail/sorobeacon/internal/rules"
+	"github.com/sorotrail/sorobeacon/internal/stellar"
+	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
 // Store is the slice of the store the poller needs.

@@ -1,4 +1,4 @@
-module github.com/sorobeacon/sorobeacon
+module github.com/sorotrail/sorobeacon
 
 go 1.25.0
 

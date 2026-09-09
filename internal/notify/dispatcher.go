@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/sorobeacon/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
 // DispatchStore is the slice of the store the dispatcher needs.

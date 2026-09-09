@@ -11,7 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/sorobeacon/sorobeacon/internal/stellar"
+	"github.com/sorotrail/sorobeacon/internal/stellar"
 )
 
 // Rule type names understood by the default registry.

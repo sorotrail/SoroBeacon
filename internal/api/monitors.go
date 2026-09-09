@@ -3,8 +3,8 @@ package api
 import (
 	"net/http"
 
-	"github.com/sorobeacon/sorobeacon/internal/stellar"
-	"github.com/sorobeacon/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/stellar"
+	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
 // validContractIDs rejects malformed contract addresses up front: the RPC

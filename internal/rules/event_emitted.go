@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/sorobeacon/sorobeacon/internal/stellar"
+	"github.com/sorotrail/sorobeacon/internal/stellar"
 )
 
 // eventEmittedParams configure the event_emitted rule.

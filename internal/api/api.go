@@ -13,10 +13,10 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
-	"github.com/sorobeacon/sorobeacon/internal/notify"
-	"github.com/sorobeacon/sorobeacon/internal/rules"
-	"github.com/sorobeacon/sorobeacon/internal/stellar"
-	"github.com/sorobeacon/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/notify"
+	"github.com/sorotrail/sorobeacon/internal/rules"
+	"github.com/sorotrail/sorobeacon/internal/stellar"
+	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
 // Server holds the API's dependencies.

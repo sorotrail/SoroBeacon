@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/sorobeacon/sorobeacon/internal/notify"
-	"github.com/sorobeacon/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/notify"
+	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
 // channelRequest carries channel writes. Config holds secrets: it is

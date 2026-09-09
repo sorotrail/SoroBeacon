@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"math/big"
 
-	"github.com/sorobeacon/sorobeacon/internal/stellar"
+	"github.com/sorotrail/sorobeacon/internal/stellar"
 )
 
 // valueThresholdParams configure the value_threshold rule.

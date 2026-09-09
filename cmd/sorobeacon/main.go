@@ -15,14 +15,14 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
-	"github.com/sorobeacon/sorobeacon/internal/api"
-	"github.com/sorobeacon/sorobeacon/internal/config"
-	"github.com/sorobeacon/sorobeacon/internal/notify"
-	"github.com/sorobeacon/sorobeacon/internal/poller"
-	"github.com/sorobeacon/sorobeacon/internal/rules"
-	"github.com/sorobeacon/sorobeacon/internal/stellar"
-	"github.com/sorobeacon/sorobeacon/internal/store"
-	"github.com/sorobeacon/sorobeacon/internal/web"
+	"github.com/sorotrail/sorobeacon/internal/api"
+	"github.com/sorotrail/sorobeacon/internal/config"
+	"github.com/sorotrail/sorobeacon/internal/notify"
+	"github.com/sorotrail/sorobeacon/internal/poller"
+	"github.com/sorotrail/sorobeacon/internal/rules"
+	"github.com/sorotrail/sorobeacon/internal/stellar"
+	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/web"
 )
 
 func main() {

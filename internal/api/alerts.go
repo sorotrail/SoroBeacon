@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/sorobeacon/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
 // listAlerts serves GET /alerts with query filters:
