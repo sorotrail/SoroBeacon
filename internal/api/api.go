@@ -67,6 +67,8 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/alerts", s.listAlerts)
 	r.Get("/alerts/{id}/deliveries", s.listDeliveries)
 	r.Get("/health", s.health)
+	r.Get("/livez", s.livez)
+	r.Get("/readyz", s.readyz)
 	r.Get("/stats", s.stats)
 
 	return r
