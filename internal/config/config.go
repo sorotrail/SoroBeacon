@@ -32,6 +32,12 @@ type Config struct {
 	DatabaseURL string
 	// PollInterval is how often the poller asks the RPC for new events.
 	PollInterval time.Duration
+	// SourceMode selects where events come from: "rpc" (standalone,
+	// default) or "sorotrail" (upstream, reads a SoroTrail indexer).
+	SourceMode string
+	// SoroTrailURL is the base URL of a SoroTrail indexer; required when
+	// SourceMode is "sorotrail", ignored otherwise.
+	SoroTrailURL string
 	// HTTPAddr is the listen address for the API and dashboard.
 	HTTPAddr string
 	// LogLevel is the minimum slog level (debug, info, warn, error).
@@ -59,13 +65,25 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("DATABASE_URL is required")
 	}
 
+	// An absolute http(s) RPC URL is required whenever one is in play —
+	// always in rpc mode, and in sorotrail mode whenever RPC_URL is set
+	// alongside the indexer URL.
 	rpcURL, err := url.Parse(cfg.RPCURL)
-	if err != nil || !rpcURL.IsAbs() || rpcURL.Host == "" ||
-		(rpcURL.Scheme != "http" && rpcURL.Scheme != "https") {
+	if cfg.RPCURL != "" && (err != nil || !rpcURL.IsAbs() || rpcURL.Host == "" ||
+		(rpcURL.Scheme != "http" && rpcURL.Scheme != "https")) {
 		return cfg, fmt.Errorf(
 			"invalid RPC_URL %q: must be an absolute http or https URL",
 			cfg.RPCURL,
 		)
+	}
+
+	cfg.SourceMode = getenv("SOURCE_MODE", "rpc")
+	if cfg.SourceMode != "rpc" && cfg.SourceMode != "sorotrail" {
+		return cfg, fmt.Errorf("invalid SOURCE_MODE %q (want rpc|sorotrail)", cfg.SourceMode)
+	}
+	cfg.SoroTrailURL = os.Getenv("SOROTRAIL_URL")
+	if cfg.SourceMode == "sorotrail" && cfg.SoroTrailURL == "" {
+		return cfg, fmt.Errorf("SOROTRAIL_URL is required when SOURCE_MODE=sorotrail")
 	}
 
 	if v := os.Getenv("POLL_INTERVAL"); v != "" {
