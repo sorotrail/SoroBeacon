@@ -20,6 +20,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
+	"github.com/sorotrail/sorobeacon/internal/reqid"
 	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
@@ -82,7 +83,7 @@ func run() error {
 		return err
 	}
 	root := chi.NewRouter()
-	root.Use(middleware.Recoverer, requestLogger(log))
+	root.Use(middleware.Recoverer, reqid.Middleware, requestLogger(log))
 	// RoutePattern returns the matched chi pattern (e.g. "/api/v1/monitors/{id}")
 	// rather than the raw path, keeping metric label cardinality bounded.
 	metrics.RoutePattern = func(r *http.Request) string {
@@ -133,7 +134,8 @@ func requestLogger(log *slog.Logger) func(http.Handler) http.Handler {
 			next.ServeHTTP(ww, r)
 			log.Debug("http request",
 				"method", r.Method, "path", r.URL.Path,
-				"status", ww.Status(), "duration", time.Since(start))
+				"status", ww.Status(), "duration", time.Since(start),
+				"request_id", reqid.From(r))
 		})
 	}
 }

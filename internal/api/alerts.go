@@ -17,7 +17,7 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("monitor_id"); v != "" {
 		id, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid monitor_id")
+			writeErr(w, r, http.StatusBadRequest, "invalid monitor_id")
 			return
 		}
 		f.MonitorID = id
@@ -26,7 +26,7 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 		if v := q.Get(name); v != "" {
 			t, err := time.Parse(time.RFC3339, v)
 			if err != nil {
-				writeErr(w, http.StatusBadRequest, "invalid "+name+" (want RFC 3339)")
+				writeErr(w, r, http.StatusBadRequest, "invalid "+name+" (want RFC 3339)")
 				return
 			}
 			*dst = t
@@ -35,7 +35,7 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 {
-			writeErr(w, http.StatusBadRequest, "invalid limit")
+			writeErr(w, r, http.StatusBadRequest, "invalid limit")
 			return
 		}
 		f.Limit = n
@@ -43,7 +43,7 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("cursor"); v != "" {
 		id, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid cursor")
+			writeErr(w, r, http.StatusBadRequest, "invalid cursor")
 			return
 		}
 		f.AfterID = id
@@ -51,7 +51,7 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 
 	alerts, err := s.store.ListAlerts(r.Context(), f)
 	if err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	if alerts == nil {
@@ -68,12 +68,12 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listDeliveries(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid id")
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
 		return
 	}
 	list, err := s.store.ListDeliveryAttempts(r.Context(), id)
 	if err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	if list == nil {

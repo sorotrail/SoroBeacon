@@ -15,6 +15,7 @@ import (
 
 	"github.com/sorotrail/sorobeacon/internal/buildinfo"
 	"github.com/sorotrail/sorobeacon/internal/notify"
+	"github.com/sorotrail/sorobeacon/internal/reqid"
 	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
@@ -84,23 +85,31 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func writeErr(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+// writeErr emits the structured error envelope. The top-level "error"
+// string is kept for clients written against the original shape; the
+// "request_id" field lets a quoted error be mapped to one request in the
+// logs, and "code" gives clients a stable token to branch on.
+func writeErr(w http.ResponseWriter, r *http.Request, status int, msg string) {
+	writeJSON(w, status, map[string]any{
+		"error":      msg,
+		"code":       http.StatusText(status),
+		"request_id": reqid.From(r),
+	})
 }
 
 // fail maps store errors to HTTP responses.
-func (s *Server) fail(w http.ResponseWriter, err error) {
+func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, store.ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "not found")
+		writeErr(w, r, http.StatusNotFound, "not found")
 		return
 	}
-	s.log.Error("api error", "err", err)
-	writeErr(w, http.StatusInternalServerError, "internal error")
+	s.log.Error("api error", "request_id", reqid.From(r), "err", err)
+	writeErr(w, r, http.StatusInternalServerError, "internal error")
 }
 
 func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(v); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		writeErr(w, r, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return false
 	}
 	return true
@@ -142,7 +151,7 @@ func (s *Server) version(w http.ResponseWriter, r *http.Request) {
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 	st, err := s.store.GetStats(r.Context())
 	if err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, st)

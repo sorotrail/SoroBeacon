@@ -10,10 +10,10 @@ import (
 // validContractIDs rejects malformed contract addresses up front: the RPC
 // refuses the entire getEvents request if any filter contains one, which
 // would stall ingestion for every monitor.
-func validContractIDs(w http.ResponseWriter, ids []string) bool {
+func validContractIDs(w http.ResponseWriter, r *http.Request, ids []string) bool {
 	for _, id := range ids {
 		if !stellar.IsValidContractID(id) {
-			writeErr(w, http.StatusBadRequest, "invalid contract id: "+id)
+			writeErr(w, r, http.StatusBadRequest, "invalid contract id: "+id)
 			return false
 		}
 	}
@@ -33,14 +33,14 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Name == nil || *req.Name == "" {
-		writeErr(w, http.StatusBadRequest, "name is required")
+		writeErr(w, r, http.StatusBadRequest, "name is required")
 		return
 	}
 	if req.ContractIDs == nil || len(*req.ContractIDs) == 0 {
-		writeErr(w, http.StatusBadRequest, "contract_ids is required")
+		writeErr(w, r, http.StatusBadRequest, "contract_ids is required")
 		return
 	}
-	if !validContractIDs(w, *req.ContractIDs) {
+	if !validContractIDs(w, r, *req.ContractIDs) {
 		return
 	}
 	m := store.Monitor{
@@ -49,12 +49,12 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 		Enabled:     req.Enabled == nil || *req.Enabled,
 	}
 	if err := s.store.CreateMonitor(r.Context(), &m); err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	if req.ChannelIDs != nil {
 		if err := s.store.SetMonitorChannels(r.Context(), m.ID, *req.ChannelIDs); err != nil {
-			s.fail(w, err)
+			s.fail(w, r, err)
 			return
 		}
 		m.ChannelIDs = *req.ChannelIDs
@@ -65,7 +65,7 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listMonitors(w http.ResponseWriter, r *http.Request) {
 	monitors, err := s.store.ListMonitors(r.Context(), r.URL.Query().Get("enabled") == "true")
 	if err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	if monitors == nil {
@@ -77,12 +77,12 @@ func (s *Server) listMonitors(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getMonitor(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid id")
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
 		return
 	}
 	m, err := s.store.GetMonitor(r.Context(), id)
 	if err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, m)
@@ -91,12 +91,12 @@ func (s *Server) getMonitor(w http.ResponseWriter, r *http.Request) {
 func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid id")
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
 		return
 	}
 	m, err := s.store.GetMonitor(r.Context(), id)
 	if err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	var req monitorRequest
@@ -107,7 +107,7 @@ func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 		m.Name = *req.Name
 	}
 	if req.ContractIDs != nil {
-		if !validContractIDs(w, *req.ContractIDs) {
+		if !validContractIDs(w, r, *req.ContractIDs) {
 			return
 		}
 		m.ContractIDs = *req.ContractIDs
@@ -116,12 +116,12 @@ func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 		m.Enabled = *req.Enabled
 	}
 	if err := s.store.UpdateMonitor(r.Context(), m); err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	if req.ChannelIDs != nil {
 		if err := s.store.SetMonitorChannels(r.Context(), m.ID, *req.ChannelIDs); err != nil {
-			s.fail(w, err)
+			s.fail(w, r, err)
 			return
 		}
 		m.ChannelIDs = *req.ChannelIDs
@@ -132,11 +132,11 @@ func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 func (s *Server) deleteMonitor(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid id")
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
 		return
 	}
 	if err := s.store.DeleteMonitor(r.Context(), id); err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

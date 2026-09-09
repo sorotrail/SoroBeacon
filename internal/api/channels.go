@@ -25,11 +25,11 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Name == nil || *req.Name == "" {
-		writeErr(w, http.StatusBadRequest, "name is required")
+		writeErr(w, r, http.StatusBadRequest, "name is required")
 		return
 	}
 	if req.Type == nil || *req.Type == "" {
-		writeErr(w, http.StatusBadRequest, "type is required")
+		writeErr(w, r, http.StatusBadRequest, "type is required")
 		return
 	}
 	config := json.RawMessage(`{}`)
@@ -38,7 +38,7 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	// Building the notifier validates the config up front.
 	if _, err := s.factory.New(*req.Type, config); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 	ch := store.Channel{
@@ -48,7 +48,7 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 		Enabled: req.Enabled == nil || *req.Enabled,
 	}
 	if err := s.store.CreateChannel(r.Context(), &ch); err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, ch)
@@ -57,7 +57,7 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listChannels(w http.ResponseWriter, r *http.Request) {
 	list, err := s.store.ListChannels(r.Context())
 	if err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	if list == nil {
@@ -69,12 +69,12 @@ func (s *Server) listChannels(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getChannel(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid id")
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
 		return
 	}
 	ch, err := s.store.GetChannel(r.Context(), id)
 	if err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, ch)
@@ -83,12 +83,12 @@ func (s *Server) getChannel(w http.ResponseWriter, r *http.Request) {
 func (s *Server) updateChannel(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid id")
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
 		return
 	}
 	ch, err := s.store.GetChannel(r.Context(), id)
 	if err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	var req channelRequest
@@ -108,11 +108,11 @@ func (s *Server) updateChannel(w http.ResponseWriter, r *http.Request) {
 		ch.Enabled = *req.Enabled
 	}
 	if _, err := s.factory.New(ch.Type, ch.Config); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err := s.store.UpdateChannel(r.Context(), ch); err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, ch)
@@ -121,11 +121,11 @@ func (s *Server) updateChannel(w http.ResponseWriter, r *http.Request) {
 func (s *Server) deleteChannel(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid id")
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
 		return
 	}
 	if err := s.store.DeleteChannel(r.Context(), id); err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -136,17 +136,17 @@ func (s *Server) deleteChannel(w http.ResponseWriter, r *http.Request) {
 func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid id")
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
 		return
 	}
 	ch, err := s.store.GetChannel(r.Context(), id)
 	if err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	notifier, err := s.factory.New(ch.Type, ch.Config)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 	testAlert := notify.Alert{

@@ -16,11 +16,11 @@ type ruleRequest struct {
 func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 	monitorID, err := pathID(r, "id")
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid monitor id")
+		writeErr(w, r, http.StatusBadRequest, "invalid monitor id")
 		return
 	}
 	if _, err := s.store.GetMonitor(r.Context(), monitorID); err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	var req ruleRequest
@@ -28,7 +28,7 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Type == nil || *req.Type == "" {
-		writeErr(w, http.StatusBadRequest, "type is required")
+		writeErr(w, r, http.StatusBadRequest, "type is required")
 		return
 	}
 	params := json.RawMessage(`{}`)
@@ -36,7 +36,7 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 		params = *req.Params
 	}
 	if err := s.registry.Validate(*req.Type, params); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 	rule := store.Rule{
@@ -46,7 +46,7 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 		Enabled:   req.Enabled == nil || *req.Enabled,
 	}
 	if err := s.store.CreateRule(r.Context(), &rule); err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, rule)
@@ -55,12 +55,12 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listRules(w http.ResponseWriter, r *http.Request) {
 	monitorID, err := pathID(r, "id")
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid monitor id")
+		writeErr(w, r, http.StatusBadRequest, "invalid monitor id")
 		return
 	}
 	list, err := s.store.ListRules(r.Context(), monitorID, false)
 	if err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	if list == nil {
@@ -88,11 +88,11 @@ func (s *Server) updateRule(w http.ResponseWriter, r *http.Request) {
 		rule.Enabled = *req.Enabled
 	}
 	if err := s.registry.Validate(rule.Type, rule.Params); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeErr(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err := s.store.UpdateRule(r.Context(), rule); err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, rule)
@@ -104,7 +104,7 @@ func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.DeleteRule(r.Context(), rule.ID); err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -115,21 +115,21 @@ func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
 func (s *Server) ruleFromPath(w http.ResponseWriter, r *http.Request) (*store.Rule, bool) {
 	monitorID, err := pathID(r, "id")
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid monitor id")
+		writeErr(w, r, http.StatusBadRequest, "invalid monitor id")
 		return nil, false
 	}
 	ruleID, err := pathID(r, "ruleID")
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid rule id")
+		writeErr(w, r, http.StatusBadRequest, "invalid rule id")
 		return nil, false
 	}
 	rule, err := s.store.GetRule(r.Context(), ruleID)
 	if err != nil {
-		s.fail(w, err)
+		s.fail(w, r, err)
 		return nil, false
 	}
 	if rule.MonitorID != monitorID {
-		writeErr(w, http.StatusNotFound, "not found")
+		writeErr(w, r, http.StatusNotFound, "not found")
 		return nil, false
 	}
 	return rule, true
