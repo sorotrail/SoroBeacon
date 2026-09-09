@@ -40,6 +40,7 @@ func NewRegistry() *Registry {
 	r := &Registry{evaluators: map[string]RuleEvaluator{}}
 	r.Register(TypeEventEmitted, EventEmitted{})
 	r.Register(TypeValueThreshold, ValueThreshold{})
+	r.Register(TypeTokenEvent, TokenEvent{})
 	return r
 }
 

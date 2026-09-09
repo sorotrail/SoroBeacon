@@ -107,10 +107,18 @@ type DecodedEvent struct {
 }
 
 // EventName returns the first topic if it is a string (the conventional
-// Soroban event name), or "" otherwise.
+// Soroban event name), or "" otherwise. Both decoded shapes are handled:
+// a bare string (the local XDR decode path) and the single-key wrapper
+// {"symbol": "..."} (the RPC's xdrFormat:"json" path).
 func (e *DecodedEvent) EventName() string {
-	if len(e.Topics) > 0 {
-		if s, ok := e.Topics[0].(string); ok {
+	if len(e.Topics) == 0 {
+		return ""
+	}
+	if s, ok := e.Topics[0].(string); ok {
+		return s
+	}
+	if m, ok := e.Topics[0].(map[string]any); ok {
+		if s, ok := m["symbol"].(string); ok {
 			return s
 		}
 	}
