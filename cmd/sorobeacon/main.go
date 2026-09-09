@@ -101,6 +101,7 @@ func run() error {
 	}
 	root := chi.NewRouter()
 	root.Use(middleware.Recoverer, reqid.Middleware, requestLogger(log))
+	root.Use(api.CORSMiddleware(api.CORSConfig{Origins: cfg.CORSAllowedOrigins}))
 	// RoutePattern returns the matched chi pattern (e.g. "/api/v1/monitors/{id}")
 	// rather than the raw path, keeping metric label cardinality bounded.
 	metrics.RoutePattern = func(r *http.Request) string {

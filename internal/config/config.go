@@ -38,6 +38,10 @@ type Config struct {
 	// SoroTrailURL is the base URL of a SoroTrail indexer; required when
 	// SourceMode is "sorotrail", ignored otherwise.
 	SoroTrailURL string
+	// CORSAllowedOrigins is the allow-list of browser Origins permitted to
+	// call the API cross-origin (CORS_ALLOWED_ORIGINS, comma-separated).
+	// Empty disables CORS; the dashboard is same-origin and never needs it.
+	CORSAllowedOrigins []string
 	// HTTPAddr is the listen address for the API and dashboard.
 	HTTPAddr string
 	// LogLevel is the minimum slog level (debug, info, warn, error).
@@ -95,6 +99,14 @@ func Load() (Config, error) {
 			return cfg, fmt.Errorf("POLL_INTERVAL %q is below the 1s minimum", v)
 		}
 		cfg.PollInterval = d
+	}
+
+	if v := os.Getenv("CORS_ALLOWED_ORIGINS"); v != "" {
+		for _, o := range strings.Split(v, ",") {
+			if o = strings.TrimSpace(o); o != "" {
+				cfg.CORSAllowedOrigins = append(cfg.CORSAllowedOrigins, o)
+			}
+		}
 	}
 
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
