@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -44,6 +45,15 @@ func Load() (Config, error) {
 
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")
+	}
+
+	rpcURL, err := url.Parse(cfg.RPCURL)
+	if err != nil || !rpcURL.IsAbs() || rpcURL.Host == "" ||
+		(rpcURL.Scheme != "http" && rpcURL.Scheme != "https") {
+		return cfg, fmt.Errorf(
+			"invalid RPC_URL %q: must be an absolute http or https URL",
+			cfg.RPCURL,
+		)
 	}
 
 	if v := os.Getenv("POLL_INTERVAL"); v != "" {
