@@ -17,6 +17,7 @@ import (
 
 	"github.com/sorotrail/sorobeacon/internal/api"
 	"github.com/sorotrail/sorobeacon/internal/config"
+	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
 	"github.com/sorotrail/sorobeacon/internal/rules"
@@ -68,10 +69,11 @@ func run() error {
 	}
 	log.Info("network verified", "network", cfg.Network.Name, "rpc_url", cfg.RPCURL)
 
+	m := metrics.New()
 	registry := rules.NewRegistry()
 	factory := notify.DefaultFactory()
-	dispatcher := notify.NewDispatcher(st, factory, log)
-	p := poller.New(rpc, stellar.DefaultDecoder{}, st, registry, dispatcher, cfg.PollInterval, log)
+	dispatcher := notify.NewDispatcher(st, factory, log).WithMetrics(m)
+	p := poller.New(rpc, stellar.DefaultDecoder{}, st, registry, dispatcher, cfg.PollInterval, log).WithMetrics(m)
 
 	// HTTP: JSON API under /api/v1, dashboard at /.
 	apiSrv := api.New(st, registry, factory, rpc, log)
@@ -81,6 +83,16 @@ func run() error {
 	}
 	root := chi.NewRouter()
 	root.Use(middleware.Recoverer, requestLogger(log))
+	// RoutePattern returns the matched chi pattern (e.g. "/api/v1/monitors/{id}")
+	// rather than the raw path, keeping metric label cardinality bounded.
+	metrics.RoutePattern = func(r *http.Request) string {
+		if rc := chi.RouteContext(r.Context()); rc != nil {
+			return rc.RoutePattern()
+		}
+		return ""
+	}
+	root.Use(m.Middleware)
+	root.Handle("/metrics", m.Handler())
 	root.Mount("/api/v1", apiSrv.Routes())
 	root.Mount("/", webSrv.Routes())
 

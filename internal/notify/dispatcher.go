@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
@@ -20,6 +21,8 @@ type Dispatcher struct {
 	store   DispatchStore
 	factory *Factory
 	log     *slog.Logger
+	// metrics is optional Prometheus instrumentation; nil-safe.
+	metrics *metrics.Metrics
 
 	// MaxAttempts per channel (default 3) and BaseBackoff between attempts
 	// (default 1s, doubled each retry: 1s, 2s, 4s...).
@@ -36,6 +39,12 @@ func NewDispatcher(s DispatchStore, f *Factory, log *slog.Logger) *Dispatcher {
 		MaxAttempts: 3,
 		BaseBackoff: time.Second,
 	}
+}
+
+// WithMetrics attaches delivery instrumentation.
+func (d *Dispatcher) WithMetrics(m *metrics.Metrics) *Dispatcher {
+	d.metrics = m
+	return d
 }
 
 // Dispatch delivers one alert to every enabled channel attached to its
@@ -65,10 +74,12 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 	for attempt := 1; ; attempt++ {
 		err := notifier.Send(ctx, a)
 		if err == nil {
+			d.metrics.RecordDelivery(ch.Type, true)
 			d.record(ctx, a.ID, ch.ID, "success", "")
 			d.log.Info("alert delivered", "alert_id", a.ID, "channel_id", ch.ID, "attempt", attempt)
 			return
 		}
+		d.metrics.RecordDelivery(ch.Type, false)
 		d.record(ctx, a.ID, ch.ID, "failed", err.Error())
 		d.log.Warn("alert delivery failed",
 			"alert_id", a.ID, "channel_id", ch.ID, "attempt", attempt, "err", err)

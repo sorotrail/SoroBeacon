@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
@@ -39,6 +40,11 @@ type Poller struct {
 	dispatch Dispatcher
 	interval time.Duration
 	log      *slog.Logger
+	// metrics is optional instrumentation; nil-safe, see internal/metrics.
+	metrics *metrics.Metrics
+	// scanned/matched accumulate per-cycle counts for metrics.
+	scanned int
+	matched int
 }
 
 // New wires a Poller.
@@ -54,6 +60,12 @@ func New(rpc stellar.Client, dec stellar.Decoder, st Store, reg *rules.Registry,
 	}
 }
 
+// WithMetrics attaches Prometheus instrumentation to the poll loop.
+func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
+	p.metrics = m
+	return p
+}
+
 // Run polls until ctx is cancelled. RPC errors back off exponentially
 // (capped at 10x the poll interval) instead of hammering the node.
 func (p *Poller) Run(ctx context.Context) {
@@ -67,7 +79,12 @@ func (p *Poller) Run(ctx context.Context) {
 		case <-time.After(delay):
 		}
 
-		if err := p.Poll(ctx); err != nil {
+		p.scanned, p.matched = 0, 0
+		start := time.Now()
+		err := p.Poll(ctx)
+		p.metrics.RecordPoll(err == nil, time.Since(start))
+		p.metrics.RecordEvents(p.scanned, p.matched)
+		if err != nil {
 			if ctx.Err() != nil {
 				continue
 			}
@@ -128,17 +145,24 @@ func (p *Poller) Poll(ctx context.Context) error {
 	// batch: 5 contracts per filter, 5 filters per request.
 	filters := buildFilters(contracts)
 	checkpoint := uint32(0) // min latestLedger across request batches
+	tip := uint32(0)        // max latestLedger across request batches
 	for i := 0; i < len(filters); i += stellar.MaxFiltersPerRequest {
 		batch := filters[i:min(i+stellar.MaxFiltersPerRequest, len(filters))]
 		latest, err := p.pollBatch(ctx, startLedger, batch, byContract)
 		if err != nil {
 			return err
 		}
-		if checkpoint == 0 || latest < checkpoint {
+		if latest > 0 && (checkpoint == 0 || latest < checkpoint) {
 			checkpoint = latest
+		}
+		if latest > tip {
+			tip = latest
 		}
 	}
 
+	// Lag: how far the checkpoint we reached trails the node's own tip.
+	// Grows when a batch's page-through takes longer than ledger cadence.
+	p.metrics.SetPollLag(int64(tip) - int64(checkpoint))
 	if checkpoint > state.LastLedger {
 		state.LastLedger = checkpoint
 		state.LastCursor = ""
@@ -165,6 +189,7 @@ func (p *Poller) pollBatch(ctx context.Context, startLedger uint32, filters []st
 		}
 		latest = res.LatestLedger
 
+		p.scanned += len(res.Events)
 		for _, ev := range res.Events {
 			p.handleEvent(ctx, ev, byContract)
 		}
@@ -216,6 +241,8 @@ func (p *Poller) handleEvent(ctx context.Context, ev stellar.Event, byContract m
 				continue
 			}
 			if matched {
+				p.matched++
+				p.metrics.RecordAlert()
 				p.fireAlert(ctx, m, rule, decoded)
 			}
 		}
