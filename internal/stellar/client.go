@@ -21,6 +21,7 @@ type Client interface {
 	GetEvents(ctx context.Context, req GetEventsRequest) (*GetEventsResult, error)
 	GetLatestLedger(ctx context.Context) (*LatestLedger, error)
 	GetHealth(ctx context.Context) (*Health, error)
+	GetNetwork(ctx context.Context) (*Network, error)
 }
 
 // RPCError is a JSON-RPC 2.0 error object returned by the node.
@@ -103,6 +104,14 @@ func (c *HTTPClient) GetLatestLedger(ctx context.Context) (*LatestLedger, error)
 func (c *HTTPClient) GetHealth(ctx context.Context) (*Health, error) {
 	var res Health
 	if err := c.call(ctx, "getHealth", struct{}{}, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+func (c *HTTPClient) GetNetwork(ctx context.Context) (*Network, error) {
+	var res Network
+	if err := c.call(ctx, "getNetwork", struct{}{}, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil

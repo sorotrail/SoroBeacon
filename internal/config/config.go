@@ -20,7 +20,13 @@ const (
 // Config holds all runtime configuration. Every field maps to one
 // environment variable; see .env.example for the full list.
 type Config struct {
-	// RPCURL is the Stellar RPC endpoint (JSON-RPC 2.0 over HTTP).
+	// Network is the Stellar network to monitor — its name, passphrase
+	// and RPC endpoint, resolved from NETWORK / RPC_URL /
+	// NETWORK_PASSPHRASE by ParseNetwork.
+	Network Network
+	// RPCURL is the Stellar RPC endpoint (JSON-RPC 2.0 over HTTP). This is
+	// Network.RPCURL; kept as a direct field since most call sites only
+	// need the URL.
 	RPCURL string
 	// DatabaseURL is a Postgres connection string (pgx format).
 	DatabaseURL string
@@ -35,8 +41,14 @@ type Config struct {
 // Load reads configuration from the environment. DATABASE_URL is the only
 // required variable; everything else has a sensible default.
 func Load() (Config, error) {
+	net, err := ParseNetwork(os.Getenv)
+	if err != nil {
+		return Config{}, err
+	}
+
 	cfg := Config{
-		RPCURL:       getenv("RPC_URL", DefaultRPCURL),
+		Network:      net,
+		RPCURL:       net.RPCURL,
 		DatabaseURL:  os.Getenv("DATABASE_URL"),
 		PollInterval: DefaultPollInterval,
 		HTTPAddr:     getenv("HTTP_ADDR", DefaultHTTPAddr),

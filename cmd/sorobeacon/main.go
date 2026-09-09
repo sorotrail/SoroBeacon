@@ -56,6 +56,18 @@ func run() error {
 
 	// Pipeline: RPC client -> decoder -> rules -> alerts -> channels.
 	rpc := stellar.NewHTTPClient(cfg.RPCURL, nil)
+
+	// Verify the RPC endpoint really is the configured network before any
+	// monitor starts evaluating events. A mainnet endpoint behind a testnet
+	// config (or the reverse) silently evaluates every rule against the
+	// wrong chain — this fails fast instead.
+	if net, err := rpc.GetNetwork(ctx); err != nil {
+		log.Warn("could not verify network passphrase", "error", err)
+	} else if err := config.VerifyPassphrase(cfg.Network.Passphrase, net.Passphrase); err != nil {
+		return err
+	}
+	log.Info("network verified", "network", cfg.Network.Name, "rpc_url", cfg.RPCURL)
+
 	registry := rules.NewRegistry()
 	factory := notify.DefaultFactory()
 	dispatcher := notify.NewDispatcher(st, factory, log)

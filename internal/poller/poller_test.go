@@ -54,6 +54,10 @@ func (f *fakeRPC) GetLatestLedger(context.Context) (*stellar.LatestLedger, error
 	return &stellar.LatestLedger{Sequence: f.latest}, nil
 }
 
+func (f *fakeRPC) GetNetwork(context.Context) (*stellar.Network, error) {
+	return &stellar.Network{}, nil
+}
+
 func (f *fakeRPC) GetHealth(context.Context) (*stellar.Health, error) {
 	return &stellar.Health{Status: "healthy"}, nil
 }
