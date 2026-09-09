@@ -22,16 +22,23 @@ import (
 )
 
 // Server holds the API's dependencies.
+// HealthChecker is the dependency the health/readyz probes consult. The
+// stellar RPC client satisfies it directly; the SoroTrail source provides
+// its own adapter in upstream mode, so probes work in both modes.
+type HealthChecker interface {
+	GetHealth(ctx context.Context) (*stellar.Health, error)
+}
+
 type Server struct {
 	store    store.Store
 	registry *rules.Registry
 	factory  *notify.Factory
-	rpc      stellar.Client
+	rpc      HealthChecker
 	log      *slog.Logger
 }
 
 // New wires an API server.
-func New(st store.Store, reg *rules.Registry, f *notify.Factory, rpc stellar.Client, log *slog.Logger) *Server {
+func New(st store.Store, reg *rules.Registry, f *notify.Factory, rpc HealthChecker, log *slog.Logger) *Server {
 	return &Server{store: st, registry: reg, factory: f, rpc: rpc, log: log}
 }
 

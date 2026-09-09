@@ -133,8 +133,8 @@ func transferEvent(id string, ledger uint32, amount string) stellar.Event {
 }
 
 func newTestPoller(rpc *fakeRPC, st *fakeStore, d *fakeDispatcher) *Poller {
-	return New(rpc, stellar.DefaultDecoder{}, st, rules.NewRegistry(), d, 0,
-		slog.New(slog.DiscardHandler))
+	src := NewRPCSource(rpc, stellar.DefaultDecoder{})
+	return New(src, st, rules.NewRegistry(), d, 0, slog.New(slog.DiscardHandler))
 }
 
 func seedMonitor(st *fakeStore, ruleParams string) {

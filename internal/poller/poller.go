@@ -33,8 +33,7 @@ type Dispatcher interface {
 // Poller runs the ingest loop: getEvents from the last checkpoint, decode,
 // match rules, create + dispatch alerts, advance the checkpoint.
 type Poller struct {
-	rpc      stellar.Client
-	decoder  stellar.Decoder
+	source   EventSource
 	store    Store
 	registry *rules.Registry
 	dispatch Dispatcher
@@ -47,11 +46,11 @@ type Poller struct {
 	matched int
 }
 
-// New wires a Poller.
-func New(rpc stellar.Client, dec stellar.Decoder, st Store, reg *rules.Registry, d Dispatcher, interval time.Duration, log *slog.Logger) *Poller {
+// New wires a Poller. src is where events come from: NewRPCSource for a
+// Stellar RPC node, or the SoroTrail source for upstream mode.
+func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval time.Duration, log *slog.Logger) *Poller {
 	return &Poller{
-		rpc:      rpc,
-		decoder:  dec,
+		source:   src,
 		store:    st,
 		registry: reg,
 		dispatch: d,
@@ -131,33 +130,42 @@ func (p *Poller) Poll(ctx context.Context) error {
 	}
 	startLedger := state.LastLedger + 1
 	if state.LastLedger == 0 {
-		// Cold start: the RPC only retains ~1-7 days of events, so begin at
-		// the current tip rather than trying to backfill history.
-		latest, err := p.rpc.GetLatestLedger(ctx)
+		// Cold start against an RPC source: the node only retains ~1-7
+		// days of events, so begin at the current tip. Upstream sources
+		// (SoroTrail) hold durable history and answer the same query.
+		latest, err := p.source.LatestLedger(ctx)
 		if err != nil {
 			return err
 		}
-		startLedger = latest.Sequence
+		startLedger = latest
 		p.log.Info("cold start", "start_ledger", startLedger)
 	}
 
-	// getEvents caps filters per request and contractIds per filter, so
-	// batch: 5 contracts per filter, 5 filters per request.
-	filters := buildFilters(contracts)
-	checkpoint := uint32(0) // min latestLedger across request batches
-	tip := uint32(0)        // max latestLedger across request batches
-	for i := 0; i < len(filters); i += stellar.MaxFiltersPerRequest {
-		batch := filters[i:min(i+stellar.MaxFiltersPerRequest, len(filters))]
-		latest, err := p.pollBatch(ctx, startLedger, batch, byContract)
+	// Page the source until it reports no more events for the cycle. The
+	// cursor is opaque; batching (the RPC caps filters per request) is the
+	// source's concern, encoded in its cursors.
+	checkpoint := uint32(0) // min latestLedger across pages
+	tip := uint32(0)        // max latestLedger across pages
+	cursor := ""
+	for {
+		page, err := p.source.FetchEvents(ctx, startLedger, contracts, cursor, stellar.DefaultEventsLimit)
 		if err != nil {
 			return err
 		}
-		if latest > 0 && (checkpoint == 0 || latest < checkpoint) {
-			checkpoint = latest
+		if page.LatestLedger > 0 && (checkpoint == 0 || page.LatestLedger < checkpoint) {
+			checkpoint = page.LatestLedger
 		}
-		if latest > tip {
-			tip = latest
+		if page.LatestLedger > tip {
+			tip = page.LatestLedger
 		}
+		p.scanned += len(page.Events)
+		for _, ev := range page.Events {
+			p.handleEvent(ctx, ev, byContract)
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
 	}
 
 	// Lag: how far the checkpoint we reached trails the node's own tip.
@@ -175,56 +183,13 @@ func (p *Poller) Poll(ctx context.Context) error {
 
 // pollBatch pages through getEvents for one set of filters, following the
 // cursor until the stream is drained. Returns the node's latestLedger.
-func (p *Poller) pollBatch(ctx context.Context, startLedger uint32, filters []stellar.EventFilter, byContract map[string][]store.Monitor) (uint32, error) {
-	req := stellar.GetEventsRequest{
-		StartLedger: startLedger,
-		Filters:     filters,
-		Pagination:  &stellar.Pagination{Limit: stellar.DefaultEventsLimit},
-	}
-	var latest uint32
-	for {
-		res, err := p.rpc.GetEvents(ctx, req)
-		if err != nil {
-			return 0, err
-		}
-		latest = res.LatestLedger
-
-		p.scanned += len(res.Events)
-		for _, ev := range res.Events {
-			p.handleEvent(ctx, ev, byContract)
-		}
-
-		if len(res.Events) < stellar.DefaultEventsLimit {
-			return latest, nil
-		}
-		cursor := res.Cursor
-		if cursor == "" && len(res.Events) > 0 {
-			// Older RPC versions: page with the last event's token/id.
-			last := res.Events[len(res.Events)-1]
-			cursor = last.PagingToken
-			if cursor == "" {
-				cursor = last.ID
-			}
-		}
-		if cursor == "" {
-			return latest, nil
-		}
-		req.Pagination = &stellar.Pagination{Cursor: cursor, Limit: stellar.DefaultEventsLimit}
-		req.StartLedger = 0
-	}
-}
-
-// handleEvent decodes one event and runs every enabled rule of every
-// monitor watching its contract. Per-event failures are logged, not fatal:
-// one undecodable event must not stall ingestion.
-func (p *Poller) handleEvent(ctx context.Context, ev stellar.Event, byContract map[string][]store.Monitor) {
-	monitors, watched := byContract[ev.ContractID]
+// handleEvent runs every enabled rule of every monitor watching the
+// event's contract. Events arrive already decoded from the source;
+// per-event failures are logged, not fatal: one bad event must not stall
+// ingestion.
+func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent, byContract map[string][]store.Monitor) {
+	monitors, watched := byContract[decoded.ContractID]
 	if !watched {
-		return
-	}
-	decoded, err := p.decoder.DecodeEvent(ev)
-	if err != nil {
-		p.log.Warn("decode event failed", "event_id", ev.ID, "contract_id", ev.ContractID, "err", err)
 		return
 	}
 
@@ -237,7 +202,7 @@ func (p *Poller) handleEvent(ctx context.Context, ev stellar.Event, byContract m
 		for _, rule := range ruleList {
 			matched, err := p.registry.Evaluate(ctx, rule.Type, decoded, rule.Params)
 			if err != nil {
-				p.log.Warn("rule evaluation failed", "rule_id", rule.ID, "event_id", ev.ID, "err", err)
+				p.log.Warn("rule evaluation failed", "rule_id", rule.ID, "event_id", decoded.ID, "err", err)
 				continue
 			}
 			if matched {

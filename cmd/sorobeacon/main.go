@@ -22,6 +22,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/poller"
 	"github.com/sorotrail/sorobeacon/internal/reqid"
 	"github.com/sorotrail/sorobeacon/internal/rules"
+	"github.com/sorotrail/sorobeacon/internal/sorotrail"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
 	"github.com/sorotrail/sorobeacon/internal/web"
@@ -56,28 +57,44 @@ func run() error {
 	defer st.Close()
 	log.Info("database ready")
 
-	// Pipeline: RPC client -> decoder -> rules -> alerts -> channels.
-	rpc := stellar.NewHTTPClient(cfg.RPCURL, nil)
+	// Pipeline: event source -> rules -> alerts -> channels. The source is
+	// the single seam between the poller and wherever events come from.
+	var src poller.EventSource
+	var health api.HealthChecker
+	switch cfg.SourceMode {
+	case "sorotrail":
+		stc := sorotrail.NewClient(cfg.SoroTrailURL, nil)
+		src = sorotrail.NewSource(stc)
+		health = stc
+		log.Info("upstream mode: reading events from SoroTrail", "url", cfg.SoroTrailURL)
+	default: // "rpc"
+		rpc := stellar.NewHTTPClient(cfg.RPCURL, nil)
 
-	// Verify the RPC endpoint really is the configured network before any
-	// monitor starts evaluating events. A mainnet endpoint behind a testnet
-	// config (or the reverse) silently evaluates every rule against the
-	// wrong chain — this fails fast instead.
-	if net, err := rpc.GetNetwork(ctx); err != nil {
-		log.Warn("could not verify network passphrase", "error", err)
-	} else if err := config.VerifyPassphrase(cfg.Network.Passphrase, net.Passphrase); err != nil {
-		return err
+		// Verify the RPC endpoint really is the configured network before
+		// any monitor starts evaluating events. A mainnet endpoint behind
+		// a testnet config (or the reverse) silently evaluates every rule
+		// against the wrong chain — this fails fast instead. There is no
+		// equivalent check in upstream mode: the indexer's own deployment
+		// owns its network.
+		if net, err := rpc.GetNetwork(ctx); err != nil {
+			log.Warn("could not verify network passphrase", "error", err)
+		} else if err := config.VerifyPassphrase(cfg.Network.Passphrase, net.Passphrase); err != nil {
+			return err
+		}
+		log.Info("network verified", "network", cfg.Network.Name, "rpc_url", cfg.RPCURL)
+
+		src = poller.NewRPCSource(rpc, stellar.DefaultDecoder{})
+		health = rpc
 	}
-	log.Info("network verified", "network", cfg.Network.Name, "rpc_url", cfg.RPCURL)
 
 	m := metrics.New()
 	registry := rules.NewRegistry()
 	factory := notify.DefaultFactory()
 	dispatcher := notify.NewDispatcher(st, factory, log).WithMetrics(m)
-	p := poller.New(rpc, stellar.DefaultDecoder{}, st, registry, dispatcher, cfg.PollInterval, log).WithMetrics(m)
+	p := poller.New(src, st, registry, dispatcher, cfg.PollInterval, log).WithMetrics(m)
 
 	// HTTP: JSON API under /api/v1, dashboard at /.
-	apiSrv := api.New(st, registry, factory, rpc, log)
+	apiSrv := api.New(st, registry, factory, health, log)
 	webSrv, err := web.New(st, registry, factory, log)
 	if err != nil {
 		return err
