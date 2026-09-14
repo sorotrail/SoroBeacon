@@ -86,6 +86,7 @@ func run() error {
 		src = poller.NewRPCSource(rpc, stellar.DefaultDecoder{})
 		health = rpc
 	}
+	logStartupHealth(ctx, log, health)
 
 	m := metrics.New()
 	registry := rules.NewRegistry()
@@ -140,6 +141,28 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return httpSrv.Shutdown(shutdownCtx)
+}
+
+// startupHealthTimeout bounds the one-off health check logged at startup,
+// so a slow or unreachable dependency delays boot by at most this long
+// rather than hanging it.
+const startupHealthTimeout = 5 * time.Second
+
+// logStartupHealth reports the event source's health once at startup, so a
+// misconfigured RPC_URL (or SOROTRAIL_URL, in upstream mode) or an
+// unreachable node is visible immediately instead of silently surfacing on
+// the first poll failure. It never fails startup: the poller already
+// retries with backoff, so an unhealthy source at boot is logged as a
+// warning and left to recover on its own.
+func logStartupHealth(ctx context.Context, log *slog.Logger, health api.HealthChecker) {
+	ctx, cancel := context.WithTimeout(ctx, startupHealthTimeout)
+	defer cancel()
+	h, err := health.GetHealth(ctx)
+	if err != nil {
+		log.Warn("event source health check failed at startup", "error", err)
+		return
+	}
+	log.Info("event source healthy", "status", h.Status, "latest_ledger", h.LatestLedger)
 }
 
 // requestLogger logs one line per request via slog, keeping chi's default
