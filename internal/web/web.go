@@ -95,6 +95,7 @@ func (s *Server) Routes() chi.Router {
 	r.Post("/channels/{id}/test", s.testChannel)
 
 	r.Get("/alerts", s.alerts)
+	r.Get("/alerts/{id}/deliveries", s.alertDeliveries)
 	return r
 }
 
@@ -464,6 +465,50 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 		"Title": "Alerts", "Alerts": alerts, "Monitors": monitors,
 		"MonitorNames": names, "SelectedMonitor": selected, "NextCursor": next,
 	})
+}
+
+// alertDeliveries serves an htmx fragment of an alert's delivery history
+// (channel, status, response snippet, timestamp), loaded lazily when a row
+// on /alerts is expanded rather than eagerly for every alert on the page.
+func (s *Server) alertDeliveries(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	attempts, err := s.store.ListDeliveryAttempts(r.Context(), id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	channels, err := s.store.ListChannels(r.Context(), false)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	names := map[int64]string{}
+	for _, c := range channels {
+		names[c.ID] = c.Name
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if len(attempts) == 0 {
+		fmt.Fprint(w, `<p class="muted">No delivery attempts yet.</p>`)
+		return
+	}
+	fmt.Fprint(w, `<table><tr><th>Channel</th><th>Status</th><th>Response</th><th>At</th></tr>`)
+	for _, a := range attempts {
+		pillClass := "off"
+		if a.Status == "success" {
+			pillClass = "on"
+		}
+		fmt.Fprintf(w, `<tr><td>%s</td><td><span class="pill %s">%s</span></td><td><code>%s</code></td><td>%s</td></tr>`,
+			template.HTMLEscapeString(names[a.ChannelID]),
+			pillClass, template.HTMLEscapeString(a.Status),
+			template.HTMLEscapeString(a.ResponseSnippet),
+			template.HTMLEscapeString(a.AttemptedAt.Format("2006-01-02 15:04:05")))
+	}
+	fmt.Fprint(w, `</table>`)
 }
 
 func (s *Server) monitorNames(r *http.Request) (map[int64]string, error) {

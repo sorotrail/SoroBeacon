@@ -214,6 +214,83 @@ func TestToggleRule(t *testing.T) {
 	}
 }
 
+// deliveriesStore backs GET /alerts/{id}/deliveries with a fixed set of
+// attempts and one named channel.
+type deliveriesStore struct {
+	emptyStore
+	attempts []store.DeliveryAttempt
+}
+
+func (s deliveriesStore) ListDeliveryAttempts(context.Context, int64) ([]store.DeliveryAttempt, error) {
+	return s.attempts, nil
+}
+func (deliveriesStore) ListChannels(context.Context, bool) ([]store.Channel, error) {
+	return []store.Channel{{ID: 7, Name: "ops-webhook"}}, nil
+}
+
+func newDeliveriesServer(t *testing.T, st store.Store) *Server {
+	t.Helper()
+	s, err := New(st, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return s
+}
+
+func TestAlertDeliveries_DistinguishesSuccessFromFailed(t *testing.T) {
+	st := deliveriesStore{attempts: []store.DeliveryAttempt{
+		{ID: 1, ChannelID: 7, Status: "success", ResponseSnippet: "200 OK"},
+		{ID: 2, ChannelID: 7, Status: "failed", ResponseSnippet: "connection refused"},
+	}}
+	srv := httptest.NewServer(newDeliveriesServer(t, st).Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/alerts/1/deliveries")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /alerts/1/deliveries = %d, want 200", res.StatusCode)
+	}
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+
+	if !strings.Contains(html, `class="pill on"`) {
+		t.Errorf("expected a success (on) pill, got:\n%s", html)
+	}
+	if !strings.Contains(html, `class="pill off"`) {
+		t.Errorf("expected a failed (off) pill, got:\n%s", html)
+	}
+	if !strings.Contains(html, "ops-webhook") {
+		t.Errorf("expected the channel name resolved from ListChannels, got:\n%s", html)
+	}
+	if !strings.Contains(html, "connection refused") {
+		t.Errorf("expected the failed attempt's response snippet, got:\n%s", html)
+	}
+}
+
+func TestAlertDeliveries_EmptyIsNotAnError(t *testing.T) {
+	srv := httptest.NewServer(newDeliveriesServer(t, deliveriesStore{}).Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/alerts/1/deliveries")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /alerts/1/deliveries = %d, want 200", res.StatusCode)
+	}
+	body, _ := io.ReadAll(res.Body)
+	if !strings.Contains(string(body), "No delivery attempts yet") {
+		t.Fatalf("expected the empty-state message, got: %s", body)
+	}
+}
+
 func TestFavicon(t *testing.T) {
 	srv := httptest.NewServer(newTestServer(t).Routes())
 	defer srv.Close()

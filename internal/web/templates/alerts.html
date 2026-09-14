@@ -10,7 +10,7 @@
 </form>
 {{if .Alerts}}
 <table>
-  <tr><th>ID</th><th>Monitor</th><th>Rule</th><th>Event</th><th>Payload</th><th>At</th></tr>
+  <tr><th>ID</th><th>Monitor</th><th>Rule</th><th>Event</th><th>Payload</th><th>Deliveries</th><th>At</th></tr>
   {{range .Alerts}}
   <tr>
     <td>{{.ID}}</td>
@@ -18,6 +18,12 @@
     <td>#{{.RuleID}}</td>
     <td><code>{{.EventID}}</code></td>
     <td><details><summary>view</summary><pre>{{prettyJSON .Payload}}</pre></details></td>
+    <td>
+      <details hx-get="/alerts/{{.ID}}/deliveries" hx-trigger="toggle once" hx-target="find div">
+        <summary>view</summary>
+        <div class="muted">loading…</div>
+      </details>
+    </td>
     <td>{{.CreatedAt.Format "2006-01-02 15:04:05"}}</td>
   </tr>
   {{end}}
