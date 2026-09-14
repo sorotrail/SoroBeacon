@@ -57,8 +57,19 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 	if alerts == nil {
 		alerts = []store.Alert{}
 	}
+	// next_cursor is only meaningful when the page came back full: a short
+	// page means there's nothing older to fetch, so setting it would just
+	// cost the client one wasted round trip to learn that. "Full" has to
+	// account for store.Postgres.ListAlerts' own default/max clamping
+	// (f.Limit <= 0 or > 500 becomes 50), not the raw f.Limit the caller
+	// passed — mirroring the heuristic internal/web/web.go's alerts page
+	// already uses, where Limit is always pre-set to a sane value.
+	effectiveLimit := f.Limit
+	if effectiveLimit <= 0 || effectiveLimit > 500 {
+		effectiveLimit = 50
+	}
 	next := ""
-	if len(alerts) > 0 {
+	if len(alerts) == effectiveLimit {
 		next = strconv.FormatInt(alerts[len(alerts)-1].ID, 10)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"alerts": alerts, "next_cursor": next})
