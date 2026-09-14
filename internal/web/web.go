@@ -27,6 +27,9 @@ import (
 //go:embed templates/*.html
 var templatesFS embed.FS
 
+//go:embed favicon.svg
+var faviconSVG []byte
+
 // Server renders the dashboard.
 type Server struct {
 	store    store.Store
@@ -53,6 +56,7 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 func (s *Server) Routes() chi.Router {
 	r := chi.NewRouter()
 	r.Get("/", s.index)
+	r.Get("/favicon.ico", s.favicon)
 
 	r.Get("/monitors", s.monitors)
 	r.Post("/monitors", s.createMonitor)
@@ -86,6 +90,16 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 
 func pathID(r *http.Request, name string) (int64, error) {
 	return strconv.ParseInt(chi.URLParam(r, name), 10, 64)
+}
+
+// favicon serves the embedded icon so browsers requesting /favicon.ico on
+// every page load stop logging 404s. Served with a long cache lifetime:
+// the icon is baked into the binary, so a new version always ships with a
+// new deploy anyway.
+func (s *Server) favicon(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "image/svg+xml")
+	w.Header().Set("Cache-Control", "public, max-age=604800")
+	w.Write(faviconSVG)
 }
 
 // --- pages ---
