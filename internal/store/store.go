@@ -121,7 +121,7 @@ type Rules interface {
 type Channels interface {
 	CreateChannel(ctx context.Context, c *Channel) error
 	GetChannel(ctx context.Context, id int64) (*Channel, error)
-	ListChannels(ctx context.Context) ([]Channel, error)
+	ListChannels(ctx context.Context, enabledOnly bool) ([]Channel, error)
 	UpdateChannel(ctx context.Context, c *Channel) error
 	DeleteChannel(ctx context.Context, id int64) error
 	// ListChannelsForMonitor returns the enabled channels a monitor alerts to.

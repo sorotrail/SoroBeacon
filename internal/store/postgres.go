@@ -219,9 +219,13 @@ func (p *Postgres) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 	return &c, nil
 }
 
-func (p *Postgres) ListChannels(ctx context.Context) ([]Channel, error) {
-	rows, err := p.pool.Query(ctx,
-		`SELECT id, name, type, config, enabled, created_at FROM channels ORDER BY id`)
+func (p *Postgres) ListChannels(ctx context.Context, enabledOnly bool) ([]Channel, error) {
+	q := `SELECT id, name, type, config, enabled, created_at FROM channels`
+	if enabledOnly {
+		q += ` WHERE enabled`
+	}
+	q += ` ORDER BY id`
+	rows, err := p.pool.Query(ctx, q)
 	if err != nil {
 		return nil, err
 	}

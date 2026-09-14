@@ -157,7 +157,7 @@ func (s *Server) monitorDetail(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	channels, err := s.store.ListChannels(r.Context())
+	channels, err := s.store.ListChannels(r.Context(), false)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -277,7 +277,7 @@ func (s *Server) setMonitorChannels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) channels(w http.ResponseWriter, r *http.Request) {
-	channels, err := s.store.ListChannels(r.Context())
+	channels, err := s.store.ListChannels(r.Context(), false)
 	if err != nil {
 		s.fail(w, err)
 		return
