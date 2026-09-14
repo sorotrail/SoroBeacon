@@ -136,7 +136,9 @@ func pathID(r *http.Request, name string) (int64, error) {
 func (s *Server) favicon(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/svg+xml")
 	w.Header().Set("Cache-Control", "public, max-age=604800")
-	w.Write(faviconSVG)
+	if _, err := w.Write(faviconSVG); err != nil {
+		s.log.Warn("writing favicon response", "err", err)
+	}
 }
 
 // --- pages ---
