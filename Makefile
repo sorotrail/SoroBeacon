@@ -1,4 +1,4 @@
-.PHONY: build run test test-db lint fmt up down clean
+.PHONY: build run test test-db cover lint fmt up down clean
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
@@ -17,6 +17,10 @@ test:
 # docker-compose Postgres (make up first, or any Postgres you point at).
 test-db:
 	TEST_DATABASE_URL=$${TEST_DATABASE_URL:-postgres://sorobeacon:sorobeacon@localhost:5432/sorobeacon?sslmode=disable} go test ./...
+
+cover:
+	go test -coverprofile=coverage.out ./...
+	go tool cover -func=coverage.out
 
 lint:
 	golangci-lint run
