@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -84,6 +85,60 @@ func TestNavHighlightsActivePage(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPrettyJSON(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"object", `{"a":1,"b":{"c":2}}`, "{\n  \"a\": 1,\n  \"b\": {\n    \"c\": 2\n  }\n}"},
+		{"empty", "", ""},
+		{"invalid falls back to raw", "not json", "not json"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := prettyJSON(json.RawMessage(tt.in))
+			if got != tt.want {
+				t.Fatalf("prettyJSON(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// alertWithPayloadStore returns one alert with an object payload, so the
+// alerts page has something to indent.
+type alertWithPayloadStore struct {
+	emptyStore
+}
+
+func (alertWithPayloadStore) ListAlerts(context.Context, store.AlertFilter) ([]store.Alert, error) {
+	return []store.Alert{{ID: 1, Payload: json.RawMessage(`{"amount":"100"}`)}}, nil
+}
+
+func TestAlertsPageRendersIndentedPayload(t *testing.T) {
+	s, err := New(alertWithPayloadStore{}, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/alerts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+
+	if !strings.Contains(html, "<pre>{\n  &#34;amount&#34;: &#34;100&#34;\n}</pre>") {
+		t.Fatalf("expected an indented, HTML-escaped payload inside <pre>, got:\n%s", html)
 	}
 }
 

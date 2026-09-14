@@ -17,7 +17,7 @@
     <td>{{index $.MonitorNames .MonitorID}}</td>
     <td>#{{.RuleID}}</td>
     <td><code>{{.EventID}}</code></td>
-    <td><details><summary>view</summary><code>{{printf "%s" .Payload}}</code></details></td>
+    <td><details><summary>view</summary><pre>{{prettyJSON .Payload}}</pre></details></td>
     <td>{{.CreatedAt.Format "2006-01-02 15:04:05"}}</td>
   </tr>
   {{end}}

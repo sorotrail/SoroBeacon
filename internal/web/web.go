@@ -7,7 +7,9 @@
 package web
 
 import (
+	"bytes"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"log/slog"
@@ -39,11 +41,30 @@ type Server struct {
 	pages    map[string]*template.Template
 }
 
+// templateFuncs are available to every page template.
+var templateFuncs = template.FuncMap{
+	"prettyJSON": prettyJSON,
+}
+
+// prettyJSON indents raw JSON for display. Invalid or empty input falls
+// back to the raw string rather than erroring the page — a payload is
+// still worth showing even if it turns out not to parse.
+func prettyJSON(raw json.RawMessage) string {
+	var buf bytes.Buffer
+	if len(raw) == 0 {
+		return string(raw)
+	}
+	if err := json.Indent(&buf, raw, "", "  "); err != nil {
+		return string(raw)
+	}
+	return buf.String()
+}
+
 // New parses templates and wires a dashboard server.
 func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logger) (*Server, error) {
 	s := &Server{store: st, registry: reg, factory: f, log: log, pages: map[string]*template.Template{}}
 	for _, page := range []string{"index", "monitors", "monitor", "channels", "alerts"} {
-		t, err := template.ParseFS(templatesFS, "templates/layout.html", "templates/"+page+".html")
+		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, fmt.Errorf("parse template %s: %w", page, err)
 		}
