@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Minimal token scope; CI only reads repo contents.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+
+  # Same test suite again, this time with TEST_DATABASE_URL set so the
+  # store integration tests (internal/store/postgres_test.go) run too
+  # instead of skipping.
+  test-db:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sorobeacon
+          POSTGRES_PASSWORD: sorobeacon
+          POSTGRES_DB: sorobeacon
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sorobeacon"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Test (with Postgres integration tests)
+        run: go test ./...
+        env:
+          TEST_DATABASE_URL: postgres://sorobeacon:sorobeacon@localhost:5432/sorobeacon?sslmode=disable
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.12.2
