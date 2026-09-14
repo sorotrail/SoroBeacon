@@ -85,6 +85,7 @@ func (s *Server) Routes() chi.Router {
 	r.Post("/monitors/{id}/toggle", s.toggleMonitor)
 	r.Post("/monitors/{id}/delete", s.deleteMonitor)
 	r.Post("/monitors/{id}/rules", s.createRule)
+	r.Post("/monitors/{id}/rules/{ruleID}/toggle", s.toggleRule)
 	r.Post("/monitors/{id}/rules/{ruleID}/delete", s.deleteRule)
 	r.Post("/monitors/{id}/channels", s.setMonitorChannels)
 
@@ -294,6 +295,30 @@ func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.DeleteRule(r.Context(), ruleID); err != nil {
+		s.fail(w, err)
+		return
+	}
+	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
+}
+
+func (s *Server) toggleRule(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	ruleID, err := pathID(r, "ruleID")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	rule, err := s.store.GetRule(r.Context(), ruleID)
+	if err != nil || rule.MonitorID != id {
+		http.NotFound(w, r)
+		return
+	}
+	rule.Enabled = !rule.Enabled
+	if err := s.store.UpdateRule(r.Context(), rule); err != nil {
 		s.fail(w, err)
 		return
 	}

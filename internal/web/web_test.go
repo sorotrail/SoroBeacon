@@ -142,6 +142,78 @@ func TestAlertsPageRendersIndentedPayload(t *testing.T) {
 	}
 }
 
+// ruleToggleStore backs one monitor with one rule, and actually flips
+// Enabled on UpdateRule (rather than ignoring it), so the test can verify
+// the toggle round-trips through Get/Update like the real store would.
+type ruleToggleStore struct {
+	emptyStore
+	rule store.Rule
+}
+
+func (s *ruleToggleStore) GetMonitor(context.Context, int64) (*store.Monitor, error) {
+	return &store.Monitor{ID: 1, Name: "m"}, nil
+}
+func (s *ruleToggleStore) ListRules(context.Context, int64, bool) ([]store.Rule, error) {
+	return []store.Rule{s.rule}, nil
+}
+func (s *ruleToggleStore) GetRule(_ context.Context, id int64) (*store.Rule, error) {
+	if id != s.rule.ID {
+		return nil, store.ErrNotFound
+	}
+	r := s.rule
+	return &r, nil
+}
+func (s *ruleToggleStore) UpdateRule(_ context.Context, r *store.Rule) error {
+	s.rule = *r
+	return nil
+}
+
+func TestToggleRule(t *testing.T) {
+	st := &ruleToggleStore{rule: store.Rule{ID: 5, MonitorID: 1, Type: "transfer", Enabled: true}}
+	s, err := New(st, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	res, err := client.Post(srv.URL+"/monitors/1/rules/5/toggle", "application/x-www-form-urlencoded", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusSeeOther {
+		t.Fatalf("toggle status = %d, want %d", res.StatusCode, http.StatusSeeOther)
+	}
+	if loc := res.Header.Get("Location"); loc != "/monitors/1" {
+		t.Fatalf("redirect Location = %q, want /monitors/1", loc)
+	}
+	if st.rule.Enabled {
+		t.Fatal("rule still enabled after toggle")
+	}
+
+	// Toggling again flips it back.
+	res2, err := client.Post(srv.URL+"/monitors/1/rules/5/toggle", "application/x-www-form-urlencoded", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res2.Body.Close()
+	if !st.rule.Enabled {
+		t.Fatal("rule still disabled after toggling twice")
+	}
+
+	// A rule that doesn't belong to the path's monitor must 404, not toggle.
+	res3, err := client.Post(srv.URL+"/monitors/999/rules/5/toggle", "application/x-www-form-urlencoded", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res3.Body.Close()
+	if res3.StatusCode != http.StatusNotFound {
+		t.Fatalf("toggle for wrong monitor = %d, want 404", res3.StatusCode)
+	}
+}
+
 func TestFavicon(t *testing.T) {
 	srv := httptest.NewServer(newTestServer(t).Routes())
 	defer srv.Close()
