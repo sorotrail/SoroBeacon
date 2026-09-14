@@ -14,7 +14,8 @@ import (
 //	{
 //	  "host": "smtp.example.com", "port": 587,
 //	  "username": "beacon", "password": "...",
-//	  "from": "beacon@example.com", "to": ["ops@example.com"]
+//	  "from": "beacon@example.com", "to": ["ops@example.com"],
+//	  "subject_prefix": "[PROD] "
 //	}
 type emailConfig struct {
 	Host     string   `json:"host"`
@@ -23,6 +24,12 @@ type emailConfig struct {
 	Password string   `json:"password"`
 	From     string   `json:"from"`
 	To       []string `json:"to"`
+	// SubjectPrefix is prepended to the subject verbatim when set, so a
+	// team routing mail through filters can key on a tag like "[PROD] "
+	// (the space, if wanted, is the caller's to include). Empty by
+	// default, which leaves the subject exactly as before this option
+	// existed.
+	SubjectPrefix string `json:"subject_prefix"`
 }
 
 // Email sends alerts over SMTP (STARTTLS via net/smtp when offered).
@@ -45,12 +52,19 @@ func NewEmail(config json.RawMessage) (Notifier, error) {
 	return &Email{cfg: cfg}, nil
 }
 
+// subject builds the alert's Subject header, honoring the configured
+// prefix. Split out from Send so it's testable without a real SMTP
+// connection.
+func (e *Email) subject(a Alert) string {
+	return e.cfg.SubjectPrefix + fmt.Sprintf("SoroBeacon alert: %s", a.MonitorName)
+}
+
 func (e *Email) Send(ctx context.Context, a Alert) error {
 	msg, err := RenderText(a)
 	if err != nil {
 		return err
 	}
-	subject := fmt.Sprintf("SoroBeacon alert: %s", a.MonitorName)
+	subject := e.subject(a)
 	body := strings.Join([]string{
 		"From: " + e.cfg.From,
 		"To: " + strings.Join(e.cfg.To, ", "),

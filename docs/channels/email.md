@@ -31,8 +31,9 @@ curl -s -X POST localhost:8080/api/v1/channels/4/test
 | `password` | no | SMTP auth password. Treated as a secret. |
 | `from` | yes | Sender address. |
 | `to` | yes | List of recipient addresses. |
+| `subject_prefix` | no | Prepended to the subject verbatim when set (e.g. `"[PROD] "` — include the trailing space if you want one). Empty by default. |
 
-The subject line is `SoroBeacon alert: <monitor name>`; the body is the standard alert summary.
+The subject line is `<subject_prefix>SoroBeacon alert: <monitor name>`; the body is the standard alert summary.
 
 {% hint style="info" %}
 For Gmail/Google Workspace use an **app password**, not the account password.
