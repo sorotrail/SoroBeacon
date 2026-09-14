@@ -76,7 +76,22 @@ func (s *Server) Routes() chi.Router {
 	return r
 }
 
+// navSection maps a page name to the header nav entry it highlights.
+// "monitor" (the detail page) highlights the same entry as "monitors" —
+// they're the same section as far as navigation is concerned. "index"
+// intentionally maps to "" (Overview has no distinct nav highlight of its
+// own beyond the brand link).
+var navSection = map[string]string{
+	"monitors": "monitors",
+	"monitor":  "monitors",
+	"channels": "channels",
+	"alerts":   "alerts",
+}
+
 func (s *Server) render(w http.ResponseWriter, page string, data any) {
+	if m, ok := data.(map[string]any); ok {
+		m["Active"] = navSection[page]
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.pages[page].ExecuteTemplate(w, "layout", data); err != nil {
 		s.log.Error("render page", "page", page, "err", err)

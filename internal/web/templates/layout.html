@@ -14,6 +14,7 @@
     header .brand { font-weight: 700; font-size: 1.1rem; }
     header a { text-decoration: none; color: inherit; opacity: .8; }
     header a:hover { opacity: 1; }
+    header a.active { opacity: 1; font-weight: 600; border-bottom: 2px solid currentColor; }
     main { padding: 1.5rem; max-width: 70rem; margin: 0 auto; }
     table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
     th, td { text-align: left; padding: .4rem .6rem;
@@ -40,10 +41,10 @@
 <body>
 <header>
   <span class="brand">📡 SoroBeacon</span>
-  <a href="/">Overview</a>
-  <a href="/monitors">Monitors</a>
-  <a href="/channels">Channels</a>
-  <a href="/alerts">Alerts</a>
+  <a href="/" {{if eq .Active ""}}class="active"{{end}}>Overview</a>
+  <a href="/monitors" {{if eq .Active "monitors"}}class="active"{{end}}>Monitors</a>
+  <a href="/channels" {{if eq .Active "channels"}}class="active"{{end}}>Channels</a>
+  <a href="/alerts" {{if eq .Active "alerts"}}class="active"{{end}}>Alerts</a>
 </header>
 <main>
 {{template "content" .}}
