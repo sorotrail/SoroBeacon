@@ -13,6 +13,12 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/api/v1/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
 
   postgres:
     image: postgres:16-alpine
