@@ -3,6 +3,7 @@ package reqid
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 )
 
@@ -70,6 +71,37 @@ func TestNewUnique(t *testing.T) {
 		}
 		if seen[id] {
 			t.Fatalf("duplicate ID %q within 1000 draws", id)
+		}
+		seen[id] = true
+	}
+}
+
+func TestMiddlewareConcurrentRequestsGetDistinctIDs(t *testing.T) {
+	h := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	const n = 32
+	ids := make([]string, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+			ids[i] = rec.Header().Get(Header)
+		}(i)
+	}
+	wg.Wait()
+
+	seen := map[string]bool{}
+	for i, id := range ids {
+		if id == "" {
+			t.Fatalf("request %d: empty X-Request-ID", i)
+		}
+		if seen[id] {
+			t.Fatalf("duplicate request ID %q across concurrent requests", id)
 		}
 		seen[id] = true
 	}
