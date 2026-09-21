@@ -29,17 +29,32 @@ type HealthChecker interface {
 	GetHealth(ctx context.Context) (*stellar.Health, error)
 }
 
+// DefaultMaxBodyBytes is 1 MiB, matching config.DefaultHTTPMaxBodyBytes.
+// Used when New is not followed by WithMaxBodyBytes.
+const DefaultMaxBodyBytes int64 = 1 << 20
+
 type Server struct {
-	store    store.Store
-	registry *rules.Registry
-	factory  *notify.Factory
-	rpc      HealthChecker
-	log      *slog.Logger
+	store        store.Store
+	registry     *rules.Registry
+	factory      *notify.Factory
+	rpc          HealthChecker
+	log          *slog.Logger
+	maxBodyBytes int64
 }
 
 // New wires an API server.
 func New(st store.Store, reg *rules.Registry, f *notify.Factory, rpc HealthChecker, log *slog.Logger) *Server {
-	return &Server{store: st, registry: reg, factory: f, rpc: rpc, log: log}
+	return &Server{store: st, registry: reg, factory: f, rpc: rpc, log: log, maxBodyBytes: DefaultMaxBodyBytes}
+}
+
+// WithMaxBodyBytes sets the write-endpoint body limit applied by
+// MaxBodyMiddleware. Non-positive values are ignored so a miswired
+// caller cannot disable the cap.
+func (s *Server) WithMaxBodyBytes(n int64) *Server {
+	if n > 0 {
+		s.maxBodyBytes = n
+	}
+	return s
 }
 
 // Routes returns the API router. Mounted under /api/v1 by cmd/sorobeacon.
@@ -48,7 +63,7 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, rpc HealthCheck
 // the API is not exposed to untrusted networks.
 func (s *Server) Routes() chi.Router {
 	r := chi.NewRouter()
-	r.Use(middleware.Recoverer)
+	r.Use(middleware.Recoverer, MaxBodyMiddleware(s.maxBodyBytes))
 
 	r.Route("/monitors", func(r chi.Router) {
 		r.Post("/", s.createMonitor)
@@ -115,7 +130,12 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(v); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeErr(w, r, http.StatusRequestEntityTooLarge, "request body too large")
+			return false
+		}
 		writeErr(w, r, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return false
 	}
