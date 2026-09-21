@@ -22,7 +22,7 @@ type emptyStore struct {
 	store.Store
 }
 
-func (emptyStore) GetStats(context.Context) (store.Stats, error)                     { return store.Stats{}, nil }
+func (emptyStore) GetStats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
 func (emptyStore) ListAlerts(context.Context, store.AlertFilter) ([]store.Alert, error) {
 	return nil, nil
 }
@@ -306,5 +306,72 @@ func TestFavicon(t *testing.T) {
 	}
 	if ct := res.Header.Get("Content-Type"); ct != "image/svg+xml" {
 		t.Fatalf("Content-Type = %q, want image/svg+xml", ct)
+	}
+}
+
+// notFoundStore returns ErrNotFound for every ID lookup so unknown numeric
+// paths 404 instead of panicking on the nil embedded Store.
+type notFoundStore struct{ emptyStore }
+
+func (notFoundStore) GetMonitor(context.Context, int64) (*store.Monitor, error) {
+	return nil, store.ErrNotFound
+}
+func (notFoundStore) GetChannel(context.Context, int64) (*store.Channel, error) {
+	return nil, store.ErrNotFound
+}
+func (notFoundStore) GetRule(context.Context, int64) (*store.Rule, error) {
+	return nil, store.ErrNotFound
+}
+func (notFoundStore) ListDeliveryAttempts(context.Context, int64) ([]store.DeliveryAttempt, error) {
+	return nil, nil
+}
+
+func TestMalformedAndUnknownIDsReturn404(t *testing.T) {
+	s, err := New(notFoundStore{}, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	cases := []struct {
+		method, path string
+	}{
+		{"GET", "/monitors/abc"},
+		{"GET", "/monitors/not-a-number"},
+		{"POST", "/monitors/abc/toggle"},
+		{"POST", "/monitors/xyz/delete"},
+		{"POST", "/monitors/abc/rules"},
+		{"POST", "/monitors/1/rules/abc/toggle"},
+		{"POST", "/monitors/abc/rules/1/toggle"},
+		{"POST", "/monitors/1/rules/abc/delete"},
+		{"POST", "/channels/nope/delete"},
+		{"POST", "/channels/nope/test"},
+		{"GET", "/alerts/nope/deliveries"},
+		{"GET", "/monitors/999"},
+		{"POST", "/monitors/999/toggle"},
+		{"POST", "/channels/999/test"},
+		{"POST", "/monitors/999/rules/1/toggle"},
+	}
+	for _, tt := range cases {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			req, err := http.NewRequest(tt.method, srv.URL+tt.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(res.Body)
+			res.Body.Close()
+			if res.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404; body=%s", res.StatusCode, body)
+			}
+			if strings.Contains(string(body), "internal error") {
+				t.Fatalf("malformed/unknown ID must not 500, got: %s", body)
+			}
+		})
 	}
 }
