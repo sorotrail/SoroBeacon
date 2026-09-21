@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -109,4 +110,77 @@ func TestLoadRejectsBadValues(t *testing.T) {
 	t.Setenv("LOG_LEVEL", "loud")
 	_, err = Load()
 	assert.ErrorContains(t, err, "LOG_LEVEL")
+}
+
+func TestLogAttrsRedactsDatabasePassword(t *testing.T) {
+	cfg := Config{
+		Network:            Network{Name: "testnet", Passphrase: "Public Global Stellar Network ; September 2015"},
+		RPCURL:             "https://soroban-testnet.stellar.org",
+		DatabaseURL:        "postgres://humaki:s3cret-pass@db.example:5432/beacon?sslmode=disable",
+		PollInterval:       DefaultPollInterval,
+		SourceMode:         "rpc",
+		SoroTrailURL:       "",
+		CORSAllowedOrigins: []string{"https://app.example"},
+		HTTPAddr:           ":8080",
+		LogLevel:           slog.LevelInfo,
+	}
+
+	attrs := cfg.LogAttrs()
+	got := map[string]string{}
+	var dump strings.Builder
+	for _, a := range attrs {
+		val := a.Value.String()
+		got[a.Key] = val
+		dump.WriteString(a.Key)
+		dump.WriteByte('=')
+		dump.WriteString(val)
+		dump.WriteByte('\n')
+	}
+	blob := dump.String()
+
+	assert.Equal(t, "postgres://db.example:5432/beacon", got["database_url"])
+	assert.Equal(t, ":8080", got["http_addr"])
+	assert.Equal(t, "rpc", got["source_mode"])
+	assert.Equal(t, "5s", got["poll_interval"])
+	assert.Equal(t, "info", got["log_level"])
+	assert.Equal(t, "testnet", got["network"])
+	assert.Equal(t, "https://soroban-testnet.stellar.org", got["rpc_url"])
+	assert.Equal(t, "", got["sorotrail_url"])
+	assert.Equal(t, "https://app.example", got["cors_allowed_origins"])
+
+	assert.NotContains(t, blob, "s3cret-pass")
+	assert.NotContains(t, blob, "humaki")
+	assert.NotContains(t, blob, "sslmode")
+	assert.NotContains(t, blob, "Public Global Stellar Network")
+}
+
+func TestRedactDatabaseURLUnparseable(t *testing.T) {
+	assert.Equal(t, "", redactDatabaseURL(""))
+	assert.Equal(t, redacted, redactDatabaseURL("not a url"))
+	assert.Equal(t, redacted, redactDatabaseURL("http://["))
+}
+
+func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
+	cfg := Config{
+		DatabaseURL: "postgres://user:pw@host/db",
+		HTTPAddr:    ":8080",
+		SourceMode:  "rpc",
+		LogLevel:    slog.LevelWarn,
+		Network:     Network{Name: "mainnet"},
+	}
+	keys := make([]string, 0, len(cfg.LogAttrs()))
+	for _, a := range cfg.LogAttrs() {
+		keys = append(keys, a.Key)
+	}
+	assert.Equal(t, []string{
+		"database_url",
+		"http_addr",
+		"source_mode",
+		"poll_interval",
+		"log_level",
+		"network",
+		"rpc_url",
+		"sorotrail_url",
+		"cors_allowed_origins",
+	}, keys)
 }
