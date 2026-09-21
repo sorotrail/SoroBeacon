@@ -27,5 +27,6 @@ SoroBeacon is deliberately a **minimal, well-tested core with clean extension po
 
 * [Quickstart](getting-started/quickstart.md) — running against testnet in one `docker compose up`
 * [Monitors & alerts](guides/monitors-and-alerts.md) — wire a contract to a Discord channel end to end
+* [Troubleshooting](troubleshooting.md) — triage empty dashboards, failed deliveries, startup and RPC
 * [HTTP API](reference/api.md) — every endpoint with `curl` examples
 * [Extending SoroBeacon](contributing/extending.md) — add your own rule type or channel

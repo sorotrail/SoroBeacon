@@ -11,6 +11,7 @@
 
 * [Monitors & alerts](guides/monitors-and-alerts.md)
 * [The dashboard](guides/dashboard.md)
+* [Troubleshooting](troubleshooting.md)
 
 ## 📏 Rule reference
 
