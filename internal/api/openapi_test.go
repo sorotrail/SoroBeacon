@@ -1,8 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -110,5 +112,31 @@ func TestOpenAPISpecCoversAllRoutes(t *testing.T) {
 				t.Errorf("openapi.json documents %s %q but no such route is registered", method, path)
 			}
 		}
+	}
+}
+
+func TestServeOpenAPISpec(t *testing.T) {
+	s := New(&fakeStore{}, rules.NewRegistry(), notify.DefaultFactory(), &fakeRPC{}, discardLogger())
+	req := httptest.NewRequest(http.MethodGet, "/openapi.json", nil)
+	res := httptest.NewRecorder()
+	s.Routes().ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("GET /openapi.json = %d, want 200", res.Code)
+	}
+	if got := res.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	body := res.Body.Bytes()
+	if !bytes.Equal(body, openapiSpec) {
+		t.Fatalf("body is %d bytes, embedded spec is %d; must be the same bytes with no re-marshalling", len(body), len(openapiSpec))
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		t.Fatalf("body is not JSON: %v", err)
+	}
+	paths, _ := doc["paths"].(map[string]any)
+	if len(paths) == 0 {
+		t.Fatal("paths is empty")
 	}
 }

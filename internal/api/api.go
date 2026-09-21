@@ -80,6 +80,7 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/readyz", s.readyz)
 	r.Get("/version", s.version)
 	r.Get("/stats", s.stats)
+	r.Get("/openapi.json", s.openapi)
 
 	return r
 }
@@ -162,4 +163,13 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, st)
+}
+
+// openapi writes the embedded OpenAPI document as-is. Re-marshalling would
+// reorder keys and change whitespace, so clients hashing or caching the
+// spec would see a different body than the file in the repository.
+func (s *Server) openapi(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(openapiSpec)
 }
