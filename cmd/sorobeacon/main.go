@@ -101,7 +101,10 @@ func run() error {
 		return err
 	}
 	root := chi.NewRouter()
-	root.Use(middleware.Recoverer, reqid.Middleware, requestLogger(log))
+	// RequestLog must sit outside Recoverer so a panic still emits the
+	// access line after chi writes 500. reqid first so the line can
+	// carry the correlation id.
+	root.Use(reqid.Middleware, api.RequestLog(log), middleware.Recoverer)
 	root.Use(api.CORSMiddleware(api.CORSConfig{Origins: cfg.CORSAllowedOrigins}))
 	// RoutePattern returns the matched chi pattern (e.g. "/api/v1/monitors/{id}")
 	// rather than the raw path, keeping metric label cardinality bounded.
@@ -165,18 +168,4 @@ func logStartupHealth(ctx context.Context, log *slog.Logger, health api.HealthCh
 	log.Info("event source healthy", "status", h.Status, "latest_ledger", h.LatestLedger)
 }
 
-// requestLogger logs one line per request via slog, keeping chi's default
-// logger (and its non-structured output) out of the picture.
-func requestLogger(log *slog.Logger) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			start := time.Now()
-			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
-			next.ServeHTTP(ww, r)
-			log.Debug("http request",
-				"method", r.Method, "path", r.URL.Path,
-				"status", ww.Status(), "duration", time.Since(start),
-				"request_id", reqid.From(r))
-		})
-	}
-}
+
