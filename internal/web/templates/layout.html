@@ -38,6 +38,8 @@
     code { font-size: .85em; word-break: break-all; }
     pre { font-size: .85em; overflow-x: auto; margin: .3rem 0 0; padding: .5rem;
           background: color-mix(in srgb, currentColor 6%, transparent); border-radius: .3rem; }
+    .copy-id { display: inline; }
+    .copy-btn { font-size: .75rem; padding: .1rem .45rem; margin-left: .25rem; vertical-align: baseline; }
   </style>
 </head>
 <body>
@@ -51,5 +53,20 @@
 <main>
 {{template "content" .}}
 </main>
+<script>
+  document.addEventListener('click', function (ev) {
+    var btn = ev.target.closest ? ev.target.closest('button.copy-btn') : null;
+    if (!btn) return;
+    var value = btn.getAttribute('data-copy') || '';
+    var clip = navigator.clipboard;
+    if (!clip || typeof clip.writeText !== 'function') return;
+    clip.writeText(value).then(function () {
+      var prev = btn.textContent;
+      btn.textContent = 'Copied';
+      setTimeout(function () { btn.textContent = prev; }, 1200);
+    }).catch(function () {});
+  });
+</script>
 </body>
 </html>{{end}}
+{{define "copyID"}}<span class="copy-id"><code>{{.}}</code><button type="button" class="copy-btn" data-copy="{{.}}" aria-label="Copy identifier">Copy</button></span>{{end}}
