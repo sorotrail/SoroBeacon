@@ -23,7 +23,7 @@ func testStore(t *testing.T) *Postgres {
 	}
 	require.NoError(t, Migrate(url))
 
-	st, err := NewPostgres(context.Background(), url)
+	st, err := NewPostgres(context.Background(), url, PoolSettings{})
 	require.NoError(t, err)
 	t.Cleanup(st.Close)
 
