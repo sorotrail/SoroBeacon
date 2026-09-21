@@ -87,6 +87,16 @@ type AlertFilter struct {
 	AfterID int64
 }
 
+// ChannelFilter narrows ListChannels. Zero values mean "no constraint":
+// EnabledOnly is the existing ?enabled=true behaviour, and Type is an
+// exact match on channels.type. An unknown Type is a valid filter — it
+// returns an empty list rather than an error, because the set of types
+// is whatever the notifier factory currently registers.
+type ChannelFilter struct {
+	EnabledOnly bool
+	Type        string
+}
+
 // Stats is the aggregate snapshot served by GET /stats.
 type Stats struct {
 	Monitors     int64     `json:"monitors"`
@@ -121,7 +131,7 @@ type Rules interface {
 type Channels interface {
 	CreateChannel(ctx context.Context, c *Channel) error
 	GetChannel(ctx context.Context, id int64) (*Channel, error)
-	ListChannels(ctx context.Context, enabledOnly bool) ([]Channel, error)
+	ListChannels(ctx context.Context, f ChannelFilter) ([]Channel, error)
 	UpdateChannel(ctx context.Context, c *Channel) error
 	DeleteChannel(ctx context.Context, id int64) error
 	// ListChannelsForMonitor returns the enabled channels a monitor alerts to.

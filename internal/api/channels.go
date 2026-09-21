@@ -55,7 +55,11 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listChannels(w http.ResponseWriter, r *http.Request) {
-	list, err := s.store.ListChannels(r.Context(), r.URL.Query().Get("enabled") == "true")
+	q := r.URL.Query()
+	list, err := s.store.ListChannels(r.Context(), store.ChannelFilter{
+		EnabledOnly: q.Get("enabled") == "true",
+		Type:        q.Get("type"),
+	})
 	if err != nil {
 		s.fail(w, r, err)
 		return

@@ -22,12 +22,14 @@ type emptyStore struct {
 	store.Store
 }
 
-func (emptyStore) GetStats(context.Context) (store.Stats, error)                     { return store.Stats{}, nil }
+func (emptyStore) GetStats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
 func (emptyStore) ListAlerts(context.Context, store.AlertFilter) ([]store.Alert, error) {
 	return nil, nil
 }
 func (emptyStore) ListMonitors(context.Context, bool) ([]store.Monitor, error) { return nil, nil }
-func (emptyStore) ListChannels(context.Context, bool) ([]store.Channel, error) { return nil, nil }
+func (emptyStore) ListChannels(context.Context, store.ChannelFilter) ([]store.Channel, error) {
+	return nil, nil
+}
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
@@ -224,7 +226,7 @@ type deliveriesStore struct {
 func (s deliveriesStore) ListDeliveryAttempts(context.Context, int64) ([]store.DeliveryAttempt, error) {
 	return s.attempts, nil
 }
-func (deliveriesStore) ListChannels(context.Context, bool) ([]store.Channel, error) {
+func (deliveriesStore) ListChannels(context.Context, store.ChannelFilter) ([]store.Channel, error) {
 	return []store.Channel{{ID: 7, Name: "ops-webhook"}}, nil
 }
 
