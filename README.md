@@ -64,7 +64,7 @@ All configuration comes from environment variables:
 | `NETWORK`       | `testnet`                              | `testnet` \| `mainnet` \| `futurenet` \| `custom` |
 | `RPC_URL`       | per network                            | Stellar RPC endpoint; overrides the preset   |
 | `NETWORK_PASSPHRASE` | per network                       | Overrides the network passphrase             |
-| `DATABASE_URL`  | *(required)*                           | Postgres connection string                   |
+| `DATABASE_URL`  | *(required)*                           | Postgres URL (`postgres` / `postgresql`); validated at load |
 | `POLL_INTERVAL` | `5s`                                   | How often to poll `getEvents` (min `1s`)     |
 | `HTTP_ADDR`     | `:8080`                                | API + dashboard listen address               |
 | `LOG_LEVEL`     | `info`                                 | `debug` \| `info` \| `warn` \| `error`       |
