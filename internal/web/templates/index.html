@@ -18,7 +18,7 @@
     <td>{{.ID}}</td>
     <td>{{index $.MonitorNames .MonitorID}}</td>
     <td>#{{.RuleID}}</td>
-    <td><code>{{.EventID}}</code></td>
+    <td><code title="{{.EventID}}">{{truncateID .EventID 8}}</code></td>
     <td>{{.CreatedAt.Format "2006-01-02 15:04:05"}}</td>
   </tr>
   {{end}}

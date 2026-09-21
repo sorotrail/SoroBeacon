@@ -108,6 +108,74 @@ func TestPrettyJSON(t *testing.T) {
 	}
 }
 
+func TestTruncateID(t *testing.T) {
+	const longID = "CDLZFC3SI2Z2B6C4A7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWHGCYSX"
+	tests := []struct {
+		name string
+		in   string
+		keep int
+		want string
+	}{
+		{"long", longID, 8, "CDLZFC3S…VWHGCYSX"},
+		{"short", "short-id", 8, "short-id"},
+		{"exactly at threshold", strings.Repeat("a", 16), 8, strings.Repeat("a", 16)},
+		{"empty", "", 8, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncateID(tt.in, tt.keep)
+			if got != tt.want {
+				t.Fatalf("truncateID(%q, %d) = %q, want %q", tt.in, tt.keep, got, tt.want)
+			}
+		})
+	}
+}
+
+// monitorWithLongIDStore returns one monitor whose contract ID is a
+// 56-character Stellar address, so the monitors table exercises truncation.
+type monitorWithLongIDStore struct {
+	emptyStore
+}
+
+func (monitorWithLongIDStore) ListMonitors(context.Context, bool) ([]store.Monitor, error) {
+	return []store.Monitor{{
+		ID:          1,
+		Name:        "m",
+		Enabled:     true,
+		ContractIDs: []string{"CDLZFC3SI2Z2B6C4A7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWHGCYSX"},
+	}}, nil
+}
+
+func TestMonitorsTableTruncatesLongContractIDs(t *testing.T) {
+	s, err := New(monitorWithLongIDStore{}, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/monitors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	const full = "CDLZFC3SI2Z2B6C4A7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWHGCYSX"
+	if !strings.Contains(html, `title="`+full+`"`) {
+		t.Fatalf("expected title with full contract ID, got:\n%s", html)
+	}
+	if !strings.Contains(html, "CDLZFC3S…VWHGCYSX") {
+		t.Fatalf("expected middle-truncated contract ID, got:\n%s", html)
+	}
+	if strings.Count(html, full) != 1 {
+		t.Fatalf("full contract ID should appear once (title only), got %d in:\n%s", strings.Count(html, full), html)
+	}
+}
+
 // alertWithPayloadStore returns one alert with an object payload, so the
 // alerts page has something to indent.
 type alertWithPayloadStore struct {
