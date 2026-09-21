@@ -53,6 +53,9 @@ make build
 set -a; . ./.env; set +a; ./bin/sorobeacon
 ```
 
+For a production-style single-host deployment, see the
+[systemd deployment guide](docs/deployment-systemd.md).
+
 ## Configuration
 
 All configuration comes from environment variables:
