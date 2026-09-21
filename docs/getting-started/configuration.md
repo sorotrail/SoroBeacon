@@ -11,7 +11,7 @@ All configuration comes from environment variables. `.env.example` in the repo i
 | `NETWORK_PASSPHRASE` | per `NETWORK` | Overrides the preset passphrase. Required with `NETWORK=custom`. |
 | `DATABASE_URL` | _(required)_ | Postgres connection string, e.g. `postgres://user:pass@host:5432/sorobeacon?sslmode=disable` |
 | `POLL_INTERVAL` | `5s` | How often the poller calls `getEvents`. Minimum `1s`. |
-| `HTTP_ADDR` | `:8080` | Listen address for the API and dashboard. |
+| `HTTP_ADDR` | `:8080` | Listen address (`host:port`) for the API and dashboard. Empty host means all interfaces. Validated at load. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` (structured JSON via `log/slog`). |
 
 ## Where secrets live
