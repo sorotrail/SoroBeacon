@@ -144,6 +144,32 @@ func (s *Server) favicon(w http.ResponseWriter, r *http.Request) {
 
 // --- pages ---
 
+// emptyKind classifies a page's empty state. Distinct cases so a fresh
+// install is not shown the same "nothing here" copy as a healthy instance
+// that simply has not matched an event yet.
+func emptyKind(monitors []store.Monitor, channels []store.Channel, alerts []store.Alert) string {
+	if len(alerts) > 0 {
+		return ""
+	}
+	if len(monitors) == 0 {
+		return "no_monitors"
+	}
+	enabled := false
+	for _, m := range monitors {
+		if m.Enabled {
+			enabled = true
+			break
+		}
+	}
+	if !enabled {
+		return "monitors_disabled"
+	}
+	if len(channels) == 0 {
+		return "no_channels"
+	}
+	return "no_alerts"
+}
+
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.store.GetStats(r.Context())
 	if err != nil {
@@ -155,13 +181,23 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	names, err := s.monitorNames(r)
+	monitors, err := s.store.ListMonitors(r.Context(), false)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
+	channels, err := s.store.ListChannels(r.Context(), false)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	names := map[int64]string{}
+	for _, m := range monitors {
+		names[m.ID] = m.Name
+	}
 	s.render(w, "index", map[string]any{
 		"Title": "Overview", "Stats": stats, "Alerts": alerts, "MonitorNames": names,
+		"Empty": emptyKind(monitors, channels, alerts),
 	})
 }
 
@@ -171,7 +207,24 @@ func (s *Server) monitors(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	s.render(w, "monitors", map[string]any{"Title": "Monitors", "Monitors": monitors})
+	empty := ""
+	if len(monitors) == 0 {
+		empty = "no_monitors"
+	} else {
+		anyEnabled := false
+		for _, m := range monitors {
+			if m.Enabled {
+				anyEnabled = true
+				break
+			}
+		}
+		if !anyEnabled {
+			empty = "monitors_disabled"
+		}
+	}
+	s.render(w, "monitors", map[string]any{
+		"Title": "Monitors", "Monitors": monitors, "Empty": empty,
+	})
 }
 
 func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
@@ -360,8 +413,18 @@ func (s *Server) channels(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	monitors, err := s.store.ListMonitors(r.Context(), false)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	empty := ""
+	if len(channels) == 0 {
+		empty = "no_channels"
+	}
 	s.render(w, "channels", map[string]any{
 		"Title": "Channels", "Channels": channels, "ChannelTypes": s.factory.Types(),
+		"Empty": empty, "HasMonitors": len(monitors) > 0,
 	})
 }
 
@@ -461,9 +524,15 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 	if len(alerts) == f.Limit {
 		next = strconv.FormatInt(alerts[len(alerts)-1].ID, 10)
 	}
+	channels, err := s.store.ListChannels(r.Context(), false)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
 	s.render(w, "alerts", map[string]any{
 		"Title": "Alerts", "Alerts": alerts, "Monitors": monitors,
 		"MonitorNames": names, "SelectedMonitor": selected, "NextCursor": next,
+		"Empty": emptyKind(monitors, channels, alerts),
 	})
 }
 
@@ -509,18 +578,6 @@ func (s *Server) alertDeliveries(w http.ResponseWriter, r *http.Request) {
 			template.HTMLEscapeString(a.AttemptedAt.Format("2006-01-02 15:04:05")))
 	}
 	fmt.Fprint(w, `</table>`)
-}
-
-func (s *Server) monitorNames(r *http.Request) (map[int64]string, error) {
-	monitors, err := s.store.ListMonitors(r.Context(), false)
-	if err != nil {
-		return nil, err
-	}
-	names := map[int64]string{}
-	for _, m := range monitors {
-		names[m.ID] = m.Name
-	}
-	return names, nil
 }
 
 func splitLines(s string) []string {
