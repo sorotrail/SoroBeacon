@@ -1,4 +1,4 @@
-.PHONY: build run test test-db cover lint fmt up down clean migrate-new
+.PHONY: build run test test-db cover lint lint-fix fmt up down clean migrate-new
 
 MIGRATIONS_DIR := internal/store/migrations
 
@@ -41,6 +41,12 @@ endif
 
 lint:
 	golangci-lint run
+
+# Apply the autofixes golangci-lint already knows how to make. Exits
+# non-zero if problems remain that it cannot fix automatically. CI still
+# runs `make lint` / `golangci-lint run` (no --fix).
+lint-fix:
+	golangci-lint run --fix
 
 fmt:
 	gofmt -w .

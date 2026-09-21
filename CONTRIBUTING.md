@@ -12,7 +12,13 @@ docker compose up -d postgres      # just the database
 cp .env.example .env
 make build && make test
 make test-db                       # includes store integration tests
+make lint                          # report lint issues (same as CI)
+make lint-fix                      # apply golangci-lint autofixes
 ```
+
+`make lint` is unchanged so CI behaviour does not move. Use `make lint-fix`
+locally to apply the autofixes golangci-lint already knows how to make;
+it still exits non-zero if problems remain that it cannot fix automatically.
 
 Go 1.25+ is required (the Stellar SDK dependency sets the floor).
 
