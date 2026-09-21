@@ -28,6 +28,9 @@
     textarea { font-family: monospace; }
     button { cursor: pointer; padding: .3rem .8rem; }
     .muted { opacity: .65; font-size: .9rem; }
+    footer.site-footer { padding: .5rem 1.5rem 1.25rem; max-width: 70rem; margin: 0 auto;
+                         font-size: .8rem; }
+    footer.site-footer a { color: inherit; }
     .pill { padding: .1rem .5rem; border-radius: 1rem; font-size: .8rem; }
     .on  { background: #14532d; color: #dcfce7; }
     .off { background: #7f1d1d; color: #fee2e2; }
@@ -51,5 +54,10 @@
 <main>
 {{template "content" .}}
 </main>
+<footer class="site-footer muted">
+  <span>{{.Version}}</span>
+  {{if .CommitURL}} · <a href="{{.CommitURL}}">{{.Commit}}</a>
+  {{else}} · <span>{{.Commit}}</span>{{end}}
+</footer>
 </body>
 </html>{{end}}

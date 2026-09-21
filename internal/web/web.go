@@ -20,6 +20,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/sorotrail/sorobeacon/internal/buildinfo"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
@@ -63,7 +64,7 @@ func prettyJSON(raw json.RawMessage) string {
 // New parses templates and wires a dashboard server.
 func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logger) (*Server, error) {
 	s := &Server{store: st, registry: reg, factory: f, log: log, pages: map[string]*template.Template{}}
-	for _, page := range []string{"index", "monitors", "monitor", "channels", "alerts"} {
+	for _, page := range []string{"index", "monitors", "monitor", "channels", "alerts", "error"} {
 		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, fmt.Errorf("parse template %s: %w", page, err)
@@ -96,6 +97,7 @@ func (s *Server) Routes() chi.Router {
 
 	r.Get("/alerts", s.alerts)
 	r.Get("/alerts/{id}/deliveries", s.alertDeliveries)
+	r.NotFound(s.notFound)
 	return r
 }
 
@@ -112,10 +114,22 @@ var navSection = map[string]string{
 }
 
 func (s *Server) render(w http.ResponseWriter, page string, data any) {
+	s.renderStatus(w, http.StatusOK, page, data)
+}
+
+func (s *Server) renderStatus(w http.ResponseWriter, status int, page string, data any) {
 	if m, ok := data.(map[string]any); ok {
-		m["Active"] = navSection[page]
+		if _, exists := m["Active"]; !exists {
+			m["Active"] = navSection[page]
+		}
+		m["Version"] = displayVersion(buildinfo.Version)
+		m["Commit"] = displayCommit(buildinfo.Commit)
+		m["CommitURL"] = commitURL(buildinfo.Commit)
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if status != http.StatusOK {
+		w.WriteHeader(status)
+	}
 	if err := s.pages[page].ExecuteTemplate(w, "layout", data); err != nil {
 		s.log.Error("render page", "page", page, "err", err)
 	}
@@ -123,7 +137,57 @@ func (s *Server) render(w http.ResponseWriter, page string, data any) {
 
 func (s *Server) fail(w http.ResponseWriter, err error) {
 	s.log.Error("web error", "err", err)
-	http.Error(w, "internal error: "+err.Error(), http.StatusInternalServerError)
+	s.renderStatus(w, http.StatusInternalServerError, "error", map[string]any{
+		"Title":   "Error",
+		"Heading": "Something went wrong",
+		"Message": "internal error: " + err.Error(),
+	})
+}
+
+func (s *Server) notFound(w http.ResponseWriter, _ *http.Request) {
+	s.renderStatus(w, http.StatusNotFound, "error", map[string]any{
+		"Title":   "Not found",
+		"Heading": "Not found",
+		"Message": "That page does not exist.",
+	})
+}
+
+func displayVersion(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "dev"
+	}
+	return v
+}
+
+func displayCommit(c string) string {
+	if strings.TrimSpace(c) == "" {
+		return "none"
+	}
+	return c
+}
+
+// commitURL is the GitHub commit page when Commit looks like a real SHA,
+// otherwise empty so the footer renders the value as plain text.
+func commitURL(commit string) string {
+	if !isGitSHA(commit) {
+		return ""
+	}
+	return "https://github.com/sorotrail/SoroBeacon/commit/" + commit
+}
+
+func isGitSHA(s string) bool {
+	if n := len(s); n < 7 || n > 40 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func pathID(r *http.Request, name string) (int64, error) {
@@ -198,12 +262,12 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 func (s *Server) monitorDetail(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
-		http.NotFound(w, r)
+		s.notFound(w, r)
 		return
 	}
 	m, err := s.store.GetMonitor(r.Context(), id)
 	if err != nil {
-		http.NotFound(w, r)
+		s.notFound(w, r)
 		return
 	}
 	ruleList, err := s.store.ListRules(r.Context(), id, false)
