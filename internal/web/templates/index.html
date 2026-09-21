@@ -7,7 +7,7 @@
   <div class="stat"><b>{{.Stats.AlertsLast24}}</b> alerts (24h)</div>
   <div class="stat"><b>{{.Stats.LastLedger}}</b> last ledger</div>
 </div>
-<p class="muted">Last poll checkpoint: {{.Stats.LastPollAt.Format "2006-01-02 15:04:05 MST"}}</p>
+<p class="muted">Last poll checkpoint: {{.Stats.LastPollAt.Format "2006-01-02 15:04:05 MST"}}{{with relTime .Stats.LastPollAt}} ({{.}}){{end}}</p>
 
 <h2>Recent alerts</h2>
 {{if .Alerts}}
@@ -19,7 +19,7 @@
     <td>{{index $.MonitorNames .MonitorID}}</td>
     <td>#{{.RuleID}}</td>
     <td><code>{{.EventID}}</code></td>
-    <td>{{.CreatedAt.Format "2006-01-02 15:04:05"}}</td>
+    <td>{{.CreatedAt.Format "2006-01-02 15:04:05"}}{{with relTime .CreatedAt}} <span class="muted">({{.}})</span>{{end}}</td>
   </tr>
   {{end}}
 </table>
