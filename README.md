@@ -104,6 +104,8 @@ checks nothing; readiness checks the database and the event source with
 per-dependency detail). `/api/v1/version` reports the version, commit and
 build date baked in at compile time. Every response carries an
 `X-Request-ID` correlation header, echoed in error bodies and log lines.
+When alerts, delivery, startup or RPC look wrong, work through
+[Troubleshooting](docs/troubleshooting.md) before opening an issue.
 
 Channel secrets (webhook URLs, bot tokens, SMTP credentials) live in each
 channel's `config` JSON in the database. They are never logged and never
