@@ -1,4 +1,4 @@
-.PHONY: build run test test-db cover lint fmt up down clean migrate-new
+.PHONY: build run test test-db cover lint fmt ci up down clean migrate-new
 
 MIGRATIONS_DIR := internal/store/migrations
 
@@ -40,6 +40,16 @@ endif
 	echo "created $$down"
 
 lint:
+	golangci-lint run
+
+# make ci mirrors the local-reproducible checks in .github/workflows/ci.yml
+# (build, vet, unit tests, lint), stopping at the first failure. Keep the
+# command list in sync with that workflow. Postgres-backed store tests skip
+# without TEST_DATABASE_URL; use `make test-db` to include them.
+ci:
+	go build ./...
+	go vet ./...
+	go test ./...
 	golangci-lint run
 
 fmt:

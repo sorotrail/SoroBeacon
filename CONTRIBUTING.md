@@ -12,7 +12,12 @@ docker compose up -d postgres      # just the database
 cp .env.example .env
 make build && make test
 make test-db                       # includes store integration tests
+make ci                            # same checks GitHub Actions runs (build, vet, test, lint)
 ```
+
+`make ci` is the thing to run before opening a PR. It does not start Docker
+or require a database: store integration tests skip without
+`TEST_DATABASE_URL`. Use `make test-db` when you have changed the store.
 
 Go 1.25+ is required (the Stellar SDK dependency sets the floor).
 
