@@ -1,6 +1,6 @@
 # Configuration
 
-All configuration comes from environment variables. `.env.example` in the repo is a ready-to-copy template.
+All configuration comes from environment variables. `.env.example` in the repo is a ready-to-copy template. The complete operator table (types, required vs optional, secrets, `SOURCE_MODE`-only variables) is [Environment variable reference](../configuration.md).
 
 | Variable | Default | Description |
 | --- | --- | --- |

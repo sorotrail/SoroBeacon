@@ -55,7 +55,11 @@ set -a; . ./.env; set +a; ./bin/sorobeacon
 
 ## Configuration
 
-All configuration comes from environment variables:
+All configuration comes from environment variables. The complete
+operator reference — every variable `internal/config` reads, grouped by
+database / RPC / HTTP / polling / logging, with types, defaults, required
+vs optional, secrets, and `SOURCE_MODE`-only notes — is
+[docs/configuration.md](docs/configuration.md).
 
 | Variable        | Default                                | Description                                  |
 |-----------------|----------------------------------------|----------------------------------------------|
@@ -67,6 +71,7 @@ All configuration comes from environment variables:
 | `DATABASE_URL`  | *(required)*                           | Postgres connection string                   |
 | `POLL_INTERVAL` | `5s`                                   | How often to poll `getEvents` (min `1s`)     |
 | `HTTP_ADDR`     | `:8080`                                | API + dashboard listen address               |
+| `CORS_ALLOWED_ORIGINS` | _(empty, CORS off)_             | Comma-separated browser Origins; empty disables CORS |
 | `LOG_LEVEL`     | `info`                                 | `debug` \| `info` \| `warn` \| `error`       |
 
 ### Networks

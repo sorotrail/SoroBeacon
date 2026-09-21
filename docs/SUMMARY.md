@@ -6,6 +6,7 @@
 
 * [Quickstart](getting-started/quickstart.md)
 * [Configuration](getting-started/configuration.md)
+* [Environment variable reference](configuration.md)
 
 ## 🧭 Guides
 
