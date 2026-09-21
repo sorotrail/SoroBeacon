@@ -22,7 +22,8 @@ type emptyStore struct {
 	store.Store
 }
 
-func (emptyStore) GetStats(context.Context) (store.Stats, error)                     { return store.Stats{}, nil }
+func (emptyStore) GetStats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
+
 func (emptyStore) ListAlerts(context.Context, store.AlertFilter) ([]store.Alert, error) {
 	return nil, nil
 }
@@ -153,9 +154,11 @@ type ruleToggleStore struct {
 func (s *ruleToggleStore) GetMonitor(context.Context, int64) (*store.Monitor, error) {
 	return &store.Monitor{ID: 1, Name: "m"}, nil
 }
+
 func (s *ruleToggleStore) ListRules(context.Context, int64, bool) ([]store.Rule, error) {
 	return []store.Rule{s.rule}, nil
 }
+
 func (s *ruleToggleStore) GetRule(_ context.Context, id int64) (*store.Rule, error) {
 	if id != s.rule.ID {
 		return nil, store.ErrNotFound
@@ -163,6 +166,7 @@ func (s *ruleToggleStore) GetRule(_ context.Context, id int64) (*store.Rule, err
 	r := s.rule
 	return &r, nil
 }
+
 func (s *ruleToggleStore) UpdateRule(_ context.Context, r *store.Rule) error {
 	s.rule = *r
 	return nil
@@ -224,6 +228,7 @@ type deliveriesStore struct {
 func (s deliveriesStore) ListDeliveryAttempts(context.Context, int64) ([]store.DeliveryAttempt, error) {
 	return s.attempts, nil
 }
+
 func (deliveriesStore) ListChannels(context.Context, bool) ([]store.Channel, error) {
 	return []store.Channel{{ID: 7, Name: "ops-webhook"}}, nil
 }

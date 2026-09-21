@@ -107,6 +107,7 @@ func (f *fakeStore) CreateAlert(_ context.Context, a *store.Alert) (bool, error)
 }
 
 func (f *fakeStore) GetIngestState(context.Context) (store.IngestState, error) { return f.state, nil }
+
 func (f *fakeStore) SetIngestState(_ context.Context, s store.IngestState) error {
 	f.state = s
 	return nil
@@ -139,8 +140,10 @@ func newTestPoller(rpc *fakeRPC, st *fakeStore, d *fakeDispatcher) *Poller {
 
 func seedMonitor(st *fakeStore, ruleParams string) {
 	st.monitors = []store.Monitor{{ID: 1, Name: "m1", ContractIDs: []string{contractA}, Enabled: true}}
-	st.rules[1] = []store.Rule{{ID: 1, MonitorID: 1, Type: rules.TypeEventEmitted,
-		Params: json.RawMessage(ruleParams), Enabled: true}}
+	st.rules[1] = []store.Rule{{
+		ID: 1, MonitorID: 1, Type: rules.TypeEventEmitted,
+		Params: json.RawMessage(ruleParams), Enabled: true,
+	}}
 }
 
 func TestPollColdStartUsesLatestLedger(t *testing.T) {
@@ -175,8 +178,10 @@ func TestPollMatchesAndDispatches(t *testing.T) {
 		responses: []*stellar.GetEventsResult{{
 			Events: []stellar.Event{
 				transferEvent("ev-1", 5990, "100"),
-				{ID: "ev-2", ContractID: contractA, Ledger: 5991, Type: "contract",
-					TopicJSON: []json.RawMessage{json.RawMessage(`{"symbol": "mint"}`)}},
+				{
+					ID: "ev-2", ContractID: contractA, Ledger: 5991, Type: "contract",
+					TopicJSON: []json.RawMessage{json.RawMessage(`{"symbol": "mint"}`)},
+				},
 			},
 			LatestLedger: 6000,
 		}},
@@ -283,8 +288,10 @@ func TestPollSkipsInvalidContractIDs(t *testing.T) {
 	rpc := &fakeRPC{latest: 6000}
 	st := newFakeStore()
 	st.state.LastLedger = 5500
-	st.monitors = []store.Monitor{{ID: 1, Name: "m1",
-		ContractIDs: []string{"not-a-contract", contractA}, Enabled: true}}
+	st.monitors = []store.Monitor{{
+		ID: 1, Name: "m1",
+		ContractIDs: []string{"not-a-contract", contractA}, Enabled: true,
+	}}
 	p := newTestPoller(rpc, st, &fakeDispatcher{})
 
 	require.NoError(t, p.Poll(context.Background()))

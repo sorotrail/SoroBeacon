@@ -35,15 +35,18 @@ type fakeRPC struct {
 func (f *fakeRPC) GetEvents(ctx context.Context, req stellar.GetEventsRequest) (*stellar.GetEventsResult, error) {
 	return &stellar.GetEventsResult{}, nil
 }
+
 func (f *fakeRPC) GetLatestLedger(ctx context.Context) (*stellar.LatestLedger, error) {
 	return &stellar.LatestLedger{}, nil
 }
+
 func (f *fakeRPC) GetHealth(ctx context.Context) (*stellar.Health, error) {
 	if f.healthErr != nil {
 		return nil, f.healthErr
 	}
 	return &stellar.Health{LatestLedger: 1234}, nil
 }
+
 func (f *fakeRPC) GetNetwork(ctx context.Context) (*stellar.Network, error) {
 	return &stellar.Network{}, nil
 }

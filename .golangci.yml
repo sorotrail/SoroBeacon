@@ -10,6 +10,7 @@ linters:
     - unconvert
     - gocritic
     - revive
+    - errorlint
   settings:
     errcheck:
       exclude-functions:
@@ -20,8 +21,17 @@ linters:
       rules:
         - name: package-comments
           disabled: true
+    errorlint:
+      # Prefer errors.Is / errors.As over == and type assertions.
+      errorf: true
+      asserts: true
+      comparison: true
   exclusions:
     rules:
       - path: _test\.go
         linters:
           - errcheck
+
+formatters:
+  enable:
+    - gofumpt
