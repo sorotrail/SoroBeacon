@@ -10,14 +10,31 @@ import (
 )
 
 func TestLoadDefaults(t *testing.T) {
+	// Pin every documented default. Clear optional vars so a leaked
+	// environment cannot masquerade as the unset path.
 	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("RPC_URL", "")
+	t.Setenv("NETWORK", "")
+	t.Setenv("NETWORK_PASSPHRASE", "")
+	t.Setenv("POLL_INTERVAL", "")
+	t.Setenv("HTTP_ADDR", "")
+	t.Setenv("LOG_LEVEL", "")
+	t.Setenv("SOURCE_MODE", "")
+	t.Setenv("SOROTRAIL_URL", "")
+	t.Setenv("CORS_ALLOWED_ORIGINS", "")
 
 	cfg, err := Load()
 	require.NoError(t, err)
+	assert.Equal(t, "postgres://x", cfg.DatabaseURL)
+	assert.Equal(t, "testnet", cfg.Network.Name)
 	assert.Equal(t, DefaultRPCURL, cfg.RPCURL)
+	assert.Equal(t, DefaultRPCURL, cfg.Network.RPCURL)
 	assert.Equal(t, DefaultPollInterval, cfg.PollInterval)
 	assert.Equal(t, DefaultHTTPAddr, cfg.HTTPAddr)
 	assert.Equal(t, slog.LevelInfo, cfg.LogLevel)
+	assert.Equal(t, "rpc", cfg.SourceMode)
+	assert.Empty(t, cfg.SoroTrailURL)
+	assert.Empty(t, cfg.CORSAllowedOrigins)
 }
 
 func TestLoadRequiresDatabaseURL(t *testing.T) {
@@ -26,19 +43,35 @@ func TestLoadRequiresDatabaseURL(t *testing.T) {
 	assert.ErrorContains(t, err, "DATABASE_URL")
 }
 
-func TestLoadOverrides(t *testing.T) {
+func TestLoadRequiresSoroTrailURL(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("SOURCE_MODE", "sorotrail")
+	t.Setenv("SOROTRAIL_URL", "")
+
+	_, err := Load()
+	assert.ErrorContains(t, err, "SOROTRAIL_URL")
+}
+
+func TestLoadOverrides(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://custom")
 	t.Setenv("RPC_URL", "https://mainnet.example")
 	t.Setenv("POLL_INTERVAL", "30s")
 	t.Setenv("HTTP_ADDR", ":9999")
 	t.Setenv("LOG_LEVEL", "debug")
+	t.Setenv("SOURCE_MODE", "sorotrail")
+	t.Setenv("SOROTRAIL_URL", "http://indexer.example")
+	t.Setenv("CORS_ALLOWED_ORIGINS", "https://ops.example, https://other.example")
 
 	cfg, err := Load()
 	require.NoError(t, err)
+	assert.Equal(t, "postgres://custom", cfg.DatabaseURL)
 	assert.Equal(t, "https://mainnet.example", cfg.RPCURL)
 	assert.Equal(t, 30*time.Second, cfg.PollInterval)
 	assert.Equal(t, ":9999", cfg.HTTPAddr)
 	assert.Equal(t, slog.LevelDebug, cfg.LogLevel)
+	assert.Equal(t, "sorotrail", cfg.SourceMode)
+	assert.Equal(t, "http://indexer.example", cfg.SoroTrailURL)
+	assert.Equal(t, []string{"https://ops.example", "https://other.example"}, cfg.CORSAllowedOrigins)
 }
 
 func TestLoadAcceptsHTTPAndHTTPSRPCURLs(t *testing.T) {
@@ -109,4 +142,9 @@ func TestLoadRejectsBadValues(t *testing.T) {
 	t.Setenv("LOG_LEVEL", "loud")
 	_, err = Load()
 	assert.ErrorContains(t, err, "LOG_LEVEL")
+
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("SOURCE_MODE", "kafka")
+	_, err = Load()
+	assert.ErrorContains(t, err, "SOURCE_MODE")
 }
