@@ -44,6 +44,7 @@ func CORSMiddleware(cfg CORSConfig) func(http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Max-Age", "86400")
 			}
 			if r.Method == http.MethodOptions && origin != "" {
+				w.Header().Set("Cache-Control", "no-store")
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
