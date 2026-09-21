@@ -13,6 +13,7 @@ All configuration comes from environment variables. `.env.example` in the repo i
 | `POLL_INTERVAL` | `5s` | How often the poller calls `getEvents`. Minimum `1s`. |
 | `HTTP_ADDR` | `:8080` | Listen address for the API and dashboard. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` (structured JSON via `log/slog`). |
+| `ALERT_RETENTION` | unset (keep forever) | Age after which alerts are deleted in batches of 1000 (`90d`, `24h`, …). `delivery_attempts` follow via `ON DELETE CASCADE`. Unset preserves current behaviour: nothing is pruned. |
 
 ## Where secrets live
 
