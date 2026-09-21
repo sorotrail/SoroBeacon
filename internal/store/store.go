@@ -59,12 +59,26 @@ type Alert struct {
 	CreatedAt time.Time       `json:"created_at"`
 }
 
+// Status values persisted on delivery_attempts.status. Anything else is
+// rejected by the API; the store filters on these exact strings.
+const (
+	DeliveryStatusSuccess = "success"
+	DeliveryStatusFailed  = "failed"
+)
+
+// ValidDeliveryStatus reports whether s is a value the store actually
+// writes. The empty string is not valid here — callers that mean "no
+// filter" should check for empty themselves.
+func ValidDeliveryStatus(s string) bool {
+	return s == DeliveryStatusSuccess || s == DeliveryStatusFailed
+}
+
 // DeliveryAttempt records one try at sending an alert through a channel.
 type DeliveryAttempt struct {
 	ID              int64     `json:"id"`
 	AlertID         int64     `json:"alert_id"`
 	ChannelID       int64     `json:"channel_id"`
-	Status          string    `json:"status"` // "success" or "failed"
+	Status          string    `json:"status"` // DeliveryStatusSuccess or DeliveryStatusFailed
 	ResponseSnippet string    `json:"response_snippet"`
 	AttemptedAt     time.Time `json:"attempted_at"`
 }
@@ -136,7 +150,9 @@ type Alerts interface {
 	CreateAlert(ctx context.Context, a *Alert) (created bool, err error)
 	ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
 	RecordDeliveryAttempt(ctx context.Context, d *DeliveryAttempt) error
-	ListDeliveryAttempts(ctx context.Context, alertID int64) ([]DeliveryAttempt, error)
+	// ListDeliveryAttempts returns attempts for one alert, oldest first.
+	// status empty means no filter; otherwise it is applied in SQL.
+	ListDeliveryAttempts(ctx context.Context, alertID int64, status string) ([]DeliveryAttempt, error)
 }
 
 // Ingest persists the poller checkpoint.

@@ -53,7 +53,7 @@ Config shapes per type: [Discord](../channels/discord.md) · [Slack](../channels
 | Method & path | Description |
 | --- | --- |
 | `GET /alerts` | History, newest first. Query: `monitor_id`, `from`/`to` (RFC 3339), `limit` (≤500, default 50), `cursor` (keyset: pass the previous response's `next_cursor`). |
-| `GET /alerts/{id}/deliveries` | Every delivery attempt for one alert. |
+| `GET /alerts/{id}/deliveries` | Delivery attempts for one alert. `?status=success` or `?status=failed` filters in SQL; omit for all. Unknown values are `400`. |
 
 ```sh
 curl -s 'localhost:8080/api/v1/alerts?monitor_id=1&from=2026-07-01T00:00:00Z&limit=20'

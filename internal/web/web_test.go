@@ -221,7 +221,7 @@ type deliveriesStore struct {
 	attempts []store.DeliveryAttempt
 }
 
-func (s deliveriesStore) ListDeliveryAttempts(context.Context, int64) ([]store.DeliveryAttempt, error) {
+func (s deliveriesStore) ListDeliveryAttempts(context.Context, int64, string) ([]store.DeliveryAttempt, error) {
 	return s.attempts, nil
 }
 func (deliveriesStore) ListChannels(context.Context, bool) ([]store.Channel, error) {

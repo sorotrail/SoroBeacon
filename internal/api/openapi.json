@@ -334,6 +334,14 @@
       ],
       "get": {
         "summary": "List one alert's delivery attempts",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Restrict to persisted statuses: success or failed. Omit for all. Unknown values are 400.",
+            "schema": { "type": "string", "enum": ["success", "failed"] }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Delivery attempts",
@@ -346,6 +354,7 @@
               }
             }
           },
+          "400": { "$ref": "#/components/responses/Error" },
           "404": { "$ref": "#/components/responses/Error" }
         }
       }

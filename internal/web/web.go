@@ -476,7 +476,7 @@ func (s *Server) alertDeliveries(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	attempts, err := s.store.ListDeliveryAttempts(r.Context(), id)
+	attempts, err := s.store.ListDeliveryAttempts(r.Context(), id, "")
 	if err != nil {
 		s.fail(w, err)
 		return

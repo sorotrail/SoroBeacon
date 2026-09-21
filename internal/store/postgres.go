@@ -332,10 +332,18 @@ func (p *Postgres) RecordDeliveryAttempt(ctx context.Context, d *DeliveryAttempt
 	).Scan(&d.ID, &d.AttemptedAt)
 }
 
-func (p *Postgres) ListDeliveryAttempts(ctx context.Context, alertID int64) ([]DeliveryAttempt, error) {
-	rows, err := p.pool.Query(ctx,
-		`SELECT id, alert_id, channel_id, status, response_snippet, attempted_at
-		 FROM delivery_attempts WHERE alert_id = $1 ORDER BY id`, alertID)
+func (p *Postgres) ListDeliveryAttempts(ctx context.Context, alertID int64, status string) ([]DeliveryAttempt, error) {
+	q := `SELECT id, alert_id, channel_id, status, response_snippet, attempted_at
+		 FROM delivery_attempts WHERE alert_id = $1`
+	args := []any{alertID}
+	if status != "" {
+		// Applied in SQL so a busy alert does not ship every attempt just
+		// so the client can throw most of them away.
+		q += ` AND status = $2`
+		args = append(args, status)
+	}
+	q += ` ORDER BY id`
+	rows, err := p.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
