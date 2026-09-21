@@ -7,7 +7,20 @@
   <link rel="icon" type="image/svg+xml" href="/favicon.ico">
   <script src="https://unpkg.com/htmx.org@1.9.12" crossorigin="anonymous"></script>
   <style>
-    :root { color-scheme: light dark; }
+    :root { color-scheme: light dark; --focus-ring: #005fcc; }
+    @media (prefers-color-scheme: dark) {
+      :root { --focus-ring: #7eb6ff; }
+    }
+    /* Keyboard-only ring: 3:1 against light (#fff) and dark (#000) canvases. */
+    a:focus-visible,
+    button:focus-visible,
+    input:focus-visible,
+    textarea:focus-visible,
+    select:focus-visible,
+    summary:focus-visible {
+      outline: 3px solid var(--focus-ring);
+      outline-offset: 2px;
+    }
     body { font-family: system-ui, sans-serif; margin: 0; line-height: 1.5; }
     header { display: flex; gap: 1.5rem; align-items: baseline; padding: .75rem 1.5rem;
              border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent); }
