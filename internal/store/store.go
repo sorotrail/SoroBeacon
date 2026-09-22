@@ -205,6 +205,9 @@ type Alerts interface {
 	ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
 	RecordDeliveryAttempt(ctx context.Context, d *DeliveryAttempt) error
 	ListDeliveryAttempts(ctx context.Context, alertID int64) ([]DeliveryAttempt, error)
+	// DeleteExpiredAlerts removes up to limit alerts with created_at
+	// before cutoff. delivery_attempts follow via ON DELETE CASCADE.
+	DeleteExpiredAlerts(ctx context.Context, cutoff time.Time, limit int) (deleted int64, err error)
 }
 
 // Ingest persists the poller checkpoint.

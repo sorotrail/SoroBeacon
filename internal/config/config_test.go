@@ -22,6 +22,7 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Equal(t, 0.0, cfg.RateLimitRPS)
 	assert.Equal(t, 0, cfg.RateLimitBurst)
 	assert.False(t, cfg.RateLimitTrustForwarded)
+	assert.Equal(t, time.Duration(0), cfg.AlertRetention)
 }
 
 func TestLoadRequiresDatabaseURL(t *testing.T) {
@@ -130,6 +131,41 @@ func TestLoadRejectsBadValues(t *testing.T) {
 	t.Setenv("LOG_LEVEL", "loud")
 	_, err = Load()
 	assert.ErrorContains(t, err, "LOG_LEVEL")
+
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("ALERT_RETENTION", "nope")
+	_, err = Load()
+	assert.ErrorContains(t, err, "ALERT_RETENTION")
+}
+
+func TestLoadAlertRetention(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("ALERT_RETENTION", "90d")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 90*24*time.Hour, cfg.AlertRetention)
+}
+
+func TestParseRetention(t *testing.T) {
+	d, err := ParseRetention("")
+	require.NoError(t, err)
+	assert.Equal(t, time.Duration(0), d)
+
+	d, err = ParseRetention("90d")
+	require.NoError(t, err)
+	assert.Equal(t, 90*24*time.Hour, d)
+
+	d, err = ParseRetention("24h")
+	require.NoError(t, err)
+	assert.Equal(t, 24*time.Hour, d)
+
+	_, err = ParseRetention("0")
+	assert.Error(t, err)
+	_, err = ParseRetention("-1h")
+	assert.Error(t, err)
+	_, err = ParseRetention("0d")
+	assert.Error(t, err)
 }
 
 func TestLoadRateLimit(t *testing.T) {
