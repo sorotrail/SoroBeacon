@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/buildinfo"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
 	"github.com/sorotrail/sorobeacon/internal/rules"
@@ -1267,5 +1268,140 @@ func TestAlertsListLinksToDetail(t *testing.T) {
 	body, _ := io.ReadAll(res.Body)
 	if !strings.Contains(string(body), `href="/alerts/1"`) {
 		t.Fatalf("alerts list should link each row to /alerts/{id}, got:\n%s", body)
+	}
+}
+
+func TestFooterRendersInjectedBuildInfo(t *testing.T) {
+	prevV, prevC := buildinfo.Version, buildinfo.Commit
+	t.Cleanup(func() {
+		buildinfo.Version, buildinfo.Commit = prevV, prevC
+	})
+	buildinfo.Version = "v9.8.7"
+	buildinfo.Commit = "abc1234"
+
+	srv := httptest.NewServer(newTestServer(t).Routes())
+	defer srv.Close()
+
+	paths := []struct {
+		path   string
+		status int
+	}{
+		{"/", http.StatusOK},
+		{"/monitors", http.StatusOK},
+		{"/channels", http.StatusOK},
+		{"/alerts", http.StatusOK},
+		{"/no-such-page", http.StatusNotFound},
+	}
+	wantLink := `href="https://github.com/sorotrail/SoroBeacon/commit/abc1234"`
+	for _, tt := range paths {
+		t.Run(tt.path, func(t *testing.T) {
+			res, err := http.Get(srv.URL + tt.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != tt.status {
+				t.Fatalf("GET %s = %d, want %d", tt.path, res.StatusCode, tt.status)
+			}
+			body, err := io.ReadAll(res.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			html := string(body)
+			if !strings.Contains(html, `class="site-footer muted"`) {
+				t.Fatalf("%s: footer missing class=site-footer (dropped from layout?)\n%s", tt.path, html)
+			}
+			if !strings.Contains(html, "v9.8.7") {
+				t.Fatalf("%s: footer missing injected version, got:\n%s", tt.path, html)
+			}
+			if !strings.Contains(html, wantLink) {
+				t.Fatalf("%s: footer missing commit link %s, got:\n%s", tt.path, wantLink, html)
+			}
+			if !strings.Contains(html, ">abc1234</a>") {
+				t.Fatalf("%s: footer missing linked short commit, got:\n%s", tt.path, html)
+			}
+		})
+	}
+}
+
+func TestFooterDevBuildIsPlainText(t *testing.T) {
+	prevV, prevC := buildinfo.Version, buildinfo.Commit
+	t.Cleanup(func() {
+		buildinfo.Version, buildinfo.Commit = prevV, prevC
+	})
+	buildinfo.Version = "dev"
+	buildinfo.Commit = "none"
+
+	srv := httptest.NewServer(newTestServer(t).Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	if !strings.Contains(html, ">dev<") {
+		t.Fatalf("dev version not rendered, got:\n%s", html)
+	}
+	if !strings.Contains(html, ">none</span>") {
+		t.Fatalf("none commit should be plain text, got:\n%s", html)
+	}
+	if strings.Contains(html, "github.com/sorotrail/SoroBeacon/commit") {
+		t.Fatalf("dev/none must not link to a commit page, got:\n%s", html)
+	}
+}
+
+func TestFooterEmptyBuildInfoFallsBack(t *testing.T) {
+	prevV, prevC := buildinfo.Version, buildinfo.Commit
+	t.Cleanup(func() {
+		buildinfo.Version, buildinfo.Commit = prevV, prevC
+	})
+	buildinfo.Version = "  "
+	buildinfo.Commit = ""
+
+	srv := httptest.NewServer(newTestServer(t).Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	if !strings.Contains(html, ">dev<") {
+		t.Fatalf("empty version should fall back to dev, got:\n%s", html)
+	}
+	if !strings.Contains(html, ">none</span>") {
+		t.Fatalf("empty commit should fall back to none, got:\n%s", html)
+	}
+}
+
+func TestCommitURL(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"abc1234", "https://github.com/sorotrail/SoroBeacon/commit/abc1234"},
+		{"ABCDEF0", "https://github.com/sorotrail/SoroBeacon/commit/ABCDEF0"},
+		{"deadbeefcafebabe", "https://github.com/sorotrail/SoroBeacon/commit/deadbeefcafebabe"},
+		{"none", ""},
+		{"dev", ""},
+		{"", ""},
+		{"abc12", ""},     // too short
+		{"not-a-sha", ""}, // hyphen
+		{"ggggggg", ""},   // not hex
+	}
+	for _, tt := range tests {
+		if got := commitURL(tt.in); got != tt.want {
+			t.Errorf("commitURL(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }

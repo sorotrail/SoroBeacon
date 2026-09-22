@@ -88,6 +88,9 @@
     .empty h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
     .empty p { margin: .4rem 0; }
     .empty a { font-weight: 600; }
+    footer.site-footer { padding: .5rem 1.5rem 1.25rem; max-width: 70rem; margin: 0 auto;
+                         font-size: .8rem; }
+    footer.site-footer a { color: inherit; }
     .pill { padding: .1rem .5rem; border-radius: 1rem; font-size: .8rem; }
     /* Explicit on/off colours stay readable on both page themes. */
     .on  { background: #14532d; color: #dcfce7; }
@@ -153,5 +156,11 @@
   document.body.addEventListener("htmx:afterSwap", apply);
 })();
 </script>
+
+<footer class="site-footer muted">
+  <span>{{.Version}}</span>
+  {{if .CommitURL}} · <a href="{{.CommitURL}}">{{.Commit}}</a>
+  {{else}} · <span>{{.Commit}}</span>{{end}}
+</footer>
 </body>
 </html>{{end}}
