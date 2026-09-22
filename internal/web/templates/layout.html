@@ -180,4 +180,4 @@
 </script>
 </body>
 </html>{{end}}
-{{define "copyID"}}<span class="copy-id"><code>{{.}}</code><button type="button" class="copy-btn" data-copy="{{.}}" aria-label="Copy identifier">Copy</button></span>{{end}}
+{{define "copyID"}}<span class="copy-id"><code title="{{.}}">{{truncateID . 8}}</code><button type="button" class="copy-btn" data-copy="{{.}}" aria-label="Copy identifier">Copy</button></span>{{end}}

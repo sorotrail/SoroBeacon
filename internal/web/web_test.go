@@ -1481,8 +1481,8 @@ func TestCopyIDButtonsRenderFullIdentifier(t *testing.T) {
 			if !strings.Contains(html, `data-copy="`+tt.id+`"`) {
 				t.Fatalf("%s: missing data-copy=%q in markup:\n%s", tt.path, tt.id, html)
 			}
-			if !strings.Contains(html, `<code>`+tt.id+`</code>`) {
-				t.Fatalf("%s: full identifier not rendered in <code>", tt.path)
+			if !strings.Contains(html, `title="`+tt.id+`"`) {
+				t.Fatalf("%s: full identifier not recoverable from title", tt.path)
 			}
 			if !strings.Contains(html, `aria-label="Copy identifier"`) {
 				t.Fatalf("%s: copy button missing accessible label", tt.path)
@@ -1530,5 +1530,79 @@ func TestCopyIDEscapesIdentifier(t *testing.T) {
 	}
 	if !strings.Contains(html, `class="copy-btn"`) {
 		t.Fatal("copy button missing on escaped-ID page")
+	}
+}
+
+func TestTruncateID(t *testing.T) {
+	const longID = "CDLZFC3SI2Z2B6C4A7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWHGCYSX"
+	tests := []struct {
+		name string
+		in   string
+		keep int
+		want string
+	}{
+		{"long", longID, 8, "CDLZFC3S…VWHGCYSX"},
+		{"short", "short-id", 8, "short-id"},
+		{"exactly at threshold", strings.Repeat("a", 16), 8, strings.Repeat("a", 16)},
+		{"empty", "", 8, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncateID(tt.in, tt.keep)
+			if got != tt.want {
+				t.Fatalf("truncateID(%q, %d) = %q, want %q", tt.in, tt.keep, got, tt.want)
+			}
+		})
+	}
+}
+
+// monitorWithLongIDStore returns one monitor whose contract ID is a
+// 56-character Stellar address, so the monitors table exercises truncation.
+type monitorWithLongIDStore struct {
+	emptyStore
+}
+
+func (monitorWithLongIDStore) ListMonitors(context.Context, bool) ([]store.Monitor, error) {
+	return []store.Monitor{{
+		ID:          1,
+		Name:        "m",
+		Enabled:     true,
+		ContractIDs: []string{"CDLZFC3SI2Z2B6C4A7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWHGCYSX"},
+	}}, nil
+}
+
+// The monitors page reads through ListMonitorsPage since pagination
+// landed; keep both in step so the page is not rendered empty.
+func (m monitorWithLongIDStore) ListMonitorsPage(ctx context.Context, _ store.ListFilter) ([]store.Monitor, error) {
+	return m.ListMonitors(ctx, false)
+}
+
+func TestMonitorsTableTruncatesLongContractIDs(t *testing.T) {
+	s, err := New(monitorWithLongIDStore{}, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/monitors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	const full = "CDLZFC3SI2Z2B6C4A7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWHGCYSX"
+	if !strings.Contains(html, `title="`+full+`"`) {
+		t.Fatalf("expected title with full contract ID, got:\n%s", html)
+	}
+	if !strings.Contains(html, "CDLZFC3S…VWHGCYSX") {
+		t.Fatalf("expected middle-truncated contract ID, got:\n%s", html)
+	}
+	if strings.Count(html, full) != 2 {
+		t.Fatalf("full contract ID should appear twice (title + data-copy), got %d in:\n%s", strings.Count(html, full), html)
 	}
 }

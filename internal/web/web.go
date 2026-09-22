@@ -56,6 +56,7 @@ var templateFuncs = template.FuncMap{
 	"prettyJSON":   prettyJSON,
 	"formatTime":   formatTime,
 	"decodedEvent": decodedEvent,
+	"truncateID":   truncateID,
 }
 
 const tsLayout = "2006-01-02 15:04:05"
@@ -90,6 +91,22 @@ func prettyJSON(raw json.RawMessage) string {
 		return string(raw)
 	}
 	return buf.String()
+}
+
+// truncateID keeps `keep` runes from each end of s, joined with an
+// ellipsis, so both identifying ends of a long contract or event ID stay
+// visible in a table cell. Strings that already fit in 2*keep runes (the
+// threshold at which truncation would not shorten the value) are returned
+// unchanged, including the empty string.
+func truncateID(s string, keep int) string {
+	if keep <= 0 {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= 2*keep {
+		return s
+	}
+	return string(r[:keep]) + "…" + string(r[len(r)-keep:])
 }
 
 // New parses templates and wires a dashboard server.
