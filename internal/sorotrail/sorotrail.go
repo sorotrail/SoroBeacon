@@ -231,7 +231,9 @@ func joinComma(parts []string) string {
 	return out
 }
 
-var _ poller.EventSource = (*Source)(nil)
-var _ interface {
-	GetHealth(ctx context.Context) (*stellar.Health, error)
-} = (*Client)(nil)
+var (
+	_ poller.EventSource = (*Source)(nil)
+	_ interface {
+		GetHealth(ctx context.Context) (*stellar.Health, error)
+	} = (*Client)(nil)
+)
