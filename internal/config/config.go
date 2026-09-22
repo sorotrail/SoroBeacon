@@ -107,8 +107,8 @@ func Load() (Config, error) {
 		LogLevel:         slog.LevelInfo,
 	}
 
-	if cfg.DatabaseURL == "" {
-		return cfg, fmt.Errorf("DATABASE_URL is required")
+	if err := validateDatabaseURL(cfg.DatabaseURL); err != nil {
+		return cfg, err
 	}
 
 	if err := validateHTTPAddr(cfg.HTTPAddr); err != nil {
@@ -319,6 +319,30 @@ func ParseRetention(s string) (time.Duration, error) {
 		return 0, fmt.Errorf("must be a positive duration")
 	}
 	return d, nil
+}
+
+const databaseURLExample = "postgres://user:pass@localhost:5432/dbname?sslmode=disable"
+
+// validateDatabaseURL checks DATABASE_URL before any connection attempt so a
+// missing or malformed value fails at config.Load instead of as a driver
+// error that looks like the database is down. Errors name the variable and
+// never echo the raw value (it holds a password); scheme and host are safe
+// to show once the URL has parsed.
+func validateDatabaseURL(raw string) error {
+	const supported = "supported schemes: postgres, postgresql"
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf("DATABASE_URL is required (e.g. %s)", databaseURLExample)
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("DATABASE_URL is not a parseable URL (%s)", supported)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "postgres", "postgresql":
+		return nil
+	default:
+		return fmt.Errorf("DATABASE_URL scheme %q (host %s) is not supported (%s)", u.Scheme, u.Host, supported)
+	}
 }
 
 func getenv(key, fallback string) string {

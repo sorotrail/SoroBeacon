@@ -64,7 +64,7 @@ All configuration comes from environment variables:
 | `NETWORK`       | `testnet`                              | `testnet` \| `mainnet` \| `futurenet` \| `custom` |
 | `RPC_URL`       | per network                            | Stellar RPC endpoint; overrides the preset   |
 | `NETWORK_PASSPHRASE` | per network                       | Overrides the network passphrase             |
-| `DATABASE_URL`  | *(required)*                           | Postgres connection string                   |
+| `DATABASE_URL`  | *(required)*                           | Postgres URL (`postgres` / `postgresql`); validated at load |
 | `DATABASE_MAX_CONNS` | pgx default                       | Pool max connections (`0` = driver default)  |
 | `DATABASE_MIN_CONNS` | pgx default                       | Pool min connections (`0` = driver default)  |
 | `DATABASE_MAX_CONN_LIFETIME` | pgx default                | Max connection lifetime (`0` = driver default) |

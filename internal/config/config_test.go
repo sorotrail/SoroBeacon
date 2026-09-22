@@ -471,3 +471,95 @@ func TestLoadRejectsInvalidDatabasePoolValues(t *testing.T) {
 	_, err = Load()
 	assert.ErrorContains(t, err, "DATABASE_MAX_CONN_LIFETIME")
 }
+
+func TestValidateDatabaseURL(t *testing.T) {
+	const secret = "s3cret-password"
+	tests := []struct {
+		name    string
+		raw     string
+		wantErr bool
+		want    []string
+	}{
+		{name: "valid postgres", raw: "postgres://user:" + secret + "@localhost:5432/sorobeacon?sslmode=disable"},
+		{name: "valid postgresql", raw: "postgresql://user:" + secret + "@db.example:5432/app"},
+		{
+			name:    "missing",
+			raw:     "",
+			wantErr: true,
+			want:    []string{"DATABASE_URL", "postgres://"},
+		},
+		{
+			name:    "unparseable",
+			raw:     "http://[",
+			wantErr: true,
+			want:    []string{"DATABASE_URL", "postgres", "postgresql"},
+		},
+		{
+			name:    "unsupported scheme",
+			raw:     "mysql://user:" + secret + "@localhost:3306/db",
+			wantErr: true,
+			want:    []string{"DATABASE_URL", "mysql", "localhost", "postgres", "postgresql"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateDatabaseURL(tt.raw)
+			if !tt.wantErr {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), secret)
+			for _, s := range tt.want {
+				assert.ErrorContains(t, err, s)
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsValidDatabaseURL(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "postgres", raw: "postgres://user:s3cret-password@localhost:5432/sorobeacon?sslmode=disable"},
+		{name: "postgresql", raw: "postgresql://user:s3cret-password@db.example:5432/app"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", tt.raw)
+
+			cfg, err := Load()
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.raw, cfg.DatabaseURL)
+		})
+	}
+}
+
+func TestLoadRejectsInvalidDatabaseURL(t *testing.T) {
+	const secret = "s3cret-password"
+	tests := []struct {
+		name string
+		raw  string
+		want []string
+	}{
+		{name: "unparseable", raw: "http://[", want: []string{"DATABASE_URL", "parseable"}},
+		{name: "unsupported scheme", raw: "mysql://user:" + secret + "@localhost:3306/db", want: []string{"DATABASE_URL", "mysql", "localhost"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", tt.raw)
+
+			_, err := Load()
+
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), secret)
+			for _, s := range tt.want {
+				assert.ErrorContains(t, err, s)
+			}
+		})
+	}
+}

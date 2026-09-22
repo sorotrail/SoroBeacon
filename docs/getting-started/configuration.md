@@ -9,7 +9,7 @@ All configuration comes from environment variables. `.env.example` in the repo i
 | `NETWORK` | `testnet` | `testnet` \| `mainnet` \| `futurenet` \| `custom`. Selects the network preset (RPC endpoint + passphrase). |
 | `RPC_URL` | per `NETWORK` | Stellar RPC endpoint (JSON-RPC 2.0). Overrides the preset. |
 | `NETWORK_PASSPHRASE` | per `NETWORK` | Overrides the preset passphrase. Required with `NETWORK=custom`. |
-| `DATABASE_URL` | _(required)_ | Postgres connection string, e.g. `postgres://user:pass@host:5432/sorobeacon?sslmode=disable` |
+| `DATABASE_URL` | _(required)_ | Postgres URL (`postgres` or `postgresql` scheme), e.g. `postgres://user:pass@host:5432/sorobeacon?sslmode=disable`. Validated at load; errors name the variable and never echo the password. |
 | `DATABASE_MAX_CONNS` | pgx default | Maximum connections in the pool. `0` or unset leaves the driver default. |
 | `DATABASE_MIN_CONNS` | pgx default | Minimum connections in the pool. `0` or unset leaves the driver default. Rejected when greater than `DATABASE_MAX_CONNS` if both are set. |
 | `DATABASE_MAX_CONN_LIFETIME` | pgx default | How long a connection may be reused. Go duration (`1h`, `30m`). `0` or unset leaves the driver default. |
