@@ -441,12 +441,22 @@ func TestDeliveryAttempts(t *testing.T) {
 	require.NoError(t, st.RecordDeliveryAttempt(ctx, d1))
 	require.NoError(t, st.RecordDeliveryAttempt(ctx, d2))
 
-	list, err := st.ListDeliveryAttempts(ctx, a.ID)
+	list, err := st.ListDeliveryAttempts(ctx, a.ID, "")
 	require.NoError(t, err)
 	require.Len(t, list, 2)
-	assert.Equal(t, "failed", list[0].Status)
+	assert.Equal(t, DeliveryStatusFailed, list[0].Status)
 	assert.Equal(t, "boom", list[0].ResponseSnippet)
-	assert.Equal(t, "success", list[1].Status)
+	assert.Equal(t, DeliveryStatusSuccess, list[1].Status)
+
+	failed, err := st.ListDeliveryAttempts(ctx, a.ID, DeliveryStatusFailed)
+	require.NoError(t, err)
+	require.Len(t, failed, 1)
+	assert.Equal(t, d1.ID, failed[0].ID)
+
+	ok, err := st.ListDeliveryAttempts(ctx, a.ID, DeliveryStatusSuccess)
+	require.NoError(t, err)
+	require.Len(t, ok, 1)
+	assert.Equal(t, d2.ID, ok[0].ID)
 
 	got, err := st.GetAlert(ctx, a.ID)
 	require.NoError(t, err)
@@ -492,11 +502,11 @@ func TestDeleteExpiredAlertsKeepsRecentAndCascadesAttempts(t *testing.T) {
 	require.Len(t, alerts, 1)
 	assert.Equal(t, recentAlert.ID, alerts[0].ID)
 
-	oldAttempts, err := st.ListDeliveryAttempts(ctx, oldAlert.ID)
+	oldAttempts, err := st.ListDeliveryAttempts(ctx, oldAlert.ID, "")
 	require.NoError(t, err)
 	assert.Empty(t, oldAttempts, "delivery_attempts must cascade with the alert")
 
-	kept, err := st.ListDeliveryAttempts(ctx, recentAlert.ID)
+	kept, err := st.ListDeliveryAttempts(ctx, recentAlert.ID, "")
 	require.NoError(t, err)
 	require.Len(t, kept, 1)
 }

@@ -143,7 +143,7 @@ func (s *retryStore) GetChannel(_ context.Context, id int64) (*store.Channel, er
 	}
 	return s.channel, nil
 }
-func (s *retryStore) ListDeliveryAttempts(context.Context, int64) ([]store.DeliveryAttempt, error) {
+func (s *retryStore) ListDeliveryAttempts(context.Context, int64, string) ([]store.DeliveryAttempt, error) {
 	return s.attempts, nil
 }
 func (s *retryStore) RecordDeliveryAttempt(_ context.Context, d *store.DeliveryAttempt) error {
@@ -244,5 +244,86 @@ func TestRetryDelivery_MissingChannel(t *testing.T) {
 	code, _, raw := postRetry(t, srv, "/alerts/10/deliveries/99/retry")
 	if code != http.StatusNotFound {
 		t.Fatalf("missing channel = %d %s, want 404", code, raw)
+	}
+}
+
+// deliveriesAPIStore records the status filter listDeliveries passed
+// through. Filtering itself is the store's job; the handler's job is
+// validating the query param and wiring it.
+type deliveriesAPIStore struct {
+	store.Store
+	gotAlertID int64
+	gotStatus  string
+	called     bool
+	attempts   []store.DeliveryAttempt
+}
+
+func (d *deliveriesAPIStore) ListDeliveryAttempts(_ context.Context, alertID int64, status string) ([]store.DeliveryAttempt, error) {
+	d.called = true
+	d.gotAlertID = alertID
+	d.gotStatus = status
+	return d.attempts, nil
+}
+
+func TestListDeliveries_StatusFilter(t *testing.T) {
+	all := []store.DeliveryAttempt{
+		{ID: 1, Status: store.DeliveryStatusFailed},
+		{ID: 2, Status: store.DeliveryStatusSuccess},
+	}
+	tests := []struct {
+		name       string
+		query      string
+		wantStatus int
+		wantFilter string
+		wantLen    int
+		wantCalled bool
+	}{
+		{name: "omitted returns everything", query: "", wantStatus: http.StatusOK, wantFilter: "", wantLen: 2, wantCalled: true},
+		{name: "status=failed", query: "?status=failed", wantStatus: http.StatusOK, wantFilter: store.DeliveryStatusFailed, wantLen: 2, wantCalled: true},
+		{name: "status=success", query: "?status=success", wantStatus: http.StatusOK, wantFilter: store.DeliveryStatusSuccess, wantLen: 2, wantCalled: true},
+		{name: "invalid status is 400", query: "?status=pending", wantStatus: http.StatusBadRequest, wantCalled: false},
+		{name: "empty status query is omitted", query: "?status=", wantStatus: http.StatusOK, wantFilter: "", wantLen: 2, wantCalled: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := &deliveriesAPIStore{attempts: all}
+			srv := httptest.NewServer(newProbeServer(st, &fakeRPC{}))
+			defer srv.Close()
+
+			res, err := http.Get(srv.URL + "/alerts/42/deliveries" + tt.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != tt.wantStatus {
+				t.Fatalf("GET /alerts/42/deliveries%s = %d, want %d", tt.query, res.StatusCode, tt.wantStatus)
+			}
+			if st.called != tt.wantCalled {
+				t.Fatalf("store called = %v, want %v", st.called, tt.wantCalled)
+			}
+			if !tt.wantCalled {
+				var env map[string]any
+				if err := json.NewDecoder(res.Body).Decode(&env); err != nil {
+					t.Fatal(err)
+				}
+				if env["error"] == nil || env["code"] == nil {
+					t.Fatalf("400 envelope missing error/code: %v", env)
+				}
+				return
+			}
+			if st.gotAlertID != 42 {
+				t.Fatalf("alertID = %d, want 42", st.gotAlertID)
+			}
+			if st.gotStatus != tt.wantFilter {
+				t.Fatalf("status filter = %q, want %q", st.gotStatus, tt.wantFilter)
+			}
+			var got []store.DeliveryAttempt
+			if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != tt.wantLen {
+				t.Fatalf("got %d attempts, want %d", len(got), tt.wantLen)
+			}
+		})
 	}
 }

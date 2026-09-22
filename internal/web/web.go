@@ -980,7 +980,7 @@ func (s *Server) retryDelivery(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	attempts, err := s.store.ListDeliveryAttempts(r.Context(), alertID)
+	attempts, err := s.store.ListDeliveryAttempts(r.Context(), alertID, "")
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -1008,7 +1008,7 @@ func (s *Server) retryDelivery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) writeDeliveriesFragment(w http.ResponseWriter, r *http.Request, alertID int64, note string) {
-	attempts, err := s.store.ListDeliveryAttempts(r.Context(), alertID)
+	attempts, err := s.store.ListDeliveryAttempts(r.Context(), alertID, "")
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -1087,7 +1087,7 @@ func (s *Server) alertDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	attempts, err := s.store.ListDeliveryAttempts(r.Context(), a.ID)
+	attempts, err := s.store.ListDeliveryAttempts(r.Context(), a.ID, "")
 	if err != nil {
 		s.fail(w, err)
 		return

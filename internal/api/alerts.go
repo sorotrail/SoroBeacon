@@ -100,13 +100,19 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 }
 
 // listDeliveries serves GET /alerts/{id}/deliveries.
+// Optional ?status=success|failed is applied in SQL; anything else is 400.
 func (s *Server) listDeliveries(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
 		writeErr(w, r, http.StatusBadRequest, "invalid id")
 		return
 	}
-	list, err := s.store.ListDeliveryAttempts(r.Context(), id)
+	status := r.URL.Query().Get("status")
+	if status != "" && !store.ValidDeliveryStatus(status) {
+		writeErr(w, r, http.StatusBadRequest, "invalid status")
+		return
+	}
+	list, err := s.store.ListDeliveryAttempts(r.Context(), id, status)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -143,7 +149,7 @@ func (s *Server) retryDelivery(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	attempts, err := s.store.ListDeliveryAttempts(r.Context(), alertID)
+	attempts, err := s.store.ListDeliveryAttempts(r.Context(), alertID, "")
 	if err != nil {
 		s.fail(w, r, err)
 		return
