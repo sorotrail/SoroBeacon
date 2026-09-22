@@ -220,6 +220,30 @@ func TestAlertsPageFilterControlsAndPreservedPaging(t *testing.T) {
 		!strings.Contains(html, `contract_id=CAAA`) || !strings.Contains(html, `sort=created_at_asc`) {
 		t.Fatalf("expected Older link to preserve filters, got:\n%s", html)
 	}
+	if !strings.Contains(html, `/api/v1/alerts.csv?`) || !strings.Contains(html, `limit=500`) {
+		t.Fatalf("expected CSV export link, got:\n%s", html)
+	}
+	if !strings.Contains(html, `Export CSV`) {
+		t.Fatalf("expected Export CSV label, got:\n%s", html)
+	}
+}
+
+func TestAlertsPageCSVExportOnEmpty(t *testing.T) {
+	srv := httptest.NewServer(newTestServer(t).Routes())
+	defer srv.Close()
+	res, err := http.Get(srv.URL + "/alerts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	if !strings.Contains(html, `/api/v1/alerts.csv?limit=500`) {
+		t.Fatalf("expected CSV export on empty alerts page, got:\n%s", html)
+	}
 }
 
 func TestAlertFilterQueryOmitsDefaults(t *testing.T) {

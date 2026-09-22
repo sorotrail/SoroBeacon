@@ -18,6 +18,7 @@
     <option value="created_at_asc" {{if eq .Sort "created_at_asc"}}selected{{end}}>Oldest</option>
   </select>
   <button>Filter</button>
+  <a href="{{.CSVHref}}">Export CSV</a>
 </form>
 {{if .Alerts}}
 <table>

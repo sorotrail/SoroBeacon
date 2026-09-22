@@ -373,6 +373,68 @@
         }
       }
     },
+    "/alerts.csv": {
+      "get": {
+        "summary": "Export alerts as CSV",
+        "description": "Same filters as GET /alerts. Columns: id, monitor_id, rule_id, event_id, created_at, payload. Channel config is never included.",
+        "parameters": [
+          {
+            "name": "monitor_id",
+            "in": "query",
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "rule_id",
+            "in": "query",
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "contract_id",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Exact match on payload.contract_id"
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "schema": { "type": "string", "enum": ["created_at_desc", "created_at_asc"], "default": "created_at_desc" }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": { "type": "string", "format": "date-time" },
+            "description": "RFC 3339 lower bound on alert creation"
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": { "type": "string", "format": "date-time" },
+            "description": "RFC 3339 upper bound on alert creation"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "CSV of alerts",
+            "content": {
+              "text/csv": {
+                "schema": { "type": "string" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/alerts": {
       "get": {
         "summary": "List alerts",

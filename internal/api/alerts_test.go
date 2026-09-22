@@ -3,10 +3,12 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -111,6 +113,107 @@ func TestListAlerts_InvalidRuleID(t *testing.T) {
 	code, body := getJSON(t, &alertsStore{n: 1}, "/alerts?rule_id=abc")
 	if code != http.StatusBadRequest {
 		t.Fatalf("status = %d body=%v, want 400", code, body)
+	}
+}
+
+type csvAlertsStore struct {
+	store.Store
+	got    store.AlertFilter
+	alerts []store.Alert
+}
+
+func (a *csvAlertsStore) ListAlerts(_ context.Context, f store.AlertFilter) ([]store.Alert, error) {
+	a.got = f
+	return a.alerts, nil
+}
+
+func getCSV(t *testing.T, st store.Store, path string) (int, http.Header, [][]string, string) {
+	t.Helper()
+	srv := httptest.NewServer(newProbeServer(st, &fakeRPC{}))
+	defer srv.Close()
+	res, err := http.Get(srv.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	raw, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var records [][]string
+	if res.StatusCode == http.StatusOK {
+		records, err = csv.NewReader(bytes.NewReader(raw)).ReadAll()
+		if err != nil {
+			t.Fatalf("csv parse: %v raw=%q", err, raw)
+		}
+	}
+	return res.StatusCode, res.Header, records, string(raw)
+}
+
+func TestListAlertsCSV_HeaderOnlyWhenEmpty(t *testing.T) {
+	code, hdr, records, raw := getCSV(t, &csvAlertsStore{}, "/alerts.csv")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d raw=%s, want 200", code, raw)
+	}
+	if ct := hdr.Get("Content-Type"); !strings.HasPrefix(ct, "text/csv") {
+		t.Fatalf("Content-Type = %q, want text/csv", ct)
+	}
+	if disp := hdr.Get("Content-Disposition"); !strings.Contains(disp, "alerts.csv") {
+		t.Fatalf("Content-Disposition = %q", disp)
+	}
+	if len(records) != 1 {
+		t.Fatalf("rows = %d, want header only; %v", len(records), records)
+	}
+	want := []string{"id", "monitor_id", "rule_id", "event_id", "created_at", "payload"}
+	if strings.Join(records[0], ",") != strings.Join(want, ",") {
+		t.Fatalf("header = %v, want %v", records[0], want)
+	}
+}
+
+func TestListAlertsCSV_EscapesPayloadAndEventID(t *testing.T) {
+	st := &csvAlertsStore{alerts: []store.Alert{{
+		ID:        7,
+		MonitorID: 3,
+		RuleID:    9,
+		EventID:   "ev,1",
+		Payload:   json.RawMessage(`{"note":"a,b\"c"}`),
+		CreatedAt: time.Date(2026, 9, 22, 8, 0, 0, 0, time.UTC),
+	}}}
+	code, _, records, raw := getCSV(t, st, "/alerts.csv")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d raw=%s, want 200", code, raw)
+	}
+	if len(records) != 2 {
+		t.Fatalf("rows = %d, want header+1; %v", len(records), records)
+	}
+	row := records[1]
+	if row[0] != "7" || row[1] != "3" || row[2] != "9" || row[3] != "ev,1" {
+		t.Fatalf("identity columns = %v", row)
+	}
+	if row[4] != "2026-09-22T08:00:00Z" {
+		t.Fatalf("created_at = %q", row[4])
+	}
+	if row[5] != `{"note":"a,b\"c"}` {
+		t.Fatalf("payload = %q", row[5])
+	}
+}
+
+func TestListAlertsCSV_HonoursFilters(t *testing.T) {
+	st := &csvAlertsStore{alerts: []store.Alert{{ID: 1}}}
+	code, _, _, raw := getCSV(t, st, "/alerts.csv?rule_id=9&contract_id=CAAA&sort=created_at_asc&monitor_id=3&limit=10&cursor=42")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d raw=%s, want 200", code, raw)
+	}
+	if st.got.RuleID != 9 || st.got.ContractID != "CAAA" || st.got.Sort != "created_at_asc" ||
+		st.got.MonitorID != 3 || st.got.Limit != 10 || st.got.AfterID != 42 {
+		t.Fatalf("filter = %+v", st.got)
+	}
+}
+
+func TestListAlertsCSV_InvalidSort(t *testing.T) {
+	code, _, _, raw := getCSV(t, &csvAlertsStore{}, "/alerts.csv?sort=id")
+	if code != http.StatusBadRequest {
+		t.Fatalf("status = %d raw=%s, want 400", code, raw)
 	}
 }
 
