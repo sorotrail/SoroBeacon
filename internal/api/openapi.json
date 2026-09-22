@@ -155,6 +155,26 @@
         }
       }
     },
+    "/monitors/{id}/stats": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "get": {
+        "summary": "Per-monitor statistics",
+        "description": "Alert totals (all time, 24h, 7d), last alert time, per-rule match counts, and delivery success/failure counts. A monitor with no alerts returns explicit zeroes rather than a 404.",
+        "responses": {
+          "200": {
+            "description": "Monitor statistics",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/monitors/{id}/duplicate": {
       "parameters": [
         { "$ref": "#/components/parameters/ID" }

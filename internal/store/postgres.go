@@ -690,6 +690,48 @@ func (p *Postgres) GetStats(ctx context.Context) (Stats, error) {
 	return s, err
 }
 
+func (p *Postgres) GetMonitorStats(ctx context.Context, id int64) (MonitorStats, error) {
+	s := MonitorStats{Rules: []RuleMatchCount{}}
+	var exists bool
+	err := p.pool.QueryRow(ctx, `
+		SELECT
+			EXISTS(SELECT 1 FROM monitors WHERE id = $1),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND created_at > now() - interval '24 hours'),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND created_at > now() - interval '7 days'),
+			(SELECT max(created_at) FROM alerts WHERE monitor_id = $1),
+			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id WHERE a.monitor_id = $1 AND da.status = 'success'),
+			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id WHERE a.monitor_id = $1 AND da.status = 'failed')`,
+		id,
+	).Scan(&exists, &s.Alerts, &s.AlertsLast24, &s.AlertsLast7d, &s.LastAlertAt, &s.Deliveries.Success, &s.Deliveries.Failed)
+	if err != nil {
+		return MonitorStats{}, err
+	}
+	if !exists {
+		return MonitorStats{}, ErrNotFound
+	}
+
+	rows, err := p.pool.Query(ctx, `
+		SELECT r.id, count(a.id)
+		FROM rules r
+		LEFT JOIN alerts a ON a.rule_id = r.id
+		WHERE r.monitor_id = $1
+		GROUP BY r.id
+		ORDER BY r.id`, id)
+	if err != nil {
+		return MonitorStats{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rc RuleMatchCount
+		if err := rows.Scan(&rc.RuleID, &rc.Matches); err != nil {
+			return MonitorStats{}, err
+		}
+		s.Rules = append(s.Rules, rc)
+	}
+	return s, rows.Err()
+}
+
 // --- helpers ---
 
 func (p *Postgres) deleteByID(ctx context.Context, table string, id int64) error {
