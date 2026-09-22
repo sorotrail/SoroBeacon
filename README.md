@@ -1,5 +1,9 @@
 # SoroBeacon 📡
 
+[![CI](https://github.com/sorotrail/SoroBeacon/actions/workflows/ci.yml/badge.svg)](https://github.com/sorotrail/SoroBeacon/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/sorotrail/SoroBeacon)](LICENSE)
+[![Go](https://img.shields.io/github/go-mod/go-version/sorotrail/SoroBeacon)](go.mod)
+
 **Monitoring and alerting for Soroban smart contracts.** Point SoroBeacon at
 one or more contracts on Stellar, define rules ("this event fired", "an
 emitted value crossed a threshold"), and get alerts on Discord, Slack,
@@ -37,13 +41,26 @@ Stellar RPC ──getEvents──▶ poller ──▶ decoder ──▶ rules en
 ## Quickstart
 
 ```sh
-git clone <this repo> && cd sorobeacon
-docker compose up --build -d
+git clone https://github.com/sorotrail/SoroBeacon.git
+cd SoroBeacon
+make up
+```
+
+`make up` is `docker compose up --build -d`. That starts Postgres and
+SoroBeacon against the Stellar **testnet** RPC. Migrations run automatically
+on startup.
+
+When the container is up, confirm the API and open the dashboard:
+
+```sh
+curl -sS http://localhost:8080/api/v1/health
+# {"db":"ok","rpc":"ok","status":"ok", ...}
+
 open http://localhost:8080        # dashboard
 ```
 
-That starts Postgres and SoroBeacon against the Stellar **testnet** RPC.
-Migrations run automatically on startup.
+A `200` from `/api/v1/health` with `"status":"ok"` means the API, database
+and RPC are reachable. The dashboard is served at `/` on the same origin.
 
 Running without Docker:
 
@@ -52,6 +69,8 @@ cp .env.example .env   # edit DATABASE_URL
 make build
 set -a; . ./.env; set +a; ./bin/sorobeacon
 ```
+
+Then use the same `curl` and dashboard URL (`HTTP_ADDR` defaults to `:8080`).
 
 ## Configuration
 
