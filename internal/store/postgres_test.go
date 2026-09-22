@@ -438,6 +438,13 @@ func TestDeliveryAttempts(t *testing.T) {
 	assert.Equal(t, "failed", list[0].Status)
 	assert.Equal(t, "boom", list[0].ResponseSnippet)
 	assert.Equal(t, "success", list[1].Status)
+
+	got, err := st.GetAlert(ctx, a.ID)
+	require.NoError(t, err)
+	assert.Equal(t, a.ID, got.ID)
+	assert.Equal(t, a.EventID, got.EventID)
+	_, err = st.GetAlert(ctx, a.ID+999)
+	assert.ErrorIs(t, err, ErrNotFound)
 }
 
 func TestIngestStateRoundTrip(t *testing.T) {

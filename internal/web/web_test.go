@@ -834,6 +834,14 @@ func TestAlertDeliveries_DistinguishesSuccessFromFailed(t *testing.T) {
 	if !strings.Contains(html, "connection refused") {
 		t.Errorf("expected the failed attempt's response snippet, got:\n%s", html)
 	}
+	if !strings.Contains(html, `hx-post="/alerts/1/deliveries/7/retry"`) {
+		t.Errorf("failed row should offer Retry, got:\n%s", html)
+	}
+	// The success row must not grow a Retry button — a stray click would
+	// double-notify. Count the one button from the failed row only.
+	if n := strings.Count(html, ">Retry</button>"); n != 1 {
+		t.Errorf("Retry buttons = %d, want 1 (failed row only), got:\n%s", n, html)
+	}
 }
 
 func TestAlertDeliveries_EmptyIsNotAnError(t *testing.T) {

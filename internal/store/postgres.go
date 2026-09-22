@@ -524,6 +524,17 @@ func alertSort(s string) string {
 	return "created_at_desc"
 }
 
+func (p *Postgres) GetAlert(ctx context.Context, id int64) (*Alert, error) {
+	var a Alert
+	err := p.pool.QueryRow(ctx,
+		`SELECT id, monitor_id, rule_id, event_id, payload, created_at FROM alerts WHERE id = $1`, id,
+	).Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return &a, nil
+}
+
 func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
 	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at FROM alerts WHERE TRUE`
 	args := []any{}

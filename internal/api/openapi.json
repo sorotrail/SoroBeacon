@@ -457,6 +457,30 @@
         }
       }
     },
+    "/alerts/{id}/deliveries/{channelID}/retry": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" },
+        { "$ref": "#/components/parameters/ChannelID" }
+      ],
+      "post": {
+        "summary": "Retry a failed delivery",
+        "description": "Records a new delivery attempt for one alert and channel. Rejects a channel that already succeeded (409), a disabled channel (400), a missing prior attempt (404), and repeats inside a 30s cooldown (429). Synchronous: the response is the new attempt.",
+        "responses": {
+          "200": {
+            "description": "New delivery attempt (success or failed)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DeliveryAttempt" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/health": {
       "get": {
         "summary": "Combined health report",
@@ -527,6 +551,12 @@
       },
       "RuleID": {
         "name": "ruleID",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "integer", "format": "int64" }
+      },
+      "ChannelID": {
+        "name": "channelID",
         "in": "path",
         "required": true,
         "schema": { "type": "integer", "format": "int64" }

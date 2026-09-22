@@ -1,10 +1,14 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
@@ -111,4 +115,90 @@ func (s *Server) listDeliveries(w http.ResponseWriter, r *http.Request) {
 		list = []store.DeliveryAttempt{}
 	}
 	writeJSON(w, http.StatusOK, list)
+}
+
+// retryDelivery serves POST /alerts/{id}/deliveries/{channelID}/retry.
+// It records a new attempt rather than mutating the failed one, rejects a
+// channel that already succeeded (409), and bounds repeats with a cooldown
+// so the dashboard button cannot spam the destination.
+func (s *Server) retryDelivery(w http.ResponseWriter, r *http.Request) {
+	alertID, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
+		return
+	}
+	channelID, err := pathID(r, "channelID")
+	if err != nil {
+		writeErr(w, r, http.StatusBadRequest, "invalid channelID")
+		return
+	}
+
+	alert, err := s.store.GetAlert(r.Context(), alertID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	ch, err := s.store.GetChannel(r.Context(), channelID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	attempts, err := s.store.ListDeliveryAttempts(r.Context(), alertID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if err := notify.GateRetry(attempts, channelID, *ch, time.Now(), notify.DefaultRetryCooldown); err != nil {
+		writeRetryGate(w, r, err)
+		return
+	}
+
+	na := notifyAlertFromStore(r.Context(), s.store, *alert)
+	d := notify.NewDispatcher(s.store, s.factory, s.log)
+	attempt := d.Retry(r.Context(), na, *ch)
+	writeJSON(w, http.StatusOK, attempt)
+}
+
+func writeRetryGate(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, notify.ErrAlreadySucceeded):
+		writeErr(w, r, http.StatusConflict, err.Error())
+	case errors.Is(err, notify.ErrChannelDisabled):
+		writeErr(w, r, http.StatusBadRequest, err.Error())
+	case errors.Is(err, notify.ErrNoAttempt):
+		writeErr(w, r, http.StatusNotFound, err.Error())
+	case errors.Is(err, notify.ErrRetryCooldown):
+		writeErr(w, r, http.StatusTooManyRequests, err.Error())
+	default:
+		writeErr(w, r, http.StatusBadRequest, err.Error())
+	}
+}
+
+func notifyAlertFromStore(ctx context.Context, st store.Store, a store.Alert) notify.Alert {
+	na := notify.Alert{
+		ID:        a.ID,
+		MonitorID: a.MonitorID,
+		RuleID:    a.RuleID,
+		EventID:   a.EventID,
+		Payload:   a.Payload,
+		CreatedAt: a.CreatedAt,
+	}
+	var p struct {
+		ContractID string `json:"contract_id"`
+		EventName  string `json:"event_name"`
+		Ledger     uint32 `json:"ledger"`
+		TxHash     string `json:"tx_hash"`
+	}
+	_ = json.Unmarshal(a.Payload, &p)
+	na.ContractID = p.ContractID
+	na.EventName = p.EventName
+	na.Ledger = p.Ledger
+	na.TxHash = p.TxHash
+	if m, err := st.GetMonitor(ctx, a.MonitorID); err == nil && m != nil {
+		na.MonitorName = m.Name
+	}
+	if rule, err := st.GetRule(ctx, a.RuleID); err == nil && rule != nil {
+		na.RuleType = rule.Type
+	}
+	return na
 }

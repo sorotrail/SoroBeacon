@@ -201,6 +201,7 @@ type Alerts interface {
 	// error) when an alert for the same (rule_id, event_id) already exists —
 	// the dedup guard.
 	CreateAlert(ctx context.Context, a *Alert) (created bool, err error)
+	GetAlert(ctx context.Context, id int64) (*Alert, error)
 	ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
 	RecordDeliveryAttempt(ctx context.Context, d *DeliveryAttempt) error
 	ListDeliveryAttempts(ctx context.Context, alertID int64) ([]DeliveryAttempt, error)

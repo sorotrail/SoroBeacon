@@ -1,12 +1,17 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/notify"
+	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
@@ -106,5 +111,138 @@ func TestListAlerts_InvalidRuleID(t *testing.T) {
 	code, body := getJSON(t, &alertsStore{n: 1}, "/alerts?rule_id=abc")
 	if code != http.StatusBadRequest {
 		t.Fatalf("status = %d body=%v, want 400", code, body)
+	}
+}
+
+type scriptedNotifier struct {
+	err error
+	n   int
+}
+
+func (s *scriptedNotifier) Send(context.Context, notify.Alert) error {
+	s.n++
+	return s.err
+}
+
+type retryStore struct {
+	store.Store
+	alert    *store.Alert
+	channel  *store.Channel
+	attempts []store.DeliveryAttempt
+}
+
+func (s *retryStore) GetAlert(context.Context, int64) (*store.Alert, error) {
+	if s.alert == nil {
+		return nil, store.ErrNotFound
+	}
+	return s.alert, nil
+}
+func (s *retryStore) GetChannel(_ context.Context, id int64) (*store.Channel, error) {
+	if s.channel == nil || s.channel.ID != id {
+		return nil, store.ErrNotFound
+	}
+	return s.channel, nil
+}
+func (s *retryStore) ListDeliveryAttempts(context.Context, int64) ([]store.DeliveryAttempt, error) {
+	return s.attempts, nil
+}
+func (s *retryStore) RecordDeliveryAttempt(_ context.Context, d *store.DeliveryAttempt) error {
+	d.ID = int64(len(s.attempts) + 1)
+	d.AttemptedAt = time.Now()
+	s.attempts = append(s.attempts, *d)
+	return nil
+}
+func (s *retryStore) GetMonitor(context.Context, int64) (*store.Monitor, error) {
+	return &store.Monitor{ID: 1, Name: "ops"}, nil
+}
+func (s *retryStore) GetRule(context.Context, int64) (*store.Rule, error) {
+	return &store.Rule{ID: 2, Type: "event_emitted"}, nil
+}
+
+func retryServer(t *testing.T, st store.Store, n *scriptedNotifier) *httptest.Server {
+	t.Helper()
+	f := notify.DefaultFactory()
+	f.Register("mock", func(json.RawMessage) (notify.Notifier, error) { return n, nil })
+	s := New(st, rules.NewRegistry(), f, &fakeRPC{}, discardLogger())
+	return httptest.NewServer(s.Routes())
+}
+
+func postRetry(t *testing.T, srv *httptest.Server, path string) (int, map[string]any, string) {
+	t.Helper()
+	res, err := http.Post(srv.URL+path, "application/json", bytes.NewReader(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(res.Body)
+	var body map[string]any
+	_ = json.Unmarshal(raw, &body)
+	return res.StatusCode, body, string(raw)
+}
+
+func TestRetryDelivery_Success(t *testing.T) {
+	st := &retryStore{
+		alert:   &store.Alert{ID: 10, MonitorID: 1, RuleID: 2, EventID: "ev-1", Payload: json.RawMessage(`{"contract_id":"C","event_name":"xfer"}`)},
+		channel: &store.Channel{ID: 7, Name: "ops", Type: "mock", Config: json.RawMessage(`{}`), Enabled: true},
+		attempts: []store.DeliveryAttempt{
+			{ID: 1, AlertID: 10, ChannelID: 7, Status: "failed", ResponseSnippet: "timeout", AttemptedAt: time.Now().Add(-time.Hour)},
+		},
+	}
+	n := &scriptedNotifier{}
+	srv := retryServer(t, st, n)
+	defer srv.Close()
+
+	code, body, raw := postRetry(t, srv, "/alerts/10/deliveries/7/retry")
+	if code != http.StatusOK {
+		t.Fatalf("retry success = %d %s, want 200", code, raw)
+	}
+	if body["status"] != "success" {
+		t.Fatalf("attempt status = %v, want success; body %s", body["status"], raw)
+	}
+	if n.n != 1 {
+		t.Fatalf("notifier calls = %d, want 1", n.n)
+	}
+	if len(st.attempts) != 2 {
+		t.Fatalf("attempts after retry = %d, want 2 (history preserved)", len(st.attempts))
+	}
+}
+
+func TestRetryDelivery_AlreadySucceededConflict(t *testing.T) {
+	st := &retryStore{
+		alert:   &store.Alert{ID: 10, MonitorID: 1, RuleID: 2},
+		channel: &store.Channel{ID: 7, Type: "mock", Config: json.RawMessage(`{}`), Enabled: true},
+		attempts: []store.DeliveryAttempt{
+			{ChannelID: 7, Status: "failed", AttemptedAt: time.Now().Add(-2 * time.Hour)},
+			{ChannelID: 7, Status: "success", AttemptedAt: time.Now().Add(-time.Hour)},
+		},
+	}
+	n := &scriptedNotifier{}
+	srv := retryServer(t, st, n)
+	defer srv.Close()
+
+	code, body, raw := postRetry(t, srv, "/alerts/10/deliveries/7/retry")
+	if code != http.StatusConflict {
+		t.Fatalf("already succeeded = %d %s, want 409", code, raw)
+	}
+	if body["error"] != notify.ErrAlreadySucceeded.Error() {
+		t.Fatalf("error = %v, want %q", body["error"], notify.ErrAlreadySucceeded.Error())
+	}
+	if n.n != 0 {
+		t.Fatalf("notifier must not be called on 409, got %d", n.n)
+	}
+}
+
+func TestRetryDelivery_MissingChannel(t *testing.T) {
+	st := &retryStore{
+		alert:    &store.Alert{ID: 10},
+		channel:  &store.Channel{ID: 7, Type: "mock", Enabled: true},
+		attempts: []store.DeliveryAttempt{{ChannelID: 7, Status: "failed", AttemptedAt: time.Now().Add(-time.Hour)}},
+	}
+	srv := retryServer(t, st, &scriptedNotifier{})
+	defer srv.Close()
+
+	code, _, raw := postRetry(t, srv, "/alerts/10/deliveries/99/retry")
+	if code != http.StatusNotFound {
+		t.Fatalf("missing channel = %d %s, want 404", code, raw)
 	}
 }

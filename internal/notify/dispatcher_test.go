@@ -116,6 +116,51 @@ func TestDispatchFansOutToAllChannels(t *testing.T) {
 	assert.Equal(t, int64(2), st.attempts[1].ChannelID)
 }
 
+func TestRetryRecordsNewAttempt(t *testing.T) {
+	st := &fakeDispatchStore{}
+	n := &mockNotifier{}
+	d := newTestDispatcher(t, st, n)
+
+	got := d.Retry(context.Background(), Alert{ID: 20, MonitorID: 2}, mockChannel(3))
+
+	assert.Equal(t, 1, n.calls)
+	require.NotNil(t, got)
+	assert.Equal(t, "success", got.Status)
+	require.Len(t, st.attempts, 1)
+	assert.Equal(t, int64(20), st.attempts[0].AlertID)
+	assert.Equal(t, int64(3), st.attempts[0].ChannelID)
+}
+
+func TestRetryFailedSendStillRecords(t *testing.T) {
+	st := &fakeDispatchStore{}
+	n := &mockNotifier{failures: 99}
+	d := newTestDispatcher(t, st, n)
+
+	got := d.Retry(context.Background(), Alert{ID: 21}, mockChannel(3))
+
+	assert.Equal(t, 1, n.calls, "manual retry is one shot, not the Dispatch backoff loop")
+	require.NotNil(t, got)
+	assert.Equal(t, "failed", got.Status)
+	assert.Contains(t, got.ResponseSnippet, "boom")
+}
+
+func TestGateRetry(t *testing.T) {
+	ch := mockChannel(3)
+	now := time.Date(2026, 9, 22, 2, 0, 0, 0, time.UTC)
+	failed := store.DeliveryAttempt{ChannelID: 3, Status: "failed", AttemptedAt: now.Add(-time.Hour)}
+	ok := store.DeliveryAttempt{ChannelID: 3, Status: "success", AttemptedAt: now.Add(-time.Hour)}
+	recent := store.DeliveryAttempt{ChannelID: 3, Status: "failed", AttemptedAt: now.Add(-time.Second)}
+	other := store.DeliveryAttempt{ChannelID: 9, Status: "success", AttemptedAt: now}
+
+	assert.NoError(t, GateRetry([]store.DeliveryAttempt{failed}, 3, ch, now, DefaultRetryCooldown))
+	assert.ErrorIs(t, GateRetry([]store.DeliveryAttempt{failed, ok}, 3, ch, now, DefaultRetryCooldown), ErrAlreadySucceeded)
+	assert.ErrorIs(t, GateRetry([]store.DeliveryAttempt{failed}, 3, store.Channel{ID: 3, Enabled: false}, now, DefaultRetryCooldown), ErrChannelDisabled)
+	assert.ErrorIs(t, GateRetry(nil, 3, ch, now, DefaultRetryCooldown), ErrNoAttempt)
+	assert.ErrorIs(t, GateRetry([]store.DeliveryAttempt{other}, 3, ch, now, DefaultRetryCooldown), ErrNoAttempt)
+	assert.ErrorIs(t, GateRetry([]store.DeliveryAttempt{recent}, 3, ch, now, DefaultRetryCooldown), ErrRetryCooldown)
+	assert.NoError(t, GateRetry([]store.DeliveryAttempt{recent}, 3, ch, now, 0), "zero cooldown disables the bound")
+}
+
 func TestDispatchBadConfigRecordsFailure(t *testing.T) {
 	st := &fakeDispatchStore{channels: []store.Channel{
 		{ID: 5, Type: "nope", Config: json.RawMessage(`{}`), Enabled: true},
