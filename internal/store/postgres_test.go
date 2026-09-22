@@ -699,6 +699,63 @@ func TestGetStats(t *testing.T) {
 	assert.Equal(t, int64(1), stats.AlertsLast24)
 }
 
+func TestGetMonitorStats(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	_, err := st.GetMonitorStats(ctx, 999)
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	empty := &Monitor{Name: "empty", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, empty))
+	got, err := st.GetMonitorStats(ctx, empty.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), got.Alerts)
+	assert.Equal(t, int64(0), got.AlertsLast24)
+	assert.Equal(t, int64(0), got.AlertsLast7d)
+	assert.Nil(t, got.LastAlertAt)
+	assert.NotNil(t, got.Rules)
+	assert.Empty(t, got.Rules)
+	assert.Equal(t, int64(0), got.Deliveries.Success)
+	assert.Equal(t, int64(0), got.Deliveries.Failed)
+
+	m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+	r1 := &Rule{MonitorID: m.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, r1))
+	r2 := &Rule{MonitorID: m.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, r2))
+	c := &Channel{Name: "c", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateChannel(ctx, c))
+
+	a1 := &Alert{MonitorID: m.ID, RuleID: r1.ID, EventID: "e1"}
+	_, err = st.CreateAlert(ctx, a1)
+	require.NoError(t, err)
+	a2 := &Alert{MonitorID: m.ID, RuleID: r1.ID, EventID: "e2"}
+	_, err = st.CreateAlert(ctx, a2)
+	require.NoError(t, err)
+	require.NoError(t, st.RecordDeliveryAttempt(ctx, &DeliveryAttempt{AlertID: a1.ID, ChannelID: c.ID, Status: "success"}))
+	require.NoError(t, st.RecordDeliveryAttempt(ctx, &DeliveryAttempt{AlertID: a2.ID, ChannelID: c.ID, Status: "failed", ResponseSnippet: "timeout"}))
+
+	got, err = st.GetMonitorStats(ctx, m.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), got.Alerts)
+	assert.Equal(t, int64(2), got.AlertsLast24)
+	assert.Equal(t, int64(2), got.AlertsLast7d)
+	require.NotNil(t, got.LastAlertAt)
+	require.Len(t, got.Rules, 2)
+	assert.Equal(t, r1.ID, got.Rules[0].RuleID)
+	assert.Equal(t, int64(2), got.Rules[0].Matches)
+	assert.Equal(t, r2.ID, got.Rules[1].RuleID)
+	assert.Equal(t, int64(0), got.Rules[1].Matches)
+	assert.Equal(t, int64(1), got.Deliveries.Success)
+	assert.Equal(t, int64(1), got.Deliveries.Failed)
+
+	other, err := st.GetMonitorStats(ctx, empty.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), other.Alerts, "stats must not leak across monitors")
+}
+
 func TestCopyMonitorName(t *testing.T) {
 	assert.Equal(t, "m (copy)", CopyMonitorName("m", nil))
 	assert.Equal(t, "m (copy)", CopyMonitorName("m", []string{"m"}))

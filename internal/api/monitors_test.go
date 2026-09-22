@@ -182,3 +182,67 @@ func TestListChannels_NextCursorPresentOnFullPage(t *testing.T) {
 		t.Fatalf("next_cursor on a full page = %v, want the last channel's id", body["next_cursor"])
 	}
 }
+
+type monitorStatsStore struct {
+	store.Store
+	stats store.MonitorStats
+	err   error
+	gotID int64
+}
+
+func (m *monitorStatsStore) GetMonitorStats(_ context.Context, id int64) (store.MonitorStats, error) {
+	m.gotID = id
+	if m.err != nil {
+		return store.MonitorStats{}, m.err
+	}
+	return m.stats, nil
+}
+
+func TestGetMonitorStats_ReturnsCounts(t *testing.T) {
+	st := &monitorStatsStore{stats: store.MonitorStats{
+		Alerts:       4,
+		AlertsLast24: 1,
+		AlertsLast7d: 3,
+		Rules:        []store.RuleMatchCount{{RuleID: 9, Matches: 4}},
+		Deliveries:   store.DeliveryCounts{Success: 2, Failed: 1},
+	}}
+	code, body := getJSON(t, st, "/monitors/7/stats")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%v", code, body)
+	}
+	if st.gotID != 7 {
+		t.Fatalf("GetMonitorStats id = %d, want 7", st.gotID)
+	}
+	if body["alerts"] != float64(4) || body["alerts_last_24h"] != float64(1) || body["alerts_last_7d"] != float64(3) {
+		t.Fatalf("counts = %v", body)
+	}
+	if body["last_alert_at"] != nil {
+		t.Fatalf("last_alert_at = %v, want null", body["last_alert_at"])
+	}
+	rules, _ := body["rules"].([]any)
+	if len(rules) != 1 {
+		t.Fatalf("rules = %v, want 1 entry", body["rules"])
+	}
+	dels, _ := body["deliveries"].(map[string]any)
+	if dels["success"] != float64(2) || dels["failed"] != float64(1) {
+		t.Fatalf("deliveries = %v", body["deliveries"])
+	}
+}
+
+func TestGetMonitorStats_UnknownMonitorIs404(t *testing.T) {
+	st := &monitorStatsStore{err: store.ErrNotFound}
+	code, body := getJSON(t, st, "/monitors/99/stats")
+	if code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 body=%v", code, body)
+	}
+	if body["error"] != "not found" {
+		t.Fatalf("error = %v, want not found", body["error"])
+	}
+}
+
+func TestGetMonitorStats_InvalidIDIs400(t *testing.T) {
+	code, body := getJSON(t, &monitorStatsStore{}, "/monitors/nope/stats")
+	if code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 body=%v", code, body)
+	}
+}

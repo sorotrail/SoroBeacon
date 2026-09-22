@@ -30,6 +30,9 @@ type emptyStore struct {
 }
 
 func (emptyStore) GetStats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
+func (emptyStore) GetMonitorStats(context.Context, int64) (store.MonitorStats, error) {
+	return store.MonitorStats{Rules: []store.RuleMatchCount{}}, nil
+}
 func (emptyStore) ListAlerts(context.Context, store.AlertFilter) ([]store.Alert, error) {
 	return nil, nil
 }
@@ -419,6 +422,57 @@ func TestMonitorPageHasDuplicateButton(t *testing.T) {
 	}
 	if !strings.Contains(html, "Duplicate") {
 		t.Fatalf("monitor page missing Duplicate button, got:\n%s", html)
+	}
+	if !strings.Contains(html, "No alerts yet.") {
+		t.Fatalf("empty monitor stats panel missing 'No alerts yet.', got:\n%s", html)
+	}
+}
+
+type monitorStatsWebStore struct {
+	emptyStore
+	stats store.MonitorStats
+}
+
+func (m monitorStatsWebStore) GetMonitor(_ context.Context, id int64) (*store.Monitor, error) {
+	return &store.Monitor{ID: id, Name: "alpha", Enabled: true, ContractIDs: []string{"C"}}, nil
+}
+func (m monitorStatsWebStore) ListRules(context.Context, int64, bool) ([]store.Rule, error) {
+	return nil, nil
+}
+func (m monitorStatsWebStore) ListChannels(context.Context, bool) ([]store.Channel, error) {
+	return nil, nil
+}
+func (m monitorStatsWebStore) GetMonitorStats(context.Context, int64) (store.MonitorStats, error) {
+	return m.stats, nil
+}
+
+func TestMonitorPageShowsStatsWhenAlertsExist(t *testing.T) {
+	st := monitorStatsWebStore{stats: store.MonitorStats{
+		Alerts: 4, AlertsLast24: 1, AlertsLast7d: 3,
+		Rules:      []store.RuleMatchCount{{RuleID: 9, Matches: 4}},
+		Deliveries: store.DeliveryCounts{Success: 2, Failed: 1},
+	}}
+	s, err := New(st, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	res, err := http.Get(srv.URL + "/monitors/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	if strings.Contains(html, "No alerts yet.") {
+		t.Fatalf("stats panel showed empty state despite alerts:\n%s", html)
+	}
+	if !strings.Contains(html, ">4</b> alerts") {
+		t.Fatalf("missing alert total, got:\n%s", html)
 	}
 }
 
