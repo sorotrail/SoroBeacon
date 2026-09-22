@@ -18,6 +18,7 @@ All configuration comes from environment variables. `.env.example` in the repo i
 | `HTTP_ADDR` | `:8080` | Listen address (`host:port`) for the API and dashboard. Empty host means all interfaces. Validated at load. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` (structured JSON via `log/slog`). |
 | `READYZ_LAG_THRESHOLD` | `0` (disabled) | Fail `/readyz` when poller ledger lag (chain tip minus last processed ledger) exceeds this. Unset or `0` leaves existing probes unchanged. |
+| `ALERT_RETENTION` | unset (keep forever) | Age after which alerts are deleted in batches of 1000 (`90d`, `24h`, …). `delivery_attempts` follow via `ON DELETE CASCADE`. Unset preserves current behaviour: nothing is pruned. |
 
 ## Where secrets live
 

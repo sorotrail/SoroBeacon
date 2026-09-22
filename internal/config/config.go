@@ -83,6 +83,10 @@ type Config struct {
 	// address. Default false: a spoofed header would otherwise defeat the
 	// limit. Only enable this behind a proxy that overwrites the header.
 	RateLimitTrustForwarded bool
+	// AlertRetention is how long alerts (and cascaded delivery_attempts)
+	// are kept. Zero (the default, when ALERT_RETENTION is unset) keeps
+	// everything forever so upgrades never start deleting history.
+	AlertRetention time.Duration
 }
 
 // Load reads configuration from the environment. DATABASE_URL is the only
@@ -227,6 +231,13 @@ func Load() (Config, error) {
 	cfg.DatabaseMinConns = minConns
 	cfg.DatabaseMaxConnLifetime = maxLifetime
 	cfg.DatabaseMaxConnIdleTime = maxIdle
+	if v := os.Getenv("ALERT_RETENTION"); v != "" {
+		d, err := ParseRetention(v)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid ALERT_RETENTION %q: %w", v, err)
+		}
+		cfg.AlertRetention = d
+	}
 
 	return cfg, nil
 }
@@ -280,6 +291,34 @@ func redactDatabaseURL(raw string) string {
 		return redacted
 	}
 	return u.Scheme + "://" + u.Host + u.Path
+}
+
+// ParseRetention accepts Go durations (24h, 90m) plus a day suffix
+// (90d) used in ALERT_RETENTION. Empty is zero (keep forever). A
+// non-positive duration is rejected so operators cannot accidentally
+// prune everything.
+func ParseRetention(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	if days, ok := strings.CutSuffix(s, "d"); ok {
+		n, err := strconv.ParseFloat(days, 64)
+		if err == nil {
+			if n <= 0 {
+				return 0, fmt.Errorf("must be a positive duration")
+			}
+			return time.Duration(n * 24 * float64(time.Hour)), nil
+		}
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, err
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("must be a positive duration")
+	}
+	return d, nil
 }
 
 func getenv(key, fallback string) string {

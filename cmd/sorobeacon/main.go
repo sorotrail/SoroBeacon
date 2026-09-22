@@ -148,6 +148,9 @@ func run() error {
 		}
 	}()
 	go p.Run(ctx)
+	if cfg.AlertRetention > 0 {
+		go store.RunAlertPruner(ctx, st, cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, log)
+	}
 
 	select {
 	case <-ctx.Done():

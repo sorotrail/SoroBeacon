@@ -447,6 +447,77 @@ func TestDeliveryAttempts(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound)
 }
 
+func TestDeleteExpiredAlertsKeepsRecentAndCascadesAttempts(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+	r := &Rule{MonitorID: m.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, r))
+	c := &Channel{Name: "c", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateChannel(ctx, c))
+
+	oldAlert := &Alert{MonitorID: m.ID, RuleID: r.ID, EventID: "old"}
+	recentAlert := &Alert{MonitorID: m.ID, RuleID: r.ID, EventID: "recent"}
+	_, err := st.CreateAlert(ctx, oldAlert)
+	require.NoError(t, err)
+	_, err = st.CreateAlert(ctx, recentAlert)
+	require.NoError(t, err)
+
+	oldCutoff := time.Now().Add(-48 * time.Hour)
+	_, err = st.pool.Exec(ctx, `UPDATE alerts SET created_at = $1 WHERE id = $2`, oldCutoff.Add(-time.Hour), oldAlert.ID)
+	require.NoError(t, err)
+
+	oldAttempt := &DeliveryAttempt{AlertID: oldAlert.ID, ChannelID: c.ID, Status: "success"}
+	recentAttempt := &DeliveryAttempt{AlertID: recentAlert.ID, ChannelID: c.ID, Status: "success"}
+	require.NoError(t, st.RecordDeliveryAttempt(ctx, oldAttempt))
+	require.NoError(t, st.RecordDeliveryAttempt(ctx, recentAttempt))
+
+	deleted, err := st.DeleteExpiredAlerts(ctx, time.Now().Add(-24*time.Hour), 1000)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted)
+
+	alerts, err := st.ListAlerts(ctx, AlertFilter{})
+	require.NoError(t, err)
+	require.Len(t, alerts, 1)
+	assert.Equal(t, recentAlert.ID, alerts[0].ID)
+
+	oldAttempts, err := st.ListDeliveryAttempts(ctx, oldAlert.ID)
+	require.NoError(t, err)
+	assert.Empty(t, oldAttempts, "delivery_attempts must cascade with the alert")
+
+	kept, err := st.ListDeliveryAttempts(ctx, recentAlert.ID)
+	require.NoError(t, err)
+	require.Len(t, kept, 1)
+}
+
+func TestDeleteExpiredAlertsBatches(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+	r := &Rule{MonitorID: m.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, r))
+
+	for i := 0; i < 3; i++ {
+		a := &Alert{MonitorID: m.ID, RuleID: r.ID, EventID: "old-" + string(rune('a'+i))}
+		_, err := st.CreateAlert(ctx, a)
+		require.NoError(t, err)
+		_, err = st.pool.Exec(ctx, `UPDATE alerts SET created_at = now() - interval '48 hours' WHERE id = $1`, a.ID)
+		require.NoError(t, err)
+	}
+
+	deleted, err := st.DeleteExpiredAlerts(ctx, time.Now().Add(-24*time.Hour), 2)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), deleted)
+
+	deleted, err = st.DeleteExpiredAlerts(ctx, time.Now().Add(-24*time.Hour), 2)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted)
+}
+
 func TestIngestStateRoundTrip(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
