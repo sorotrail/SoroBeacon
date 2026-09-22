@@ -32,6 +32,9 @@ func (emptyStore) GetStats(context.Context) (store.Stats, error) { return store.
 func (emptyStore) ListAlerts(context.Context, store.AlertFilter) ([]store.Alert, error) {
 	return nil, nil
 }
+func (emptyStore) GetAlert(context.Context, int64) (*store.Alert, error) {
+	return nil, store.ErrNotFound
+}
 func (emptyStore) ListMonitors(context.Context, bool) ([]store.Monitor, error) { return nil, nil }
 func (emptyStore) ListChannels(context.Context, bool) ([]store.Channel, error) { return nil, nil }
 func (emptyStore) ListMonitorsPage(context.Context, store.ListFilter) ([]store.Monitor, error) {
@@ -1090,5 +1093,179 @@ func TestFocusVisibleStyles(t *testing.T) {
 	}
 	if !strings.Contains(html, "outline: 3px solid var(--focus-ring)") {
 		t.Fatal("missing 3px :focus-visible outline using --focus-ring")
+	}
+}
+
+// alertDetailStore backs GET /alerts/{id} with one populated alert,
+// optional deliveries, and the related monitor/rule/channel.
+type alertDetailStore struct {
+	emptyStore
+	alert    store.Alert
+	monitor  store.Monitor
+	rule     store.Rule
+	attempts []store.DeliveryAttempt
+}
+
+func (s alertDetailStore) GetAlert(_ context.Context, id int64) (*store.Alert, error) {
+	if id != s.alert.ID {
+		return nil, store.ErrNotFound
+	}
+	a := s.alert
+	return &a, nil
+}
+func (s alertDetailStore) GetMonitor(_ context.Context, id int64) (*store.Monitor, error) {
+	if id != s.monitor.ID {
+		return nil, store.ErrNotFound
+	}
+	m := s.monitor
+	return &m, nil
+}
+func (s alertDetailStore) GetRule(_ context.Context, id int64) (*store.Rule, error) {
+	if id != s.rule.ID {
+		return nil, store.ErrNotFound
+	}
+	r := s.rule
+	return &r, nil
+}
+func (s alertDetailStore) ListDeliveryAttempts(context.Context, int64) ([]store.DeliveryAttempt, error) {
+	return s.attempts, nil
+}
+func (s alertDetailStore) ListChannels(context.Context, bool) ([]store.Channel, error) {
+	return []store.Channel{{ID: 7, Name: "ops-webhook"}}, nil
+}
+
+func sampleAlertDetail() alertDetailStore {
+	closed := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	return alertDetailStore{
+		alert: store.Alert{
+			ID:        42,
+			MonitorID: 3,
+			RuleID:    9,
+			EventID:   "evt-abc",
+			CreatedAt: time.Date(2026, 9, 21, 12, 1, 0, 0, time.UTC),
+			Payload: json.RawMessage(`{
+				"contract_id":"CA7QYNF7",
+				"event_name":"transfer",
+				"ledger":12345,
+				"ledger_closed_at":"2026-09-21T12:00:00Z",
+				"topics":["transfer","GFROM","GTO"],
+				"value":{"i128":"100"}
+			}`),
+		},
+		monitor: store.Monitor{ID: 3, Name: "Treasury"},
+		rule:    store.Rule{ID: 9, MonitorID: 3, Type: "token_event"},
+		attempts: []store.DeliveryAttempt{
+			{ID: 1, ChannelID: 7, Status: "success", ResponseSnippet: "200 OK", AttemptedAt: closed},
+			{ID: 2, ChannelID: 7, Status: "failed", ResponseSnippet: "timeout", AttemptedAt: closed},
+		},
+	}
+}
+
+func TestAlertDetailPageRendersPopulatedAlert(t *testing.T) {
+	st := sampleAlertDetail()
+	s, err := New(st, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/alerts/42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /alerts/42 = %d, want 200", res.StatusCode)
+	}
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	wants := []string{
+		"Alert #42",
+		`href="/monitors/3"`,
+		"Treasury",
+		"token_event",
+		"#9",
+		"CA7QYNF7",
+		"transfer",
+		"evt-abc",
+		"12345",
+		"2026-09-21 12:00:00 UTC",
+		`class="decoded"`,
+		">from<",
+		"ops-webhook",
+		`class="pill on"`,
+		`class="pill off"`,
+		"timeout",
+		`href="/alerts"`,
+	}
+	for _, want := range wants {
+		if !strings.Contains(html, want) {
+			t.Errorf("missing %q in:\n%s", want, html)
+		}
+	}
+	idx := strings.Index(html, ">Alerts</a>")
+	if idx < 0 {
+		t.Fatal("Alerts nav link missing")
+	}
+	tag := html[strings.LastIndex(html[:idx], "<a "):idx]
+	if !strings.Contains(tag, `class="active"`) {
+		t.Fatalf("Alerts nav should stay active on the detail page, tag=%s", tag)
+	}
+}
+
+func TestAlertDetailPageEmptyDeliveries(t *testing.T) {
+	st := sampleAlertDetail()
+	st.attempts = nil
+	s, err := New(st, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	res, err := http.Get(srv.URL + "/alerts/42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if !strings.Contains(string(body), "No delivery attempts yet") {
+		t.Fatalf("expected empty delivery state, got: %s", body)
+	}
+}
+
+func TestAlertDetailNotFoundAndMalformed(t *testing.T) {
+	srv := httptest.NewServer(newTestServer(t).Routes())
+	defer srv.Close()
+	for _, path := range []string{"/alerts/99", "/alerts/abc"} {
+		res, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != http.StatusNotFound {
+			t.Errorf("%s = %d, want 404", path, res.StatusCode)
+		}
+	}
+}
+
+func TestAlertsListLinksToDetail(t *testing.T) {
+	s, err := New(alertWithPayloadStore{}, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	res, err := http.Get(srv.URL + "/alerts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if !strings.Contains(string(body), `href="/alerts/1"`) {
+		t.Fatalf("alerts list should link each row to /alerts/{id}, got:\n%s", body)
 	}
 }

@@ -295,6 +295,15 @@ func TestAlertDedupAndListing(t *testing.T) {
 	assert.True(t, created)
 	assert.NotZero(t, a.ID)
 
+	got, err := st.GetAlert(ctx, a.ID)
+	require.NoError(t, err)
+	assert.Equal(t, a.ID, got.ID)
+	assert.Equal(t, "ev-1", got.EventID)
+	assert.JSONEq(t, `{"k":"v"}`, string(got.Payload))
+
+	_, err = st.GetAlert(ctx, a.ID+9999)
+	require.ErrorIs(t, err, ErrNotFound)
+
 	dup := &Alert{MonitorID: m.ID, RuleID: r.ID, EventID: "ev-1"}
 	created, err = st.CreateAlert(ctx, dup)
 	require.NoError(t, err)

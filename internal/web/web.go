@@ -94,7 +94,7 @@ func prettyJSON(raw json.RawMessage) string {
 // New parses templates and wires a dashboard server.
 func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logger) (*Server, error) {
 	s := &Server{store: st, registry: reg, factory: f, log: log, pages: map[string]*template.Template{}}
-	for _, page := range []string{"index", "monitors", "monitor", "channels", "alerts"} {
+	for _, page := range []string{"index", "monitors", "monitor", "channels", "alerts", "alert"} {
 		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, fmt.Errorf("parse template %s: %w", page, err)
@@ -138,6 +138,7 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/alerts", s.alerts)
 	r.Get("/alerts/{id}/deliveries", s.alertDeliveries)
 	r.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)
+	r.Get("/alerts/{id}", s.alertDetail)
 	return r
 }
 
@@ -151,6 +152,7 @@ var navSection = map[string]string{
 	"monitor":  "monitors",
 	"channels": "channels",
 	"alerts":   "alerts",
+	"alert":    "alerts",
 }
 
 func (s *Server) render(w http.ResponseWriter, r *http.Request, page string, data any) {
@@ -962,6 +964,120 @@ func (s *Server) writeDeliveriesFragment(w http.ResponseWriter, r *http.Request,
 			retry)
 	}
 	fmt.Fprint(w, `</table>`)
+}
+
+// alertDetail is the permalink for one alert: monitor, rule, decoded
+// event, full payload, and every delivery attempt. Malformed and unknown
+// IDs use the same 404 path as the rest of the dashboard.
+func (s *Server) alertDetail(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	a, err := s.store.GetAlert(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		s.fail(w, err)
+		return
+	}
+
+	var monitor *store.Monitor
+	if m, err := s.store.GetMonitor(r.Context(), a.MonitorID); err == nil {
+		monitor = m
+	} else if !errors.Is(err, store.ErrNotFound) {
+		s.fail(w, err)
+		return
+	}
+	var rule *store.Rule
+	if ru, err := s.store.GetRule(r.Context(), a.RuleID); err == nil {
+		rule = ru
+	} else if !errors.Is(err, store.ErrNotFound) {
+		s.fail(w, err)
+		return
+	}
+
+	attempts, err := s.store.ListDeliveryAttempts(r.Context(), a.ID)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	channels, err := s.store.ListChannels(r.Context(), false)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	channelNames := map[int64]string{}
+	for _, c := range channels {
+		channelNames[c.ID] = c.Name
+	}
+
+	fields := payloadFields(a.Payload)
+	s.render(w, r, "alert", map[string]any{
+		"Title":          fmt.Sprintf("Alert #%d", a.ID),
+		"Alert":          a,
+		"Monitor":        monitor,
+		"Rule":           rule,
+		"Attempts":       attempts,
+		"ChannelNames":   channelNames,
+		"ContractID":     fields.contractID,
+		"EventName":      fields.eventName,
+		"Ledger":         fields.ledger,
+		"LedgerClosedAt": fields.closedAt,
+	})
+}
+
+type alertPayloadFields struct {
+	contractID string
+	eventName  string
+	ledger     string
+	closedAt   time.Time
+}
+
+// payloadFields pulls the permalink columns out of the stored event JSON
+// without a second schema. Missing keys stay empty rather than failing
+// the page — a payload is still worth showing even if a field is absent.
+func payloadFields(raw json.RawMessage) alertPayloadFields {
+	var out alertPayloadFields
+	if len(raw) == 0 {
+		return out
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return out
+	}
+	out.contractID = stringifyPayload(m["contract_id"])
+	out.eventName = stringifyPayload(m["event_name"])
+	if out.eventName == "" {
+		topics, _ := m["topics"].([]any)
+		out.eventName = eventNameFrom(m, topics)
+	}
+	out.ledger = stringifyPayload(m["ledger"])
+	if v, ok := m["ledger_closed_at"].(string); ok {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			out.closedAt = t
+		}
+	}
+	return out
+}
+
+func stringifyPayload(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch t := v.(type) {
+	case string:
+		return t
+	case float64:
+		return strconv.FormatInt(int64(t), 10)
+	case json.Number:
+		return t.String()
+	default:
+		return fmt.Sprint(t)
+	}
 }
 
 func splitLines(s string) []string {
