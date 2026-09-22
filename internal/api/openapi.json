@@ -451,6 +451,25 @@
           "request_id": {
             "type": "string",
             "description": "Correlation ID, also on the X-Request-ID response header"
+          },
+          "details": {
+            "type": "array",
+            "description": "Field-level validation problems. Omitted when there are none so existing clients keep working. Each entry names a JSON path and why it failed; all problems in one request are listed together.",
+            "items": { "$ref": "#/components/schemas/ErrorDetail" }
+          }
+        }
+      },
+      "ErrorDetail": {
+        "type": "object",
+        "required": ["field", "reason"],
+        "properties": {
+          "field": {
+            "type": "string",
+            "description": "Dotted JSON path of the offending field, e.g. rules[0].params.min_amount"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Human-readable failure for that field"
           }
         }
       },

@@ -77,23 +77,41 @@ func (TokenEvent) Validate(params json.RawMessage) error {
 	if err != nil {
 		return err
 	}
+	var details FieldErrors
 	if p.Event == "" {
-		return fmt.Errorf("token_event: event is required (transfer|mint|burn|clawback|set_admin|*)")
-	}
-	if p.Event != "*" {
+		details = append(details, FieldError{
+			Field:  "event",
+			Reason: "token_event: event is required (transfer|mint|burn|clawback|set_admin|*)",
+		})
+	} else if p.Event != "*" {
 		if _, ok := sep41Events[p.Event]; !ok {
-			return fmt.Errorf("token_event: unknown event %q (want transfer|mint|burn|clawback|set_admin|*)", p.Event)
+			details = append(details, FieldError{
+				Field:  "event",
+				Reason: fmt.Sprintf("token_event: unknown event %q (want transfer|mint|burn|clawback|set_admin|*)", p.Event),
+			})
 		}
 	}
 	if _, ok := new(big.Int).SetString(p.MinAmount, 10); p.MinAmount != "" && !ok {
-		return fmt.Errorf("token_event: min_amount %q is not a decimal integer", p.MinAmount)
+		details = append(details, FieldError{
+			Field:  "min_amount",
+			Reason: fmt.Sprintf("token_event: min_amount %q is not a decimal integer", p.MinAmount),
+		})
 	}
 	if _, ok := new(big.Int).SetString(p.MaxAmount, 10); p.MaxAmount != "" && !ok {
-		return fmt.Errorf("token_event: max_amount %q is not a decimal integer", p.MaxAmount)
+		details = append(details, FieldError{
+			Field:  "max_amount",
+			Reason: fmt.Sprintf("token_event: max_amount %q is not a decimal integer", p.MaxAmount),
+		})
 	}
 	// set_admin carries no value; amount filters on it can never match.
 	if p.Event == "set_admin" && (p.MinAmount != "" || p.MaxAmount != "") {
-		return fmt.Errorf("token_event: set_admin carries no amount; remove min_amount/max_amount")
+		details = append(details, FieldError{
+			Field:  "min_amount",
+			Reason: "token_event: set_admin carries no amount; remove min_amount/max_amount",
+		})
+	}
+	if len(details) > 0 {
+		return details
 	}
 	return nil
 }

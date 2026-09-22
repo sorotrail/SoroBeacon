@@ -31,13 +31,23 @@ func (EventEmitted) Validate(params json.RawMessage) error {
 	if err != nil {
 		return err
 	}
+	var details FieldErrors
 	if p.EventName == "" && len(p.TopicEquals) == 0 {
-		return fmt.Errorf("event_emitted: set event_name and/or topic_equals")
+		details = append(details, FieldError{
+			Field:  "event_name",
+			Reason: "event_emitted: set event_name and/or topic_equals",
+		})
 	}
 	for k := range p.TopicEquals {
 		if _, err := strconv.Atoi(k); err != nil {
-			return fmt.Errorf("event_emitted: topic_equals key %q is not a topic index", k)
+			details = append(details, FieldError{
+				Field:  "topic_equals." + k,
+				Reason: fmt.Sprintf("event_emitted: topic_equals key %q is not a topic index", k),
+			})
 		}
+	}
+	if len(details) > 0 {
+		return details
 	}
 	return nil
 }

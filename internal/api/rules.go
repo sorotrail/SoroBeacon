@@ -3,9 +3,23 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
+
+// ruleParamDetails maps a registry.Validate error onto envelope fields.
+// Unknown types belong on "type"; param problems keep their path under
+// "params" rather than flattening into a single message.
+func ruleParamDetails(err error) []FieldError {
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(err.Error(), "unknown rule type") {
+		return []FieldError{{Field: "type", Reason: err.Error()}}
+	}
+	return detailsFromErr("params", err)
+}
 
 type ruleRequest struct {
 	Type    *string          `json:"type"`
@@ -27,16 +41,21 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
+	var details []FieldError
 	if req.Type == nil || *req.Type == "" {
-		writeErr(w, r, http.StatusBadRequest, "type is required")
-		return
+		details = append(details, FieldError{Field: "type", Reason: "type is required"})
 	}
 	params := json.RawMessage(`{}`)
 	if req.Params != nil {
 		params = *req.Params
 	}
-	if err := s.registry.Validate(*req.Type, params); err != nil {
-		writeErr(w, r, http.StatusBadRequest, err.Error())
+	if req.Type != nil && *req.Type != "" {
+		if err := s.registry.Validate(*req.Type, params); err != nil {
+			details = append(details, ruleParamDetails(err)...)
+		}
+	}
+	if len(details) > 0 {
+		writeValidation(w, r, details)
 		return
 	}
 	rule := store.Rule{
@@ -79,6 +98,10 @@ func (s *Server) updateRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Type != nil {
+		if *req.Type == "" {
+			writeValidation(w, r, []FieldError{{Field: "type", Reason: "type is required"}})
+			return
+		}
 		rule.Type = *req.Type
 	}
 	if req.Params != nil {
@@ -88,7 +111,7 @@ func (s *Server) updateRule(w http.ResponseWriter, r *http.Request) {
 		rule.Enabled = *req.Enabled
 	}
 	if err := s.registry.Validate(rule.Type, rule.Params); err != nil {
-		writeErr(w, r, http.StatusBadRequest, err.Error())
+		writeValidation(w, r, ruleParamDetails(err))
 		return
 	}
 	if err := s.store.UpdateRule(r.Context(), rule); err != nil {

@@ -92,16 +92,81 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// FieldError is one entry in the optional "details" array on the error
+// envelope. Field is a dotted JSON path (rules[0].params.min_amount);
+// Reason is the human-readable failure for that field.
+type FieldError struct {
+	Field  string `json:"field"`
+	Reason string `json:"reason"`
+}
+
 // writeErr emits the structured error envelope. The top-level "error"
 // string is kept for clients written against the original shape; the
 // "request_id" field lets a quoted error be mapped to one request in the
 // logs, and "code" gives clients a stable token to branch on.
-func writeErr(w http.ResponseWriter, r *http.Request, status int, msg string) {
-	writeJSON(w, status, map[string]any{
+//
+// details is purely additive: omitted when empty so existing clients keep
+// working. When present, every validation problem in the request is listed
+// rather than only the first.
+func writeErr(w http.ResponseWriter, r *http.Request, status int, msg string, details ...FieldError) {
+	body := map[string]any{
 		"error":      msg,
 		"code":       http.StatusText(status),
 		"request_id": reqid.From(r),
-	})
+	}
+	if len(details) > 0 {
+		body["details"] = details
+	}
+	writeJSON(w, status, body)
+}
+
+// writeValidation reports one or more field-level problems as a 400.
+// A single detail keeps that field's reason as the top-level error so
+// existing clients still see "name is required"; several details share
+// the summary "validation failed" and list every field in details.
+func writeValidation(w http.ResponseWriter, r *http.Request, details []FieldError) {
+	if len(details) == 0 {
+		return
+	}
+	msg := details[0].Reason
+	if len(details) > 1 {
+		msg = "validation failed"
+	}
+	writeErr(w, r, http.StatusBadRequest, msg, details...)
+}
+
+// detailsFromErr turns a Validate / constructor error into envelope
+// details. FieldErrors from the rules registry keep their paths, prefixed
+// so nested params show up as params.min_amount rather than a flattened
+// string. Anything else is a single detail on prefix.
+func detailsFromErr(prefix string, err error) []FieldError {
+	if err == nil {
+		return nil
+	}
+	var fields rules.FieldErrors
+	if errors.As(err, &fields) && len(fields) > 0 {
+		out := make([]FieldError, 0, len(fields))
+		for _, d := range fields {
+			out = append(out, FieldError{Field: joinPath(prefix, d.Field), Reason: d.Reason})
+		}
+		return out
+	}
+	var one rules.FieldError
+	if errors.As(err, &one) && (one.Field != "" || one.Reason != "") {
+		return []FieldError{{Field: joinPath(prefix, one.Field), Reason: one.Reason}}
+	}
+	return []FieldError{{Field: prefix, Reason: err.Error()}}
+}
+
+func joinPath(prefix, field string) string {
+	switch {
+	case prefix == "":
+		return field
+	case field == "":
+		return prefix
+	default:
+		return prefix + "." + field
+	}
 }
 
 // fail maps store errors to HTTP responses.
