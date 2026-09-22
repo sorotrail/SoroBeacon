@@ -1080,18 +1080,6 @@ func stringifyPayload(v any) string {
 	}
 }
 
-func (s *Server) monitorNames(r *http.Request) (map[int64]string, error) {
-	monitors, err := s.store.ListMonitors(r.Context(), false)
-	if err != nil {
-		return nil, err
-	}
-	names := map[int64]string{}
-	for _, m := range monitors {
-		names[m.ID] = m.Name
-	}
-	return names, nil
-}
-
 func splitLines(s string) []string {
 	var out []string
 	for _, line := range strings.FieldsFunc(s, func(r rune) bool {
