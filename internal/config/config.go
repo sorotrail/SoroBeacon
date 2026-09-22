@@ -197,6 +197,38 @@ func validateHTTPAddr(addr string) error {
 	return nil
 }
 
+const redacted = "[redacted]"
+
+// LogAttrs returns the effective configuration as slog attributes.
+// Fields are opted in: a new Config field is not logged until it is
+// listed here, so a secret cannot leak by accident.
+func (c Config) LogAttrs() []slog.Attr {
+	return []slog.Attr{
+		slog.String("database_url", redactDatabaseURL(c.DatabaseURL)),
+		slog.String("http_addr", c.HTTPAddr),
+		slog.String("source_mode", c.SourceMode),
+		slog.String("poll_interval", c.PollInterval.String()),
+		slog.String("log_level", strings.ToLower(c.LogLevel.String())),
+		slog.String("network", c.Network.Name),
+		slog.String("rpc_url", c.RPCURL),
+		slog.String("sorotrail_url", c.SoroTrailURL),
+		slog.String("cors_allowed_origins", strings.Join(c.CORSAllowedOrigins, ",")),
+	}
+}
+
+// redactDatabaseURL keeps scheme, host (with port) and database name and
+// drops userinfo, query and fragment so a password never appears in logs.
+func redactDatabaseURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return redacted
+	}
+	return u.Scheme + "://" + u.Host + u.Path
+}
+
 func getenv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
