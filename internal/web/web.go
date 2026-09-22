@@ -96,6 +96,7 @@ func (s *Server) Routes() chi.Router {
 
 	r.Get("/alerts", s.alerts)
 	r.Get("/alerts/{id}/deliveries", s.alertDeliveries)
+	r.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)
 	return r
 }
 
@@ -476,7 +477,62 @@ func (s *Server) alertDeliveries(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	attempts, err := s.store.ListDeliveryAttempts(r.Context(), id)
+	s.writeDeliveriesFragment(w, r, id, "")
+}
+
+// retryDelivery re-sends one failed attempt and swaps the deliveries
+// fragment in place. Gate failures stay in the fragment so htmx can
+// swap them without a full page reload.
+func (s *Server) retryDelivery(w http.ResponseWriter, r *http.Request) {
+	alertID, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	channelID, err := pathID(r, "channelID")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	alert, err := s.store.GetAlert(r.Context(), alertID)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	ch, err := s.store.GetChannel(r.Context(), channelID)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	attempts, err := s.store.ListDeliveryAttempts(r.Context(), alertID)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	if err := notify.GateRetry(attempts, channelID, *ch, time.Now(), notify.DefaultRetryCooldown); err != nil {
+		s.writeDeliveriesFragment(w, r, alertID, err.Error())
+		return
+	}
+	na := notify.Alert{
+		ID:        alert.ID,
+		MonitorID: alert.MonitorID,
+		RuleID:    alert.RuleID,
+		EventID:   alert.EventID,
+		Payload:   alert.Payload,
+		CreatedAt: alert.CreatedAt,
+	}
+	if m, merr := s.store.GetMonitor(r.Context(), alert.MonitorID); merr == nil && m != nil {
+		na.MonitorName = m.Name
+	}
+	if rule, rerr := s.store.GetRule(r.Context(), alert.RuleID); rerr == nil && rule != nil {
+		na.RuleType = rule.Type
+	}
+	notify.NewDispatcher(s.store, s.factory, s.log).Retry(r.Context(), na, *ch)
+	s.writeDeliveriesFragment(w, r, alertID, "")
+}
+
+func (s *Server) writeDeliveriesFragment(w http.ResponseWriter, r *http.Request, alertID int64, note string) {
+	attempts, err := s.store.ListDeliveryAttempts(r.Context(), alertID)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -492,21 +548,31 @@ func (s *Server) alertDeliveries(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if note != "" {
+		fmt.Fprintf(w, `<p class="muted">%s</p>`, template.HTMLEscapeString(note))
+	}
 	if len(attempts) == 0 {
 		fmt.Fprint(w, `<p class="muted">No delivery attempts yet.</p>`)
 		return
 	}
-	fmt.Fprint(w, `<table><tr><th>Channel</th><th>Status</th><th>Response</th><th>At</th></tr>`)
+	fmt.Fprint(w, `<table><tr><th>Channel</th><th>Status</th><th>Response</th><th>At</th><th></th></tr>`)
 	for _, a := range attempts {
 		pillClass := "off"
 		if a.Status == "success" {
 			pillClass = "on"
 		}
-		fmt.Fprintf(w, `<tr><td>%s</td><td><span class="pill %s">%s</span></td><td><code>%s</code></td><td>%s</td></tr>`,
+		retry := ""
+		if a.Status != "success" {
+			retry = fmt.Sprintf(
+				`<button type="button" hx-post="/alerts/%d/deliveries/%d/retry" hx-target="closest div" hx-swap="innerHTML">Retry</button>`,
+				alertID, a.ChannelID)
+		}
+		fmt.Fprintf(w, `<tr><td>%s</td><td><span class="pill %s">%s</span></td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>`,
 			template.HTMLEscapeString(names[a.ChannelID]),
 			pillClass, template.HTMLEscapeString(a.Status),
 			template.HTMLEscapeString(a.ResponseSnippet),
-			template.HTMLEscapeString(a.AttemptedAt.Format("2006-01-02 15:04:05")))
+			template.HTMLEscapeString(a.AttemptedAt.Format("2006-01-02 15:04:05")),
+			retry)
 	}
 	fmt.Fprint(w, `</table>`)
 }
