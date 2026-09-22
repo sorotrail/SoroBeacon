@@ -1,0 +1,27 @@
+# Keep Go modules and GitHub Actions current without waiting for someone
+# to notice a quiet security patch in a transitive dependency.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    # Routine minor/patch bumps share one PR. Major version updates stay
+    # ungrouped so they can be reviewed on their own.
+    groups:
+      go-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
