@@ -106,6 +106,8 @@
     table.decoded { width: auto; min-width: 16rem; margin: .3rem 0 .5rem; }
     table.decoded th { text-transform: none; font-weight: 600; white-space: nowrap;
                        width: 1%; padding-right: 1rem; }
+    .copy-id { display: inline; }
+    .copy-btn { font-size: .75rem; padding: .1rem .45rem; margin-left: .25rem; vertical-align: baseline; }
   </style>
 </head>
 <body>
@@ -162,5 +164,20 @@
   {{if .CommitURL}} · <a href="{{.CommitURL}}">{{.Commit}}</a>
   {{else}} · <span>{{.Commit}}</span>{{end}}
 </footer>
+
+  document.addEventListener('click', function (ev) {
+    var btn = ev.target.closest ? ev.target.closest('button.copy-btn') : null;
+    if (!btn) return;
+    var value = btn.getAttribute('data-copy') || '';
+    var clip = navigator.clipboard;
+    if (!clip || typeof clip.writeText !== 'function') return;
+    clip.writeText(value).then(function () {
+      var prev = btn.textContent;
+      btn.textContent = 'Copied';
+      setTimeout(function () { btn.textContent = prev; }, 1200);
+    }).catch(function () {});
+  });
+</script>
 </body>
 </html>{{end}}
+{{define "copyID"}}<span class="copy-id"><code>{{.}}</code><button type="button" class="copy-btn" data-copy="{{.}}" aria-label="Copy identifier">Copy</button></span>{{end}}

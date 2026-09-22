@@ -27,7 +27,7 @@
     <td><a href="/alerts/{{.ID}}">{{.ID}}</a></td>
     <td>{{index $.MonitorNames .MonitorID}}</td>
     <td>#{{.RuleID}}</td>
-    <td><code>{{.EventID}}</code></td>
+    <td>{{template "copyID" .EventID}}</td>
     <td><details><summary>view</summary>{{decodedEvent .Payload}}<pre>{{prettyJSON .Payload}}</pre></details></td>
     <td>
       <details hx-get="/alerts/{{.ID}}/deliveries" hx-trigger="toggle once" hx-target="find div">

@@ -1405,3 +1405,130 @@ func TestCommitURL(t *testing.T) {
 		}
 	}
 }
+
+// copyIDStore backs overview/monitors/alerts/detail with one long contract
+// ID and one long event ID so copy-button markup can be asserted.
+const (
+	testContractID = "CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"
+	testEventID    = "000123456789abcdef000123456789abcdef000123456789abcdef00"
+)
+
+type copyIDStore struct {
+	emptyStore
+}
+
+func (copyIDStore) ListMonitors(context.Context, bool) ([]store.Monitor, error) {
+	return []store.Monitor{{ID: 1, Name: "alpha", ContractIDs: []string{testContractID}, Enabled: true}}, nil
+}
+
+// The monitors page reads through ListMonitorsPage since pagination
+// landed; keep both in step so the page is not rendered empty.
+func (c copyIDStore) ListMonitorsPage(ctx context.Context, _ store.ListFilter) ([]store.Monitor, error) {
+	return c.ListMonitors(ctx, false)
+}
+
+func (copyIDStore) GetMonitor(_ context.Context, id int64) (*store.Monitor, error) {
+	if id != 1 {
+		return nil, store.ErrNotFound
+	}
+	m := store.Monitor{ID: 1, Name: "alpha", ContractIDs: []string{testContractID}, Enabled: true}
+	return &m, nil
+}
+
+func (copyIDStore) ListRules(context.Context, int64, bool) ([]store.Rule, error) {
+	return nil, nil
+}
+
+func (copyIDStore) ListAlerts(context.Context, store.AlertFilter) ([]store.Alert, error) {
+	return []store.Alert{{ID: 9, MonitorID: 1, RuleID: 3, EventID: testEventID}}, nil
+}
+
+func TestCopyIDButtonsRenderFullIdentifier(t *testing.T) {
+	s, err := New(copyIDStore{}, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	pages := []struct {
+		path string
+		id   string
+	}{
+		{"/", testEventID},
+		{"/alerts", testEventID},
+		{"/monitors", testContractID},
+		{"/monitors/1", testContractID},
+	}
+	for _, tt := range pages {
+		t.Run(tt.path, func(t *testing.T) {
+			res, err := http.Get(srv.URL + tt.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("GET %s = %d, want 200", tt.path, res.StatusCode)
+			}
+			body, err := io.ReadAll(res.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			html := string(body)
+			if !strings.Contains(html, `class="copy-btn"`) {
+				t.Fatalf("%s: missing copy button (class=copy-btn)", tt.path)
+			}
+			if !strings.Contains(html, `data-copy="`+tt.id+`"`) {
+				t.Fatalf("%s: missing data-copy=%q in markup:\n%s", tt.path, tt.id, html)
+			}
+			if !strings.Contains(html, `<code>`+tt.id+`</code>`) {
+				t.Fatalf("%s: full identifier not rendered in <code>", tt.path)
+			}
+			if !strings.Contains(html, `aria-label="Copy identifier"`) {
+				t.Fatalf("%s: copy button missing accessible label", tt.path)
+			}
+			if !strings.Contains(html, "clip.writeText") {
+				t.Fatalf("%s: layout script with clipboard writeText missing", tt.path)
+			}
+		})
+	}
+}
+
+// xssEventStore renders an event ID that would break out of an attribute
+// if the template failed to escape it.
+type xssEventStore struct {
+	emptyStore
+}
+
+func (xssEventStore) ListAlerts(context.Context, store.AlertFilter) ([]store.Alert, error) {
+	return []store.Alert{{ID: 1, EventID: `"><img src=x onerror=alert(1)>`}}, nil
+}
+
+func TestCopyIDEscapesIdentifier(t *testing.T) {
+	s, err := New(xssEventStore{}, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/alerts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	if strings.Contains(html, `"><img`) || strings.Contains(html, `"<img src=x`) {
+		t.Fatalf("event ID was not HTML-escaped:\n%s", html)
+	}
+	if !strings.Contains(html, `&lt;img`) {
+		t.Fatalf("expected escaped &lt;img in markup:\n%s", html)
+	}
+	if !strings.Contains(html, `class="copy-btn"`) {
+		t.Fatal("copy button missing on escaped-ID page")
+	}
+}

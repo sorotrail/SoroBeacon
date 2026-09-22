@@ -54,7 +54,7 @@
     <td><a href="/alerts/{{.ID}}">{{.ID}}</a></td>
     <td>{{index $.MonitorNames .MonitorID}}</td>
     <td>#{{.RuleID}}</td>
-    <td><code>{{.EventID}}</code></td>
+    <td>{{template "copyID" .EventID}}</td>
     <td>{{formatTime .CreatedAt $.Timezone}}</td>
   </tr>
   {{end}}
