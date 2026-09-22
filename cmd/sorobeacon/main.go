@@ -51,7 +51,12 @@ func run() error {
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		return err
 	}
-	st, err := store.NewPostgres(ctx, cfg.DatabaseURL)
+	st, err := store.NewPostgres(ctx, cfg.DatabaseURL, store.PoolSettings{
+		MaxConns:        cfg.DatabaseMaxConns,
+		MinConns:        cfg.DatabaseMinConns,
+		MaxConnLifetime: cfg.DatabaseMaxConnLifetime,
+		MaxConnIdleTime: cfg.DatabaseMaxConnIdleTime,
+	})
 	if err != nil {
 		return err
 	}

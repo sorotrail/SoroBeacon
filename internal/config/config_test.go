@@ -41,6 +41,10 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Equal(t, "rpc", cfg.SourceMode)
 	assert.Empty(t, cfg.SoroTrailURL)
 	assert.Empty(t, cfg.CORSAllowedOrigins)
+	assert.Zero(t, cfg.DatabaseMaxConns)
+	assert.Zero(t, cfg.DatabaseMinConns)
+	assert.Zero(t, cfg.DatabaseMaxConnLifetime)
+	assert.Zero(t, cfg.DatabaseMaxConnIdleTime)
 }
 
 func TestLoadRequiresDatabaseURL(t *testing.T) {
@@ -350,4 +354,84 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"sorotrail_url",
 		"cors_allowed_origins",
 	}, keys)
+}
+
+func TestLoadDatabasePoolSettings(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("DATABASE_MAX_CONNS", "8")
+	t.Setenv("DATABASE_MIN_CONNS", "2")
+	t.Setenv("DATABASE_MAX_CONN_LIFETIME", "1h")
+	t.Setenv("DATABASE_MAX_CONN_IDLE_TIME", "10m")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, int32(8), cfg.DatabaseMaxConns)
+	assert.Equal(t, int32(2), cfg.DatabaseMinConns)
+	assert.Equal(t, time.Hour, cfg.DatabaseMaxConnLifetime)
+	assert.Equal(t, 10*time.Minute, cfg.DatabaseMaxConnIdleTime)
+}
+
+func TestLoadDatabasePoolZeroMeansDriverDefault(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("DATABASE_MAX_CONNS", "0")
+	t.Setenv("DATABASE_MIN_CONNS", "0")
+	t.Setenv("DATABASE_MAX_CONN_LIFETIME", "0s")
+	t.Setenv("DATABASE_MAX_CONN_IDLE_TIME", "0s")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Zero(t, cfg.DatabaseMaxConns)
+	assert.Zero(t, cfg.DatabaseMinConns)
+	assert.Zero(t, cfg.DatabaseMaxConnLifetime)
+	assert.Zero(t, cfg.DatabaseMaxConnIdleTime)
+}
+
+func TestLoadRejectsNegativeDatabasePoolSettings(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+
+	t.Setenv("DATABASE_MAX_CONNS", "-1")
+	_, err := Load()
+	assert.ErrorContains(t, err, "DATABASE_MAX_CONNS")
+	assert.ErrorContains(t, err, "negative")
+
+	t.Setenv("DATABASE_MAX_CONNS", "4")
+	t.Setenv("DATABASE_MIN_CONNS", "-2")
+	_, err = Load()
+	assert.ErrorContains(t, err, "DATABASE_MIN_CONNS")
+	assert.ErrorContains(t, err, "negative")
+
+	t.Setenv("DATABASE_MIN_CONNS", "1")
+	t.Setenv("DATABASE_MAX_CONN_LIFETIME", "-1s")
+	_, err = Load()
+	assert.ErrorContains(t, err, "DATABASE_MAX_CONN_LIFETIME")
+	assert.ErrorContains(t, err, "negative")
+
+	t.Setenv("DATABASE_MAX_CONN_LIFETIME", "1h")
+	t.Setenv("DATABASE_MAX_CONN_IDLE_TIME", "-5m")
+	_, err = Load()
+	assert.ErrorContains(t, err, "DATABASE_MAX_CONN_IDLE_TIME")
+	assert.ErrorContains(t, err, "negative")
+}
+
+func TestLoadRejectsMaxConnsBelowMinConns(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("DATABASE_MAX_CONNS", "2")
+	t.Setenv("DATABASE_MIN_CONNS", "5")
+
+	_, err := Load()
+	assert.ErrorContains(t, err, "DATABASE_MAX_CONNS 2")
+	assert.ErrorContains(t, err, "DATABASE_MIN_CONNS 5")
+}
+
+func TestLoadRejectsInvalidDatabasePoolValues(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+
+	t.Setenv("DATABASE_MAX_CONNS", "plenty")
+	_, err := Load()
+	assert.ErrorContains(t, err, "DATABASE_MAX_CONNS")
+
+	t.Setenv("DATABASE_MAX_CONNS", "4")
+	t.Setenv("DATABASE_MAX_CONN_LIFETIME", "forever")
+	_, err = Load()
+	assert.ErrorContains(t, err, "DATABASE_MAX_CONN_LIFETIME")
 }

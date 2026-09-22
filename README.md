@@ -65,6 +65,10 @@ All configuration comes from environment variables:
 | `RPC_URL`       | per network                            | Stellar RPC endpoint; overrides the preset   |
 | `NETWORK_PASSPHRASE` | per network                       | Overrides the network passphrase             |
 | `DATABASE_URL`  | *(required)*                           | Postgres connection string                   |
+| `DATABASE_MAX_CONNS` | pgx default                       | Pool max connections (`0` = driver default)  |
+| `DATABASE_MIN_CONNS` | pgx default                       | Pool min connections (`0` = driver default)  |
+| `DATABASE_MAX_CONN_LIFETIME` | pgx default                | Max connection lifetime (`0` = driver default) |
+| `DATABASE_MAX_CONN_IDLE_TIME` | pgx default               | Max idle time (`0` = driver default)         |
 | `POLL_INTERVAL` | `5s`                                   | How often to poll `getEvents` (min `1s`)     |
 | `HTTP_ADDR`     | `:8080`                                | API + dashboard listen address (`host:port`) |
 | `HTTP_MAX_BODY_BYTES` | `1048576` (1 MiB)                 | Max API write-body size; GET is unaffected   |
