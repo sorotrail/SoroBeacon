@@ -12,6 +12,8 @@ docker compose up -d postgres      # just the database
 cp .env.example .env
 make build && make test
 make test-db                       # includes store integration tests
+make docker-build                  # image tagged VERSION + latest; passes VERSION/COMMIT/DATE
+make docker-run                    # publishes 8080; forwards DATABASE_URL and RPC_URL
 ```
 
 Go 1.25+ is required (the Stellar SDK dependency sets the floor).

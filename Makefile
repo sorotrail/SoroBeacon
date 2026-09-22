@@ -1,16 +1,34 @@
-.PHONY: build run test test-db cover lint fmt up down clean migrate-new
+.PHONY: build run test test-db cover lint fmt up down clean migrate-new docker-build docker-run
 
 MIGRATIONS_DIR := internal/store/migrations
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+IMAGE   ?= sorobeacon
 
 build:
 	go build -ldflags "-X github.com/sorotrail/sorobeacon/internal/buildinfo.Version=$(VERSION) -X github.com/sorotrail/sorobeacon/internal/buildinfo.Commit=$(COMMIT) -X github.com/sorotrail/sorobeacon/internal/buildinfo.Date=$(DATE)" -o bin/sorobeacon ./cmd/sorobeacon
 
 run: build
 	./bin/sorobeacon
+
+# docker-build reuses VERSION/COMMIT/DATE from the binary build so
+# GET /api/v1/version inside the image matches `make build`.
+docker-build:
+	docker build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg COMMIT=$(COMMIT) \
+		--build-arg DATE=$(DATE) \
+		-t $(IMAGE):$(VERSION) \
+		-t $(IMAGE):latest \
+		.
+
+docker-run:
+	docker run --rm -p 8080:8080 \
+		-e DATABASE_URL \
+		-e RPC_URL \
+		$(IMAGE):$(VERSION)
 
 test:
 	go test ./...
