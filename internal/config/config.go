@@ -138,6 +138,7 @@ func Load() (Config, error) {
 			return cfg, fmt.Errorf("invalid READYZ_LAG_THRESHOLD %q: %w", v, err)
 		}
 		cfg.ReadyzLagThreshold = uint32(n)
+	}
 	if v := os.Getenv("RATE_LIMIT_RPS"); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {

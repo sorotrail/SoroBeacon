@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/sorotrail/sorobeacon/internal/store"
@@ -41,6 +42,79 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
+	rule, details := s.ruleFromRequest(monitorID, req)
+	if len(details) > 0 {
+		writeValidation(w, r, details)
+		return
+	}
+	if err := s.store.CreateRule(r.Context(), &rule); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, rule)
+}
+
+// maxBulkRules is the documented ceiling on POST /rules/bulk. Provisioning
+// a monitor should never need more than this in one shot; a larger body is
+// almost certainly a bug or an unbounded script.
+const maxBulkRules = 50
+
+func (s *Server) createRulesBulk(w http.ResponseWriter, r *http.Request) {
+	monitorID, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, r, http.StatusBadRequest, "invalid monitor id")
+		return
+	}
+	if _, err := s.store.GetMonitor(r.Context(), monitorID); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	var reqs []ruleRequest
+	if !readJSON(w, r, &reqs) {
+		return
+	}
+	if len(reqs) == 0 {
+		writeValidation(w, r, []FieldError{{Field: "rules", Reason: "must not be empty"}})
+		return
+	}
+	if len(reqs) > maxBulkRules {
+		writeValidation(w, r, []FieldError{{
+			Field:  "rules",
+			Reason: "at most 50 rules per request",
+		}})
+		return
+	}
+
+	var details []FieldError
+	rules := make([]*store.Rule, 0, len(reqs))
+	for i, req := range reqs {
+		rule, d := s.ruleFromRequest(monitorID, req)
+		if len(d) > 0 {
+			prefix := "rules[" + strconv.Itoa(i) + "]"
+			for _, fe := range d {
+				details = append(details, FieldError{Field: joinPath(prefix, fe.Field), Reason: fe.Reason})
+			}
+			continue
+		}
+		created := rule
+		rules = append(rules, &created)
+	}
+	if len(details) > 0 {
+		writeValidation(w, r, details)
+		return
+	}
+	if err := s.store.CreateRules(r.Context(), rules); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	out := make([]store.Rule, len(rules))
+	for i, rule := range rules {
+		out[i] = *rule
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
+
+func (s *Server) ruleFromRequest(monitorID int64, req ruleRequest) (store.Rule, []FieldError) {
 	var details []FieldError
 	if req.Type == nil || *req.Type == "" {
 		details = append(details, FieldError{Field: "type", Reason: "type is required"})
@@ -55,20 +129,14 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(details) > 0 {
-		writeValidation(w, r, details)
-		return
+		return store.Rule{}, details
 	}
-	rule := store.Rule{
+	return store.Rule{
 		MonitorID: monitorID,
 		Type:      *req.Type,
 		Params:    params,
 		Enabled:   req.Enabled == nil || *req.Enabled,
-	}
-	if err := s.store.CreateRule(r.Context(), &rule); err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, rule)
+	}, nil
 }
 
 func (s *Server) listRules(w http.ResponseWriter, r *http.Request) {

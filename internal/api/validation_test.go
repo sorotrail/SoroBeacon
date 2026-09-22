@@ -40,6 +40,14 @@ func (v *validationStore) CreateRule(_ context.Context, r *store.Rule) error {
 	return nil
 }
 
+func (v *validationStore) CreateRules(_ context.Context, rules []*store.Rule) error {
+	for _, r := range rules {
+		v.createdRules++
+		r.ID = int64(v.createdRules)
+	}
+	return nil
+}
+
 func (v *validationStore) CreateChannel(_ context.Context, ch *store.Channel) error {
 	v.createdChannels++
 	ch.ID = int64(v.createdChannels)

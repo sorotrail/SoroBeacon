@@ -97,12 +97,12 @@ func run() error {
 	// HTTP: JSON API under /api/v1, dashboard at /.
 	apiSrv := api.New(st, registry, factory, health, log).
 		WithPoller(p).
-		WithReadyzLagThreshold(cfg.ReadyzLagThreshold)
-	apiSrv := api.New(st, registry, factory, health, log).WithRateLimit(api.RateLimitConfig{
-		RPS:            cfg.RateLimitRPS,
-		Burst:          cfg.RateLimitBurst,
-		TrustForwarded: cfg.RateLimitTrustForwarded,
-	})
+		WithReadyzLagThreshold(cfg.ReadyzLagThreshold).
+		WithRateLimit(api.RateLimitConfig{
+			RPS:            cfg.RateLimitRPS,
+			Burst:          cfg.RateLimitBurst,
+			TrustForwarded: cfg.RateLimitTrustForwarded,
+		})
 	webSrv, err := web.New(st, registry, factory, log)
 	if err != nil {
 		return err
