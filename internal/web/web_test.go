@@ -38,6 +38,7 @@ func (emptyStore) ListChannels(context.Context, bool) ([]store.Channel, error) {
 func (emptyStore) ListMonitorsPage(context.Context, store.ListFilter) ([]store.Monitor, error) {
 	return nil, nil
 }
+
 func (emptyStore) ListChannelsPage(context.Context, store.ListFilter) ([]store.Channel, error) {
 	return nil, nil
 }
@@ -924,6 +925,7 @@ type oneMonitorStore struct {
 func (s oneMonitorStore) ListMonitors(context.Context, bool) ([]store.Monitor, error) {
 	return []store.Monitor{{ID: 1, Name: "alpha", Enabled: s.enabled}}, nil
 }
+
 func (oneMonitorStore) GetStats(context.Context) (store.Stats, error) {
 	return store.Stats{Monitors: 1}, nil
 }
@@ -933,9 +935,11 @@ type readyNoAlertsStore struct{ emptyStore }
 func (readyNoAlertsStore) ListMonitors(context.Context, bool) ([]store.Monitor, error) {
 	return []store.Monitor{{ID: 1, Name: "alpha", Enabled: true}}, nil
 }
+
 func (readyNoAlertsStore) ListChannels(context.Context, bool) ([]store.Channel, error) {
 	return []store.Channel{{ID: 2, Name: "ops", Type: "webhook", Enabled: true}}, nil
 }
+
 func (readyNoAlertsStore) GetStats(context.Context) (store.Stats, error) {
 	return store.Stats{Monitors: 1, Channels: 1}, nil
 }
