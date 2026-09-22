@@ -105,6 +105,17 @@ func (f *fakeStore) CreateAlert(_ context.Context, a *store.Alert) (bool, error)
 	f.dedup[key] = true
 	a.ID = int64(len(f.alerts) + 1)
 	f.alerts = append(f.alerts, *a)
+	if !a.LedgerClosedAt.IsZero() {
+		for i := range f.monitors {
+			if f.monitors[i].ID != a.MonitorID {
+				continue
+			}
+			t := a.LedgerClosedAt.UTC()
+			if f.monitors[i].LastMatchedAt == nil || t.After(*f.monitors[i].LastMatchedAt) {
+				f.monitors[i].LastMatchedAt = &t
+			}
+		}
+	}
 	return true, nil
 }
 
@@ -125,12 +136,13 @@ func (f *fakeDispatcher) Dispatch(_ context.Context, a notify.Alert) {
 
 func transferEvent(id string, ledger uint32, amount string) stellar.Event {
 	return stellar.Event{
-		ID:         id,
-		ContractID: contractA,
-		Ledger:     ledger,
-		Type:       "contract",
-		TopicJSON:  []json.RawMessage{json.RawMessage(`{"symbol": "transfer"}`)},
-		ValueJSON:  json.RawMessage(fmt.Sprintf(`{"i128": %q}`, amount)),
+		ID:             id,
+		ContractID:     contractA,
+		Ledger:         ledger,
+		LedgerClosedAt: time.Unix(1_700_000_000, 0).UTC(),
+		Type:           "contract",
+		TopicJSON:      []json.RawMessage{json.RawMessage(`{"symbol": "transfer"}`)},
+		ValueJSON:      json.RawMessage(fmt.Sprintf(`{"i128": %q}`, amount)),
 	}
 }
 
@@ -239,6 +251,9 @@ func TestPollMatchesAndDispatches(t *testing.T) {
 	require.Len(t, d.dispatched, 1)
 	assert.Equal(t, "m1", d.dispatched[0].MonitorName)
 	assert.Equal(t, "transfer", d.dispatched[0].EventName)
+	require.NotNil(t, st.monitors[0].LastMatchedAt)
+	assert.True(t, st.monitors[0].LastMatchedAt.Equal(time.Unix(1_700_000_000, 0).UTC()),
+		"last_matched_at must be the event ledger close time, not wall clock")
 }
 
 func TestPollDedupsAcrossPolls(t *testing.T) {

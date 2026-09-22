@@ -11,6 +11,7 @@ All configuration comes from environment variables. `.env.example` in the repo i
 | `NETWORK_PASSPHRASE` | per `NETWORK` | Overrides the preset passphrase. Required with `NETWORK=custom`. |
 | `DATABASE_URL` | _(required)_ | Postgres connection string, e.g. `postgres://user:pass@host:5432/sorobeacon?sslmode=disable` |
 | `POLL_INTERVAL` | `5s` | How often the poller calls `getEvents`. Minimum `1s`. |
+| `MONITOR_SILENT_AFTER` | `24h` | How long since `last_matched_at` (event ledger close time) before the monitors list marks a monitor silent. |
 | `HTTP_ADDR` | `:8080` | Listen address for the API and dashboard. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` (structured JSON via `log/slog`). |
 | `READYZ_LAG_THRESHOLD` | `0` (disabled) | Fail `/readyz` when poller ledger lag (chain tip minus last processed ledger) exceeds this. Unset or `0` leaves existing probes unchanged. |

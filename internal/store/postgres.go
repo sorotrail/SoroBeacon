@@ -61,7 +61,7 @@ func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
 
 func (p *Postgres) GetMonitor(ctx context.Context, id int64) (*Monitor, error) {
 	m, err := scanMonitor(p.pool.QueryRow(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at FROM monitors WHERE id = $1`, id))
+		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at FROM monitors WHERE id = $1`, id))
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +78,7 @@ func (p *Postgres) GetMonitor(ctx context.Context, id int64) (*Monitor, error) {
 }
 
 func (p *Postgres) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at FROM monitors`
+	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at FROM monitors`
 	if enabledOnly {
 		q += ` WHERE enabled`
 	}
@@ -100,7 +100,7 @@ func (p *Postgres) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monito
 }
 
 func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at FROM monitors WHERE TRUE`
+	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at FROM monitors WHERE TRUE`
 	args := []any{}
 	n := 0
 	arg := func(v any) string {
@@ -244,7 +244,7 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
 	src, err := scanMonitor(tx.QueryRow(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at FROM monitors WHERE id = $1`, id))
+		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at FROM monitors WHERE id = $1`, id))
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +341,7 @@ type rowScanner interface{ Scan(dest ...any) error }
 func scanMonitor(r rowScanner) (*Monitor, error) {
 	var m Monitor
 	var ids []byte
-	if err := r.Scan(&m.ID, &m.Name, &ids, &m.Enabled, &m.CreatedAt); err != nil {
+	if err := r.Scan(&m.ID, &m.Name, &ids, &m.Enabled, &m.CreatedAt, &m.LastMatchedAt); err != nil {
 		return nil, mapErr(err)
 	}
 	if err := json.Unmarshal(ids, &m.ContractIDs); err != nil {
@@ -500,7 +500,13 @@ func scanChannel(row pgx.CollectableRow) (Channel, error) {
 // --- alerts ---
 
 func (p *Postgres) CreateAlert(ctx context.Context, a *Alert) (bool, error) {
-	err := p.pool.QueryRow(ctx,
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	err = tx.QueryRow(ctx,
 		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload) VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (rule_id, event_id) DO NOTHING
 		 RETURNING id, created_at`,
@@ -510,6 +516,20 @@ func (p *Postgres) CreateAlert(ctx context.Context, a *Alert) (bool, error) {
 		return false, nil // duplicate (rule_id, event_id): deduped
 	}
 	if err != nil {
+		return false, err
+	}
+	// Stamp last_matched_at with the event's ledger close time, never wall
+	// clock. Only move the column forward so a replayed older event cannot
+	// make a live monitor look stale.
+	if !a.LedgerClosedAt.IsZero() {
+		if _, err := tx.Exec(ctx,
+			`UPDATE monitors SET last_matched_at = $1
+			 WHERE id = $2 AND (last_matched_at IS NULL OR last_matched_at < $1)`,
+			a.LedgerClosedAt.UTC(), a.MonitorID); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return false, err
 	}
 	return true, nil

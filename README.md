@@ -66,6 +66,7 @@ All configuration comes from environment variables:
 | `NETWORK_PASSPHRASE` | per network                       | Overrides the network passphrase             |
 | `DATABASE_URL`  | *(required)*                           | Postgres connection string                   |
 | `POLL_INTERVAL` | `5s`                                   | How often to poll `getEvents` (min `1s`)     |
+| `MONITOR_SILENT_AFTER` | `24h`                            | Mark monitors silent on the dashboard after this much time since last match |
 | `HTTP_ADDR`     | `:8080`                                | API + dashboard listen address               |
 | `LOG_LEVEL`     | `info`                                 | `debug` \| `info` \| `warn` \| `error`       |
 | `READYZ_LAG_THRESHOLD` | `0` (disabled)                  | Fail `/readyz` when poller ledger lag exceeds this; 0 leaves probes unchanged |

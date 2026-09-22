@@ -17,6 +17,9 @@ const (
 	DefaultRPCURL       = "https://soroban-testnet.stellar.org"
 	DefaultPollInterval = 5 * time.Second
 	DefaultHTTPAddr     = ":8080"
+	// DefaultMonitorSilentAfter is how long since last_matched_at before
+	// the monitors list treats a monitor as silent.
+	DefaultMonitorSilentAfter = 24 * time.Hour
 )
 
 // Config holds all runtime configuration. Every field maps to one
@@ -61,6 +64,9 @@ type Config struct {
 	// address. Default false: a spoofed header would otherwise defeat the
 	// limit. Only enable this behind a proxy that overwrites the header.
 	RateLimitTrustForwarded bool
+	// MonitorSilentAfter is how long since last_matched_at before the
+	// dashboard marks a monitor silent. Default 24h.
+	MonitorSilentAfter time.Duration
 }
 
 // Load reads configuration from the environment. DATABASE_URL is the only
@@ -72,12 +78,13 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		Network:      net,
-		RPCURL:       net.RPCURL,
-		DatabaseURL:  os.Getenv("DATABASE_URL"),
-		PollInterval: DefaultPollInterval,
-		HTTPAddr:     getenv("HTTP_ADDR", DefaultHTTPAddr),
-		LogLevel:     slog.LevelInfo,
+		Network:            net,
+		RPCURL:             net.RPCURL,
+		DatabaseURL:        os.Getenv("DATABASE_URL"),
+		PollInterval:       DefaultPollInterval,
+		HTTPAddr:           getenv("HTTP_ADDR", DefaultHTTPAddr),
+		LogLevel:           slog.LevelInfo,
+		MonitorSilentAfter: DefaultMonitorSilentAfter,
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -159,6 +166,17 @@ func Load() (Config, error) {
 			cfg.RateLimitBurst = 1
 		}
 	}
+	if v := os.Getenv("MONITOR_SILENT_AFTER"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid MONITOR_SILENT_AFTER %q: %w", v, err)
+		}
+		if d <= 0 {
+			return cfg, fmt.Errorf("MONITOR_SILENT_AFTER %q must be greater than 0", v)
+		}
+		cfg.MonitorSilentAfter = d
+	}
+
 	if v := os.Getenv("RATE_LIMIT_TRUST_FORWARDED"); v != "" {
 		switch strings.ToLower(strings.TrimSpace(v)) {
 		case "1", "true", "yes", "on":

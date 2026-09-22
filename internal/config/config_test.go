@@ -22,6 +22,7 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Equal(t, 0.0, cfg.RateLimitRPS)
 	assert.Equal(t, 0, cfg.RateLimitBurst)
 	assert.False(t, cfg.RateLimitTrustForwarded)
+	assert.Equal(t, DefaultMonitorSilentAfter, cfg.MonitorSilentAfter)
 }
 
 func TestLoadRequiresDatabaseURL(t *testing.T) {
@@ -43,6 +44,23 @@ func TestLoadOverrides(t *testing.T) {
 	assert.Equal(t, 30*time.Second, cfg.PollInterval)
 	assert.Equal(t, ":9999", cfg.HTTPAddr)
 	assert.Equal(t, slog.LevelDebug, cfg.LogLevel)
+}
+
+func TestLoadMonitorSilentAfter(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("MONITOR_SILENT_AFTER", "48h")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 48*time.Hour, cfg.MonitorSilentAfter)
+}
+
+func TestLoadRejectsInvalidMonitorSilentAfter(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("MONITOR_SILENT_AFTER", "nope")
+
+	_, err := Load()
+	assert.ErrorContains(t, err, "MONITOR_SILENT_AFTER")
 }
 
 func TestLoadReadyzLagThreshold(t *testing.T) {
