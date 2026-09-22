@@ -41,5 +41,29 @@
 </table>
 {{if .OlderHref}}<p><a href="{{.OlderHref}}">Older →</a></p>{{end}}
 {{else if or .SelectedMonitor .SelectedRule .ContractID}}<p class="muted">No alerts match these filters.</p>
-{{else}}<p class="muted">No alerts.</p>{{end}}
+{{else if eq .Empty "no_monitors"}}
+<section class="empty">
+  <h2>Nothing is being watched yet</h2>
+  <p>Create a monitor first — alerts only appear for events that occur after a monitor was created.</p>
+  <p><a href="/monitors">Create a monitor</a></p>
+</section>
+{{else if eq .Empty "monitors_disabled"}}
+<section class="empty">
+  <h2>All monitors are disabled</h2>
+  <p>Enable a monitor to start matching events. Alerts only appear for events that occur after a monitor was created.</p>
+  <p><a href="/monitors">Enable a monitor</a></p>
+</section>
+{{else if eq .Empty "no_channels"}}
+<section class="empty">
+  <h2>No alerts yet, and nowhere to send them</h2>
+  <p>Add a notification channel so a match can reach you. Alerts only appear for events that occur after a monitor was created.</p>
+  <p><a href="/channels">Add a channel</a></p>
+</section>
+{{else}}
+<section class="empty">
+  <h2>No alerts yet — that's expected</h2>
+  <p>Alerts only appear for events that occur after a monitor was created. An empty list here is healthy, not broken.</p>
+  <p><a href="/monitors">Review monitors</a></p>
+</section>
+{{end}}
 {{end}}

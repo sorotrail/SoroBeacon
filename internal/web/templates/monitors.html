@@ -1,5 +1,16 @@
 {{define "content"}}
 <h1>Monitors</h1>
+{{if eq .Empty "no_monitors"}}
+<section class="empty">
+  <h2>Create your first monitor</h2>
+  <p>A monitor watches one or more Soroban contracts. Use the form below to add one — alerts only match events that happen after it is created.</p>
+</section>
+{{else if eq .Empty "monitors_disabled"}}
+<section class="empty">
+  <h2>All monitors are disabled</h2>
+  <p>Enable a monitor to start matching events. Disabled monitors keep their rules but do not fire.</p>
+</section>
+{{end}}
 <form class="filters" method="get" action="/monitors">
   <label for="q">Name</label>
   <input type="search" id="q" name="q" value="{{.Query}}" placeholder="Search by name">

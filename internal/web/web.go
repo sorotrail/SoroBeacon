@@ -296,6 +296,32 @@ func (s *Server) favicon(w http.ResponseWriter, r *http.Request) {
 
 // --- pages ---
 
+// emptyKind classifies a page's empty state. Distinct cases so a fresh
+// install is not shown the same "nothing here" copy as a healthy instance
+// that simply has not matched an event yet.
+func emptyKind(monitors []store.Monitor, channels []store.Channel, alerts []store.Alert) string {
+	if len(alerts) > 0 {
+		return ""
+	}
+	if len(monitors) == 0 {
+		return "no_monitors"
+	}
+	enabled := false
+	for _, m := range monitors {
+		if m.Enabled {
+			enabled = true
+			break
+		}
+	}
+	if !enabled {
+		return "monitors_disabled"
+	}
+	if len(channels) == 0 {
+		return "no_channels"
+	}
+	return "no_alerts"
+}
+
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.store.GetStats(r.Context())
 	if err != nil {
@@ -307,13 +333,23 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	names, err := s.monitorNames(r)
+	monitors, err := s.store.ListMonitors(r.Context(), false)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
+	channels, err := s.store.ListChannels(r.Context(), false)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	names := map[int64]string{}
+	for _, m := range monitors {
+		names[m.ID] = m.Name
+	}
 	data := map[string]any{
 		"Title": "Overview", "Stats": stats, "Alerts": alerts, "MonitorNames": names,
+		"Empty": emptyKind(monitors, channels, alerts),
 	}
 	if s.poller != nil {
 		if pos := s.poller.Position(); pos.Ready() {
@@ -347,6 +383,21 @@ func (s *Server) monitors(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	empty := ""
+	if len(monitors) == 0 {
+		empty = "no_monitors"
+	} else {
+		anyEnabled := false
+		for _, m := range monitors {
+			if m.Enabled {
+				anyEnabled = true
+				break
+			}
+		}
+		if !anyEnabled {
+			empty = "monitors_disabled"
+		}
+	}
 	next := ""
 	if len(monitors) == f.Limit {
 		next = strconv.FormatInt(monitors[len(monitors)-1].ID, 10)
@@ -358,6 +409,7 @@ func (s *Server) monitors(w http.ResponseWriter, r *http.Request) {
 	}
 	data := map[string]any{
 		"Title": "Monitors", "Monitors": monitors, "NextCursor": next,
+		"Empty": empty,
 		"Query": f.Query, "Enabled": enabled, "Sort": sort,
 	}
 	if next != "" {
@@ -627,12 +679,22 @@ func (s *Server) channels(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	monitors, err := s.store.ListMonitors(r.Context(), false)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	empty := ""
+	if len(channels) == 0 {
+		empty = "no_channels"
+	}
 	next := ""
 	if len(channels) == f.Limit {
 		next = strconv.FormatInt(channels[len(channels)-1].ID, 10)
 	}
 	s.render(w, r, "channels", map[string]any{
 		"Title": "Channels", "Channels": channels, "ChannelTypes": s.factory.Types(),
+		"Empty": empty, "HasMonitors": len(monitors) > 0,
 		"NextCursor": next,
 	})
 }
@@ -747,10 +809,19 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 	if sort == "" {
 		sort = "created_at_desc"
 	}
+	// Channels are only needed to tell the empty states apart: "no alerts
+	// yet" reads very differently when nothing is being watched, when every
+	// monitor is off, and when there is nowhere to deliver to.
+	channels, err := s.store.ListChannels(r.Context(), false)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
 	data := map[string]any{
 		"Title": "Alerts", "Alerts": alerts, "Monitors": monitors,
 		"MonitorNames": names, "SelectedMonitor": selected,
 		"SelectedRule": selectedRule, "ContractID": f.ContractID, "Sort": sort,
+		"Empty": emptyKind(monitors, channels, alerts),
 	}
 	if next != "" {
 		// template.URL so filter query separators are not %26-escaped.
@@ -825,18 +896,6 @@ func (s *Server) alertDeliveries(w http.ResponseWriter, r *http.Request) {
 			formatTime(a.AttemptedAt, tzFromRequest(r)))
 	}
 	fmt.Fprint(w, `</table>`)
-}
-
-func (s *Server) monitorNames(r *http.Request) (map[int64]string, error) {
-	monitors, err := s.store.ListMonitors(r.Context(), false)
-	if err != nil {
-		return nil, err
-	}
-	names := map[int64]string{}
-	for _, m := range monitors {
-		names[m.ID] = m.Name
-	}
-	return names, nil
 }
 
 func splitLines(s string) []string {

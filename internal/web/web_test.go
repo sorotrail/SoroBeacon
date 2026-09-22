@@ -871,3 +871,175 @@ func TestFavicon(t *testing.T) {
 		t.Fatalf("Content-Type = %q, want image/svg+xml", ct)
 	}
 }
+
+func TestEmptyKind(t *testing.T) {
+	mon := store.Monitor{ID: 1, Name: "alpha", Enabled: true}
+	dis := store.Monitor{ID: 1, Name: "alpha", Enabled: false}
+	ch := store.Channel{ID: 2, Name: "ops", Type: "webhook"}
+	al := store.Alert{ID: 3}
+
+	tests := []struct {
+		name     string
+		monitors []store.Monitor
+		channels []store.Channel
+		alerts   []store.Alert
+		want     string
+	}{
+		{"fresh install", nil, nil, nil, "no_monitors"},
+		{"all disabled", []store.Monitor{dis}, []store.Channel{ch}, nil, "monitors_disabled"},
+		{"monitors but no channels", []store.Monitor{mon}, nil, nil, "no_channels"},
+		{"healthy empty", []store.Monitor{mon}, []store.Channel{ch}, nil, "no_alerts"},
+		{"has alerts", []store.Monitor{mon}, []store.Channel{ch}, []store.Alert{al}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := emptyKind(tt.monitors, tt.channels, tt.alerts); got != tt.want {
+				t.Fatalf("emptyKind = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+type oneMonitorStore struct {
+	emptyStore
+	enabled bool
+}
+
+func (s oneMonitorStore) ListMonitors(context.Context, bool) ([]store.Monitor, error) {
+	return []store.Monitor{{ID: 1, Name: "alpha", Enabled: s.enabled}}, nil
+}
+func (oneMonitorStore) GetStats(context.Context) (store.Stats, error) {
+	return store.Stats{Monitors: 1}, nil
+}
+
+type readyNoAlertsStore struct{ emptyStore }
+
+func (readyNoAlertsStore) ListMonitors(context.Context, bool) ([]store.Monitor, error) {
+	return []store.Monitor{{ID: 1, Name: "alpha", Enabled: true}}, nil
+}
+func (readyNoAlertsStore) ListChannels(context.Context, bool) ([]store.Channel, error) {
+	return []store.Channel{{ID: 2, Name: "ops", Type: "webhook", Enabled: true}}, nil
+}
+func (readyNoAlertsStore) GetStats(context.Context) (store.Stats, error) {
+	return store.Stats{Monitors: 1, Channels: 1}, nil
+}
+
+func getHTML(t *testing.T, st store.Store, path string) string {
+	t.Helper()
+	s, err := New(st, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	t.Cleanup(srv.Close)
+	res, err := http.Get(srv.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d, want 200", path, res.StatusCode)
+	}
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
+}
+
+func TestOnboardingEmptyStates(t *testing.T) {
+	tests := []struct {
+		name    string
+		store   store.Store
+		path    string
+		want    []string
+		notWant []string
+	}{
+		{
+			name:  "overview nothing configured",
+			store: emptyStore{},
+			path:  "/",
+			want:  []string{`class="empty"`, "Nothing is being watched yet", `href="/monitors"`},
+			notWant: []string{
+				"that's expected",
+				"alerts have nowhere to go",
+				"<td><code>",
+			},
+		},
+		{
+			name:    "overview monitors but no channels",
+			store:   oneMonitorStore{enabled: true},
+			path:    "/",
+			want:    []string{`class="empty"`, "alerts have nowhere to go", `href="/channels"`},
+			notWant: []string{"Nothing is being watched yet", "that's expected", "<td><code>"},
+		},
+		{
+			name:    "overview all monitors disabled",
+			store:   oneMonitorStore{enabled: false},
+			path:    "/",
+			want:    []string{`class="empty"`, "All monitors are disabled", `href="/monitors"`},
+			notWant: []string{"Nothing is being watched yet", "that's expected"},
+		},
+		{
+			name:  "overview healthy no alerts",
+			store: readyNoAlertsStore{},
+			path:  "/",
+			want: []string{
+				`class="empty"`,
+				"that's expected",
+				"after a monitor was created",
+			},
+			notWant: []string{"Nothing is being watched yet", "alerts have nowhere to go", "<td><code>"},
+		},
+		{
+			name:    "monitors page first-run",
+			store:   emptyStore{},
+			path:    "/monitors",
+			want:    []string{`class="empty"`, "Create your first monitor", "after it is created"},
+			notWant: []string{"All monitors are disabled"},
+		},
+		{
+			name:    "channels page with a monitor waiting",
+			store:   oneMonitorStore{enabled: true},
+			path:    "/channels",
+			want:    []string{`class="empty"`, "No notification channels yet", "A monitor is already in place", `href="/monitors"`},
+			notWant: []string{"that's expected"},
+		},
+		{
+			name:    "alerts page healthy empty",
+			store:   readyNoAlertsStore{},
+			path:    "/alerts",
+			want:    []string{`class="empty"`, "that's expected", "after a monitor was created"},
+			notWant: []string{"Nothing is being watched yet", "<td><code>"},
+		},
+		{
+			name:    "alerts page nothing configured",
+			store:   emptyStore{},
+			path:    "/alerts",
+			want:    []string{`class="empty"`, "Nothing is being watched yet", "after a monitor was created", `href="/monitors"`},
+			notWant: []string{"that's expected"},
+		},
+		{
+			name:    "overview with real alerts is not an empty state",
+			store:   alertWithPayloadStore{},
+			path:    "/",
+			want:    []string{"Recent alerts"},
+			notWant: []string{`class="empty"`, "Nothing is being watched yet", "that's expected"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			html := getHTML(t, tt.store, tt.path)
+			for _, s := range tt.want {
+				if !strings.Contains(html, s) {
+					t.Errorf("missing %q in %s:\n%s", s, tt.path, html)
+				}
+			}
+			for _, s := range tt.notWant {
+				if strings.Contains(html, s) {
+					t.Errorf("unexpected %q in %s:\n%s", s, tt.path, html)
+				}
+			}
+		})
+	}
+}
