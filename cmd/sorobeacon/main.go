@@ -114,7 +114,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	webSrv.WithPoller(p)
+	webSrv.WithPoller(p).WithSilentAfter(cfg.MonitorSilentAfter)
 	root := chi.NewRouter()
 	// RequestLog must sit outside Recoverer so a panic still emits the
 	// access line after chi writes 500. reqid first so the line can

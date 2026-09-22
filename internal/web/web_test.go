@@ -89,6 +89,52 @@ func TestMonitorsPageShowsOlderLinkOnFullPage(t *testing.T) {
 	}
 }
 
+func TestMonitorsPageLastMatchedCues(t *testing.T) {
+	never := store.Monitor{ID: 1, Name: "never-matched", Enabled: true}
+	recent := time.Now().UTC().Add(-time.Hour)
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	ok := store.Monitor{ID: 2, Name: "recent-match", Enabled: true, LastMatchedAt: &recent}
+	silent := store.Monitor{ID: 3, Name: "long-silent", Enabled: true, LastMatchedAt: &old}
+	s, err := New(matchCueStore{rows: []store.Monitor{never, ok, silent}}, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	res, err := http.Get(srv.URL + "/monitors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	for _, want := range []string{
+		`Last matched`,
+		`class="pill never">never`,
+		`class="pill silent">silent`,
+		`datetime="` + recent.Format(time.RFC3339),
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("monitors page missing %q in %s", want, html)
+		}
+	}
+	if strings.Count(html, `class="pill never">never`) != 1 {
+		t.Fatalf("want one never cue, got html %s", html)
+	}
+}
+
+type matchCueStore struct {
+	emptyStore
+	rows []store.Monitor
+}
+
+func (m matchCueStore) ListMonitorsPage(context.Context, store.ListFilter) ([]store.Monitor, error) {
+	return m.rows, nil
+}
+
 func TestMonitorsPageShowsBulkActionBar(t *testing.T) {
 	s, err := New(pagingStore{n: 2}, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
 	if err != nil {
