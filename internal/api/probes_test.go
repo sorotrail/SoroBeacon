@@ -20,9 +20,18 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
-type stubPosition struct{ pos poller.Position }
+type stubPosition struct {
+	pos      poller.Position
+	interval time.Duration
+}
 
 func (s stubPosition) Position() poller.Position { return s.pos }
+
+func (s stubPosition) EffectiveInterval() time.Duration { return s.interval }
+
+func (f *fakeStore) GetStats(context.Context) (store.Stats, error) {
+	return store.Stats{Monitors: 3, Rules: 2, Channels: 1, Alerts: 4, AlertsLast24: 1, LastLedger: 99}, nil
+}
 
 // fakeStore embeds the full Store interface so the fake keeps satisfying it
 // as the interface grows; only what the probes touch is stubbed.
@@ -308,5 +317,37 @@ func TestReadyzHealthyWhenLagWithinThreshold(t *testing.T) {
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("readyz within threshold = %d, want 200", res.StatusCode)
+	}
+}
+
+func TestStatsIncludesPollInterval(t *testing.T) {
+	s := New(&fakeStore{}, rules.NewRegistry(), notify.DefaultFactory(), &fakeRPC{}, discardLogger()).
+		WithPoller(stubPosition{interval: 2500 * time.Millisecond})
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	code, body := decodeHealth(t, srv.URL+"/stats")
+	if code != http.StatusOK {
+		t.Fatalf("stats = %d, want 200", code)
+	}
+	if body["poll_interval"] != "2.5s" {
+		t.Fatalf("poll_interval = %v, want 2.5s", body["poll_interval"])
+	}
+	if body["monitors"] != float64(3) {
+		t.Fatalf("monitors = %v", body["monitors"])
+	}
+}
+
+func TestStatsOmitsPollIntervalWithoutIntervalReader(t *testing.T) {
+	s := New(&fakeStore{}, rules.NewRegistry(), notify.DefaultFactory(), &fakeRPC{}, discardLogger())
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	code, body := decodeHealth(t, srv.URL+"/stats")
+	if code != http.StatusOK {
+		t.Fatalf("stats = %d, want 200", code)
+	}
+	if _, ok := body["poll_interval"]; ok {
+		t.Fatalf("poll_interval must be omitted without a poller, got %+v", body)
 	}
 }

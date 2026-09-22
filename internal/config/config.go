@@ -49,8 +49,16 @@ type Config struct {
 	// DatabaseMaxConnIdleTime is the pgx pool MaxConnIdleTime. Zero
 	// means use the driver default (DATABASE_MAX_CONN_IDLE_TIME).
 	DatabaseMaxConnIdleTime time.Duration
-	// PollInterval is how often the poller asks the RPC for new events.
+	// PollInterval is how often the poller asks the RPC for new events
+	// when adaptive polling is off (both min and max are zero).
 	PollInterval time.Duration
+	// PollIntervalMin is the floor of the adaptive poll interval
+	// (POLL_INTERVAL_MIN). Zero means adaptive polling is off and
+	// PollInterval is used as a fixed delay.
+	PollIntervalMin time.Duration
+	// PollIntervalMax is the ceiling of the adaptive poll interval
+	// (POLL_INTERVAL_MAX). Zero means adaptive polling is off.
+	PollIntervalMax time.Duration
 	// SourceMode selects where events come from: "rpc" (standalone,
 	// default) or "sorotrail" (upstream, reads a SoroTrail indexer).
 	SourceMode string
@@ -145,6 +153,28 @@ func Load() (Config, error) {
 			return cfg, fmt.Errorf("POLL_INTERVAL %q is below the 1s minimum", v)
 		}
 		cfg.PollInterval = d
+	}
+
+	minD, err := parseOptionalDuration("POLL_INTERVAL_MIN", os.Getenv("POLL_INTERVAL_MIN"))
+	if err != nil {
+		return cfg, err
+	}
+	maxD, err := parseOptionalDuration("POLL_INTERVAL_MAX", os.Getenv("POLL_INTERVAL_MAX"))
+	if err != nil {
+		return cfg, err
+	}
+	if (minD == 0) != (maxD == 0) {
+		return cfg, fmt.Errorf("POLL_INTERVAL_MIN and POLL_INTERVAL_MAX must both be set, or both left unset")
+	}
+	if minD > 0 {
+		if minD < time.Second {
+			return cfg, fmt.Errorf("POLL_INTERVAL_MIN %q is below the 1s minimum", os.Getenv("POLL_INTERVAL_MIN"))
+		}
+		if maxD < minD {
+			return cfg, fmt.Errorf("POLL_INTERVAL_MAX %s is below POLL_INTERVAL_MIN %s", maxD, minD)
+		}
+		cfg.PollIntervalMin = minD
+		cfg.PollIntervalMax = maxD
 	}
 
 	if v := os.Getenv("CORS_ALLOWED_ORIGINS"); v != "" {
@@ -272,6 +302,8 @@ func (c Config) LogAttrs() []slog.Attr {
 		slog.String("http_addr", c.HTTPAddr),
 		slog.String("source_mode", c.SourceMode),
 		slog.String("poll_interval", c.PollInterval.String()),
+		slog.String("poll_interval_min", c.PollIntervalMin.String()),
+		slog.String("poll_interval_max", c.PollIntervalMax.String()),
 		slog.String("log_level", strings.ToLower(c.LogLevel.String())),
 		slog.String("network", c.Network.Name),
 		slog.String("rpc_url", c.RPCURL),
@@ -291,6 +323,23 @@ func redactDatabaseURL(raw string) string {
 		return redacted
 	}
 	return u.Scheme + "://" + u.Host + u.Path
+}
+
+// parseOptionalDuration reads a Go duration env var. Empty or "0"/"0s"
+// means unset (zero). Non-zero values below 1s are rejected by the caller
+// so POLL_INTERVAL_MIN/MAX share the same floor as POLL_INTERVAL.
+func parseOptionalDuration(name, v string) (time.Duration, error) {
+	if v == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", name, v, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("invalid %s %q: must be zero or a positive duration", name, v)
+	}
+	return d, nil
 }
 
 // ParseRetention accepts Go durations (24h, 90m) plus a day suffix

@@ -70,6 +70,8 @@ All configuration comes from environment variables:
 | `DATABASE_MAX_CONN_LIFETIME` | pgx default                | Max connection lifetime (`0` = driver default) |
 | `DATABASE_MAX_CONN_IDLE_TIME` | pgx default               | Max idle time (`0` = driver default)         |
 | `POLL_INTERVAL` | `5s`                                   | How often to poll `getEvents` (min `1s`)     |
+| `POLL_INTERVAL_MIN` | `0` (off)                           | Adaptive floor; both min and max must be set |
+| `POLL_INTERVAL_MAX` | `0` (off)                           | Adaptive ceiling; halves on backlog, doubles on idle |
 | `HTTP_ADDR`     | `:8080`                                | API + dashboard listen address (`host:port`) |
 | `HTTP_MAX_BODY_BYTES` | `1048576` (1 MiB)                 | Max API write-body size; GET is unaffected   |
 | `LOG_LEVEL`     | `info`                                 | `debug` \| `info` \| `warn` \| `error`       |

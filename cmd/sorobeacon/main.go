@@ -98,7 +98,9 @@ func run() error {
 	registry := rules.NewRegistry()
 	factory := notify.DefaultFactory()
 	dispatcher := notify.NewDispatcher(st, factory, log).WithMetrics(m)
-	p := poller.New(src, st, registry, dispatcher, cfg.PollInterval, log).WithMetrics(m)
+	p := poller.New(src, st, registry, dispatcher, cfg.PollInterval, log).
+		WithMetrics(m).
+		WithAdaptive(cfg.PollIntervalMin, cfg.PollIntervalMax)
 
 	// HTTP: JSON API under /api/v1, dashboard at /.
 	apiSrv := api.New(st, registry, factory, health, log).

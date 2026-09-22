@@ -18,6 +18,8 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("NETWORK", "")
 	t.Setenv("NETWORK_PASSPHRASE", "")
 	t.Setenv("POLL_INTERVAL", "")
+	t.Setenv("POLL_INTERVAL_MIN", "")
+	t.Setenv("POLL_INTERVAL_MAX", "")
 	t.Setenv("HTTP_ADDR", "")
 	t.Setenv("LOG_LEVEL", "")
 	t.Setenv("SOURCE_MODE", "")
@@ -31,6 +33,8 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Equal(t, DefaultRPCURL, cfg.RPCURL)
 	assert.Equal(t, DefaultRPCURL, cfg.Network.RPCURL)
 	assert.Equal(t, DefaultPollInterval, cfg.PollInterval)
+	assert.Zero(t, cfg.PollIntervalMin)
+	assert.Zero(t, cfg.PollIntervalMax)
 	assert.Equal(t, DefaultHTTPAddr, cfg.HTTPAddr)
 	assert.Equal(t, DefaultHTTPMaxBodyBytes, cfg.HTTPMaxBodyBytes)
 	assert.Equal(t, slog.LevelInfo, cfg.LogLevel)
@@ -251,6 +255,46 @@ func TestLoadRejectsBadValues(t *testing.T) {
 	assert.ErrorContains(t, err, "ALERT_RETENTION")
 }
 
+func TestLoadAdaptivePollInterval(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("POLL_INTERVAL_MIN", "2s")
+	t.Setenv("POLL_INTERVAL_MAX", "30s")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 2*time.Second, cfg.PollIntervalMin)
+	assert.Equal(t, 30*time.Second, cfg.PollIntervalMax)
+}
+
+func TestLoadRejectsAdaptivePollInterval(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+
+	t.Setenv("POLL_INTERVAL_MIN", "2s")
+	t.Setenv("POLL_INTERVAL_MAX", "")
+	_, err := Load()
+	assert.ErrorContains(t, err, "both be set")
+
+	t.Setenv("POLL_INTERVAL_MIN", "")
+	t.Setenv("POLL_INTERVAL_MAX", "30s")
+	_, err = Load()
+	assert.ErrorContains(t, err, "both be set")
+
+	t.Setenv("POLL_INTERVAL_MIN", "10s")
+	t.Setenv("POLL_INTERVAL_MAX", "2s")
+	_, err = Load()
+	assert.ErrorContains(t, err, "below POLL_INTERVAL_MIN")
+
+	t.Setenv("POLL_INTERVAL_MIN", "100ms")
+	t.Setenv("POLL_INTERVAL_MAX", "5s")
+	_, err = Load()
+	assert.ErrorContains(t, err, "1s minimum")
+
+	t.Setenv("POLL_INTERVAL_MIN", "nope")
+	t.Setenv("POLL_INTERVAL_MAX", "5s")
+	_, err = Load()
+	assert.ErrorContains(t, err, "POLL_INTERVAL_MIN")
+}
+
 func TestLoadAlertRetention(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://x")
 	t.Setenv("ALERT_RETENTION", "90d")
@@ -384,6 +428,8 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"http_addr",
 		"source_mode",
 		"poll_interval",
+		"poll_interval_min",
+		"poll_interval_max",
 		"log_level",
 		"network",
 		"rpc_url",

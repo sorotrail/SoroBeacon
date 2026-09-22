@@ -56,7 +56,12 @@ type Poller struct {
 	registry *rules.Registry
 	dispatch Dispatcher
 	interval time.Duration
-	log      *slog.Logger
+	// min/max bound the adaptive delay. Both zero keeps interval fixed.
+	min, max time.Duration
+	// effective is the delay used for the next cycle, stored as int64
+	// nanoseconds so the stats handler can read it without a mutex.
+	effective atomic.Int64
+	log       *slog.Logger
 	// metrics is optional instrumentation; nil-safe, see internal/metrics.
 	metrics *metrics.Metrics
 	// scanned/matched accumulate per-cycle counts for metrics.
@@ -88,7 +93,7 @@ func (p *Poller) recordPosition(processed, latest uint32, at time.Time) {
 // New wires a Poller. src is where events come from: NewRPCSource for a
 // Stellar RPC node, or the SoroTrail source for upstream mode.
 func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval time.Duration, log *slog.Logger) *Poller {
-	return &Poller{
+	p := &Poller{
 		source:   src,
 		store:    st,
 		registry: reg,
@@ -96,6 +101,25 @@ func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval 
 		interval: interval,
 		log:      log,
 	}
+	p.effective.Store(int64(interval))
+	return p
+}
+
+// WithAdaptive enables POLL_INTERVAL_MIN/MAX. Both zero is a no-op so
+// existing deployments keep a fixed interval. The starting delay is
+// clamped into [min, max].
+func (p *Poller) WithAdaptive(min, max time.Duration) *Poller {
+	p.min, p.max = min, max
+	start := clampInterval(p.interval, min, max)
+	p.interval = start
+	p.effective.Store(int64(start))
+	return p
+}
+
+// EffectiveInterval is the delay the poller will wait before the next
+// cycle. Safe to call from another goroutine (the stats handler).
+func (p *Poller) EffectiveInterval() time.Duration {
+	return time.Duration(p.effective.Load())
 }
 
 // WithMetrics attaches Prometheus instrumentation to the poll loop.
@@ -105,10 +129,11 @@ func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
 }
 
 // Run polls until ctx is cancelled. RPC errors back off exponentially
-// (capped at 10x the poll interval) instead of hammering the node.
+// (capped at 10x the configured poll interval) instead of hammering the node.
 func (p *Poller) Run(ctx context.Context) {
-	p.log.Info("poller started", "interval", p.interval)
-	delay := p.interval
+	p.log.Info("poller started", "interval", p.EffectiveInterval(),
+		"poll_interval_min", p.min, "poll_interval_max", p.max)
+	delay := p.EffectiveInterval()
 	for {
 		select {
 		case <-ctx.Done():
@@ -130,7 +155,10 @@ func (p *Poller) Run(ctx context.Context) {
 			p.log.Error("poll failed", "err", err, "retry_in", delay)
 			continue
 		}
-		delay = p.interval
+		backlog := p.scanned > 0 || p.Position().Lag() > 0
+		next := AdjustInterval(p.EffectiveInterval(), p.min, p.max, backlog)
+		p.effective.Store(int64(next))
+		delay = next
 	}
 }
 

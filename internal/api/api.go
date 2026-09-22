@@ -37,6 +37,12 @@ type PositionReader interface {
 	Position() poller.Position
 }
 
+// IntervalReader is the poller's current delay. Optional: GET /stats
+// omits poll_interval when the attached poller does not implement it.
+type IntervalReader interface {
+	EffectiveInterval() time.Duration
+}
+
 // DefaultMaxBodyBytes is 1 MiB, matching config.DefaultHTTPMaxBodyBytes.
 // Used when New is not followed by WithMaxBodyBytes.
 const DefaultMaxBodyBytes int64 = 1 << 20
@@ -406,5 +412,17 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, st)
+	out := map[string]any{
+		"monitors":        st.Monitors,
+		"rules":           st.Rules,
+		"channels":        st.Channels,
+		"alerts":          st.Alerts,
+		"alerts_last_24h": st.AlertsLast24,
+		"last_ledger":     st.LastLedger,
+		"last_poll_at":    st.LastPollAt,
+	}
+	if ir, ok := s.poller.(IntervalReader); ok {
+		out["poll_interval"] = ir.EffectiveInterval().String()
+	}
+	writeJSON(w, http.StatusOK, out)
 }
