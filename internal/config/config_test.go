@@ -229,6 +229,8 @@ func TestLoadRejectsBadValues(t *testing.T) {
 	t.Setenv("SOURCE_MODE", "kafka")
 	_, err = Load()
 	assert.ErrorContains(t, err, "SOURCE_MODE")
+
+	t.Setenv("SOURCE_MODE", "rpc")
 	t.Setenv("HTTP_MAX_BODY_BYTES", "nope")
 	_, err = Load()
 	assert.ErrorContains(t, err, "HTTP_MAX_BODY_BYTES")
