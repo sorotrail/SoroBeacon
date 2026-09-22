@@ -66,3 +66,4 @@ curl -s 'localhost:8080/api/v1/alerts?monitor_id=1&from=2026-07-01T00:00:00Z&lim
 | --- | --- |
 | `GET /health` | Checks Postgres and the RPC. `200` when both are ok, `503` with per-dependency detail when degraded. |
 | `GET /stats` | Counts (monitors, rules, channels, alerts, alerts last 24h), last ingested ledger, last poll time. |
+| `GET /openapi.json` | Embedded OpenAPI 3.1 document for this API (`Content-Type: application/json`). |
