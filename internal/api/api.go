@@ -129,6 +129,7 @@ func (s *Server) Routes() chi.Router {
 		r.Post("/{id}/test", s.testChannel)
 	})
 
+	r.Get("/alerts.csv", s.listAlertsCSV)
 	r.Get("/alerts", s.listAlerts)
 	r.Get("/alerts/{id}/deliveries", s.listDeliveries)
 	r.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)

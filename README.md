@@ -244,6 +244,7 @@ HMAC-SHA256 of the request body under your `secret`.
 ```sh
 curl -s 'localhost:8080/api/v1/alerts?monitor_id=1&rule_id=3&sort=created_at_asc&limit=20'
 curl -s 'localhost:8080/api/v1/alerts?cursor=42'      # keyset pagination (next_cursor)
+curl -s 'localhost:8080/api/v1/alerts.csv?monitor_id=1&limit=500' -o alerts.csv
 curl -s localhost:8080/api/v1/alerts/7/deliveries     # delivery attempts for one alert
 curl -s localhost:8080/api/v1/health
 curl -s localhost:8080/api/v1/stats

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -12,11 +13,9 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
-// listAlerts serves GET /alerts with query filters:
-// monitor_id, rule_id, contract_id, from, to (RFC 3339), sort
-// (created_at_desc default, created_at_asc), limit, cursor (last seen
-// alert id; comparison follows sort).
-func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
+// parseAlertFilter reads the shared listing query params used by GET /alerts
+// and GET /alerts.csv so the CSV export cannot drift from the JSON listing.
+func parseAlertFilter(w http.ResponseWriter, r *http.Request) (store.AlertFilter, bool) {
 	q := r.URL.Query()
 	var f store.AlertFilter
 
@@ -24,7 +23,7 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 		id, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			writeErr(w, r, http.StatusBadRequest, "invalid monitor_id")
-			return
+			return store.AlertFilter{}, false
 		}
 		f.MonitorID = id
 	}
@@ -32,7 +31,7 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 		id, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			writeErr(w, r, http.StatusBadRequest, "invalid rule_id")
-			return
+			return store.AlertFilter{}, false
 		}
 		f.RuleID = id
 	}
@@ -43,7 +42,7 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 			f.Sort = v
 		default:
 			writeErr(w, r, http.StatusBadRequest, "invalid sort")
-			return
+			return store.AlertFilter{}, false
 		}
 	}
 	for name, dst := range map[string]*time.Time{"from": &f.From, "to": &f.To} {
@@ -51,7 +50,7 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 			t, err := time.Parse(time.RFC3339, v)
 			if err != nil {
 				writeErr(w, r, http.StatusBadRequest, "invalid "+name+" (want RFC 3339)")
-				return
+				return store.AlertFilter{}, false
 			}
 			*dst = t
 		}
@@ -60,7 +59,7 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 {
 			writeErr(w, r, http.StatusBadRequest, "invalid limit")
-			return
+			return store.AlertFilter{}, false
 		}
 		f.Limit = n
 	}
@@ -68,18 +67,37 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 		id, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			writeErr(w, r, http.StatusBadRequest, "invalid cursor")
-			return
+			return store.AlertFilter{}, false
 		}
 		f.AfterID = id
 	}
+	return f, true
+}
 
+func loadAlerts(s *Server, w http.ResponseWriter, r *http.Request) ([]store.Alert, store.AlertFilter, bool) {
+	f, ok := parseAlertFilter(w, r)
+	if !ok {
+		return nil, store.AlertFilter{}, false
+	}
 	alerts, err := s.store.ListAlerts(r.Context(), f)
 	if err != nil {
 		s.fail(w, r, err)
-		return
+		return nil, f, false
 	}
 	if alerts == nil {
 		alerts = []store.Alert{}
+	}
+	return alerts, f, true
+}
+
+// listAlerts serves GET /alerts with query filters:
+// monitor_id, rule_id, contract_id, from, to (RFC 3339), sort
+// (created_at_desc default, created_at_asc), limit, cursor (last seen
+// alert id; comparison follows sort).
+func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
+	alerts, f, ok := loadAlerts(s, w, r)
+	if !ok {
+		return
 	}
 	// next_cursor is only meaningful when the page came back full: a short
 	// page means there's nothing older to fetch, so setting it would just
@@ -97,6 +115,48 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 		next = strconv.FormatInt(alerts[len(alerts)-1].ID, 10)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"alerts": alerts, "next_cursor": next})
+}
+
+// listAlertsCSV serves GET /alerts.csv with the same filters as GET /alerts.
+// Channel config never appears here: rows are alert identity, timestamps and
+// the event payload only.
+func (s *Server) listAlertsCSV(w http.ResponseWriter, r *http.Request) {
+	alerts, _, ok := loadAlerts(s, w, r)
+	if !ok {
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="alerts.csv"`)
+	cw := csv.NewWriter(w)
+	if err := cw.Write([]string{"id", "monitor_id", "rule_id", "event_id", "created_at", "payload"}); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	for _, a := range alerts {
+		created := ""
+		if !a.CreatedAt.IsZero() {
+			created = a.CreatedAt.UTC().Format(time.RFC3339)
+		}
+		payload := ""
+		if len(a.Payload) > 0 {
+			payload = string(a.Payload)
+		}
+		if err := cw.Write([]string{
+			strconv.FormatInt(a.ID, 10),
+			strconv.FormatInt(a.MonitorID, 10),
+			strconv.FormatInt(a.RuleID, 10),
+			a.EventID,
+			created,
+			payload,
+		}); err != nil {
+			s.fail(w, r, err)
+			return
+		}
+	}
+	cw.Flush()
+	if err := cw.Error(); err != nil {
+		s.fail(w, r, err)
+	}
 }
 
 // listDeliveries serves GET /alerts/{id}/deliveries.

@@ -999,6 +999,9 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 		// template.URL so filter query separators are not %26-escaped.
 		data["OlderHref"] = template.URL("/alerts?" + alertFilterQuery(selected, selectedRule, f.ContractID, f.Sort) + "cursor=" + next)
 	}
+	// Dashboard export uses the API max page so a spreadsheet dump is
+	// useful without silently ignoring the listing's filter keys.
+	data["CSVHref"] = template.URL("/api/v1/alerts.csv?" + alertFilterQuery(selected, selectedRule, f.ContractID, f.Sort) + "limit=500")
 	s.render(w, r, "alerts", data)
 }
 

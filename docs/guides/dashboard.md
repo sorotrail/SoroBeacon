@@ -10,7 +10,7 @@ SoroBeacon ships a server-rendered dashboard (Go `html/template` + htmx — no b
 | **Monitors** (`/monitors`) | List, create (name + contract IDs), enable/disable, delete. Click through to a monitor for its rules and channel wiring. |
 | **Monitor detail** (`/monitors/{id}`) | Add/delete rules (type + params JSON), attach/detach notification channels with checkboxes. |
 | **Channels** (`/channels`) | List, create (type + config JSON), delete — and a **Send test** button that fires a synthetic alert through the real channel and shows the result inline. |
-| **Alerts** (`/alerts`) | Paged history with monitor, rule, contract and newest/oldest sort; expand any row to see the full decoded event payload. |
+| **Alerts** (`/alerts`) | Paged history with monitor, rule, contract and newest/oldest sort; expand any row to see the full decoded event payload. **Export CSV** downloads the current filters as `GET /api/v1/alerts.csv`. |
 
 {% hint style="info" %}
 Channel config is write-only in the UI, same as the API: you paste secrets in when creating a channel, and they are never displayed again.
