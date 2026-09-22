@@ -1054,3 +1054,41 @@ func TestOnboardingEmptyStates(t *testing.T) {
 		})
 	}
 }
+
+func TestFocusVisibleStyles(t *testing.T) {
+	srv := httptest.NewServer(newTestServer(t).Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET / = %d, want 200", res.StatusCode)
+	}
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+
+	if strings.Contains(html, "outline: none") || strings.Contains(html, "outline:none") {
+		t.Fatal("layout still suppresses outlines without a replacement")
+	}
+	for _, sel := range []string{
+		"a:focus-visible",
+		"button:focus-visible",
+		"input:focus-visible",
+		"textarea:focus-visible",
+		"select:focus-visible",
+		"summary:focus-visible",
+	} {
+		if !strings.Contains(html, sel) {
+			t.Errorf("missing %s in dashboard CSS", sel)
+		}
+	}
+	if !strings.Contains(html, "outline: 3px solid var(--focus-ring)") {
+		t.Fatal("missing 3px :focus-visible outline using --focus-ring")
+	}
+}

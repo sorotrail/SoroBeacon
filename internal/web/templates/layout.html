@@ -13,6 +13,12 @@
       --fg: CanvasText;
       --line: color-mix(in srgb, currentColor 20%, transparent);
       --pre-bg: color-mix(in srgb, currentColor 6%, transparent);
+      --focus-ring: #005fcc;
+    }
+    /* Only applies while the theme is "system"; the explicit themes below
+       set --focus-ring themselves and win on specificity. */
+    @media (prefers-color-scheme: dark) {
+      :root { --focus-ring: #7eb6ff; }
     }
     html[data-theme="light"] {
       color-scheme: light;
@@ -20,6 +26,7 @@
       --fg: #111;
       --line: #d4d4d4;
       --pre-bg: #f4f4f5;
+      --focus-ring: #005fcc;
     }
     html[data-theme="dark"] {
       color-scheme: dark;
@@ -27,12 +34,22 @@
       --fg: #eee;
       --line: #3f3f46;
       --pre-bg: #1c1c1c;
+      --focus-ring: #7eb6ff;
     }
     body { font-family: system-ui, sans-serif; margin: 0; line-height: 1.5;
            background: var(--bg); color: var(--fg); }
     header { display: flex; gap: 1.5rem; align-items: baseline; flex-wrap: wrap;
              padding: .75rem 1.5rem; border-bottom: 1px solid var(--line); }
-    :root { color-scheme: light dark; }
+    /* Keyboard-only ring: 3:1 against light (#fff) and dark (#000) canvases. */
+    a:focus-visible,
+    button:focus-visible,
+    input:focus-visible,
+    textarea:focus-visible,
+    select:focus-visible,
+    summary:focus-visible {
+      outline: 3px solid var(--focus-ring);
+      outline-offset: 2px;
+    }
     body { font-family: system-ui, sans-serif; margin: 0; line-height: 1.5; }
     header { display: flex; gap: 1.5rem; align-items: baseline; flex-wrap: wrap;
              padding: .75rem 1.5rem;
