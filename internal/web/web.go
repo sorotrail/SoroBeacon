@@ -52,8 +52,9 @@ type Server struct {
 
 // templateFuncs are available to every page template.
 var templateFuncs = template.FuncMap{
-	"prettyJSON": prettyJSON,
-	"formatTime": formatTime,
+	"prettyJSON":   prettyJSON,
+	"formatTime":   formatTime,
+	"decodedEvent": decodedEvent,
 }
 
 const tsLayout = "2006-01-02 15:04:05"
@@ -74,8 +75,6 @@ func formatTime(t time.Time, tz string) template.HTML {
 		template.HTMLEscapeString(parseTZ(tz)),
 		template.HTMLEscapeString(label),
 	))
-	"prettyJSON":   prettyJSON,
-	"decodedEvent": decodedEvent,
 }
 
 // prettyJSON indents raw JSON for display. Invalid or empty input falls
@@ -669,7 +668,6 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 		sort = "created_at_desc"
 	}
 	data := map[string]any{
-	s.render(w, r, "alerts", map[string]any{
 		"Title": "Alerts", "Alerts": alerts, "Monitors": monitors,
 		"MonitorNames": names, "SelectedMonitor": selected,
 		"SelectedRule": selectedRule, "ContractID": f.ContractID, "Sort": sort,
@@ -678,7 +676,7 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 		// template.URL so filter query separators are not %26-escaped.
 		data["OlderHref"] = template.URL("/alerts?" + alertFilterQuery(selected, selectedRule, f.ContractID, f.Sort) + "cursor=" + next)
 	}
-	s.render(w, "alerts", data)
+	s.render(w, r, "alerts", data)
 }
 
 // alertFilterQuery is the monitor/rule/contract/sort prefix preserved on
