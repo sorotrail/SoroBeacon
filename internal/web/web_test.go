@@ -10,11 +10,17 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sorotrail/sorobeacon/internal/notify"
+	"github.com/sorotrail/sorobeacon/internal/poller"
 	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
+
+type stubPosition struct{ pos poller.Position }
+
+func (s stubPosition) Position() poller.Position { return s.pos }
 
 // emptyStore answers every page-rendering call with an empty result, so
 // index/monitors/channels/alerts render without a real database.
@@ -28,6 +34,12 @@ func (emptyStore) ListAlerts(context.Context, store.AlertFilter) ([]store.Alert,
 }
 func (emptyStore) ListMonitors(context.Context, bool) ([]store.Monitor, error) { return nil, nil }
 func (emptyStore) ListChannels(context.Context, bool) ([]store.Channel, error) { return nil, nil }
+func (emptyStore) ListMonitorsPage(context.Context, store.ListFilter) ([]store.Monitor, error) {
+	return nil, nil
+}
+func (emptyStore) ListChannelsPage(context.Context, store.ListFilter) ([]store.Channel, error) {
+	return nil, nil
+}
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
@@ -36,6 +48,41 @@ func newTestServer(t *testing.T) *Server {
 		t.Fatalf("New: %v", err)
 	}
 	return s
+}
+
+type pagingStore struct {
+	emptyStore
+	n int
+}
+
+func (p pagingStore) ListMonitorsPage(context.Context, store.ListFilter) ([]store.Monitor, error) {
+	out := make([]store.Monitor, p.n)
+	for i := range out {
+		out[i] = store.Monitor{ID: int64(i + 1), Name: "m"}
+	}
+	return out, nil
+}
+
+func TestMonitorsPageShowsOlderLinkOnFullPage(t *testing.T) {
+	s, err := New(pagingStore{n: 50}, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	res, err := http.Get(srv.URL + "/monitors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	if !strings.Contains(html, `/monitors?cursor=50`) {
+		t.Fatalf("expected Older paging link for a full page, got:\n%s", html)
+	}
 }
 
 func TestNavHighlightsActivePage(t *testing.T) {
@@ -85,6 +132,53 @@ func TestNavHighlightsActivePage(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestOverviewShowsPollerLagWhenReady(t *testing.T) {
+	s := newTestServer(t).WithPoller(stubPosition{pos: poller.Position{
+		LastProcessedLedger: 100,
+		LatestChainLedger:   125,
+		LastSuccessfulPoll:  time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC),
+	}})
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	for _, want := range []string{"ledger lag", "125", "100", "Last successful poll"} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("overview missing %q in %s", want, html)
+		}
+	}
+	if strings.Contains(html, "waiting for the first successful poll") {
+		t.Fatal("ready poller should not show the waiting copy")
+	}
+}
+
+func TestOverviewWaitingCopyBeforeFirstPoll(t *testing.T) {
+	srv := httptest.NewServer(newTestServer(t).Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "waiting for the first successful poll") {
+		t.Fatalf("overview should wait for first poll, got %s", body)
 	}
 }
 

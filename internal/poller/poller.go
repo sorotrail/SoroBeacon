@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/sorotrail/sorobeacon/internal/metrics"
@@ -14,6 +15,23 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
+
+// Position is a race-free snapshot of how far the poller has got relative
+// to the chain. A zero LastSuccessfulPoll means no successful poll has
+// completed yet — callers must not treat the ledger fields as "in sync".
+type Position struct {
+	LastProcessedLedger uint32
+	LatestChainLedger   uint32
+	LastSuccessfulPoll  time.Time
+}
+
+// Ready reports whether a successful poll has completed.
+func (p Position) Ready() bool { return !p.LastSuccessfulPoll.IsZero() }
+
+// Lag is latest known chain ledger minus last processed ledger.
+func (p Position) Lag() int64 {
+	return int64(p.LatestChainLedger) - int64(p.LastProcessedLedger)
+}
 
 // Store is the slice of the store the poller needs.
 type Store interface {
@@ -44,6 +62,27 @@ type Poller struct {
 	// scanned/matched accumulate per-cycle counts for metrics.
 	scanned int
 	matched int
+	// pos is the last successful poll snapshot, stored as Position.
+	// atomic.Value so HTTP handlers can read it without a mutex.
+	pos atomic.Value
+}
+
+// Position returns the last successful poll snapshot. Safe to call from
+// another goroutine (the HTTP health handler). Before the first successful
+// poll the returned Position is the zero value and Ready is false.
+func (p *Poller) Position() Position {
+	if v := p.pos.Load(); v != nil {
+		return v.(Position)
+	}
+	return Position{}
+}
+
+func (p *Poller) recordPosition(processed, latest uint32, at time.Time) {
+	p.pos.Store(Position{
+		LastProcessedLedger: processed,
+		LatestChainLedger:   latest,
+		LastSuccessfulPoll:  at.UTC(),
+	})
 }
 
 // New wires a Poller. src is where events come from: NewRPCSource for a
@@ -178,6 +217,11 @@ func (p *Poller) Poll(ctx context.Context) error {
 			return err
 		}
 	}
+	processed := checkpoint
+	if processed == 0 {
+		processed = state.LastLedger
+	}
+	p.recordPosition(processed, tip, time.Now())
 	return nil
 }
 

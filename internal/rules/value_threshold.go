@@ -44,11 +44,21 @@ func (ValueThreshold) Validate(params json.RawMessage) error {
 	if err != nil {
 		return err
 	}
+	var details FieldErrors
 	if _, ok := comparisons[p.Comparison]; !ok {
-		return fmt.Errorf("value_threshold: invalid comparison %q (want gt|gte|lt|lte|eq|neq)", p.Comparison)
+		details = append(details, FieldError{
+			Field:  "comparison",
+			Reason: fmt.Sprintf("value_threshold: invalid comparison %q (want gt|gte|lt|lte|eq|neq)", p.Comparison),
+		})
 	}
 	if threshold == nil {
-		return fmt.Errorf("value_threshold: threshold must be a number (or a numeric string)")
+		details = append(details, FieldError{
+			Field:  "threshold",
+			Reason: "value_threshold: threshold must be a number (or a numeric string)",
+		})
+	}
+	if len(details) > 0 {
+		return details
 	}
 	return nil
 }

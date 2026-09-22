@@ -9,6 +9,7 @@ require (
 	github.com/prometheus/client_golang v1.24.1
 	github.com/stellar/go-stellar-sdk v0.6.0
 	github.com/stretchr/testify v1.11.1
+	golang.org/x/time v0.14.0
 )
 
 require (

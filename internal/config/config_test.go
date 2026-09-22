@@ -18,6 +18,10 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Equal(t, DefaultPollInterval, cfg.PollInterval)
 	assert.Equal(t, DefaultHTTPAddr, cfg.HTTPAddr)
 	assert.Equal(t, slog.LevelInfo, cfg.LogLevel)
+	assert.Equal(t, uint32(0), cfg.ReadyzLagThreshold)
+	assert.Equal(t, 0.0, cfg.RateLimitRPS)
+	assert.Equal(t, 0, cfg.RateLimitBurst)
+	assert.False(t, cfg.RateLimitTrustForwarded)
 }
 
 func TestLoadRequiresDatabaseURL(t *testing.T) {
@@ -39,6 +43,23 @@ func TestLoadOverrides(t *testing.T) {
 	assert.Equal(t, 30*time.Second, cfg.PollInterval)
 	assert.Equal(t, ":9999", cfg.HTTPAddr)
 	assert.Equal(t, slog.LevelDebug, cfg.LogLevel)
+}
+
+func TestLoadReadyzLagThreshold(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("READYZ_LAG_THRESHOLD", "50")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, uint32(50), cfg.ReadyzLagThreshold)
+}
+
+func TestLoadRejectsInvalidReadyzLagThreshold(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("READYZ_LAG_THRESHOLD", "nope")
+
+	_, err := Load()
+	assert.ErrorContains(t, err, "READYZ_LAG_THRESHOLD")
 }
 
 func TestLoadAcceptsHTTPAndHTTPSRPCURLs(t *testing.T) {
@@ -109,4 +130,42 @@ func TestLoadRejectsBadValues(t *testing.T) {
 	t.Setenv("LOG_LEVEL", "loud")
 	_, err = Load()
 	assert.ErrorContains(t, err, "LOG_LEVEL")
+}
+
+func TestLoadRateLimit(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("RATE_LIMIT_RPS", "10")
+	t.Setenv("RATE_LIMIT_TRUST_FORWARDED", "true")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 10.0, cfg.RateLimitRPS)
+	assert.Equal(t, 10, cfg.RateLimitBurst)
+	assert.True(t, cfg.RateLimitTrustForwarded)
+
+	t.Setenv("RATE_LIMIT_BURST", "25")
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, 25, cfg.RateLimitBurst)
+}
+
+func TestLoadRejectsBadRateLimit(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("RATE_LIMIT_RPS", "nope")
+	_, err := Load()
+	assert.ErrorContains(t, err, "RATE_LIMIT_RPS")
+
+	t.Setenv("RATE_LIMIT_RPS", "-1")
+	_, err = Load()
+	assert.ErrorContains(t, err, "RATE_LIMIT_RPS")
+
+	t.Setenv("RATE_LIMIT_RPS", "1")
+	t.Setenv("RATE_LIMIT_BURST", "-2")
+	_, err = Load()
+	assert.ErrorContains(t, err, "RATE_LIMIT_BURST")
+
+	t.Setenv("RATE_LIMIT_BURST", "1")
+	t.Setenv("RATE_LIMIT_TRUST_FORWARDED", "maybe")
+	_, err = Load()
+	assert.ErrorContains(t, err, "RATE_LIMIT_TRUST_FORWARDED")
 }

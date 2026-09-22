@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stretchr/testify/assert"
@@ -154,6 +156,49 @@ func TestPollColdStartUsesLatestLedger(t *testing.T) {
 	require.Len(t, rpc.requests, 1)
 	assert.Equal(t, uint32(5000), rpc.requests[0].StartLedger, "cold start begins at the tip")
 	assert.Equal(t, uint32(5000), st.state.LastLedger, "checkpoint advances to latestLedger")
+}
+
+func TestPositionEmptyBeforeFirstPoll(t *testing.T) {
+	p := newTestPoller(&fakeRPC{latest: 1}, newFakeStore(), &fakeDispatcher{})
+	pos := p.Position()
+	assert.False(t, pos.Ready())
+	assert.Zero(t, pos.LastProcessedLedger)
+	assert.Zero(t, pos.LatestChainLedger)
+}
+
+func TestPositionAfterSuccessfulPoll(t *testing.T) {
+	rpc := &fakeRPC{latest: 5000}
+	st := newFakeStore()
+	seedMonitor(st, `{"event_name": "transfer"}`)
+	p := newTestPoller(rpc, st, &fakeDispatcher{})
+
+	before := time.Now().UTC().Add(-time.Second)
+	require.NoError(t, p.Poll(context.Background()))
+	pos := p.Position()
+	require.True(t, pos.Ready())
+	assert.Equal(t, uint32(5000), pos.LastProcessedLedger)
+	assert.Equal(t, uint32(5000), pos.LatestChainLedger)
+	assert.Zero(t, pos.Lag())
+	assert.False(t, pos.LastSuccessfulPoll.Before(before))
+}
+
+func TestPositionConcurrentReadDuringPoll(t *testing.T) {
+	rpc := &fakeRPC{latest: 4200}
+	st := newFakeStore()
+	seedMonitor(st, `{"event_name": "transfer"}`)
+	p := newTestPoller(rpc, st, &fakeDispatcher{})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 1000 {
+			_ = p.Position()
+		}
+	}()
+	require.NoError(t, p.Poll(context.Background()))
+	wg.Wait()
+	assert.True(t, p.Position().Ready())
 }
 
 func TestPollWarmStartResumesFromCheckpoint(t *testing.T) {

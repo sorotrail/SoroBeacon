@@ -29,6 +29,8 @@
   {{end}}
 </table>
 {{end}}
+{{if .NextCursor}}<p><a href="/monitors?cursor={{.NextCursor}}">Older →</a></p>{{end}}
+{{else}}<p class="muted">No monitors yet — create one below.</p>{{end}}
 
 <fieldset>
   <legend>New monitor</legend>

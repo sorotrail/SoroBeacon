@@ -1,23 +1,29 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
-// validContractIDs rejects malformed contract addresses up front: the RPC
+// contractIDDetails rejects malformed contract addresses up front: the RPC
 // refuses the entire getEvents request if any filter contains one, which
-// would stall ingestion for every monitor.
-func validContractIDs(w http.ResponseWriter, r *http.Request, ids []string) bool {
-	for _, id := range ids {
+// would stall ingestion for every monitor. Each bad ID is a separate
+// detail so a monitor with several typos is not a round-trip per typo.
+func contractIDDetails(ids []string) []FieldError {
+	var details []FieldError
+	for i, id := range ids {
 		if !stellar.IsValidContractID(id) {
-			writeErr(w, r, http.StatusBadRequest, "invalid contract id: "+id)
-			return false
+			details = append(details, FieldError{
+				Field:  fmt.Sprintf("contract_ids[%d]", i),
+				Reason: "invalid contract id: " + id,
+			})
 		}
 	}
-	return true
+	return details
 }
 
 type monitorRequest struct {
@@ -32,15 +38,17 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
+	var details []FieldError
 	if req.Name == nil || *req.Name == "" {
-		writeErr(w, r, http.StatusBadRequest, "name is required")
-		return
+		details = append(details, FieldError{Field: "name", Reason: "name is required"})
 	}
 	if req.ContractIDs == nil || len(*req.ContractIDs) == 0 {
-		writeErr(w, r, http.StatusBadRequest, "contract_ids is required")
-		return
+		details = append(details, FieldError{Field: "contract_ids", Reason: "contract_ids is required"})
+	} else {
+		details = append(details, contractIDDetails(*req.ContractIDs)...)
 	}
-	if !validContractIDs(w, r, *req.ContractIDs) {
+	if len(details) > 0 {
+		writeValidation(w, r, details)
 		return
 	}
 	m := store.Monitor{
@@ -63,7 +71,11 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listMonitors(w http.ResponseWriter, r *http.Request) {
-	monitors, err := s.store.ListMonitors(r.Context(), r.URL.Query().Get("enabled") == "true")
+	f, ok := parseListFilter(w, r)
+	if !ok {
+		return
+	}
+	monitors, err := s.store.ListMonitorsPage(r.Context(), f)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -71,7 +83,11 @@ func (s *Server) listMonitors(w http.ResponseWriter, r *http.Request) {
 	if monitors == nil {
 		monitors = []store.Monitor{}
 	}
-	writeJSON(w, http.StatusOK, monitors)
+	next := ""
+	if len(monitors) == effectivePageLimit(f.Limit) {
+		next = strconv.FormatInt(monitors[len(monitors)-1].ID, 10)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"monitors": monitors, "next_cursor": next})
 }
 
 func (s *Server) getMonitor(w http.ResponseWriter, r *http.Request) {
@@ -103,14 +119,28 @@ func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
+	var details []FieldError
 	if req.Name != nil {
-		m.Name = *req.Name
+		if *req.Name == "" {
+			details = append(details, FieldError{Field: "name", Reason: "name is required"})
+		} else {
+			m.Name = *req.Name
+		}
 	}
 	if req.ContractIDs != nil {
-		if !validContractIDs(w, r, *req.ContractIDs) {
-			return
+		if len(*req.ContractIDs) == 0 {
+			details = append(details, FieldError{Field: "contract_ids", Reason: "contract_ids is required"})
+		} else {
+			ids := contractIDDetails(*req.ContractIDs)
+			details = append(details, ids...)
+			if len(ids) == 0 {
+				m.ContractIDs = *req.ContractIDs
+			}
 		}
-		m.ContractIDs = *req.ContractIDs
+	}
+	if len(details) > 0 {
+		writeValidation(w, r, details)
+		return
 	}
 	if req.Enabled != nil {
 		m.Enabled = *req.Enabled

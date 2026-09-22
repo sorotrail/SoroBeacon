@@ -87,6 +87,16 @@ type AlertFilter struct {
 	AfterID int64
 }
 
+// ListFilter pages monitors or channels. Zero values mean "no constraint"
+// besides the store's default page size. AfterID uses the same newest-first
+// keyset as AlertFilter (id < AfterID) so the API does not grow a second
+// cursor dialect.
+type ListFilter struct {
+	EnabledOnly bool
+	Limit       int
+	AfterID     int64
+}
+
 // Stats is the aggregate snapshot served by GET /stats.
 type Stats struct {
 	Monitors     int64     `json:"monitors"`
@@ -103,6 +113,10 @@ type Monitors interface {
 	CreateMonitor(ctx context.Context, m *Monitor) error
 	GetMonitor(ctx context.Context, id int64) (*Monitor, error)
 	ListMonitors(ctx context.Context, enabledOnly bool) ([]Monitor, error)
+	// ListMonitorsPage is the keyset-paginated listing used by the API and
+	// dashboard. ListMonitors stays unpaginated for the poller, which must
+	// see every enabled monitor in one shot.
+	ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor, error)
 	UpdateMonitor(ctx context.Context, m *Monitor) error
 	DeleteMonitor(ctx context.Context, id int64) error
 	SetMonitorChannels(ctx context.Context, monitorID int64, channelIDs []int64) error
@@ -122,6 +136,7 @@ type Channels interface {
 	CreateChannel(ctx context.Context, c *Channel) error
 	GetChannel(ctx context.Context, id int64) (*Channel, error)
 	ListChannels(ctx context.Context, enabledOnly bool) ([]Channel, error)
+	ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel, error)
 	UpdateChannel(ctx context.Context, c *Channel) error
 	DeleteChannel(ctx context.Context, id int64) error
 	// ListChannelsForMonitor returns the enabled channels a monitor alerts to.

@@ -19,8 +19,8 @@ type channelsStore struct {
 	gotEnabledOnly *bool
 }
 
-func (c *channelsStore) ListChannels(ctx context.Context, enabledOnly bool) ([]store.Channel, error) {
-	c.gotEnabledOnly = &enabledOnly
+func (c *channelsStore) ListChannelsPage(ctx context.Context, f store.ListFilter) ([]store.Channel, error) {
+	c.gotEnabledOnly = &f.EnabledOnly
 	return []store.Channel{{ID: 1, Name: "ops", Type: "webhook", Enabled: true}}, nil
 }
 
@@ -56,12 +56,13 @@ func TestListChannels_EnabledParamWiring(t *testing.T) {
 				t.Fatalf("enabledOnly = %v, want %v", *cs.gotEnabledOnly, tt.want)
 			}
 
-			var got []store.Channel
-			if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+			var body map[string]any
+			if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
-			if len(got) != 1 {
-				t.Fatalf("got %d channels, want 1", len(got))
+			list, _ := body["channels"].([]any)
+			if len(list) != 1 {
+				t.Fatalf("got %d channels, want 1 (body=%v)", len(list), body)
 			}
 		})
 	}

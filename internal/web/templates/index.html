@@ -8,6 +8,16 @@
   <div class="stat"><b>{{.Stats.LastLedger}}</b> last ledger</div>
 </div>
 <p class="muted">Last poll checkpoint: {{.Stats.LastPollAt.Format "2006-01-02 15:04:05 MST"}}</p>
+{{if .Poller}}
+<div class="stats">
+  <div class="stat"><b>{{.Poller.Lag}}</b> ledger lag</div>
+  <div class="stat"><b>{{.Poller.LastProcessedLedger}}</b> processed</div>
+  <div class="stat"><b>{{.Poller.LatestChainLedger}}</b> chain tip</div>
+</div>
+<p class="muted">Last successful poll: {{.Poller.LastSuccessfulPoll.Format "2006-01-02 15:04:05 MST"}}</p>
+{{else}}
+<p class="muted">Poller lag: waiting for the first successful poll.</p>
+{{end}}
 
 {{if eq .Empty "no_monitors"}}
 <section class="empty">

@@ -4,8 +4,10 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -46,6 +48,19 @@ type Config struct {
 	HTTPAddr string
 	// LogLevel is the minimum slog level (debug, info, warn, error).
 	LogLevel slog.Level
+	// ReadyzLagThreshold is the ledger lag at which /readyz fails.
+	// Zero (the default) disables the check so existing probes stay green.
+	ReadyzLagThreshold uint32
+	// RateLimitRPS is the per-client API token-bucket refill rate.
+	// Zero (default) disables the limiter.
+	RateLimitRPS float64
+	// RateLimitBurst is the per-client bucket size. When the limiter is
+	// enabled and this is zero, Load defaults it to max(1, ceil(RPS)).
+	RateLimitBurst int
+	// RateLimitTrustForwarded keys clients by the first X-Forwarded-For
+	// address. Default false: a spoofed header would otherwise defeat the
+	// limit. Only enable this behind a proxy that overwrites the header.
+	RateLimitTrustForwarded bool
 }
 
 // Load reads configuration from the environment. DATABASE_URL is the only
@@ -115,6 +130,43 @@ func Load() (Config, error) {
 			return cfg, err
 		}
 		cfg.LogLevel = lvl
+	}
+
+	if v := os.Getenv("READYZ_LAG_THRESHOLD"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 32)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid READYZ_LAG_THRESHOLD %q: %w", v, err)
+		}
+		cfg.ReadyzLagThreshold = uint32(n)
+	if v := os.Getenv("RATE_LIMIT_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid RATE_LIMIT_RPS %q (want a non-negative number)", v)
+		}
+		cfg.RateLimitRPS = rps
+	}
+	if v := os.Getenv("RATE_LIMIT_BURST"); v != "" {
+		burst, err := strconv.Atoi(v)
+		if err != nil || burst < 0 {
+			return cfg, fmt.Errorf("invalid RATE_LIMIT_BURST %q (want a non-negative integer)", v)
+		}
+		cfg.RateLimitBurst = burst
+	}
+	if cfg.RateLimitRPS > 0 && cfg.RateLimitBurst == 0 {
+		cfg.RateLimitBurst = int(math.Ceil(cfg.RateLimitRPS))
+		if cfg.RateLimitBurst < 1 {
+			cfg.RateLimitBurst = 1
+		}
+	}
+	if v := os.Getenv("RATE_LIMIT_TRUST_FORWARDED"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			cfg.RateLimitTrustForwarded = true
+		case "0", "false", "no", "off":
+			cfg.RateLimitTrustForwarded = false
+		default:
+			return cfg, fmt.Errorf("invalid RATE_LIMIT_TRUST_FORWARDED %q (want true|false)", v)
+		}
 	}
 
 	return cfg, nil

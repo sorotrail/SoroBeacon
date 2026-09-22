@@ -66,6 +66,78 @@ func TestMonitorCRUD(t *testing.T) {
 	assert.ErrorIs(t, st.DeleteMonitor(ctx, m.ID), ErrNotFound)
 }
 
+func TestMonitorsAndChannelsKeysetPagination(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	// Seven monitors, newest last by id. Mix enabled so the enabled-only
+	// filter has something to compose with the cursor.
+	for i := 0; i < 7; i++ {
+		m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: i%2 == 0}
+		require.NoError(t, st.CreateMonitor(ctx, m))
+	}
+	for i := 0; i < 7; i++ {
+		c := &Channel{Name: "c", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: i%2 == 0}
+		require.NoError(t, st.CreateChannel(ctx, c))
+	}
+
+	collectIDs := func(page func(after int64) []int64) []int64 {
+		var all []int64
+		seen := map[int64]bool{}
+		var after int64
+		for {
+			ids := page(after)
+			if len(ids) == 0 {
+				break
+			}
+			for _, id := range ids {
+				if seen[id] {
+					t.Fatalf("duplicate id %d across pages", id)
+				}
+				seen[id] = true
+				all = append(all, id)
+			}
+			if len(ids) < 3 {
+				break
+			}
+			after = ids[len(ids)-1]
+		}
+		return all
+	}
+
+	monIDs := collectIDs(func(after int64) []int64 {
+		list, err := st.ListMonitorsPage(ctx, ListFilter{Limit: 3, AfterID: after})
+		require.NoError(t, err)
+		ids := make([]int64, len(list))
+		for i, m := range list {
+			ids[i] = m.ID
+		}
+		return ids
+	})
+	require.Len(t, monIDs, 7, "every monitor must appear exactly once")
+	for i := 1; i < len(monIDs); i++ {
+		assert.Greater(t, monIDs[i-1], monIDs[i], "newest-first, no gaps in order")
+	}
+
+	chIDs := collectIDs(func(after int64) []int64 {
+		list, err := st.ListChannelsPage(ctx, ListFilter{Limit: 3, AfterID: after})
+		require.NoError(t, err)
+		ids := make([]int64, len(list))
+		for i, c := range list {
+			ids[i] = c.ID
+		}
+		return ids
+	})
+	require.Len(t, chIDs, 7, "every channel must appear exactly once")
+
+	enabled, err := st.ListMonitorsPage(ctx, ListFilter{EnabledOnly: true, Limit: 50})
+	require.NoError(t, err)
+	require.Len(t, enabled, 4)
+	for _, m := range enabled {
+		assert.True(t, m.Enabled)
+	}
+}
+
 func TestRuleCRUDAndCascade(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

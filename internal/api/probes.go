@@ -63,6 +63,23 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 	}()
 	wg.Wait()
 
+	if s.readyzLagThreshold > 0 && s.poller != nil {
+		pos := s.poller.Position()
+		c := check{name: "poller"}
+		if !pos.Ready() {
+			// No successful poll yet: do not fail the probe on missing lag.
+			c.healthy = true
+			c.detail = "waiting for first poll"
+		} else if lag := pos.Lag(); lag > int64(s.readyzLagThreshold) {
+			c.detail = "ledger lag " + strconv.FormatInt(lag, 10) +
+				" exceeds threshold " + strconv.FormatUint(uint64(s.readyzLagThreshold), 10)
+		} else {
+			c.healthy = true
+			c.detail = "ledger lag " + strconv.FormatInt(lag, 10)
+		}
+		checks = append(checks, c)
+	}
+
 	status := http.StatusOK
 	byName := map[string]any{}
 	for _, c := range checks {

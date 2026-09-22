@@ -35,6 +35,16 @@ func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
 func (p *Postgres) Ping(ctx context.Context) error { return p.pool.Ping(ctx) }
 func (p *Postgres) Close()                         { p.pool.Close() }
 
+// pageLimit matches ListAlerts: a missing or out-of-range limit becomes
+// 50 rather than being rejected, so omitting pagination params still
+// returns a bounded first page.
+func pageLimit(limit int) int {
+	if limit <= 0 || limit > 500 {
+		return 50
+	}
+	return limit
+}
+
 // --- monitors ---
 
 func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
@@ -74,6 +84,38 @@ func (p *Postgres) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monito
 	}
 	q += ` ORDER BY id`
 	rows, err := p.pool.Query(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Monitor
+	for rows.Next() {
+		m, err := scanMonitor(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *m)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor, error) {
+	q := `SELECT id, name, contract_ids, enabled, created_at FROM monitors WHERE TRUE`
+	args := []any{}
+	n := 0
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	if f.EnabledOnly {
+		q += ` AND enabled`
+	}
+	if f.AfterID != 0 {
+		q += ` AND id < ` + arg(f.AfterID)
+	}
+	q += ` ORDER BY id DESC LIMIT ` + arg(pageLimit(f.Limit))
+	rows, err := p.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -226,6 +268,29 @@ func (p *Postgres) ListChannels(ctx context.Context, enabledOnly bool) ([]Channe
 	}
 	q += ` ORDER BY id`
 	rows, err := p.pool.Query(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, scanChannel)
+}
+
+func (p *Postgres) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel, error) {
+	q := `SELECT id, name, type, config, enabled, created_at FROM channels WHERE TRUE`
+	args := []any{}
+	n := 0
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	if f.EnabledOnly {
+		q += ` AND enabled`
+	}
+	if f.AfterID != 0 {
+		q += ` AND id < ` + arg(f.AfterID)
+	}
+	q += ` ORDER BY id DESC LIMIT ` + arg(pageLimit(f.Limit))
+	rows, err := p.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}

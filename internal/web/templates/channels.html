@@ -29,6 +29,8 @@
   {{end}}
 </table>
 {{end}}
+{{if .NextCursor}}<p><a href="/channels?cursor={{.NextCursor}}">Older →</a></p>{{end}}
+{{else}}<p class="muted">No channels yet — create one below.</p>{{end}}
 
 <fieldset>
   <legend>New channel</legend>
