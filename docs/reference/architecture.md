@@ -29,7 +29,7 @@ line in `cmd/sorobeacon`'s mode switch. Nothing in the poller changes.
 
 ## Ingestion (`internal/poller`)
 
-* Every `POLL_INTERVAL`, the poller collects the contract IDs of all **enabled** monitors and pages its event source from the checkpoint.
+* Every poll delay, the poller collects the contract IDs of all **enabled** monitors and pages its event source from the checkpoint. The delay is `POLL_INTERVAL` unless `POLL_INTERVAL_MIN` and `POLL_INTERVAL_MAX` are both set, in which case it halves toward the minimum while events (or lag) are observed and doubles toward the maximum while idle. The current delay is on `GET /api/v1/stats` as `poll_interval`.
 * The source's cursors are followed until it reports no more events; then the checkpoint (`ingest_state.last_ledger`) advances to the minimum `latestLedger` the source reported.
 * **Cold start** begins at the source's tip (an RPC retains only ~1–7 days of events, so deep backfill is impossible there; an indexer holds everything, but a fresh monitor has no reason to replay the past). **Warm start** resumes at `last_ledger + 1`.
 * Source failures back off exponentially, capped at 10× the poll interval.

@@ -14,7 +14,9 @@ All configuration comes from environment variables. `.env.example` in the repo i
 | `DATABASE_MIN_CONNS` | pgx default | Minimum connections in the pool. `0` or unset leaves the driver default. Rejected when greater than `DATABASE_MAX_CONNS` if both are set. |
 | `DATABASE_MAX_CONN_LIFETIME` | pgx default | How long a connection may be reused. Go duration (`1h`, `30m`). `0` or unset leaves the driver default. |
 | `DATABASE_MAX_CONN_IDLE_TIME` | pgx default | How long an idle connection is kept. Go duration. `0` or unset leaves the driver default. |
-| `POLL_INTERVAL` | `5s` | How often the poller calls `getEvents`. Minimum `1s`. |
+| `POLL_INTERVAL` | `5s` | How often the poller calls `getEvents` when adaptive polling is off. Minimum `1s`. |
+| `POLL_INTERVAL_MIN` | `0` (off) | Adaptive floor. Both min and max must be set, or both left unset so the delay stays at `POLL_INTERVAL`. |
+| `POLL_INTERVAL_MAX` | `0` (off) | Adaptive ceiling. After a cycle with events or ledger lag the delay halves toward min; after an idle cycle it doubles toward max. Never below `1s`. `GET /api/v1/stats` reports the current value as `poll_interval`. |
 | `HTTP_ADDR` | `:8080` | Listen address (`host:port`) for the API and dashboard. Empty host means all interfaces. Validated at load. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` (structured JSON via `log/slog`). |
 | `READYZ_LAG_THRESHOLD` | `0` (disabled) | Fail `/readyz` when poller ledger lag (chain tip minus last processed ledger) exceeds this. Unset or `0` leaves existing probes unchanged. |
