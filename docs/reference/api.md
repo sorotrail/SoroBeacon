@@ -46,7 +46,7 @@ Params for the built-in types: [`event_emitted`](../rules/event-emitted.md), [`v
 | `DELETE /channels/{id}` | Delete. |
 | `POST /channels/{id}/test` | Send a synthetic alert through the channel right now. `200 {"status":"sent"}` or `502 {"status":"failed","error":"..."}`. |
 
-Config shapes per type: [Discord](../channels/discord.md) · [Slack](../channels/slack.md) · [Telegram](../channels/telegram.md) · [Email](../channels/email.md) · [Webhook](../channels/webhook.md)
+Config shapes per type: [Discord](../channels/discord.md) · [Slack](../channels/slack.md) · [Telegram](../channels/telegram.md) · [Email](../channels/email.md) · [ntfy](../channels/ntfy.md) · [Webhook](../channels/webhook.md)
 
 ## Alerts
 

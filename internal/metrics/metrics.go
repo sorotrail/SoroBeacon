@@ -147,7 +147,7 @@ func (m *Metrics) RecordAlert() {
 
 // RecordDelivery counts one delivery attempt per channel type and outcome.
 // channelType is the notifier kind (discord, slack, telegram, email,
-// webhook) — a static set, never request-derived, so cardinality stays
+// webhook, ntfy) — a static set, never request-derived, so cardinality stays
 // bounded.
 func (m *Metrics) RecordDelivery(channelType string, ok bool) {
 	if m == nil {
