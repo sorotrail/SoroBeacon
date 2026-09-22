@@ -102,7 +102,8 @@ func run() error {
 			RPS:            cfg.RateLimitRPS,
 			Burst:          cfg.RateLimitBurst,
 			TrustForwarded: cfg.RateLimitTrustForwarded,
-		})
+		}).
+		WithMaxBodyBytes(cfg.HTTPMaxBodyBytes)
 	webSrv, err := web.New(st, registry, factory, log)
 	if err != nil {
 		return err
@@ -175,5 +176,3 @@ func logStartupHealth(ctx context.Context, log *slog.Logger, health api.HealthCh
 	}
 	log.Info("event source healthy", "status", h.Status, "latest_ledger", h.LatestLedger)
 }
-
-
