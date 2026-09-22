@@ -137,24 +137,29 @@ func (s *retryStore) GetAlert(context.Context, int64) (*store.Alert, error) {
 	}
 	return s.alert, nil
 }
+
 func (s *retryStore) GetChannel(_ context.Context, id int64) (*store.Channel, error) {
 	if s.channel == nil || s.channel.ID != id {
 		return nil, store.ErrNotFound
 	}
 	return s.channel, nil
 }
+
 func (s *retryStore) ListDeliveryAttempts(context.Context, int64, string) ([]store.DeliveryAttempt, error) {
 	return s.attempts, nil
 }
+
 func (s *retryStore) RecordDeliveryAttempt(_ context.Context, d *store.DeliveryAttempt) error {
 	d.ID = int64(len(s.attempts) + 1)
 	d.AttemptedAt = time.Now()
 	s.attempts = append(s.attempts, *d)
 	return nil
 }
+
 func (s *retryStore) GetMonitor(context.Context, int64) (*store.Monitor, error) {
 	return &store.Monitor{ID: 1, Name: "ops"}, nil
 }
+
 func (s *retryStore) GetRule(context.Context, int64) (*store.Rule, error) {
 	return &store.Rule{ID: 2, Type: "event_emitted"}, nil
 }

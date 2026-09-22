@@ -85,8 +85,10 @@ func TestDecodeJSONValShapes(t *testing.T) {
 		{"string", `{"string": "hello"}`, "hello"},
 		{"symbol", `{"symbol": "transfer"}`, "transfer"},
 		{"vec", `{"vec": [{"u32": 1}, {"symbol": "two"}]}`, []any{big.NewInt(1), "two"}},
-		{"unknown wrapper passes through", `{"contract_instance": {"executable": "x"}}`,
-			map[string]any{"contract_instance": map[string]any{"executable": "x"}}},
+		{
+			"unknown wrapper passes through", `{"contract_instance": {"executable": "x"}}`,
+			map[string]any{"contract_instance": map[string]any{"executable": "x"}},
+		},
 		{"non-wrapper passes through", `"plain"`, "plain"},
 	}
 	for _, tt := range tests {

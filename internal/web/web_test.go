@@ -30,9 +30,11 @@ type emptyStore struct {
 }
 
 func (emptyStore) GetStats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
+
 func (emptyStore) ListAlerts(context.Context, store.AlertFilter) ([]store.Alert, error) {
 	return nil, nil
 }
+
 func (emptyStore) GetAlert(context.Context, int64) (*store.Alert, error) {
 	return nil, store.ErrNotFound
 }
@@ -41,6 +43,7 @@ func (emptyStore) ListChannels(context.Context, bool) ([]store.Channel, error) {
 func (emptyStore) ListMonitorsPage(context.Context, store.ListFilter) ([]store.Monitor, error) {
 	return nil, nil
 }
+
 func (emptyStore) ListChannelsPage(context.Context, store.ListFilter) ([]store.Channel, error) {
 	return nil, nil
 }
@@ -766,9 +769,11 @@ type ruleToggleStore struct {
 func (s *ruleToggleStore) GetMonitor(context.Context, int64) (*store.Monitor, error) {
 	return &store.Monitor{ID: 1, Name: "m"}, nil
 }
+
 func (s *ruleToggleStore) ListRules(context.Context, int64, bool) ([]store.Rule, error) {
 	return []store.Rule{s.rule}, nil
 }
+
 func (s *ruleToggleStore) GetRule(_ context.Context, id int64) (*store.Rule, error) {
 	if id != s.rule.ID {
 		return nil, store.ErrNotFound
@@ -776,6 +781,7 @@ func (s *ruleToggleStore) GetRule(_ context.Context, id int64) (*store.Rule, err
 	r := s.rule
 	return &r, nil
 }
+
 func (s *ruleToggleStore) UpdateRule(_ context.Context, r *store.Rule) error {
 	s.rule = *r
 	return nil
@@ -837,6 +843,7 @@ type deliveriesStore struct {
 func (s deliveriesStore) ListDeliveryAttempts(context.Context, int64, string) ([]store.DeliveryAttempt, error) {
 	return s.attempts, nil
 }
+
 func (deliveriesStore) ListChannels(context.Context, bool) ([]store.Channel, error) {
 	return []store.Channel{{ID: 7, Name: "ops-webhook"}}, nil
 }
@@ -969,6 +976,7 @@ type oneMonitorStore struct {
 func (s oneMonitorStore) ListMonitors(context.Context, bool) ([]store.Monitor, error) {
 	return []store.Monitor{{ID: 1, Name: "alpha", Enabled: s.enabled}}, nil
 }
+
 func (oneMonitorStore) GetStats(context.Context) (store.Stats, error) {
 	return store.Stats{Monitors: 1}, nil
 }
@@ -978,9 +986,11 @@ type readyNoAlertsStore struct{ emptyStore }
 func (readyNoAlertsStore) ListMonitors(context.Context, bool) ([]store.Monitor, error) {
 	return []store.Monitor{{ID: 1, Name: "alpha", Enabled: true}}, nil
 }
+
 func (readyNoAlertsStore) ListChannels(context.Context, bool) ([]store.Channel, error) {
 	return []store.Channel{{ID: 2, Name: "ops", Type: "webhook", Enabled: true}}, nil
 }
+
 func (readyNoAlertsStore) GetStats(context.Context) (store.Stats, error) {
 	return store.Stats{Monitors: 1, Channels: 1}, nil
 }
@@ -1160,6 +1170,7 @@ func (s alertDetailStore) GetAlert(_ context.Context, id int64) (*store.Alert, e
 	a := s.alert
 	return &a, nil
 }
+
 func (s alertDetailStore) GetMonitor(_ context.Context, id int64) (*store.Monitor, error) {
 	if id != s.monitor.ID {
 		return nil, store.ErrNotFound
@@ -1167,6 +1178,7 @@ func (s alertDetailStore) GetMonitor(_ context.Context, id int64) (*store.Monito
 	m := s.monitor
 	return &m, nil
 }
+
 func (s alertDetailStore) GetRule(_ context.Context, id int64) (*store.Rule, error) {
 	if id != s.rule.ID {
 		return nil, store.ErrNotFound
@@ -1174,9 +1186,11 @@ func (s alertDetailStore) GetRule(_ context.Context, id int64) (*store.Rule, err
 	r := s.rule
 	return &r, nil
 }
+
 func (s alertDetailStore) ListDeliveryAttempts(context.Context, int64, string) ([]store.DeliveryAttempt, error) {
 	return s.attempts, nil
 }
+
 func (s alertDetailStore) ListChannels(context.Context, bool) ([]store.Channel, error) {
 	return []store.Channel{{ID: 7, Name: "ops-webhook"}}, nil
 }
@@ -1692,12 +1706,15 @@ type timestampedPagesStore struct {
 func (s timestampedPagesStore) GetStats(context.Context) (store.Stats, error) {
 	return store.Stats{LastPollAt: s.at}, nil
 }
+
 func (s timestampedPagesStore) ListAlerts(context.Context, store.AlertFilter) ([]store.Alert, error) {
 	return []store.Alert{{ID: 1, MonitorID: 1, RuleID: 2, EventID: "evt-1", CreatedAt: s.at}}, nil
 }
+
 func (s timestampedPagesStore) ListMonitors(context.Context, bool) ([]store.Monitor, error) {
 	return []store.Monitor{{ID: 1, Name: "main", CreatedAt: s.at}}, nil
 }
+
 func (s timestampedPagesStore) ListChannels(context.Context, bool) ([]store.Channel, error) {
 	return []store.Channel{{ID: 3, Name: "ops", Type: "webhook", CreatedAt: s.at}}, nil
 }
