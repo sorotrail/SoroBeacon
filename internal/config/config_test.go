@@ -23,6 +23,7 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("SOURCE_MODE", "")
 	t.Setenv("SOROTRAIL_URL", "")
 	t.Setenv("CORS_ALLOWED_ORIGINS", "")
+	t.Setenv("SHUTDOWN_GRACE", "")
 
 	cfg, err := Load()
 	require.NoError(t, err)
@@ -47,6 +48,7 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Zero(t, cfg.DatabaseMaxConnIdleTime)
 	assert.Equal(t, time.Duration(0), cfg.AlertRetention)
 	assert.Equal(t, DefaultMonitorSilentAfter, cfg.MonitorSilentAfter)
+	assert.Equal(t, DefaultShutdownGrace, cfg.ShutdownGrace)
 }
 
 func TestLoadRequiresDatabaseURL(t *testing.T) {
@@ -245,6 +247,16 @@ func TestLoadRejectsBadValues(t *testing.T) {
 	assert.ErrorContains(t, err, "1s minimum")
 
 	t.Setenv("POLL_INTERVAL", "5s")
+	t.Setenv("SHUTDOWN_GRACE", "nope")
+	_, err = Load()
+	assert.ErrorContains(t, err, "SHUTDOWN_GRACE")
+
+	t.Setenv("SHUTDOWN_GRACE", "500ms")
+	_, err = Load()
+	assert.ErrorContains(t, err, "1s minimum")
+	t.Setenv("SHUTDOWN_GRACE", "")
+
+	t.Setenv("POLL_INTERVAL", "5s")
 	t.Setenv("LOG_LEVEL", "loud")
 	_, err = Load()
 	assert.ErrorContains(t, err, "LOG_LEVEL")
@@ -407,7 +419,16 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"rpc_url",
 		"sorotrail_url",
 		"cors_allowed_origins",
+		"shutdown_grace",
 	}, keys)
+}
+
+func TestLoadShutdownGrace(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("SHUTDOWN_GRACE", "15s")
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 15*time.Second, cfg.ShutdownGrace)
 }
 
 func TestLoadDatabasePoolSettings(t *testing.T) {
