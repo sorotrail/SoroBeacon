@@ -554,15 +554,6 @@ func (p *Postgres) CreateAlert(ctx context.Context, a *Alert) (bool, error) {
 	return true, nil
 }
 
-// alertSort maps AlertFilter.Sort onto the allowlist. Unknown / empty
-// values become created_at_desc so a typo cannot change the ORDER BY shape.
-func alertSort(s string) string {
-	if s == "created_at_asc" {
-		return "created_at_asc"
-	}
-	return "created_at_desc"
-}
-
 func (p *Postgres) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	var a Alert
 	err := p.pool.QueryRow(ctx,
@@ -572,6 +563,15 @@ func (p *Postgres) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 		return nil, mapErr(err)
 	}
 	return &a, nil
+}
+
+// alertSort maps AlertFilter.Sort onto the allowlist. Unknown / empty
+// values become created_at_desc so a typo cannot change the ORDER BY shape.
+func alertSort(s string) string {
+	if s == "created_at_asc" {
+		return "created_at_asc"
+	}
+	return "created_at_desc"
 }
 
 func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {

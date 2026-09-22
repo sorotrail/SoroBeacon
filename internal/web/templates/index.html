@@ -51,7 +51,7 @@
   <tr><th>ID</th><th>Monitor</th><th>Rule</th><th>Event</th><th>At</th></tr>
   {{range .Alerts}}
   <tr>
-    <td>{{.ID}}</td>
+    <td><a href="/alerts/{{.ID}}">{{.ID}}</a></td>
     <td>{{index $.MonitorNames .MonitorID}}</td>
     <td>#{{.RuleID}}</td>
     <td><code>{{.EventID}}</code></td>
