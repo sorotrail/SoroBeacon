@@ -1,0 +1,32 @@
+{{define "content"}}
+<p class="muted"><a href="/alerts">← Alerts</a></p>
+<h1>Alert #{{.Alert.ID}}</h1>
+<table class="decoded">
+  <tr><th>Monitor</th><td>{{if .Monitor}}<a href="/monitors/{{.Monitor.ID}}">{{.Monitor.Name}}</a>{{else}}#{{.Alert.MonitorID}}{{end}}</td></tr>
+  <tr><th>Rule</th><td>{{if .Rule}}{{.Rule.Type}} (#{{.Rule.ID}}){{else}}#{{.Alert.RuleID}}{{end}}</td></tr>
+  <tr><th>Contract</th><td><code>{{.ContractID}}</code></td></tr>
+  <tr><th>Event</th><td>{{.EventName}} <code>{{.Alert.EventID}}</code></td></tr>
+  <tr><th>Ledger</th><td>{{.Ledger}}</td></tr>
+  <tr><th>Ledger closed</th><td>{{formatTime .LedgerClosedAt .Timezone}}</td></tr>
+  <tr><th>Created</th><td>{{formatTime .Alert.CreatedAt .Timezone}}</td></tr>
+</table>
+
+<h2>Event</h2>
+{{decodedEvent .Alert.Payload}}
+<pre>{{prettyJSON .Alert.Payload}}</pre>
+
+<h2>Deliveries</h2>
+{{if .Attempts}}
+<table>
+  <tr><th>Channel</th><th>Status</th><th>Response</th><th>At</th></tr>
+  {{range .Attempts}}
+  <tr>
+    <td>{{index $.ChannelNames .ChannelID}}</td>
+    <td><span class="pill {{if eq .Status "success"}}on{{else}}off{{end}}">{{.Status}}</span></td>
+    <td><code>{{.ResponseSnippet}}</code></td>
+    <td>{{formatTime .AttemptedAt $.Timezone}}</td>
+  </tr>
+  {{end}}
+</table>
+{{else}}<p class="muted">No delivery attempts yet.</p>{{end}}
+{{end}}

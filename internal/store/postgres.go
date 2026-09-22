@@ -468,6 +468,17 @@ func (p *Postgres) CreateAlert(ctx context.Context, a *Alert) (bool, error) {
 	return true, nil
 }
 
+func (p *Postgres) GetAlert(ctx context.Context, id int64) (*Alert, error) {
+	var a Alert
+	err := p.pool.QueryRow(ctx,
+		`SELECT id, monitor_id, rule_id, event_id, payload, created_at FROM alerts WHERE id = $1`, id,
+	).Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return &a, nil
+}
+
 // alertSort maps AlertFilter.Sort onto the allowlist. Unknown / empty
 // values become created_at_desc so a typo cannot change the ORDER BY shape.
 func alertSort(s string) string {
