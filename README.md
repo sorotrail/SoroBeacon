@@ -53,6 +53,10 @@ make build
 set -a; . ./.env; set +a; ./bin/sorobeacon
 ```
 
+On a VPS, run the same binary under systemd instead of a shell:
+[Deploying with systemd](docs/deployment-systemd.md) (dedicated user,
+`EnvironmentFile=` at `0600`, `Restart=on-failure`, journalctl).
+
 ## Configuration
 
 All configuration comes from environment variables. The complete
