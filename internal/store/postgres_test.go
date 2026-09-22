@@ -47,6 +47,7 @@ func TestMonitorCRUD(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "m1", got.Name)
 	assert.Equal(t, []string{"CAAA", "CBBB"}, got.ContractIDs)
+	assert.Nil(t, got.LastMatchedAt, "new monitors must stay unmatched")
 
 	m.Name = "renamed"
 	m.Enabled = false
@@ -345,6 +346,63 @@ func TestListChannelsTypeAndEnabledFilters(t *testing.T) {
 	unknown, err := st.ListChannelsPage(ctx, ListFilter{Type: "not-a-real-type"})
 	require.NoError(t, err)
 	assert.Empty(t, unknown, "unknown types return an empty list, not an error")
+}
+
+func TestMonitorLastMatchedAt(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+	r := &Rule{MonitorID: m.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, r))
+
+	got, err := st.GetMonitor(ctx, m.ID)
+	require.NoError(t, err)
+	assert.Nil(t, got.LastMatchedAt)
+
+	older := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	newer := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+	created, err := st.CreateAlert(ctx, &Alert{
+		MonitorID: m.ID, RuleID: r.ID, EventID: "ev-new", LedgerClosedAt: newer,
+	})
+	require.NoError(t, err)
+	assert.True(t, created)
+
+	got, err = st.GetMonitor(ctx, m.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.LastMatchedAt)
+	assert.True(t, got.LastMatchedAt.Equal(newer), "got %v", got.LastMatchedAt)
+
+	created, err = st.CreateAlert(ctx, &Alert{
+		MonitorID: m.ID, RuleID: r.ID, EventID: "ev-old", LedgerClosedAt: older,
+	})
+	require.NoError(t, err)
+	assert.True(t, created)
+	got, err = st.GetMonitor(ctx, m.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.LastMatchedAt)
+	assert.True(t, got.LastMatchedAt.Equal(newer), "older ledger close must not overwrite")
+
+	created, err = st.CreateAlert(ctx, &Alert{
+		MonitorID: m.ID, RuleID: r.ID, EventID: "ev-new", LedgerClosedAt: newer.Add(time.Hour),
+	})
+	require.NoError(t, err)
+	assert.False(t, created, "dedup must not restamp")
+	got, err = st.GetMonitor(ctx, m.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.LastMatchedAt)
+	assert.True(t, got.LastMatchedAt.Equal(newer))
+
+	created, err = st.CreateAlert(ctx, &Alert{
+		MonitorID: m.ID, RuleID: r.ID, EventID: "ev-plain",
+	})
+	require.NoError(t, err)
+	assert.True(t, created)
+	got, err = st.GetMonitor(ctx, m.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.LastMatchedAt)
+	assert.True(t, got.LastMatchedAt.Equal(newer), "zero LedgerClosedAt must not stamp wall clock")
 }
 
 func TestAlertDedupAndListing(t *testing.T) {

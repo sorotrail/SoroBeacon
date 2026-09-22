@@ -21,6 +21,10 @@ type Monitor struct {
 	ContractIDs []string  `json:"contract_ids"`
 	Enabled     bool      `json:"enabled"`
 	CreatedAt   time.Time `json:"created_at"`
+	// LastMatchedAt is the ledger close time of the most recent event that
+	// created an alert for this monitor. Nil means it has never matched —
+	// do not backfill a fake timestamp.
+	LastMatchedAt *time.Time `json:"last_matched_at"`
 	// ChannelIDs are the notification channels this monitor alerts to.
 	ChannelIDs []int64 `json:"channel_ids"`
 }
@@ -58,6 +62,11 @@ type Alert struct {
 	EventID   string          `json:"event_id"`
 	Payload   json.RawMessage `json:"payload"`
 	CreatedAt time.Time       `json:"created_at"`
+	// LedgerClosedAt is the matching event's ledger close time. CreateAlert
+	// uses it to stamp monitors.last_matched_at; it is not stored on the
+	// alert row. Zero skips the stamp so callers that only persist an
+	// alert (tests, retries) do not invent a wall-clock match time.
+	LedgerClosedAt time.Time `json:"-"`
 }
 
 // Status values persisted on delivery_attempts.status. Anything else is
@@ -222,7 +231,8 @@ type Channels interface {
 type Alerts interface {
 	// CreateAlert inserts a new alert. It returns created=false (and no
 	// error) when an alert for the same (rule_id, event_id) already exists —
-	// the dedup guard.
+	// the dedup guard. On a new row, a non-zero LedgerClosedAt is written
+	// to monitors.last_matched_at when it is newer than the stored value.
 	CreateAlert(ctx context.Context, a *Alert) (created bool, err error)
 	GetAlert(ctx context.Context, id int64) (*Alert, error)
 	ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)

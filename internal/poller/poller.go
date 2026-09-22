@@ -275,10 +275,11 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 	}
 
 	alert := &store.Alert{
-		MonitorID: m.ID,
-		RuleID:    rule.ID,
-		EventID:   ev.ID,
-		Payload:   payload,
+		MonitorID:      m.ID,
+		RuleID:         rule.ID,
+		EventID:        ev.ID,
+		Payload:        payload,
+		LedgerClosedAt: ev.LedgerClosedAt,
 	}
 	created, err := p.store.CreateAlert(ctx, alert)
 	if err != nil {

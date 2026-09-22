@@ -46,6 +46,7 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Zero(t, cfg.DatabaseMaxConnLifetime)
 	assert.Zero(t, cfg.DatabaseMaxConnIdleTime)
 	assert.Equal(t, time.Duration(0), cfg.AlertRetention)
+	assert.Equal(t, DefaultMonitorSilentAfter, cfg.MonitorSilentAfter)
 }
 
 func TestLoadRequiresDatabaseURL(t *testing.T) {
@@ -85,6 +86,23 @@ func TestLoadOverrides(t *testing.T) {
 	assert.Equal(t, "sorotrail", cfg.SourceMode)
 	assert.Equal(t, "http://indexer.example", cfg.SoroTrailURL)
 	assert.Equal(t, []string{"https://ops.example", "https://other.example"}, cfg.CORSAllowedOrigins)
+}
+
+func TestLoadMonitorSilentAfter(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("MONITOR_SILENT_AFTER", "48h")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 48*time.Hour, cfg.MonitorSilentAfter)
+}
+
+func TestLoadRejectsInvalidMonitorSilentAfter(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("MONITOR_SILENT_AFTER", "nope")
+
+	_, err := Load()
+	assert.ErrorContains(t, err, "MONITOR_SILENT_AFTER")
 }
 
 func TestLoadReadyzLagThreshold(t *testing.T) {

@@ -3,6 +3,11 @@
   {{if .Monitor.Enabled}}<span class="pill on">enabled</span>{{else}}<span class="pill off">disabled</span>{{end}}
 </h1>
 <p class="muted">Contracts: {{range .Monitor.ContractIDs}}{{template "copyID" .}} {{end}}</p>
+<p>Last matched:
+  {{if eq .Monitor.Cue "never"}}<span class="pill never">never</span>
+  {{else}}{{.Monitor.MatchedHTML}}{{if eq .Monitor.Cue "silent"}} <span class="pill silent">silent</span>{{end}}
+  {{end}}
+</p>
 <form class="inline" method="post" action="/monitors/{{.Monitor.ID}}/duplicate">
   <button>Duplicate</button>
 </form>

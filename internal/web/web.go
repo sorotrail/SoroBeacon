@@ -49,6 +49,17 @@ type Server struct {
 	log      *slog.Logger
 	pages    map[string]*template.Template
 	poller   PositionReader
+	// silentAfter is how long since last_matched_at before a monitor is
+	// marked silent on the list. Zero means the New default (24h).
+	silentAfter time.Duration
+}
+
+// monitorListRow is a monitor plus the last-matched cue rendered on the
+// monitors list and detail pages.
+type monitorListRow struct {
+	store.Monitor
+	Cue         string
+	MatchedHTML template.HTML
 }
 
 // templateFuncs are available to every page template.
@@ -148,7 +159,11 @@ func truncateID(s string, keep int) string {
 
 // New parses templates and wires a dashboard server.
 func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logger) (*Server, error) {
-	s := &Server{store: st, registry: reg, factory: f, log: log, pages: map[string]*template.Template{}}
+	s := &Server{
+		store: st, registry: reg, factory: f, log: log,
+		pages:       map[string]*template.Template{},
+		silentAfter: 24 * time.Hour,
+	}
 	for _, page := range []string{"index", "monitors", "monitor", "channels", "alerts", "alert", "error"} {
 		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/"+page+".html")
 		if err != nil {
@@ -163,6 +178,36 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 func (s *Server) WithPoller(p PositionReader) *Server {
 	s.poller = p
 	return s
+}
+
+// WithSilentAfter sets how long since last_matched_at before a monitor is
+// marked silent. Ignored when d <= 0 so callers can skip wiring.
+func (s *Server) WithSilentAfter(d time.Duration) *Server {
+	if d > 0 {
+		s.silentAfter = d
+	}
+	return s
+}
+
+func (s *Server) monitorRow(m store.Monitor, tz string, now time.Time) monitorListRow {
+	row := monitorListRow{Monitor: m}
+	if m.LastMatchedAt == nil {
+		row.Cue = "never"
+		return row
+	}
+	row.MatchedHTML = formatTime(*m.LastMatchedAt, tz)
+	if now.Sub(m.LastMatchedAt.UTC()) > s.silentAfter {
+		row.Cue = "silent"
+	}
+	return row
+}
+
+func (s *Server) monitorRows(monitors []store.Monitor, tz string, now time.Time) []monitorListRow {
+	out := make([]monitorListRow, 0, len(monitors))
+	for _, m := range monitors {
+		out = append(out, s.monitorRow(m, tz, now))
+	}
+	return out
 }
 
 // Routes returns the dashboard router, mounted at / by cmd/sorobeacon.
@@ -535,7 +580,7 @@ func (s *Server) monitors(w http.ResponseWriter, r *http.Request) {
 		sort = "name"
 	}
 	data := map[string]any{
-		"Title": "Monitors", "Monitors": monitors, "NextCursor": next,
+		"Title": "Monitors", "Monitors": s.monitorRows(monitors, tzFromRequest(r), time.Now()), "NextCursor": next,
 		"Empty": empty,
 		"Query": f.Query, "Enabled": enabled, "Sort": sort,
 	}
@@ -614,7 +659,7 @@ func (s *Server) monitorDetail(w http.ResponseWriter, r *http.Request) {
 		attached[cid] = true
 	}
 	s.render(w, r, "monitor", map[string]any{
-		"Title": m.Name, "Monitor": m, "Rules": ruleList,
+		"Title": m.Name, "Monitor": s.monitorRow(*m, tzFromRequest(r), time.Now()), "Rules": ruleList,
 		"Channels": channels, "Attached": attached, "RuleTypes": s.registry.Types(),
 	})
 }
