@@ -22,6 +22,10 @@ const (
 	// channel configs are small; 1 MiB is well above any legitimate write
 	// payload while bounding unauthenticated POSTs on a small instance.
 	DefaultHTTPMaxBodyBytes int64 = 1 << 20
+	// DefaultShutdownGrace is how long SIGTERM waits for in-flight
+	// deliveries before abandoning them. Matches the previous hard-coded
+	// HTTP shutdown timeout so existing deploys keep the same bound.
+	DefaultShutdownGrace = 10 * time.Second
 )
 
 // Config holds all runtime configuration. Every field maps to one
@@ -87,6 +91,9 @@ type Config struct {
 	// are kept. Zero (the default, when ALERT_RETENTION is unset) keeps
 	// everything forever so upgrades never start deleting history.
 	AlertRetention time.Duration
+	// ShutdownGrace is how long SIGTERM waits for in-flight deliveries
+	// and HTTP handlers before the process exits (SHUTDOWN_GRACE).
+	ShutdownGrace time.Duration
 }
 
 // Load reads configuration from the environment. DATABASE_URL is the only
@@ -105,6 +112,7 @@ func Load() (Config, error) {
 		HTTPAddr:         getenv("HTTP_ADDR", DefaultHTTPAddr),
 		HTTPMaxBodyBytes: DefaultHTTPMaxBodyBytes,
 		LogLevel:         slog.LevelInfo,
+		ShutdownGrace:    DefaultShutdownGrace,
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -239,6 +247,17 @@ func Load() (Config, error) {
 		cfg.AlertRetention = d
 	}
 
+	if v := os.Getenv("SHUTDOWN_GRACE"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid SHUTDOWN_GRACE %q: %w", v, err)
+		}
+		if d < time.Second {
+			return cfg, fmt.Errorf("SHUTDOWN_GRACE %q is below the 1s minimum", v)
+		}
+		cfg.ShutdownGrace = d
+	}
+
 	return cfg, nil
 }
 
@@ -277,6 +296,7 @@ func (c Config) LogAttrs() []slog.Attr {
 		slog.String("rpc_url", c.RPCURL),
 		slog.String("sorotrail_url", c.SoroTrailURL),
 		slog.String("cors_allowed_origins", strings.Join(c.CORSAllowedOrigins, ",")),
+		slog.String("shutdown_grace", c.ShutdownGrace.String()),
 	}
 }
 

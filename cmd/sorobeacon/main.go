@@ -154,15 +154,43 @@ func run() error {
 
 	select {
 	case <-ctx.Done():
-		log.Info("shutting down")
+		log.Info("shutting down", "grace_period", cfg.ShutdownGrace.String())
 	case err := <-errCh:
 		return err
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	return httpSrv.Shutdown(shutdownCtx)
+	return gracefulShutdown(cfg.ShutdownGrace, log, dispatcher, httpSrv)
 }
+
+// gracefulShutdown stops accepting HTTP requests and waits for in-flight
+// deliveries up to grace. Leftovers are persisted as failed/retryable;
+// hung sends are cancelled so exit stays bounded.
+func gracefulShutdown(grace time.Duration, log *slog.Logger, d *notify.Dispatcher, httpSrv *http.Server) error {
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+
+	httpErr := make(chan error, 1)
+	go func() {
+		httpErr <- httpSrv.Shutdown(ctx)
+	}()
+
+	abandoned := d.Drain(ctx)
+	log.Info("shutdown drain",
+		"abandoned_deliveries", abandoned,
+		"grace_period", grace.String(),
+	)
+
+	select {
+	case err := <-httpErr:
+		return err
+	case <-time.After(grace + drainExitMargin):
+		return errors.New("http shutdown exceeded grace period")
+	}
+}
+
+// drainExitMargin is the extra bound past SHUTDOWN_GRACE for HTTP
+// Shutdown to return after Drain has cancelled hung work.
+const drainExitMargin = 500 * time.Millisecond
 
 // startupHealthTimeout bounds the one-off health check logged at startup,
 // so a slow or unreachable dependency delays boot by at most this long
