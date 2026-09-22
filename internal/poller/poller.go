@@ -55,8 +55,10 @@ type Poller struct {
 	store    Store
 	registry *rules.Registry
 	dispatch Dispatcher
-	interval time.Duration
-	log      *slog.Logger
+	// intervalNs is the poll delay, stored as nanoseconds so SIGHUP can
+	// change it without racing the Run loop.
+	intervalNs atomic.Int64
+	log        *slog.Logger
 	// metrics is optional instrumentation; nil-safe, see internal/metrics.
 	metrics *metrics.Metrics
 	// scanned/matched accumulate per-cycle counts for metrics.
@@ -88,14 +90,35 @@ func (p *Poller) recordPosition(processed, latest uint32, at time.Time) {
 // New wires a Poller. src is where events come from: NewRPCSource for a
 // Stellar RPC node, or the SoroTrail source for upstream mode.
 func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval time.Duration, log *slog.Logger) *Poller {
-	return &Poller{
+	p := &Poller{
 		source:   src,
 		store:    st,
 		registry: reg,
 		dispatch: d,
-		interval: interval,
 		log:      log,
 	}
+	p.SetInterval(interval)
+	return p
+}
+
+// SetInterval updates the poll delay. Safe to call from another
+// goroutine (SIGHUP reload). Values below 1s are clamped to 1s so a
+// caller cannot undo Load's minimum.
+func (p *Poller) SetInterval(d time.Duration) {
+	if d < time.Second {
+		d = time.Second
+	}
+	p.intervalNs.Store(int64(d))
+}
+
+// Interval is the current poll delay. Safe to call from another
+// goroutine.
+func (p *Poller) Interval() time.Duration {
+	d := time.Duration(p.intervalNs.Load())
+	if d <= 0 {
+		return time.Second
+	}
+	return d
 }
 
 // WithMetrics attaches Prometheus instrumentation to the poll loop.
@@ -107,8 +130,8 @@ func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
 // Run polls until ctx is cancelled. RPC errors back off exponentially
 // (capped at 10x the poll interval) instead of hammering the node.
 func (p *Poller) Run(ctx context.Context) {
-	p.log.Info("poller started", "interval", p.interval)
-	delay := p.interval
+	p.log.Info("poller started", "interval", p.Interval())
+	delay := p.Interval()
 	for {
 		select {
 		case <-ctx.Done():
@@ -126,11 +149,11 @@ func (p *Poller) Run(ctx context.Context) {
 			if ctx.Err() != nil {
 				continue
 			}
-			delay = min(delay*2, 10*p.interval)
+			delay = min(delay*2, 10*p.Interval())
 			p.log.Error("poll failed", "err", err, "retry_in", delay)
 			continue
 		}
-		delay = p.interval
+		delay = p.Interval()
 	}
 }
 

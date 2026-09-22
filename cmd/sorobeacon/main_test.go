@@ -7,7 +7,11 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/config"
+	"github.com/sorotrail/sorobeacon/internal/poller"
+	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 )
 
@@ -56,5 +60,86 @@ func TestLogStartupHealth_Unreachable(t *testing.T) {
 	}
 	if !strings.Contains(out, "connection refused") {
 		t.Fatalf("expected the underlying error in the log line, got: %s", out)
+	}
+}
+
+func TestApplySIGHUPReloadsLogLevelAndPollInterval(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("POLL_INTERVAL", "5s")
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_ADDR", ":8080")
+	t.Setenv("SOURCE_MODE", "rpc")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	level := new(slog.LevelVar)
+	level.Set(cfg.LogLevel)
+	p := poller.New(nil, nil, rules.NewRegistry(), nil, cfg.PollInterval, slog.New(slog.DiscardHandler))
+	live := &liveConfig{
+		cfg:    cfg,
+		level:  level,
+		poller: p,
+		log:    slog.New(slog.NewTextHandler(&buf, nil)),
+	}
+
+	t.Setenv("LOG_LEVEL", "debug")
+	t.Setenv("POLL_INTERVAL", "12s")
+	t.Setenv("HTTP_ADDR", ":9999")
+	applySIGHUP(live)
+
+	if live.cfg.LogLevel != slog.LevelDebug {
+		t.Fatalf("log level = %v, want debug", live.cfg.LogLevel)
+	}
+	if live.level.Level() != slog.LevelDebug {
+		t.Fatalf("slog LevelVar = %v, want debug", live.level.Level())
+	}
+	if p.Interval() != 12*time.Second {
+		t.Fatalf("poll interval = %s, want 12s", p.Interval())
+	}
+	if live.cfg.HTTPAddr != ":8080" {
+		t.Fatalf("HTTP_ADDR applied on reload: %s", live.cfg.HTTPAddr)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "configuration reloaded") || !strings.Contains(out, "log_level") {
+		t.Fatalf("expected applied log_level line, got: %s", out)
+	}
+	if !strings.Contains(out, "configuration reload skipped") || !strings.Contains(out, "http_addr") {
+		t.Fatalf("expected skipped http_addr line, got: %s", out)
+	}
+}
+
+func TestApplySIGHUPRejectsInvalid(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("POLL_INTERVAL", "5s")
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_ADDR", ":8080")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	level := new(slog.LevelVar)
+	level.Set(cfg.LogLevel)
+	p := poller.New(nil, nil, rules.NewRegistry(), nil, cfg.PollInterval, slog.New(slog.DiscardHandler))
+	live := &liveConfig{
+		cfg:    cfg,
+		level:  level,
+		poller: p,
+		log:    slog.New(slog.NewTextHandler(&buf, nil)),
+	}
+
+	t.Setenv("LOG_LEVEL", "nope")
+	applySIGHUP(live)
+
+	if live.cfg.LogLevel != slog.LevelInfo {
+		t.Fatalf("rejected reload mutated log level: %v", live.cfg.LogLevel)
+	}
+	if p.Interval() != 5*time.Second {
+		t.Fatalf("rejected reload mutated poll interval: %s", p.Interval())
+	}
+	if !strings.Contains(buf.String(), "configuration reload rejected") {
+		t.Fatalf("expected rejection log, got: %s", buf.String())
 	}
 }

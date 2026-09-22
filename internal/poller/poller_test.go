@@ -339,6 +339,15 @@ func TestPollSkipsInvalidContractIDs(t *testing.T) {
 	assert.Equal(t, []string{contractA}, rpc.requests[0].Filters[0].ContractIDs)
 }
 
+func TestSetIntervalIsVisibleToReaders(t *testing.T) {
+	p := New(nil, nil, rules.NewRegistry(), nil, 5*time.Second, slog.New(slog.DiscardHandler))
+	assert.Equal(t, 5*time.Second, p.Interval())
+	p.SetInterval(15 * time.Second)
+	assert.Equal(t, 15*time.Second, p.Interval())
+	p.SetInterval(0)
+	assert.Equal(t, time.Second, p.Interval())
+}
+
 func TestPollIgnoresEventsFromUnwatchedContracts(t *testing.T) {
 	rpc := &fakeRPC{latest: 6000, responses: []*stellar.GetEventsResult{{
 		Events: []stellar.Event{{
