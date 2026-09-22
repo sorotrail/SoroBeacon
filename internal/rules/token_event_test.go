@@ -53,8 +53,10 @@ func TestTokenEventEvaluate(t *testing.T) {
 		{"max amount inclusive", transfer, `{"event":"transfer","max_amount":"1000000"}`, true},
 		{"max amount below", transfer, `{"event":"transfer","max_amount":"999999"}`, false},
 		{"amount range", transfer, `{"event":"transfer","min_amount":"1","max_amount":"2000000"}`, true},
-		{"i128 wider than 64 bits", sep41Event("transfer", alice, bob, map[string]any{"i128": "170141183460469231731687303715884105727"}),
-			`{"event":"transfer","min_amount":"170141183460469231731687303715884105726"}`, true},
+		{
+			"i128 wider than 64 bits", sep41Event("transfer", alice, bob, map[string]any{"i128": "170141183460469231731687303715884105727"}),
+			`{"event":"transfer","min_amount":"170141183460469231731687303715884105726"}`, true,
+		},
 		{"non-SEP41 event with same name shape", &stellar.DecodedEvent{Topics: []any{"transfer"}}, `{"event":"transfer"}`, false},
 		{"from and to together", transfer, `{"event":"transfer","from":"` + alice + `","to":"` + bob + `"}`, true},
 	}
