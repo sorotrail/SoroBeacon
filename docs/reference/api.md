@@ -44,6 +44,7 @@ Params for the built-in types: [`event_emitted`](../rules/event-emitted.md), [`v
 | `GET /channels` / `GET /channels/{id}` | List / get. **`config` is never returned.** |
 | `PATCH /channels/{id}` | Partial update; config re-validated. |
 | `DELETE /channels/{id}` | Delete. |
+| `GET /channels/{id}/stats` | Delivery counts over `?window=` (Go duration, default `24h`): `total_attempts`, `successes`, `failures`, `success_rate` (omitted when there are no attempts), `last_success`, `last_failure`. Known channel with no attempts returns zeroes and null timestamps, not 404. |
 | `POST /channels/{id}/test` | Send a synthetic alert through the channel right now. `200 {"status":"sent"}` or `502 {"status":"failed","error":"..."}`. |
 
 Config shapes per type: [Discord](../channels/discord.md) · [Slack](../channels/slack.md) · [Telegram](../channels/telegram.md) · [Email](../channels/email.md) · [Webhook](../channels/webhook.md)

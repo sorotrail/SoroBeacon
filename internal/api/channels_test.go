@@ -3,9 +3,12 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
@@ -104,4 +107,161 @@ func TestListChannels_TypeFilter(t *testing.T) {
 			t.Fatalf("type = %q, want empty", cs.gotType)
 		}
 	})
+}
+
+type channelStatsStore struct {
+	store.Store
+	stats    store.ChannelStats
+	statsErr error
+	gotID    int64
+	gotSince time.Time
+	called   bool
+}
+
+func (s *channelStatsStore) GetChannel(_ context.Context, id int64) (*store.Channel, error) {
+	if id != 7 {
+		return nil, store.ErrNotFound
+	}
+	return &store.Channel{ID: 7, Name: "ops", Type: "webhook", Enabled: true}, nil
+}
+
+func (s *channelStatsStore) ChannelStats(_ context.Context, id int64, since time.Time) (store.ChannelStats, error) {
+	s.called = true
+	s.gotID = id
+	s.gotSince = since
+	if s.statsErr != nil {
+		return store.ChannelStats{}, s.statsErr
+	}
+	out := s.stats
+	out.ChannelID = id
+	return out, nil
+}
+
+func TestChannelStats_EmptyWindowUsesDefaultAndOmitsRate(t *testing.T) {
+	st := &channelStatsStore{stats: store.ChannelStats{TotalAttempts: 0, Successes: 0, Failures: 0}}
+	srv := httptest.NewServer(newProbeServer(st, &fakeRPC{}))
+	defer srv.Close()
+
+	before := time.Now()
+	res, err := http.Get(srv.URL + "/channels/7/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	after := time.Now()
+	if res.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(res.Body)
+		t.Fatalf("status = %d, want 200 body=%s", res.StatusCode, body)
+	}
+	if !st.called || st.gotID != 7 {
+		t.Fatalf("ChannelStats called=%v id=%d", st.called, st.gotID)
+	}
+	wantSince := after.Add(-store.DefaultChannelStatsWindow)
+	if st.gotSince.After(after.Add(-store.DefaultChannelStatsWindow+time.Second)) || st.gotSince.Before(before.Add(-store.DefaultChannelStatsWindow-time.Second)) {
+		t.Fatalf("since = %v, want ~%v", st.gotSince, wantSince)
+	}
+	raw, _ := io.ReadAll(res.Body)
+	if strings.Contains(string(raw), "success_rate") {
+		t.Fatalf("success_rate must be omitted when there are no attempts: %s", raw)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["window"] != "24h" {
+		t.Fatalf("window = %v, want 24h", body["window"])
+	}
+	if body["total_attempts"] != float64(0) {
+		t.Fatalf("total_attempts = %v, want 0", body["total_attempts"])
+	}
+	if body["last_success"] != nil || body["last_failure"] != nil {
+		t.Fatalf("timestamps must be null with no attempts: %s", raw)
+	}
+}
+
+func TestChannelStats_WindowQueryAndRate(t *testing.T) {
+	rate := 0.5
+	now := time.Now().UTC().Truncate(time.Second)
+	st := &channelStatsStore{stats: store.ChannelStats{
+		TotalAttempts: 4, Successes: 2, Failures: 2, SuccessRate: &rate,
+		LastSuccess: &now, LastFailure: &now,
+	}}
+	srv := httptest.NewServer(newProbeServer(st, &fakeRPC{}))
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/channels/7/stats?window=1h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(res.Body)
+		t.Fatalf("status = %d body=%s", res.StatusCode, body)
+	}
+	if time.Until(st.gotSince.Add(time.Hour)) > 2*time.Second {
+		t.Fatalf("window 1h since = %v", st.gotSince)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["success_rate"] != 0.5 {
+		t.Fatalf("success_rate = %v, want 0.5", body["success_rate"])
+	}
+	if body["window"] != "1h" {
+		t.Fatalf("window = %v, want 1h", body["window"])
+	}
+}
+
+func TestChannelStats_InvalidWindow(t *testing.T) {
+	st := &channelStatsStore{}
+	srv := httptest.NewServer(newProbeServer(st, &fakeRPC{}))
+	defer srv.Close()
+
+	for _, q := range []string{"?window=nope", "?window=0s", "?window=-1h"} {
+		res, err := http.Get(srv.URL + "/channels/7/stats" + q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400", q, res.StatusCode)
+		}
+		res.Body.Close()
+		if st.called {
+			t.Fatalf("%s must not hit the store", q)
+		}
+	}
+}
+
+func TestChannelStats_UnknownChannel(t *testing.T) {
+	st := &channelStatsStore{statsErr: store.ErrNotFound}
+	srv := httptest.NewServer(newProbeServer(st, &fakeRPC{}))
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/channels/99/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", res.StatusCode)
+	}
+}
+
+func TestChannelStats_InvalidID(t *testing.T) {
+	st := &channelStatsStore{}
+	srv := httptest.NewServer(newProbeServer(st, &fakeRPC{}))
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/channels/nope/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", res.StatusCode)
+	}
+	if st.called {
+		t.Fatal("store must not be called for invalid id")
+	}
 }

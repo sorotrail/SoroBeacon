@@ -44,6 +44,9 @@ func (emptyStore) ListMonitorsPage(context.Context, store.ListFilter) ([]store.M
 func (emptyStore) ListChannelsPage(context.Context, store.ListFilter) ([]store.Channel, error) {
 	return nil, nil
 }
+func (emptyStore) ChannelStats(context.Context, int64, time.Time) (store.ChannelStats, error) {
+	return store.ChannelStats{}, nil
+}
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
@@ -161,6 +164,65 @@ func TestMonitorsPageShowsBulkActionBar(t *testing.T) {
 	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("monitors page missing %q in %s", want, html)
+		}
+	}
+}
+
+type channelCueStore struct {
+	emptyStore
+}
+
+func (channelCueStore) ListChannelsPage(context.Context, store.ListFilter) ([]store.Channel, error) {
+	return []store.Channel{
+		{ID: 1, Name: "quiet", Type: "webhook", Enabled: true},
+		{ID: 2, Name: "healthy", Type: "webhook", Enabled: true},
+		{ID: 3, Name: "flaky", Type: "webhook", Enabled: true},
+	}, nil
+}
+
+func (channelCueStore) ListMonitors(context.Context, bool) ([]store.Monitor, error) {
+	return []store.Monitor{{ID: 1, Name: "m"}}, nil
+}
+
+func (channelCueStore) ChannelStats(_ context.Context, id int64, _ time.Time) (store.ChannelStats, error) {
+	switch id {
+	case 2:
+		rate := 1.0
+		return store.ChannelStats{TotalAttempts: 3, Successes: 3, SuccessRate: &rate}, nil
+	case 3:
+		rate := 0.5
+		return store.ChannelStats{TotalAttempts: 4, Successes: 2, Failures: 2, SuccessRate: &rate}, nil
+	default:
+		return store.ChannelStats{}, nil
+	}
+}
+
+func TestChannelsPageDeliveryCues(t *testing.T) {
+	s, err := New(channelCueStore{}, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	res, err := http.Get(srv.URL + "/channels")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	for _, want := range []string{
+		"24h delivery",
+		"no deliveries",
+		"3/3 ok",
+		"2/4 ok",
+		`class="failing-channel"`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("channels page missing %q in %s", want, html)
 		}
 	}
 }
