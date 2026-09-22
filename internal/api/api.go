@@ -157,6 +157,7 @@ func parseListFilter(w http.ResponseWriter, r *http.Request) (store.ListFilter, 
 		f.Enabled = &t
 	}
 	f.Query = strings.TrimSpace(q.Get("q"))
+	f.Type = strings.TrimSpace(q.Get("type"))
 	if v := q.Get("sort"); v != "" {
 		switch v {
 		case "name", "id", "created_at":

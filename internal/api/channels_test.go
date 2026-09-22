@@ -17,10 +17,12 @@ import (
 type channelsStore struct {
 	store.Store
 	gotEnabledOnly *bool
+	gotType        string
 }
 
 func (c *channelsStore) ListChannelsPage(ctx context.Context, f store.ListFilter) ([]store.Channel, error) {
 	c.gotEnabledOnly = &f.EnabledOnly
+	c.gotType = f.Type
 	return []store.Channel{{ID: 1, Name: "ops", Type: "webhook", Enabled: true}}, nil
 }
 
@@ -66,4 +68,40 @@ func TestListChannels_EnabledParamWiring(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestListChannels_TypeFilter covers the ?type= filter. The filter itself is
+// applied in SQL; what the handler owns is validating the value and passing
+// it through, so an unknown type is a 400 rather than an empty list that
+// reads like "no channels configured".
+func TestListChannels_TypeFilter(t *testing.T) {
+	t.Run("passes a known type through", func(t *testing.T) {
+		cs := &channelsStore{}
+		code, _ := getJSON(t, cs, "/channels?type=webhook")
+		if code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", code)
+		}
+		if cs.gotType != "webhook" {
+			t.Fatalf("type = %q, want %q", cs.gotType, "webhook")
+		}
+	})
+
+	t.Run("rejects an unknown type", func(t *testing.T) {
+		cs := &channelsStore{}
+		code, _ := getJSON(t, cs, "/channels?type=carrier-pigeon")
+		if code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", code)
+		}
+	})
+
+	t.Run("no type means no filter", func(t *testing.T) {
+		cs := &channelsStore{}
+		code, _ := getJSON(t, cs, "/channels")
+		if code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", code)
+		}
+		if cs.gotType != "" {
+			t.Fatalf("type = %q, want empty", cs.gotType)
+		}
+	})
 }

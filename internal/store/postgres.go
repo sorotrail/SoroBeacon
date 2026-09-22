@@ -489,6 +489,9 @@ func (p *Postgres) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channe
 	if f.EnabledOnly {
 		q += ` AND enabled`
 	}
+	if f.Type != "" {
+		q += ` AND type = ` + arg(f.Type)
+	}
 	if f.AfterID != 0 {
 		q += ` AND id < ` + arg(f.AfterID)
 	}

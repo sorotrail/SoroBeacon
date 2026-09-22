@@ -92,6 +92,9 @@ type AlertFilter struct {
 	// the cursor row; created_at_asc uses >. Comparing only on id would
 	// repeat or skip rows once sort is not newest-id.
 	AfterID int64
+	// Type filters channels by their notifier type ("slack", "discord",
+	// ...). Empty means no type filter. Only meaningful for channels.
+	Type string
 	// Sort is an allowlisted order key: "created_at_desc" (default) or
 	// "created_at_asc". Unknown values are treated as the default in the
 	// store; the API rejects them with 400. Never interpolate this into SQL.
@@ -108,6 +111,9 @@ type AlertFilter struct {
 // there still means "all", matching the pre-tri-state API).
 type ListFilter struct {
 	EnabledOnly bool
+	// Type filters channels by notifier type ("slack", "discord", ...).
+	// Empty means no type filter; only meaningful for channels.
+	Type string
 	// Enabled is the monitors tri-state filter: nil = all (default), true =
 	// enabled only, false = disabled only. When nil, EnabledOnly is used.
 	Enabled *bool

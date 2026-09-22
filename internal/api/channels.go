@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -79,6 +80,12 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listChannels(w http.ResponseWriter, r *http.Request) {
 	f, ok := parseListFilter(w, r)
 	if !ok {
+		return
+	}
+	// An unknown type would otherwise return an empty list and look like
+	// "no channels configured" rather than "that is not a channel type".
+	if f.Type != "" && !slices.Contains(s.factory.Types(), f.Type) {
+		writeErr(w, r, http.StatusBadRequest, "invalid type")
 		return
 	}
 	list, err := s.store.ListChannelsPage(r.Context(), f)

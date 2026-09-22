@@ -280,6 +280,37 @@ func TestChannelsAndAttachments(t *testing.T) {
 	assert.Equal(t, []int64{c2.ID}, got.ChannelIDs)
 }
 
+func TestListChannelsTypeAndEnabledFilters(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	slackOn := &Channel{Name: "ops-slack", Type: "slack", Config: json.RawMessage(`{"webhook_url":"u"}`), Enabled: true}
+	webhookOn := &Channel{Name: "ops-hook", Type: "webhook", Config: json.RawMessage(`{"url":"u","secret":"s"}`), Enabled: true}
+	slackOff := &Channel{Name: "quiet-slack", Type: "slack", Config: json.RawMessage(`{"webhook_url":"u"}`), Enabled: false}
+	require.NoError(t, st.CreateChannel(ctx, slackOn))
+	require.NoError(t, st.CreateChannel(ctx, webhookOn))
+	require.NoError(t, st.CreateChannel(ctx, slackOff))
+
+	all, err := st.ListChannelsPage(ctx, ListFilter{})
+	require.NoError(t, err)
+	require.Len(t, all, 3)
+
+	byType, err := st.ListChannelsPage(ctx, ListFilter{Type: "slack"})
+	require.NoError(t, err)
+	require.Len(t, byType, 2, "type filter is applied in SQL, not after fetch")
+	assert.Equal(t, "slack", byType[0].Type)
+	assert.Equal(t, "slack", byType[1].Type)
+
+	composed, err := st.ListChannelsPage(ctx, ListFilter{Type: "slack", EnabledOnly: true})
+	require.NoError(t, err)
+	require.Len(t, composed, 1)
+	assert.Equal(t, slackOn.ID, composed[0].ID)
+
+	unknown, err := st.ListChannelsPage(ctx, ListFilter{Type: "not-a-real-type"})
+	require.NoError(t, err)
+	assert.Empty(t, unknown, "unknown types return an empty list, not an error")
+}
+
 func TestAlertDedupAndListing(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
