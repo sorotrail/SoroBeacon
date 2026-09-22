@@ -125,6 +125,7 @@ func (s *Server) Routes() chi.Router {
 		r.Get("/{id}", s.getChannel)
 		r.Patch("/{id}", s.updateChannel)
 		r.Delete("/{id}", s.deleteChannel)
+		r.Get("/{id}/stats", s.channelStats)
 		r.Post("/{id}/test", s.testChannel)
 	})
 

@@ -360,6 +360,35 @@
         }
       }
     },
+    "/channels/{id}/stats": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "get": {
+        "summary": "Delivery statistics for one channel",
+        "description": "SQL aggregation of delivery_attempts over `window` (Go duration, default 24h). A known channel with no attempts returns zeroes and null timestamps; success_rate is omitted when there are no attempts. Unknown ids are 404.",
+        "parameters": [
+          {
+            "name": "window",
+            "in": "query",
+            "schema": { "type": "string", "default": "24h" },
+            "description": "Positive Go duration such as 24h or 1h. Empty uses 24h. Invalid values are 400."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Channel delivery stats",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ChannelStats" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/channels/{id}/test": {
       "parameters": [
         { "$ref": "#/components/parameters/ID" }
@@ -708,6 +737,25 @@
           },
           "config": { "type": "object" },
           "enabled": { "type": "boolean" }
+        }
+      },
+      "ChannelStats": {
+        "type": "object",
+        "properties": {
+          "channel_id": { "type": "integer", "format": "int64" },
+          "window": { "type": "string", "example": "24h" },
+          "total_attempts": { "type": "integer", "format": "int64" },
+          "successes": { "type": "integer", "format": "int64" },
+          "failures": { "type": "integer", "format": "int64" },
+          "success_rate": {
+            "type": "number",
+            "format": "double",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Omitted when total_attempts is 0"
+          },
+          "last_success": { "type": "string", "format": "date-time", "nullable": true },
+          "last_failure": { "type": "string", "format": "date-time", "nullable": true }
         }
       },
       "ChannelInput": {

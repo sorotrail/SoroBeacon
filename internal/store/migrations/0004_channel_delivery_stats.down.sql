@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS delivery_attempts_channel_attempted_idx;

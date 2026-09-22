@@ -447,6 +447,57 @@ func TestDeliveryAttempts(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound)
 }
 
+func TestChannelDeliveryStats(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+	r := &Rule{MonitorID: m.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, r))
+	live := &Channel{Name: "live", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true}
+	quiet := &Channel{Name: "quiet", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateChannel(ctx, live))
+	require.NoError(t, st.CreateChannel(ctx, quiet))
+	a := &Alert{MonitorID: m.ID, RuleID: r.ID, EventID: "ev-stats"}
+	_, err := st.CreateAlert(ctx, a)
+	require.NoError(t, err)
+
+	empty, err := st.ChannelStats(ctx, quiet.ID, time.Now().Add(-24*time.Hour))
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), empty.TotalAttempts)
+	assert.Equal(t, int64(0), empty.Successes)
+	assert.Equal(t, int64(0), empty.Failures)
+	assert.Nil(t, empty.SuccessRate)
+	assert.Nil(t, empty.LastSuccess)
+	assert.Nil(t, empty.LastFailure)
+
+	_, err = st.ChannelStats(ctx, 99999, time.Now().Add(-24*time.Hour))
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	ok := &DeliveryAttempt{AlertID: a.ID, ChannelID: live.ID, Status: "success"}
+	fail := &DeliveryAttempt{AlertID: a.ID, ChannelID: live.ID, Status: "failed"}
+	old := &DeliveryAttempt{AlertID: a.ID, ChannelID: live.ID, Status: "failed"}
+	require.NoError(t, st.RecordDeliveryAttempt(ctx, ok))
+	require.NoError(t, st.RecordDeliveryAttempt(ctx, fail))
+	require.NoError(t, st.RecordDeliveryAttempt(ctx, old))
+	_, err = st.pool.Exec(ctx, `UPDATE delivery_attempts SET attempted_at = $1 WHERE id = $2`,
+		time.Now().Add(-48*time.Hour), old.ID)
+	require.NoError(t, err)
+
+	got, err := st.ChannelStats(ctx, live.ID, time.Now().Add(-24*time.Hour))
+	require.NoError(t, err)
+	assert.Equal(t, live.ID, got.ChannelID)
+	assert.Equal(t, int64(2), got.TotalAttempts)
+	assert.Equal(t, int64(1), got.Successes)
+	assert.Equal(t, int64(1), got.Failures)
+	require.NotNil(t, got.SuccessRate)
+	assert.InDelta(t, 0.5, *got.SuccessRate, 1e-9)
+	require.NotNil(t, got.LastSuccess)
+	require.NotNil(t, got.LastFailure)
+	assert.True(t, got.LastSuccess.Equal(ok.AttemptedAt) || got.LastSuccess.Equal(ok.AttemptedAt.UTC()))
+}
+
 func TestDeleteExpiredAlertsKeepsRecentAndCascadesAttempts(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

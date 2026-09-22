@@ -8,6 +8,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -694,10 +695,44 @@ func (s *Server) channels(w http.ResponseWriter, r *http.Request) {
 		next = strconv.FormatInt(channels[len(channels)-1].ID, 10)
 	}
 	s.render(w, r, "channels", map[string]any{
-		"Title": "Channels", "Channels": channels, "ChannelTypes": s.factory.Types(),
+		"Title": "Channels", "Channels": s.channelRows(r.Context(), channels), "ChannelTypes": s.factory.Types(),
 		"Empty": empty, "HasMonitors": len(monitors) > 0,
 		"NextCursor": next,
 	})
+}
+
+// channelListRow is one channels-table row plus 24h delivery stats so a
+// failing destination is obvious without expanding individual alerts.
+type channelListRow struct {
+	store.Channel
+	Attempts  int64
+	Successes int64
+	Failures  int64
+	Cue       string // "none", "ok", or "failing"
+}
+
+func (s *Server) channelRows(ctx context.Context, channels []store.Channel) []channelListRow {
+	out := make([]channelListRow, 0, len(channels))
+	since := time.Now().Add(-store.DefaultChannelStatsWindow)
+	for _, c := range channels {
+		row := channelListRow{Channel: c, Cue: "none"}
+		st, err := s.store.ChannelStats(ctx, c.ID, since)
+		if err == nil {
+			row.Attempts = st.TotalAttempts
+			row.Successes = st.Successes
+			row.Failures = st.Failures
+			switch {
+			case st.TotalAttempts == 0:
+				row.Cue = "none"
+			case st.Failures > 0:
+				row.Cue = "failing"
+			default:
+				row.Cue = "ok"
+			}
+		}
+		out = append(out, row)
+	}
+	return out
 }
 
 func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {

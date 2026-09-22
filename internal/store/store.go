@@ -131,6 +131,25 @@ type Stats struct {
 	LastPollAt   time.Time `json:"last_poll_at"`
 }
 
+// DefaultChannelStatsWindow is the GET /channels/{id}/stats window when
+// none is given.
+const DefaultChannelStatsWindow = 24 * time.Hour
+
+// ChannelStats is delivery performance for one channel over a window.
+// SuccessRate is nil when TotalAttempts is 0 — a rate over zero events
+// is meaningless and must not be reported as 0 or 100. LastSuccess and
+// LastFailure stay null (not omitted) when there is no matching attempt.
+type ChannelStats struct {
+	ChannelID     int64      `json:"channel_id"`
+	Window        string     `json:"window"`
+	TotalAttempts int64      `json:"total_attempts"`
+	Successes     int64      `json:"successes"`
+	Failures      int64      `json:"failures"`
+	SuccessRate   *float64   `json:"success_rate,omitempty"`
+	LastSuccess   *time.Time `json:"last_success"`
+	LastFailure   *time.Time `json:"last_failure"`
+}
+
 // Monitors persists monitors and their channel attachments.
 type Monitors interface {
 	CreateMonitor(ctx context.Context, m *Monitor) error
@@ -193,6 +212,11 @@ type Channels interface {
 	DeleteChannel(ctx context.Context, id int64) error
 	// ListChannelsForMonitor returns the enabled channels a monitor alerts to.
 	ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]Channel, error)
+	// ChannelStats aggregates delivery_attempts for one channel with
+	// attempted_at >= since. Unknown channel IDs return ErrNotFound;
+	// a known channel with no attempts in the window returns zeroes
+	// and null timestamps, not 404. Aggregation is SQL, not a Go loop.
+	ChannelStats(ctx context.Context, channelID int64, since time.Time) (ChannelStats, error)
 }
 
 // Alerts persists alerts and delivery attempts.
