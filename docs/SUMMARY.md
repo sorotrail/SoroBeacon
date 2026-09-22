@@ -7,6 +7,7 @@
 * [Quickstart](getting-started/quickstart.md)
 * [Configuration](getting-started/configuration.md)
 * [Environment variable reference](configuration.md)
+* [Deploying with systemd](deployment-systemd.md)
 
 ## 🧭 Guides
 
