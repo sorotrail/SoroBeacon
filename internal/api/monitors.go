@@ -104,6 +104,20 @@ func (s *Server) getMonitor(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, m)
 }
 
+func (s *Server) getMonitorStats(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
+		return
+	}
+	st, err := s.store.GetMonitorStats(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
 func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {

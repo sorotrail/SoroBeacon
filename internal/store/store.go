@@ -160,6 +160,30 @@ type Stats struct {
 	LastPollAt   time.Time `json:"last_poll_at"`
 }
 
+// MonitorStats is the per-monitor snapshot served by GET /monitors/{id}/stats.
+// Counts are always explicit zeroes, never nulls. LastAlertAt is nil when the
+// monitor has never fired so clients can tell "no alerts" from a Unix epoch.
+type MonitorStats struct {
+	Alerts       int64            `json:"alerts"`
+	AlertsLast24 int64            `json:"alerts_last_24h"`
+	AlertsLast7d int64            `json:"alerts_last_7d"`
+	LastAlertAt  *time.Time       `json:"last_alert_at"`
+	Rules        []RuleMatchCount `json:"rules"`
+	Deliveries   DeliveryCounts   `json:"deliveries"`
+}
+
+// RuleMatchCount is how many times one rule on a monitor has fired.
+type RuleMatchCount struct {
+	RuleID  int64 `json:"rule_id"`
+	Matches int64 `json:"matches"`
+}
+
+// DeliveryCounts is success/failure totals for a monitor's delivery attempts.
+type DeliveryCounts struct {
+	Success int64 `json:"success"`
+	Failed  int64 `json:"failed"`
+}
+
 // Monitors persists monitors and their channel attachments.
 type Monitors interface {
 	CreateMonitor(ctx context.Context, m *Monitor) error
@@ -259,6 +283,10 @@ type Store interface {
 	Alerts
 	Ingest
 	GetStats(ctx context.Context) (Stats, error)
+	// GetMonitorStats returns per-monitor alert and delivery counts.
+	// Unknown IDs return ErrNotFound; a monitor with no alerts returns
+	// explicit zeroes rather than nulls.
+	GetMonitorStats(ctx context.Context, id int64) (MonitorStats, error)
 	Ping(ctx context.Context) error
 	Close()
 }

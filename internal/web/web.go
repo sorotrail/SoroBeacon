@@ -658,9 +658,15 @@ func (s *Server) monitorDetail(w http.ResponseWriter, r *http.Request) {
 	for _, cid := range m.ChannelIDs {
 		attached[cid] = true
 	}
+	stats, err := s.store.GetMonitorStats(r.Context(), id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
 	s.render(w, r, "monitor", map[string]any{
 		"Title": m.Name, "Monitor": s.monitorRow(*m, tzFromRequest(r), time.Now()), "Rules": ruleList,
 		"Channels": channels, "Attached": attached, "RuleTypes": s.registry.Types(),
+		"Stats": stats,
 	})
 }
 

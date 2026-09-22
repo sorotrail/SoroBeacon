@@ -13,6 +13,28 @@
 </form>
 <p class="muted">Duplicate copies rules and channel attachments under a new name, created disabled so it cannot alert until reviewed.</p>
 
+<h2>Stats</h2>
+{{if eq .Stats.Alerts 0}}
+<p class="muted">No alerts yet.</p>
+{{else}}
+<div class="stats">
+  <div class="stat"><b>{{.Stats.Alerts}}</b> alerts</div>
+  <div class="stat"><b>{{.Stats.AlertsLast24}}</b> last 24h</div>
+  <div class="stat"><b>{{.Stats.AlertsLast7d}}</b> last 7d</div>
+  <div class="stat"><b>{{.Stats.Deliveries.Success}}</b> deliveries ok</div>
+  <div class="stat"><b>{{.Stats.Deliveries.Failed}}</b> deliveries failed</div>
+</div>
+{{if .Stats.LastAlertAt}}<p class="muted">Last alert: {{formatTime .Stats.LastAlertAt.UTC .Timezone}}</p>{{end}}
+{{if .Stats.Rules}}
+<table>
+  <tr><th>Rule</th><th>Matches</th></tr>
+  {{range .Stats.Rules}}
+  <tr><td>#{{.RuleID}}</td><td>{{.Matches}}</td></tr>
+  {{end}}
+</table>
+{{end}}
+{{end}}
+
 <h2>Rules</h2>
 {{if .Rules}}
 <table>
