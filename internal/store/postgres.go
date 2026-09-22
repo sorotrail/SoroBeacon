@@ -560,6 +560,38 @@ func scanChannel(row pgx.CollectableRow) (Channel, error) {
 	return c, err
 }
 
+func (p *Postgres) ChannelStats(ctx context.Context, channelID int64, since time.Time) (ChannelStats, error) {
+	if _, err := p.GetChannel(ctx, channelID); err != nil {
+		return ChannelStats{}, err
+	}
+	var (
+		out         ChannelStats
+		lastSuccess *time.Time
+		lastFailure *time.Time
+	)
+	err := p.pool.QueryRow(ctx,
+		`SELECT COUNT(*)::bigint,
+		        COUNT(*) FILTER (WHERE status = 'success')::bigint,
+		        COUNT(*) FILTER (WHERE status = 'failed')::bigint,
+		        MAX(attempted_at) FILTER (WHERE status = 'success'),
+		        MAX(attempted_at) FILTER (WHERE status = 'failed')
+		 FROM delivery_attempts
+		 WHERE channel_id = $1 AND attempted_at >= $2`,
+		channelID, since,
+	).Scan(&out.TotalAttempts, &out.Successes, &out.Failures, &lastSuccess, &lastFailure)
+	if err != nil {
+		return ChannelStats{}, err
+	}
+	out.ChannelID = channelID
+	out.LastSuccess = lastSuccess
+	out.LastFailure = lastFailure
+	if out.TotalAttempts > 0 {
+		rate := float64(out.Successes) / float64(out.TotalAttempts)
+		out.SuccessRate = &rate
+	}
+	return out, nil
+}
+
 // --- alerts ---
 
 func (p *Postgres) CreateAlert(ctx context.Context, a *Alert) (bool, error) {

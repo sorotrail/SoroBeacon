@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"slices"
 	"strconv"
@@ -101,6 +102,48 @@ func (s *Server) listChannels(w http.ResponseWriter, r *http.Request) {
 		next = strconv.FormatInt(list[len(list)-1].ID, 10)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"channels": list, "next_cursor": next})
+}
+
+func (s *Server) channelStats(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
+		return
+	}
+	window, err := parseStatsWindow(r.URL.Query().Get("window"))
+	if err != nil {
+		writeValidation(w, r, []FieldError{{Field: "window", Reason: err.Error()}})
+		return
+	}
+	stats, err := s.store.ChannelStats(r.Context(), id, time.Now().Add(-window))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	stats.Window = formatStatsWindow(window)
+	writeJSON(w, http.StatusOK, stats)
+}
+
+func formatStatsWindow(d time.Duration) string {
+	if d%time.Hour == 0 {
+		return strconv.FormatInt(int64(d/time.Hour), 10) + "h"
+	}
+	return d.String()
+}
+
+// parseStatsWindow accepts a positive Go duration (24h, 1h, 30m). Empty
+// means the documented 24h default. Zero, negative, and unparseable
+// values are rejected rather than clamped, so a typo cannot silently
+// widen the window.
+func parseStatsWindow(raw string) (time.Duration, error) {
+	if raw == "" {
+		return store.DefaultChannelStatsWindow, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 0, errors.New("must be a positive Go duration such as 24h or 1h")
+	}
+	return d, nil
 }
 
 func (s *Server) getChannel(w http.ResponseWriter, r *http.Request) {
