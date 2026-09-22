@@ -1606,3 +1606,94 @@ func TestMonitorsTableTruncatesLongContractIDs(t *testing.T) {
 		t.Fatalf("full contract ID should appear twice (title + data-copy), got %d in:\n%s", strings.Count(html, full), html)
 	}
 }
+
+func TestRelTime(t *testing.T) {
+	now := time.Date(2026, 9, 21, 16, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		t    time.Time
+		now  time.Time
+		want string
+	}{
+		{"zero time", time.Time{}, now, ""},
+		{"exactly now", now, now, "just now"},
+		{"under one second", now.Add(-500 * time.Millisecond), now, "just now"},
+		{"one second", now.Add(-1 * time.Second), now, "1s ago"},
+		{"59 seconds (last second bucket)", now.Add(-59 * time.Second), now, "59s ago"},
+		{"one minute (first minute bucket)", now.Add(-time.Minute), now, "1m ago"},
+		{"59 minutes (last minute bucket)", now.Add(-59 * time.Minute), now, "59m ago"},
+		{"one hour (first hour bucket)", now.Add(-time.Hour), now, "1h ago"},
+		{"23 hours (last hour bucket)", now.Add(-23 * time.Hour), now, "23h ago"},
+		{"one day (first day bucket)", now.Add(-24 * time.Hour), now, "1d ago"},
+		{"two days", now.Add(-48 * time.Hour), now, "2d ago"},
+		{"future clock skew", now.Add(5 * time.Second), now, "just now"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := relTime(tt.t, tt.now)
+			if got != tt.want {
+				t.Fatalf("relTime(%v, %v) = %q, want %q", tt.t, tt.now, got, tt.want)
+			}
+		})
+	}
+}
+
+type timestampedPagesStore struct {
+	emptyStore
+	at time.Time
+}
+
+func (s timestampedPagesStore) GetStats(context.Context) (store.Stats, error) {
+	return store.Stats{LastPollAt: s.at}, nil
+}
+func (s timestampedPagesStore) ListAlerts(context.Context, store.AlertFilter) ([]store.Alert, error) {
+	return []store.Alert{{ID: 1, MonitorID: 1, RuleID: 2, EventID: "evt-1", CreatedAt: s.at}}, nil
+}
+func (s timestampedPagesStore) ListMonitors(context.Context, bool) ([]store.Monitor, error) {
+	return []store.Monitor{{ID: 1, Name: "main", CreatedAt: s.at}}, nil
+}
+func (s timestampedPagesStore) ListChannels(context.Context, bool) ([]store.Channel, error) {
+	return []store.Channel{{ID: 3, Name: "ops", Type: "webhook", CreatedAt: s.at}}, nil
+}
+
+// The monitors and channels pages read through the paginated calls since
+// pagination landed; keep both in step so the pages are not rendered empty.
+func (s timestampedPagesStore) ListMonitorsPage(ctx context.Context, _ store.ListFilter) ([]store.Monitor, error) {
+	return s.ListMonitors(ctx, false)
+}
+
+func (s timestampedPagesStore) ListChannelsPage(ctx context.Context, _ store.ListFilter) ([]store.Channel, error) {
+	return s.ListChannels(ctx, false)
+}
+
+func TestPagesShowRelativeTimesNextToAbsolute(t *testing.T) {
+	at := time.Date(2026, 9, 21, 14, 32, 11, 0, time.UTC)
+	s, err := New(timestampedPagesStore{at: at}, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	abs := at.Format("2006-01-02 15:04:05")
+	for _, path := range []string{"/", "/alerts", "/monitors", "/channels"} {
+		t.Run(path, func(t *testing.T) {
+			res, err := http.Get(srv.URL + path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			body, err := io.ReadAll(res.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			html := string(body)
+			if !strings.Contains(html, abs) {
+				t.Fatalf("%s: expected absolute timestamp %q, got:\n%s", path, abs, html)
+			}
+			if !strings.Contains(html, "ago") && !strings.Contains(html, "just now") {
+				t.Fatalf("%s: expected a relative time next to the absolute timestamp, got:\n%s", path, html)
+			}
+		})
+	}
+}

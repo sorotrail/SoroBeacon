@@ -57,6 +57,7 @@ var templateFuncs = template.FuncMap{
 	"formatTime":   formatTime,
 	"decodedEvent": decodedEvent,
 	"truncateID":   truncateID,
+	"relTime":      relTime,
 }
 
 const tsLayout = "2006-01-02 15:04:05"
@@ -77,6 +78,42 @@ func formatTime(t time.Time, tz string) template.HTML {
 		template.HTMLEscapeString(parseTZ(tz)),
 		template.HTMLEscapeString(label),
 	))
+}
+
+// relTime renders a short relative duration ("2m ago") next to an absolute
+// timestamp. now is optional so templates can call {{relTime .CreatedAt}}
+// while tests pass an explicit reference time instead of freezing the clock.
+// Zero times yield an empty string; a timestamp in the future (clock skew)
+// renders as "just now" rather than a negative duration.
+//
+// Rounding: seconds under a minute, minutes under an hour, hours under a
+// day, then whole days.
+func relTime(t time.Time, now ...time.Time) string {
+	ref := time.Now()
+	if len(now) > 0 && !now[0].IsZero() {
+		ref = now[0]
+	}
+	if t.IsZero() {
+		return ""
+	}
+	d := ref.Sub(t)
+	if d < time.Second {
+		return "just now"
+	}
+	switch {
+	case d < time.Minute:
+		n := int(d / time.Second)
+		return fmt.Sprintf("%ds ago", n)
+	case d < time.Hour:
+		n := int(d / time.Minute)
+		return fmt.Sprintf("%dm ago", n)
+	case d < 24*time.Hour:
+		n := int(d / time.Hour)
+		return fmt.Sprintf("%dh ago", n)
+	default:
+		n := int(d / (24 * time.Hour))
+		return fmt.Sprintf("%dd ago", n)
+	}
 }
 
 // prettyJSON indents raw JSON for display. Invalid or empty input falls
@@ -1043,11 +1080,16 @@ func (s *Server) writeDeliveriesFragment(w http.ResponseWriter, r *http.Request,
 				`<button type="button" hx-post="/alerts/%d/deliveries/%d/retry" hx-target="closest div" hx-swap="innerHTML">Retry</button>`,
 				alertID, a.ChannelID)
 		}
+		// formatTime returns escaped markup; relTime is plain text.
+		when := string(formatTime(a.AttemptedAt, tzFromRequest(r)))
+		if rel := relTime(a.AttemptedAt); rel != "" {
+			when += ` <span class="muted">(` + template.HTMLEscapeString(rel) + `)</span>`
+		}
 		fmt.Fprintf(w, `<tr><td>%s</td><td><span class="pill %s">%s</span></td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>`,
 			template.HTMLEscapeString(names[a.ChannelID]),
 			pillClass, template.HTMLEscapeString(a.Status),
 			template.HTMLEscapeString(a.ResponseSnippet),
-			formatTime(a.AttemptedAt, tzFromRequest(r)),
+			when,
 			retry)
 	}
 	fmt.Fprint(w, `</table>`)

@@ -7,7 +7,7 @@
   <div class="stat"><b>{{.Stats.AlertsLast24}}</b> alerts (24h)</div>
   <div class="stat"><b>{{.Stats.LastLedger}}</b> last ledger</div>
 </div>
-<p class="muted">Last poll checkpoint: {{formatTime .Stats.LastPollAt .Timezone}}</p>
+<p class="muted">Last poll checkpoint: {{formatTime .Stats.LastPollAt .Timezone}}{{with relTime .Stats.LastPollAt}} <span class="muted">({{.}})</span>{{end}}</p>
 {{if .Poller}}
 <div class="stats">
   <div class="stat"><b>{{.Poller.Lag}}</b> ledger lag</div>
@@ -55,7 +55,7 @@
     <td>{{index $.MonitorNames .MonitorID}}</td>
     <td>#{{.RuleID}}</td>
     <td>{{template "copyID" .EventID}}</td>
-    <td>{{formatTime .CreatedAt $.Timezone}}</td>
+    <td>{{formatTime .CreatedAt $.Timezone}}{{with relTime .CreatedAt}} <span class="muted">({{.}})</span>{{end}}</td>
   </tr>
   {{end}}
 </table>

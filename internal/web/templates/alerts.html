@@ -35,7 +35,7 @@
         <div class="muted">loading…</div>
       </details>
     </td>
-    <td>{{formatTime .CreatedAt $.Timezone}}</td>
+    <td>{{formatTime .CreatedAt $.Timezone}}{{with relTime .CreatedAt}} <span class="muted">({{.}})</span>{{end}}</td>
   </tr>
   {{end}}
 </table>
