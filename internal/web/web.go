@@ -849,11 +849,47 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err != nil {
-		fmt.Fprintf(w, "❌ %s", template.HTMLEscapeString(err.Error()))
-		return
+	fmt.Fprint(w, testChannelHTML(err))
+}
+
+// testChannelHTML is the htmx fragment swapped into the Send-test result
+// slot. Success and failure reuse the existing .pill.on / .pill.off
+// styling. Provider HTTP statuses are labelled "HTTP N" so an operator
+// can tell a rejection from a network failure. The error text is
+// escaped: notifier errors are already written without channel config,
+// and this must not reintroduce it by treating the message as HTML.
+func testChannelHTML(err error) string {
+	if err == nil {
+		return `<span class="pill on">sent</span>`
 	}
-	fmt.Fprint(w, "✅ sent")
+	if code, detail, ok := providerHTTPStatus(err); ok {
+		if detail == "" {
+			return fmt.Sprintf(`<span class="pill off">failed</span> HTTP %d`, code)
+		}
+		return fmt.Sprintf(`<span class="pill off">failed</span> HTTP %d: %s`, code, template.HTMLEscapeString(detail))
+	}
+	return fmt.Sprintf(`<span class="pill off">failed</span> %s`, template.HTMLEscapeString(err.Error()))
+}
+
+// providerHTTPStatus reports a provider HTTP status embedded in a
+// notifier error (notify.postJSON formats these as "status N: …").
+func providerHTTPStatus(err error) (code int, detail string, ok bool) {
+	msg := err.Error()
+	const needle = "status "
+	idx := strings.Index(msg, needle)
+	if idx < 0 {
+		return 0, "", false
+	}
+	rest := msg[idx+len(needle):]
+	colon := strings.IndexByte(rest, ':')
+	if colon < 0 {
+		return 0, "", false
+	}
+	code, convErr := strconv.Atoi(strings.TrimSpace(rest[:colon]))
+	if convErr != nil || code < 100 || code > 599 {
+		return 0, "", false
+	}
+	return code, strings.TrimSpace(rest[colon+1:]), true
 }
 
 func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {

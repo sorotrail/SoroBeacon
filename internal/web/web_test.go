@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -1605,4 +1606,160 @@ func TestMonitorsTableTruncatesLongContractIDs(t *testing.T) {
 	if strings.Count(html, full) != 2 {
 		t.Fatalf("full contract ID should appear twice (title + data-copy), got %d in:\n%s", strings.Count(html, full), html)
 	}
+}
+
+func TestTestChannelHTML(t *testing.T) {
+	t.Parallel()
+
+	ok := testChannelHTML(nil)
+	if !strings.Contains(ok, `class="pill on"`) {
+		t.Fatalf("success markup missing on-pill: %s", ok)
+	}
+	if strings.Contains(ok, `class="pill off"`) {
+		t.Fatalf("success markup must not use the off-pill: %s", ok)
+	}
+
+	plain := testChannelHTML(fmt.Errorf("connection refused"))
+	if !strings.Contains(plain, `class="pill off"`) {
+		t.Fatalf("failure markup missing off-pill: %s", plain)
+	}
+	if strings.Contains(plain, `class="pill on"`) {
+		t.Fatalf("failure markup must not use the on-pill: %s", plain)
+	}
+	if !strings.Contains(plain, "connection refused") {
+		t.Fatalf("failure markup missing error text: %s", plain)
+	}
+
+	httpErr := testChannelHTML(fmt.Errorf("status 403: provider said no"))
+	if !strings.Contains(httpErr, `class="pill off"`) {
+		t.Fatalf("HTTP failure markup missing off-pill: %s", httpErr)
+	}
+	if !strings.Contains(httpErr, "HTTP 403") {
+		t.Fatalf("HTTP failure must state the status explicitly: %s", httpErr)
+	}
+	if !strings.Contains(httpErr, "provider said no") {
+		t.Fatalf("HTTP failure missing provider body: %s", httpErr)
+	}
+
+	escaped := testChannelHTML(fmt.Errorf(`<script>alert("x")</script>`))
+	if strings.Contains(escaped, `<script>`) {
+		t.Fatalf("error text must be HTML-escaped, got: %s", escaped)
+	}
+	if !strings.Contains(escaped, "&lt;script&gt;") {
+		t.Fatalf("expected escaped script tag, got: %s", escaped)
+	}
+}
+
+type channelGetStore struct {
+	emptyStore
+	ch store.Channel
+}
+
+func (s channelGetStore) GetChannel(_ context.Context, id int64) (*store.Channel, error) {
+	if s.ch.ID != id {
+		return nil, store.ErrNotFound
+	}
+	c := s.ch
+	return &c, nil
+}
+
+func (s channelGetStore) ListChannels(context.Context, bool) ([]store.Channel, error) {
+	return []store.Channel{s.ch}, nil
+}
+
+type stubNotifier struct{ err error }
+
+func (s stubNotifier) Send(context.Context, notify.Alert) error { return s.err }
+
+func newChannelTestServer(t *testing.T, sendErr error) *httptest.Server {
+	t.Helper()
+	f := notify.DefaultFactory()
+	f.Register("stub", func(json.RawMessage) (notify.Notifier, error) {
+		return stubNotifier{err: sendErr}, nil
+	})
+	st := channelGetStore{ch: store.Channel{
+		ID: 1, Name: "ops", Type: "stub", Config: json.RawMessage(`{"webhook_url":"https://secret.example"}`), Enabled: true,
+	}}
+	s, err := New(st, rules.NewRegistry(), f, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return httptest.NewServer(s.Routes())
+}
+
+func TestTestChannelHandler_SuccessAndFailureMarkup(t *testing.T) {
+	t.Parallel()
+
+	okSrv := newChannelTestServer(t, nil)
+	defer okSrv.Close()
+	okBody := postTestChannel(t, okSrv, 1)
+	if !strings.Contains(okBody, `class="pill on"`) || !strings.Contains(okBody, "sent") {
+		t.Fatalf("success fragment: %s", okBody)
+	}
+	if strings.Contains(okBody, "secret.example") {
+		t.Fatalf("must not echo channel config: %s", okBody)
+	}
+
+	failSrv := newChannelTestServer(t, fmt.Errorf("status 502: <upstream>"))
+	defer failSrv.Close()
+	failBody := postTestChannel(t, failSrv, 1)
+	if !strings.Contains(failBody, `class="pill off"`) {
+		t.Fatalf("failure fragment missing off-pill: %s", failBody)
+	}
+	if !strings.Contains(failBody, "HTTP 502") {
+		t.Fatalf("failure fragment missing HTTP status: %s", failBody)
+	}
+	if strings.Contains(failBody, "<upstream>") {
+		t.Fatalf("provider text must be escaped: %s", failBody)
+	}
+	if !strings.Contains(failBody, "&lt;upstream&gt;") {
+		t.Fatalf("expected escaped provider text: %s", failBody)
+	}
+	if strings.Contains(failBody, "secret.example") {
+		t.Fatalf("must not echo channel config: %s", failBody)
+	}
+}
+
+func TestChannelsPage_TestResultIsLiveRegion(t *testing.T) {
+	t.Parallel()
+
+	srv := newChannelTestServer(t, nil)
+	defer srv.Close()
+	res, err := http.Get(srv.URL + "/channels")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	if !strings.Contains(html, `id="test-result-1"`) {
+		t.Fatalf("expected a test-result slot, got:\n%s", html)
+	}
+	idx := strings.Index(html, `id="test-result-1"`)
+	tagStart := strings.LastIndex(html[:idx], "<span")
+	tagEnd := strings.Index(html[tagStart:], ">")
+	tag := html[tagStart : tagStart+tagEnd+1]
+	if !strings.Contains(tag, `aria-live="polite"`) {
+		t.Fatalf("test-result slot must be a live region, tag=%s", tag)
+	}
+}
+
+func postTestChannel(t *testing.T, srv *httptest.Server, id int64) string {
+	t.Helper()
+	res, err := http.Post(fmt.Sprintf("%s/channels/%d/test", srv.URL, id), "application/x-www-form-urlencoded", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("POST /channels/%d/test = %d, want 200", id, res.StatusCode)
+	}
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
 }
