@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -82,6 +83,10 @@ func Load() (Config, error) {
 
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")
+	}
+
+	if err := validateHTTPAddr(cfg.HTTPAddr); err != nil {
+		return cfg, err
 	}
 
 	// An absolute http(s) RPC URL is required whenever one is in play —
@@ -171,6 +176,25 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// validateHTTPAddr checks HTTP_ADDR is a host:port pair with a numeric
+// port in 0–65535. An empty host is valid (:8080 listens on all
+// interfaces). Called from Load so a bad listen address fails before
+// migrations or the poller start.
+func validateHTTPAddr(addr string) error {
+	const form = "must be host:port with a numeric port 0-65535 (e.g. :8080 or 127.0.0.1:8080)"
+	if addr == "" {
+		return fmt.Errorf("invalid HTTP_ADDR %q: %s", addr, form)
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid HTTP_ADDR %q: %s", addr, form)
+	}
+	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+		return fmt.Errorf("invalid HTTP_ADDR %q: %s", addr, form)
+	}
+	return nil
 }
 
 func getenv(key, fallback string) string {

@@ -115,6 +115,64 @@ func TestLoadRejectsInvalidRPCURL(t *testing.T) {
 	}
 }
 
+func TestLoadHTTPAddr(t *testing.T) {
+	tests := []struct {
+		name    string
+		addr    string
+		wantErr bool
+	}{
+		{name: "all interfaces", addr: ":8080"},
+		{name: "loopback", addr: "127.0.0.1:8080"},
+		{name: "wildcard ipv4", addr: "0.0.0.0:9090"},
+		{name: "missing colon", addr: "8080", wantErr: true},
+		{name: "non-numeric port", addr: ":abc", wantErr: true},
+		{name: "port out of range", addr: ":99999", wantErr: true},
+		{name: "empty", addr: "", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateHTTPAddr(tt.addr)
+			if !tt.wantErr {
+				require.NoError(t, err)
+				return
+			}
+			assert.ErrorContains(t, err, "HTTP_ADDR")
+			assert.ErrorContains(t, err, tt.addr)
+			assert.ErrorContains(t, err, "host:port")
+		})
+	}
+}
+
+func TestLoadAcceptsValidHTTPAddr(t *testing.T) {
+	for _, addr := range []string{":8080", "127.0.0.1:8080", "0.0.0.0:9090"} {
+		t.Run(addr, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://x")
+			t.Setenv("HTTP_ADDR", addr)
+
+			cfg, err := Load()
+
+			require.NoError(t, err)
+			assert.Equal(t, addr, cfg.HTTPAddr)
+		})
+	}
+}
+
+func TestLoadRejectsInvalidHTTPAddr(t *testing.T) {
+	for _, addr := range []string{"8080", ":abc", ":99999"} {
+		t.Run(addr, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://x")
+			t.Setenv("HTTP_ADDR", addr)
+
+			_, err := Load()
+
+			assert.ErrorContains(t, err, "HTTP_ADDR")
+			assert.ErrorContains(t, err, addr)
+			assert.ErrorContains(t, err, "host:port")
+		})
+	}
+}
+
 func TestLoadRejectsBadValues(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://x")
 
