@@ -82,6 +82,11 @@ func (s *Server) Routes() chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Use(RateLimitMiddleware(s.rateLimit))
+	// JSON clients hitting a typo'd path or the wrong method should get
+	// the same envelope as every other API error, not chi's plain-text
+	// 404/405. The dashboard mux is a different router and is untouched.
+	r.NotFound(s.notFound)
+	r.MethodNotAllowed(s.methodNotAllowed)
 
 	r.Route("/monitors", func(r chi.Router) {
 		r.Post("/", s.createMonitor)
@@ -255,6 +260,46 @@ func joinPath(prefix, field string) string {
 	default:
 		return prefix + "." + field
 	}
+}
+
+func (s *Server) notFound(w http.ResponseWriter, r *http.Request) {
+	writeErr(w, r, http.StatusNotFound, "not found")
+}
+
+func (s *Server) methodNotAllowed(w http.ResponseWriter, r *http.Request) {
+	// Chi's custom MethodNotAllowed handler replaces the default, which
+	// is what would have set Allow. Ask the router which methods this
+	// path actually accepts instead of hardcoding a list.
+	if allow := allowHeader(r); allow != "" {
+		w.Header().Set("Allow", allow)
+	}
+	writeErr(w, r, http.StatusMethodNotAllowed, "method not allowed")
+}
+
+func allowHeader(r *http.Request) string {
+	rctx := chi.RouteContext(r.Context())
+	if rctx == nil || rctx.Routes == nil {
+		return ""
+	}
+	path := rctx.RoutePath
+	if path == "" {
+		if r.URL.RawPath != "" {
+			path = r.URL.RawPath
+		} else {
+			path = r.URL.Path
+		}
+	}
+	candidates := []string{
+		http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+		http.MethodPatch, http.MethodDelete, http.MethodOptions,
+	}
+	var allow []string
+	for _, m := range candidates {
+		if rctx.Routes.Match(chi.NewRouteContext(), m, path) {
+			allow = append(allow, m)
+		}
+	}
+	return strings.Join(allow, ", ")
 }
 
 // fail maps store errors to HTTP responses.
