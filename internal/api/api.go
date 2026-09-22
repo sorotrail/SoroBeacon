@@ -37,6 +37,10 @@ type PositionReader interface {
 	Position() poller.Position
 }
 
+// DefaultMaxBodyBytes is 1 MiB, matching config.DefaultHTTPMaxBodyBytes.
+// Used when New is not followed by WithMaxBodyBytes.
+const DefaultMaxBodyBytes int64 = 1 << 20
+
 type Server struct {
 	store              store.Store
 	registry           *rules.Registry
@@ -46,11 +50,22 @@ type Server struct {
 	poller             PositionReader
 	readyzLagThreshold uint32
 	rateLimit          RateLimitConfig
+	maxBodyBytes       int64
 }
 
 // New wires an API server. Rate limiting stays off until WithRateLimit.
 func New(st store.Store, reg *rules.Registry, f *notify.Factory, rpc HealthChecker, log *slog.Logger) *Server {
-	return &Server{store: st, registry: reg, factory: f, rpc: rpc, log: log}
+	return &Server{store: st, registry: reg, factory: f, rpc: rpc, log: log, maxBodyBytes: DefaultMaxBodyBytes}
+}
+
+// WithMaxBodyBytes sets the write-endpoint body limit applied by
+// MaxBodyMiddleware. Non-positive values are ignored so a miswired
+// caller cannot disable the cap.
+func (s *Server) WithMaxBodyBytes(n int64) *Server {
+	if n > 0 {
+		s.maxBodyBytes = n
+	}
+	return s
 }
 
 // WithPoller attaches the ingest-position source used by /health and /readyz.
@@ -80,7 +95,7 @@ func (s *Server) WithRateLimit(cfg RateLimitConfig) *Server {
 // the API is not exposed to untrusted networks.
 func (s *Server) Routes() chi.Router {
 	r := chi.NewRouter()
-	r.Use(middleware.Recoverer)
+	r.Use(middleware.Recoverer, MaxBodyMiddleware(s.maxBodyBytes))
 	r.Use(RateLimitMiddleware(s.rateLimit))
 	// JSON clients hitting a typo'd path or the wrong method should get
 	// the same envelope as every other API error, not chi's plain-text
@@ -322,7 +337,12 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(v); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeErr(w, r, http.StatusRequestEntityTooLarge, "request body too large")
+			return false
+		}
 		writeErr(w, r, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return false
 	}

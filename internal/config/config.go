@@ -18,6 +18,10 @@ const (
 	DefaultRPCURL       = "https://soroban-testnet.stellar.org"
 	DefaultPollInterval = 5 * time.Second
 	DefaultHTTPAddr     = ":8080"
+	// DefaultHTTPMaxBodyBytes is 1 MiB. Rule params are nested JSON and
+	// channel configs are small; 1 MiB is well above any legitimate write
+	// payload while bounding unauthenticated POSTs on a small instance.
+	DefaultHTTPMaxBodyBytes int64 = 1 << 20
 )
 
 // Config holds all runtime configuration. Every field maps to one
@@ -47,6 +51,11 @@ type Config struct {
 	CORSAllowedOrigins []string
 	// HTTPAddr is the listen address for the API and dashboard.
 	HTTPAddr string
+	// HTTPMaxBodyBytes is the maximum request body size accepted by API
+	// write endpoints (HTTP_MAX_BODY_BYTES). GET/HEAD/OPTIONS are not
+	// limited. Zero is not a valid configured value; Load always sets a
+	// positive default.
+	HTTPMaxBodyBytes int64
 	// LogLevel is the minimum slog level (debug, info, warn, error).
 	LogLevel slog.Level
 	// ReadyzLagThreshold is the ledger lag at which /readyz fails.
@@ -73,12 +82,13 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		Network:      net,
-		RPCURL:       net.RPCURL,
-		DatabaseURL:  os.Getenv("DATABASE_URL"),
-		PollInterval: DefaultPollInterval,
-		HTTPAddr:     getenv("HTTP_ADDR", DefaultHTTPAddr),
-		LogLevel:     slog.LevelInfo,
+		Network:          net,
+		RPCURL:           net.RPCURL,
+		DatabaseURL:      os.Getenv("DATABASE_URL"),
+		PollInterval:     DefaultPollInterval,
+		HTTPAddr:         getenv("HTTP_ADDR", DefaultHTTPAddr),
+		HTTPMaxBodyBytes: DefaultHTTPMaxBodyBytes,
+		LogLevel:         slog.LevelInfo,
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -127,6 +137,14 @@ func Load() (Config, error) {
 				cfg.CORSAllowedOrigins = append(cfg.CORSAllowedOrigins, o)
 			}
 		}
+	}
+
+	if v := os.Getenv("HTTP_MAX_BODY_BYTES"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			return cfg, fmt.Errorf("invalid HTTP_MAX_BODY_BYTES %q: must be a positive integer (bytes)", v)
+		}
+		cfg.HTTPMaxBodyBytes = n
 	}
 
 	if v := os.Getenv("LOG_LEVEL"); v != "" {

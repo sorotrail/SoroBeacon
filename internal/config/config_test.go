@@ -31,6 +31,7 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Equal(t, DefaultRPCURL, cfg.Network.RPCURL)
 	assert.Equal(t, DefaultPollInterval, cfg.PollInterval)
 	assert.Equal(t, DefaultHTTPAddr, cfg.HTTPAddr)
+	assert.Equal(t, DefaultHTTPMaxBodyBytes, cfg.HTTPMaxBodyBytes)
 	assert.Equal(t, slog.LevelInfo, cfg.LogLevel)
 	assert.Equal(t, uint32(0), cfg.ReadyzLagThreshold)
 	assert.Equal(t, 0.0, cfg.RateLimitRPS)
@@ -61,6 +62,7 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("RPC_URL", "https://mainnet.example")
 	t.Setenv("POLL_INTERVAL", "30s")
 	t.Setenv("HTTP_ADDR", ":9999")
+	t.Setenv("HTTP_MAX_BODY_BYTES", "4096")
 	t.Setenv("LOG_LEVEL", "debug")
 	t.Setenv("SOURCE_MODE", "sorotrail")
 	t.Setenv("SOROTRAIL_URL", "http://indexer.example")
@@ -72,6 +74,7 @@ func TestLoadOverrides(t *testing.T) {
 	assert.Equal(t, "https://mainnet.example", cfg.RPCURL)
 	assert.Equal(t, 30*time.Second, cfg.PollInterval)
 	assert.Equal(t, ":9999", cfg.HTTPAddr)
+	assert.Equal(t, int64(4096), cfg.HTTPMaxBodyBytes)
 	assert.Equal(t, slog.LevelDebug, cfg.LogLevel)
 	assert.Equal(t, "sorotrail", cfg.SourceMode)
 	assert.Equal(t, "http://indexer.example", cfg.SoroTrailURL)
@@ -226,6 +229,13 @@ func TestLoadRejectsBadValues(t *testing.T) {
 	t.Setenv("SOURCE_MODE", "kafka")
 	_, err = Load()
 	assert.ErrorContains(t, err, "SOURCE_MODE")
+	t.Setenv("HTTP_MAX_BODY_BYTES", "nope")
+	_, err = Load()
+	assert.ErrorContains(t, err, "HTTP_MAX_BODY_BYTES")
+
+	t.Setenv("HTTP_MAX_BODY_BYTES", "0")
+	_, err = Load()
+	assert.ErrorContains(t, err, "HTTP_MAX_BODY_BYTES")
 }
 
 func TestLoadRateLimit(t *testing.T) {
