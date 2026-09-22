@@ -5,11 +5,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// PoolSettings tunes the pgx connection pool. A zero value in any field
+// leaves the corresponding pgx default in place so deployments that do
+// not set the env vars keep the same behaviour as before.
+type PoolSettings struct {
+	MaxConns        int32
+	MinConns        int32
+	MaxConnLifetime time.Duration
+	MaxConnIdleTime time.Duration
+}
 
 // Postgres implements Store on top of a pgx connection pool.
 type Postgres struct {
@@ -19,9 +30,14 @@ type Postgres struct {
 var _ Store = (*Postgres)(nil)
 
 // NewPostgres connects to databaseURL and verifies the connection.
-// Call Migrate before using the store on a fresh database.
-func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
+// Call Migrate before using the store on a fresh database. Pass a zero
+// PoolSettings to keep pgx's own pool defaults.
+func NewPostgres(ctx context.Context, databaseURL string, settings PoolSettings) (*Postgres, error) {
+	cfg, err := buildPoolConfig(databaseURL, settings)
+	if err != nil {
+		return nil, fmt.Errorf("connect postgres: %w", err)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
@@ -30,6 +46,29 @@ func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
 	return &Postgres{pool: pool}, nil
+}
+
+// buildPoolConfig parses databaseURL and overlays any non-zero pool
+// settings. Zero means "leave the pgx default" so unset env vars do
+// not change MaxConns / MinConns / lifetimes.
+func buildPoolConfig(databaseURL string, settings PoolSettings) (*pgxpool.Config, error) {
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	if settings.MaxConns > 0 {
+		cfg.MaxConns = settings.MaxConns
+	}
+	if settings.MinConns > 0 {
+		cfg.MinConns = settings.MinConns
+	}
+	if settings.MaxConnLifetime > 0 {
+		cfg.MaxConnLifetime = settings.MaxConnLifetime
+	}
+	if settings.MaxConnIdleTime > 0 {
+		cfg.MaxConnIdleTime = settings.MaxConnIdleTime
+	}
+	return cfg, nil
 }
 
 func (p *Postgres) Ping(ctx context.Context) error { return p.pool.Ping(ctx) }
