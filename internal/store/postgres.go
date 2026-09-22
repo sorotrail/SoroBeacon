@@ -398,6 +398,27 @@ func (p *Postgres) CreateRule(ctx context.Context, r *Rule) error {
 	).Scan(&r.ID))
 }
 
+func (p *Postgres) CreateRules(ctx context.Context, rules []*Rule) error {
+	if len(rules) == 0 {
+		return nil
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	for _, r := range rules {
+		if err := tx.QueryRow(ctx,
+			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES ($1, $2, $3, $4) RETURNING id`,
+			r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled,
+		).Scan(&r.ID); err != nil {
+			return mapErr(err)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
 func (p *Postgres) GetRule(ctx context.Context, id int64) (*Rule, error) {
 	var r Rule
 	err := p.pool.QueryRow(ctx,

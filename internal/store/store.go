@@ -177,6 +177,9 @@ func CopyMonitorName(src string, existing []string) string {
 // Rules persists rules.
 type Rules interface {
 	CreateRule(ctx context.Context, r *Rule) error
+	// CreateRules inserts the batch in one transaction and fills each
+	// rule's ID in request order. An empty slice is a no-op.
+	CreateRules(ctx context.Context, rules []*Rule) error
 	GetRule(ctx context.Context, id int64) (*Rule, error)
 	ListRules(ctx context.Context, monitorID int64, enabledOnly bool) ([]Rule, error)
 	UpdateRule(ctx context.Context, r *Rule) error

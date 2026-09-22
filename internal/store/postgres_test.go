@@ -252,6 +252,42 @@ func TestRuleCRUDAndCascade(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound)
 }
 
+func TestCreateRules_Atomic(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+
+	ok := []*Rule{
+		{MonitorID: m.ID, Type: "event_emitted", Params: json.RawMessage(`{"event_name":"transfer"}`), Enabled: true},
+		{MonitorID: m.ID, Type: "token_event", Params: json.RawMessage(`{"event":"mint"}`), Enabled: false},
+	}
+	require.NoError(t, st.CreateRules(ctx, ok))
+	require.NotZero(t, ok[0].ID)
+	require.NotZero(t, ok[1].ID)
+	require.Greater(t, ok[1].ID, ok[0].ID)
+
+	list, err := st.ListRules(ctx, m.ID, false)
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	assert.Equal(t, ok[0].ID, list[0].ID)
+	assert.Equal(t, ok[1].ID, list[1].ID)
+
+	// A later row that fails the monitor FK must not leave the first row of
+	// this batch in the table — the insert is one transaction.
+	bad := []*Rule{
+		{MonitorID: m.ID, Type: "event_emitted", Params: json.RawMessage(`{"event_name":"burn"}`), Enabled: true},
+		{MonitorID: m.ID + 999, Type: "event_emitted", Params: json.RawMessage(`{"event_name":"clawback"}`), Enabled: true},
+	}
+	err = st.CreateRules(ctx, bad)
+	require.Error(t, err)
+
+	list, err = st.ListRules(ctx, m.ID, false)
+	require.NoError(t, err)
+	require.Len(t, list, 2, "failed batch must not insert a prefix of the rules")
+}
+
 func TestChannelsAndAttachments(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

@@ -114,6 +114,7 @@ func (s *Server) Routes() chi.Router {
 			r.Post("/duplicate", s.duplicateMonitor)
 			r.Post("/rules", s.createRule)
 			r.Get("/rules", s.listRules)
+			r.Post("/rules/bulk", s.createRulesBulk)
 			r.Patch("/rules/{ruleID}", s.updateRule)
 			r.Delete("/rules/{ruleID}", s.deleteRule)
 		})
