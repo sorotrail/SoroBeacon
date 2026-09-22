@@ -5,9 +5,13 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 )
 
@@ -39,6 +43,33 @@ func TestLogStartupHealth_Healthy(t *testing.T) {
 	}
 	if strings.Contains(out, "level=WARN") {
 		t.Fatalf("healthy source must not log a warning, got: %s", out)
+	}
+}
+
+func TestGracefulShutdownBoundsExit(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	d := notify.NewDispatcher(nil, notify.DefaultFactory(), slog.New(slog.DiscardHandler))
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	start := time.Now()
+	if err := gracefulShutdown(time.Second, log, d, srv); err != nil {
+		t.Fatalf("gracefulShutdown: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("shutdown took %s, want bounded by grace period", elapsed)
+	}
+	if !strings.Contains(buf.String(), "shutdown drain") {
+		t.Fatalf("expected shutdown drain log, got: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "abandoned_deliveries=0") {
+		t.Fatalf("expected abandoned_deliveries count, got: %s", buf.String())
 	}
 }
 

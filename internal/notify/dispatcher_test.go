@@ -173,3 +173,125 @@ func TestDispatchBadConfigRecordsFailure(t *testing.T) {
 	assert.Equal(t, "failed", st.attempts[0].Status)
 	assert.Contains(t, st.attempts[0].ResponseSnippet, "unknown channel type")
 }
+
+// slowNotifier blocks until delay, then succeeds. Respects ctx.
+type slowNotifier struct {
+	started chan struct{}
+	delay   time.Duration
+	calls   int
+}
+
+func (s *slowNotifier) Send(ctx context.Context, _ Alert) error {
+	s.calls++
+	if s.started != nil {
+		select {
+		case <-s.started:
+		default:
+			close(s.started)
+		}
+	}
+	timer := time.NewTimer(s.delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// hungNotifier never returns unless unblock is closed. Ignores ctx, like
+// a webhook client that does not honor cancellation.
+type hungNotifier struct {
+	started chan struct{}
+	unblock chan struct{}
+	calls   int
+}
+
+func (h *hungNotifier) Send(_ context.Context, _ Alert) error {
+	h.calls++
+	if h.started != nil {
+		select {
+		case <-h.started:
+		default:
+			close(h.started)
+		}
+	}
+	<-h.unblock
+	return nil
+}
+
+func TestDispatchSkippedWhenCallerCancelled(t *testing.T) {
+	st := &fakeDispatchStore{channels: []store.Channel{mockChannel(1)}}
+	n := &mockNotifier{}
+	d := newTestDispatcher(t, st, n)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	d.Dispatch(ctx, Alert{ID: 30, MonitorID: 2})
+
+	assert.Equal(t, 0, n.calls, "cancelled poller context must not start new deliveries")
+	assert.Empty(t, st.attempts)
+}
+
+func TestDrainWaitsForInFlightSend(t *testing.T) {
+	st := &fakeDispatchStore{channels: []store.Channel{mockChannel(1)}}
+	n := &slowNotifier{started: make(chan struct{}), delay: 80 * time.Millisecond}
+	d := newTestDispatcher(t, st, n)
+
+	go d.Dispatch(context.Background(), Alert{ID: 31, MonitorID: 2})
+	<-n.started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	abandoned := d.Drain(ctx)
+
+	assert.Equal(t, 0, abandoned)
+	require.Len(t, st.attempts, 1)
+	assert.Equal(t, "success", st.attempts[0].Status)
+}
+
+func TestDrainAbandonsHungSend(t *testing.T) {
+	st := &fakeDispatchStore{channels: []store.Channel{mockChannel(1)}}
+	n := &hungNotifier{started: make(chan struct{}), unblock: make(chan struct{})}
+	d := newTestDispatcher(t, st, n)
+
+	go d.Dispatch(context.Background(), Alert{ID: 32, MonitorID: 2})
+	<-n.started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	abandoned := d.Drain(ctx)
+	elapsed := time.Since(start)
+
+	assert.Equal(t, 1, abandoned)
+	assert.Less(t, elapsed, time.Second, "hung send must not block past the grace period")
+	require.NotEmpty(t, st.attempts)
+	assert.Equal(t, "failed", st.attempts[len(st.attempts)-1].Status)
+	assert.Equal(t, abandonedSnippet, st.attempts[len(st.attempts)-1].ResponseSnippet)
+	close(n.unblock)
+}
+
+func TestDrainAbandonsWhenSnippetMissingFails(t *testing.T) {
+	// Guard: temporarily dropping abandonedSnippet from the recorded
+	// attempt must fail this assertion. The real record path writes it.
+	st := &fakeDispatchStore{channels: []store.Channel{mockChannel(1)}}
+	n := &hungNotifier{started: make(chan struct{}), unblock: make(chan struct{})}
+	d := newTestDispatcher(t, st, n)
+	go d.Dispatch(context.Background(), Alert{ID: 33, MonitorID: 2})
+	<-n.started
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_ = d.Drain(ctx)
+	found := false
+	for _, a := range st.attempts {
+		if a.ResponseSnippet == abandonedSnippet {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("pending work at shutdown must be persisted as retryable (abandoned at shutdown)")
+	}
+	close(n.unblock)
+}
