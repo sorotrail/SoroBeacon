@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -40,7 +41,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	levelVar := new(slog.LevelVar)
+	levelVar.Set(cfg.LogLevel)
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: levelVar}))
 	slog.SetDefault(log)
 	log.LogAttrs(context.Background(), slog.LevelInfo, "configuration loaded", cfg.LogAttrs()...)
 
@@ -152,6 +155,11 @@ func run() error {
 		go store.RunAlertPruner(ctx, st, cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, log)
 	}
 
+	live := &liveConfig{cfg: cfg, level: levelVar, poller: p, log: log}
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go watchSIGHUP(ctx, hup, live)
+
 	select {
 	case <-ctx.Done():
 		log.Info("shutting down")
@@ -175,6 +183,55 @@ const startupHealthTimeout = 5 * time.Second
 // the first poll failure. It never fails startup: the poller already
 // retries with backoff, so an unhealthy source at boot is logged as a
 // warning and left to recover on its own.
+// liveConfig is the process's current configuration. SIGHUP reloads log
+// level and poll interval through it; a mutex keeps Reload from racing
+// the next SIGHUP.
+type liveConfig struct {
+	mu     sync.Mutex
+	cfg    config.Config
+	level  *slog.LevelVar
+	poller *poller.Poller
+	log    *slog.Logger
+}
+
+func watchSIGHUP(ctx context.Context, hup <-chan os.Signal, live *liveConfig) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-hup:
+			applySIGHUP(live)
+		}
+	}
+}
+
+func applySIGHUP(live *liveConfig) {
+	live.mu.Lock()
+	defer live.mu.Unlock()
+	next, result, err := config.Reload(live.cfg)
+	if err != nil {
+		live.log.Error("configuration reload rejected", "error", err)
+		return
+	}
+	live.cfg = next
+	live.level.Set(next.LogLevel)
+	live.poller.SetInterval(next.PollInterval)
+	logReload(live.log, result)
+}
+
+func logReload(log *slog.Logger, result config.ReloadResult) {
+	if len(result.Applied) == 0 && len(result.Skipped) == 0 {
+		log.Info("configuration reload", "status", "unchanged")
+		return
+	}
+	for _, c := range result.Applied {
+		log.Info("configuration reloaded", "setting", c.Name, "from", c.From, "to", c.To)
+	}
+	for _, s := range result.Skipped {
+		log.Info("configuration reload skipped", "setting", s.Name, "reason", s.Reason, "from", s.From, "to", s.To)
+	}
+}
+
 func logStartupHealth(ctx context.Context, log *slog.Logger, health api.HealthChecker) {
 	ctx, cancel := context.WithTimeout(ctx, startupHealthTimeout)
 	defer cancel()

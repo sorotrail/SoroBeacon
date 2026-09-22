@@ -14,11 +14,10 @@ All configuration comes from environment variables. `.env.example` in the repo i
 | `DATABASE_MIN_CONNS` | pgx default | Minimum connections in the pool. `0` or unset leaves the driver default. Rejected when greater than `DATABASE_MAX_CONNS` if both are set. |
 | `DATABASE_MAX_CONN_LIFETIME` | pgx default | How long a connection may be reused. Go duration (`1h`, `30m`). `0` or unset leaves the driver default. |
 | `DATABASE_MAX_CONN_IDLE_TIME` | pgx default | How long an idle connection is kept. Go duration. `0` or unset leaves the driver default. |
-| `POLL_INTERVAL` | `5s` | How often the poller calls `getEvents`. Minimum `1s`. |
-| `HTTP_ADDR` | `:8080` | Listen address (`host:port`) for the API and dashboard. Empty host means all interfaces. Validated at load. |
+| `POLL_INTERVAL` | `5s` | How often the poller calls `getEvents`. Minimum `1s`. Reloadable on SIGHUP. |
+| `HTTP_ADDR` | `:8080` | Listen address (`host:port`) for the API and dashboard. Empty host means all interfaces. Validated at load. Not reloadable. |
 | `MONITOR_SILENT_AFTER` | `24h` | How long since `last_matched_at` (event ledger close time) before the monitors list marks a monitor silent. |
-| `HTTP_ADDR` | `:8080` | Listen address for the API and dashboard. |
-| `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` (structured JSON via `log/slog`). |
+| `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` (structured JSON via `log/slog`). Reloadable on SIGHUP. |
 | `READYZ_LAG_THRESHOLD` | `0` (disabled) | Fail `/readyz` when poller ledger lag (chain tip minus last processed ledger) exceeds this. Unset or `0` leaves existing probes unchanged. |
 | `ALERT_RETENTION` | unset (keep forever) | Age after which alerts are deleted in batches of 1000 (`90d`, `24h`, …). `delivery_attempts` follow via `ON DELETE CASCADE`. Unset preserves current behaviour: nothing is pruned. |
 
@@ -29,6 +28,19 @@ Channel secrets — webhook URLs, bot tokens, SMTP credentials — are stored in
 {% hint style="warning" %}
 The MVP has **no API authentication** and stores channel secrets **unencrypted** in the database. Run SoroBeacon on a trusted network (or behind an authenticating reverse proxy) and restrict database access. Both hardening items are open contributor issues with designed-in extension points.
 {% endhint %}
+
+## Reloading at runtime (SIGHUP)
+
+Send `SIGHUP` to the process to re-read the environment without dropping in-flight work or resetting the poller's position.
+
+Reloadable settings (an explicit list):
+
+* `LOG_LEVEL`
+* `POLL_INTERVAL` (still bounded by the 1s minimum)
+
+Everything else — `DATABASE_URL`, `HTTP_ADDR`, `SOURCE_MODE`, network/RPC, CORS, body size, rate limits, alert retention — is **not** reloadable. If those values changed, the reload logs them as skipped rather than silently ignoring the edit. Apply them with a restart.
+
+An invalid environment (unknown log level, `POLL_INTERVAL` below 1s, missing `DATABASE_URL`, …) is rejected wholesale: the previous configuration stays in effect, so a bad SIGHUP cannot leave the process half-configured. The reload logs each applied setting as old value → new value. Secrets (database userinfo) are never included.
 
 ## Behavior under errors
 
