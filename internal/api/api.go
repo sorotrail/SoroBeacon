@@ -176,6 +176,7 @@ func effectivePageLimit(limit int) int {
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
@@ -186,6 +187,14 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 type FieldError struct {
 	Field  string `json:"field"`
 	Reason string `json:"reason"`
+}
+
+// writeNoContent ends a successful DELETE (and similar) with 204 and the
+// same no-store directive as JSON bodies, so a proxy cannot reuse the
+// pre-delete listing that used to live at this URL.
+func writeNoContent(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // writeErr emits the structured error envelope. The top-level "error"

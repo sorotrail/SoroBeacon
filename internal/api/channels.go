@@ -170,7 +170,7 @@ func (s *Server) deleteChannel(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeNoContent(w)
 }
 
 // testChannel sends a synthetic alert through a channel so users can verify

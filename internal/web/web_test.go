@@ -878,6 +878,9 @@ func TestFavicon(t *testing.T) {
 	if ct := res.Header.Get("Content-Type"); ct != "image/svg+xml" {
 		t.Fatalf("Content-Type = %q, want image/svg+xml", ct)
 	}
+	if cc := res.Header.Get("Cache-Control"); cc != "public, max-age=604800" {
+		t.Fatalf("Cache-Control = %q, want public, max-age=604800", cc)
+	}
 }
 
 func TestEmptyKind(t *testing.T) {

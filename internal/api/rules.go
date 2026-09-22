@@ -130,7 +130,7 @@ func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeNoContent(w)
 }
 
 // ruleFromPath loads the rule at /monitors/{id}/rules/{ruleID}, verifying

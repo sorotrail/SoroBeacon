@@ -215,7 +215,7 @@ func (s *Server) deleteMonitor(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeNoContent(w)
 }
 
 func (s *Server) duplicateMonitor(w http.ResponseWriter, r *http.Request) {
