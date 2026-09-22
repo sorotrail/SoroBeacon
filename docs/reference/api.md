@@ -53,6 +53,7 @@ Config shapes per type: [Discord](../channels/discord.md) · [Slack](../channels
 | Method & path | Description |
 | --- | --- |
 | `GET /alerts` | History. Query: `monitor_id`, `rule_id`, `contract_id` (matches `payload.contract_id`), `from`/`to` (RFC 3339), `sort` (`created_at_desc` default, `created_at_asc`; anything else is 400), `limit` (≤500, default 50), `cursor` (keyset: pass the previous response's `next_cursor`; comparison follows `sort`). |
+| `GET /alerts.csv` | Same filters as `GET /alerts`. CSV columns: `id`, `monitor_id`, `rule_id`, `event_id`, `created_at`, `payload`. Channel config is never included. |
 | `GET /alerts/{id}/deliveries` | Delivery attempts for one alert. `?status=success` or `?status=failed` filters in SQL; omit for all. Unknown values are `400`. |
 
 ```sh
