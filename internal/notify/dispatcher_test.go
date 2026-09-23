@@ -34,6 +34,10 @@ func (m *mockNotifier) Send(_ context.Context, a Alert) error {
 type fakeDispatchStore struct {
 	channels []store.Channel
 	attempts []store.DeliveryAttempt
+	// window, when set, is returned by ActiveMaintenanceWindow.
+	window *store.MaintenanceWindow
+	// suppressed records the alert ID and reason of each suppression.
+	suppressed []string
 }
 
 func (f *fakeDispatchStore) ListChannelsForMonitor(_ context.Context, _ int64) ([]store.Channel, error) {
@@ -42,6 +46,15 @@ func (f *fakeDispatchStore) ListChannelsForMonitor(_ context.Context, _ int64) (
 
 func (f *fakeDispatchStore) RecordDeliveryAttempt(_ context.Context, d *store.DeliveryAttempt) error {
 	f.attempts = append(f.attempts, *d)
+	return nil
+}
+
+func (f *fakeDispatchStore) ActiveMaintenanceWindow(_ context.Context, _ int64, _ string, _ time.Time) (*store.MaintenanceWindow, error) {
+	return f.window, nil
+}
+
+func (f *fakeDispatchStore) SetAlertSuppressed(_ context.Context, _ int64, reason string) error {
+	f.suppressed = append(f.suppressed, reason)
 	return nil
 }
 
@@ -159,6 +172,21 @@ func TestGateRetry(t *testing.T) {
 	assert.ErrorIs(t, GateRetry([]store.DeliveryAttempt{other}, 3, ch, now, DefaultRetryCooldown), ErrNoAttempt)
 	assert.ErrorIs(t, GateRetry([]store.DeliveryAttempt{recent}, 3, ch, now, DefaultRetryCooldown), ErrRetryCooldown)
 	assert.NoError(t, GateRetry([]store.DeliveryAttempt{recent}, 3, ch, now, 0), "zero cooldown disables the bound")
+}
+
+func TestDispatchSuppressedByMaintenanceWindow(t *testing.T) {
+	st := &fakeDispatchStore{
+		channels: []store.Channel{mockChannel(1)},
+		window:   &store.MaintenanceWindow{ID: 9, Reason: "upgrade", Scope: store.MaintenanceScopeGlobal},
+	}
+	n := &mockNotifier{}
+	d := newTestDispatcher(t, st, n)
+
+	d.Dispatch(context.Background(), Alert{ID: 15, MonitorID: 2})
+
+	assert.Equal(t, 0, n.calls, "a suppressed alert must not be delivered")
+	assert.Empty(t, st.attempts, "no delivery attempt should be recorded")
+	require.Equal(t, []string{"upgrade"}, st.suppressed, "the alert is marked with the window reason")
 }
 
 func TestDispatchBadConfigRecordsFailure(t *testing.T) {

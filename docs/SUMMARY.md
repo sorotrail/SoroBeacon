@@ -11,6 +11,7 @@
 ## 🧭 Guides
 
 * [Monitors & alerts](guides/monitors-and-alerts.md)
+* [Maintenance windows](guides/maintenance-windows.md)
 * [The dashboard](guides/dashboard.md)
 
 ## 📏 Rule reference
@@ -18,12 +19,15 @@
 * [event\_emitted](rules/event-emitted.md)
 * [value\_threshold](rules/value-threshold.md)
 * [token\_event](rules/token-event.md)
+* [self\_transfer](rules/self-transfer.md)
+* [time\_window](rules/time-window.md)
 
 ## 📣 Channel reference
 
 * [Discord](channels/discord.md)
 * [Slack](channels/slack.md)
 * [Telegram](channels/telegram.md)
+* [ntfy](channels/ntfy.md)
 * [Email (SMTP)](channels/email.md)
 * [Generic webhook](channels/webhook.md)
 
