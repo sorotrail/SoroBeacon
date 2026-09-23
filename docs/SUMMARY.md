@@ -25,6 +25,7 @@
 * [Slack](channels/slack.md)
 * [Telegram](channels/telegram.md)
 * [Email (SMTP)](channels/email.md)
+* [ntfy](channels/ntfy.md)
 * [Generic webhook](channels/webhook.md)
 
 ## 🛠️ Reference

@@ -3,7 +3,7 @@
 **Monitoring and alerting for Soroban smart contracts.** Point SoroBeacon at
 one or more contracts on Stellar, define rules ("this event fired", "an
 emitted value crossed a threshold"), and get alerts on Discord, Slack,
-Telegram, email, or any webhook — with a small dashboard to manage monitors
+Telegram, email, ntfy, or any webhook — with a small dashboard to manage monitors
 and review alert history.
 
 Stellar has no good open-source way to watch a contract and get notified when
@@ -212,7 +212,7 @@ curl -s -X DELETE localhost:8080/api/v1/monitors/1/rules/2
 
 ### Channels
 
-Five channel types ship with the MVP. `config` is validated on create/update
+Six channel types ship with the MVP. `config` is validated on create/update
 and never returned in responses.
 
 ```sh
@@ -227,6 +227,7 @@ curl -s -X POST localhost:8080/api/v1/channels -d '{
 # Email:    {"host": "smtp.example.com", "port": 587, "username": "u",
 #            "password": "p", "from": "beacon@example.com", "to": ["ops@example.com"]}
 # Webhook:  {"url": "https://example.com/hook", "secret": "shared-secret"}
+# ntfy:     {"topic": "sorobeacon-ops"}  # optional server_url, access_token, priority
 
 curl -s localhost:8080/api/v1/channels
 curl -s -X PATCH localhost:8080/api/v1/channels/1 -d '{"enabled": false}'
@@ -313,7 +314,7 @@ Decoded events use a small value vocabulary (`nil`, `bool`, `string`,
 - Secret encryption at rest for `channels.config`
 - API authentication
 - More rule types (rate/frequency, absence-of-event, aggregation windows)
-- More channels (Matrix, PagerDuty, ntfy, ...)
+- More channels (Matrix, PagerDuty, ...)
 - A richer SPA dashboard (the current one is intentionally minimal)
 - Contract-spec-aware event decoding (named fields instead of raw topics)
 

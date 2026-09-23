@@ -54,6 +54,7 @@ const (
 	TypeTelegram = "telegram"
 	TypeEmail    = "email"
 	TypeWebhook  = "webhook"
+	TypeNtfy     = "ntfy"
 )
 
 // DefaultFactory returns a Factory with the built-in channel types.
@@ -64,6 +65,7 @@ func DefaultFactory() *Factory {
 	f.Register(TypeTelegram, NewTelegram)
 	f.Register(TypeEmail, NewEmail)
 	f.Register(TypeWebhook, NewWebhook)
+	f.Register(TypeNtfy, NewNtfy)
 	return f
 }
 

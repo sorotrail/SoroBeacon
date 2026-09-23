@@ -16,11 +16,20 @@ var httpClient = &http.Client{Timeout: 15 * time.Second}
 // Error messages include a truncated response body but never the URL,
 // since webhook URLs are secrets.
 func postJSON(ctx context.Context, url string, body []byte, headers map[string]string) error {
+	return post(ctx, url, body, "application/json", headers)
+}
+
+// postPlain POSTs a UTF-8 text body using the shared HTTP client.
+func postPlain(ctx context.Context, url, body string, headers map[string]string) error {
+	return post(ctx, url, []byte(body), "text/plain; charset=utf-8", headers)
+}
+
+func post(ctx context.Context, url string, body []byte, contentType string, headers map[string]string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", contentType)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
