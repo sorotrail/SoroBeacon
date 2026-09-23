@@ -3,7 +3,7 @@
 **Monitoring and alerting for Soroban smart contracts.** Point SoroBeacon at
 one or more contracts on Stellar, define rules ("this event fired", "an
 emitted value crossed a threshold"), and get alerts on Discord, Slack,
-Telegram, email, or any webhook — with a small dashboard to manage monitors
+Telegram, ntfy, email, or any webhook — with a small dashboard to manage monitors
 and review alert history.
 
 Stellar has no good open-source way to watch a contract and get notified when
@@ -153,7 +153,7 @@ curl -s -X DELETE localhost:8080/api/v1/monitors/1
 
 ### Rules
 
-Three rule types ship:
+Five rule types ship:
 
 **`event_emitted`** — match on event name (the first topic, by Soroban
 convention) and/or exact topic values:
@@ -198,9 +198,30 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
   "type": "token_event",
   "params": {
     "event": "transfer",
-    "from": "GDW6...SENDER",
-    "min_amount": "1000000000"
+    "from": "GDW6...SENDER",	"min_amount": "1000000000"
   }
+}'
+```
+
+**`self_transfer`** — SEP-41 `transfer` events whose from and to slots hold
+the same address: contract bugs and wash trading, caught without one rule per
+address pair. `min_amount` is an optional inclusive i128 lower bound:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "self_transfer",
+  "params": {"min_amount": "1000000000"}
+}'
+```
+
+**`time_window`** — matches when the event's ledger close time falls inside
+(or, with `outside: true`, outside) a recurring UTC window. `days` defaults
+to every day; a window whose `end` precedes its `start` crosses midnight:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "time_window",
+  "params": {"start": "09:00", "end": "17:00", "days": ["mon","tue","wed","thu","fri"], "outside": true}
 }'
 ```
 
@@ -212,7 +233,7 @@ curl -s -X DELETE localhost:8080/api/v1/monitors/1/rules/2
 
 ### Channels
 
-Five channel types ship with the MVP. `config` is validated on create/update
+Six channel types ship with the MVP. `config` is validated on create/update
 and never returned in responses.
 
 ```sh
@@ -224,6 +245,7 @@ curl -s -X POST localhost:8080/api/v1/channels -d '{
 
 # Slack:    {"webhook_url": "https://hooks.slack.com/services/..."}
 # Telegram: {"bot_token": "123:abc", "chat_id": "-1001234567890"}
+# ntfy:     {"topic": "sorobeacon-8f3a1c", "access_token": "tk_...", "priority": 4}
 # Email:    {"host": "smtp.example.com", "port": 587, "username": "u",
 #            "password": "p", "from": "beacon@example.com", "to": ["ops@example.com"]}
 # Webhook:  {"url": "https://example.com/hook", "secret": "shared-secret"}
@@ -249,6 +271,23 @@ curl -s localhost:8080/api/v1/health
 curl -s localhost:8080/api/v1/stats
 ```
 
+### Maintenance windows
+
+Time-bounded silences that suppress **delivery**, not **detection**. Alerts
+raised inside a window are still stored and visible, marked suppressed with
+the window's reason. Scope a window globally, per monitor, or per contract ID;
+`end_at` is required and must follow `start_at`.
+
+```sh
+curl -s -X POST localhost:8080/api/v1/maintenance-windows -d '{
+  "reason": "planned upgrade", "scope": "global",
+  "start_at": "2026-09-23T22:00:00Z", "end_at": "2026-09-24T02:00:00Z"
+}'
+curl -s 'localhost:8080/api/v1/maintenance-windows?active=true'
+```
+
+See [Maintenance windows](docs/guides/maintenance-windows.md).
+
 ## Development
 
 ```sh
@@ -266,8 +305,8 @@ cmd/sorobeacon      wiring + graceful shutdown
 internal/config     env config
 internal/stellar    RPC client (getEvents/getLatestLedger/getHealth) + ScVal decoder
 internal/store      Postgres (pgx) + embedded golang-migrate migrations
-internal/rules      RuleEvaluator interface + event_emitted, value_threshold
-internal/notify     Notifier interface + 5 channels + retrying dispatcher
+internal/rules      RuleEvaluator interface + the built-in rule types
+internal/notify     Notifier interface + 6 channels + retrying dispatcher
 internal/poller     ingest loop: poll -> decode -> match -> alert -> dispatch
 internal/api        chi JSON API
 internal/web        html/template + htmx dashboard
@@ -313,7 +352,7 @@ Decoded events use a small value vocabulary (`nil`, `bool`, `string`,
 - Secret encryption at rest for `channels.config`
 - API authentication
 - More rule types (rate/frequency, absence-of-event, aggregation windows)
-- More channels (Matrix, PagerDuty, ntfy, ...)
+- More channels (Matrix, PagerDuty, ...)
 - A richer SPA dashboard (the current one is intentionally minimal)
 - Contract-spec-aware event decoding (named fields instead of raw topics)
 

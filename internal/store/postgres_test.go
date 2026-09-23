@@ -28,7 +28,7 @@ func testStore(t *testing.T) *Postgres {
 	t.Cleanup(st.Close)
 
 	_, err = st.pool.Exec(context.Background(),
-		`TRUNCATE monitors, rules, channels, monitor_channels, alerts, delivery_attempts RESTART IDENTITY CASCADE;
+		`TRUNCATE monitors, rules, channels, monitor_channels, alerts, delivery_attempts, maintenance_windows RESTART IDENTITY CASCADE;
 		 UPDATE ingest_state SET last_ledger = 0, last_cursor = '' WHERE id = 1`)
 	require.NoError(t, err)
 	return st

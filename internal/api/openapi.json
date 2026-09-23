@@ -410,6 +410,113 @@
         }
       }
     },
+    "/maintenance-windows": {
+      "post": {
+        "summary": "Create a maintenance window",
+        "description": "Time-bounded silence. Alerts raised inside the window are still persisted and visible but are not delivered.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MaintenanceWindowInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MaintenanceWindow" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "get": {
+        "summary": "List maintenance windows",
+        "parameters": [
+          {
+            "name": "active",
+            "in": "query",
+            "schema": { "type": "boolean" },
+            "description": "Restrict to windows containing the current time"
+          },
+          {
+            "name": "upcoming",
+            "in": "query",
+            "schema": { "type": "boolean" },
+            "description": "Restrict to windows starting in the future"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Maintenance windows",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MaintenanceWindowPage" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/maintenance-windows/{id}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "get": {
+        "summary": "Fetch one maintenance window",
+        "responses": {
+          "200": {
+            "description": "Maintenance window",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MaintenanceWindow" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "patch": {
+        "summary": "Update a maintenance window",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MaintenanceWindowInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MaintenanceWindow" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "summary": "Delete a maintenance window",
+        "responses": {
+          "204": { "description": "Deleted" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/alerts": {
       "get": {
         "summary": "List alerts",
@@ -722,7 +829,7 @@
           "monitor_id": { "type": "integer", "format": "int64" },
           "type": {
             "type": "string",
-            "enum": ["event_emitted", "value_threshold", "token_event"]
+            "enum": ["event_emitted", "value_threshold", "token_event", "self_transfer", "time_window"]
           },
           "params": { "type": "object" },
           "enabled": { "type": "boolean" }
@@ -734,7 +841,7 @@
         "properties": {
           "type": {
             "type": "string",
-            "enum": ["event_emitted", "value_threshold", "token_event"]
+            "enum": ["event_emitted", "value_threshold", "token_event", "self_transfer", "time_window"]
           },
           "params": {
             "type": "object",
@@ -750,7 +857,7 @@
           "name": { "type": "string" },
           "type": {
             "type": "string",
-            "enum": ["discord", "slack", "telegram", "email", "webhook"]
+            "enum": ["discord", "slack", "telegram", "email", "webhook", "ntfy"]
           },
           "config": { "type": "object" },
           "enabled": { "type": "boolean" }
@@ -763,7 +870,7 @@
           "name": { "type": "string", "minLength": 1 },
           "type": {
             "type": "string",
-            "enum": ["discord", "slack", "telegram", "email", "webhook"]
+            "enum": ["discord", "slack", "telegram", "email", "webhook", "ntfy"]
           },
           "config": {
             "type": "object",
@@ -821,7 +928,43 @@
           "event_id": { "type": "string" },
           "event_name": { "type": "string" },
           "payload": { "type": "object" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "suppressed": { "type": "boolean", "description": "True when a maintenance window silenced delivery" },
+          "suppression_reason": { "type": "string" }
+        }
+      },
+      "MaintenanceWindow": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "reason": { "type": "string" },
+          "scope": { "type": "string", "enum": ["global", "monitor", "contract"] },
+          "monitor_id": { "type": "integer", "format": "int64" },
+          "contract_id": { "type": "string" },
+          "start_at": { "type": "string", "format": "date-time" },
+          "end_at": { "type": "string", "format": "date-time" },
           "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "MaintenanceWindowInput": {
+        "type": "object",
+        "required": ["reason", "scope", "start_at", "end_at"],
+        "properties": {
+          "reason": { "type": "string", "minLength": 1 },
+          "scope": { "type": "string", "enum": ["global", "monitor", "contract"] },
+          "monitor_id": { "type": "integer", "format": "int64", "description": "Required when scope is monitor" },
+          "contract_id": { "type": "string", "description": "Required when scope is contract" },
+          "start_at": { "type": "string", "format": "date-time" },
+          "end_at": { "type": "string", "format": "date-time", "description": "Must be after start_at; open-ended windows are rejected" }
+        }
+      },
+      "MaintenanceWindowPage": {
+        "type": "object",
+        "properties": {
+          "maintenance_windows": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/MaintenanceWindow" }
+          }
         }
       },
       "DeliveryAttempt": {

@@ -28,6 +28,11 @@ const DefaultRetryCooldown = 30 * time.Second
 type DispatchStore interface {
 	ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]store.Channel, error)
 	RecordDeliveryAttempt(ctx context.Context, d *store.DeliveryAttempt) error
+	// ActiveMaintenanceWindow reports a window silencing this alert's
+	// monitor/contract at the given time, or nil when none is active.
+	ActiveMaintenanceWindow(ctx context.Context, monitorID int64, contractID string, at time.Time) (*store.MaintenanceWindow, error)
+	// SetAlertSuppressed records why an alert was not delivered.
+	SetAlertSuppressed(ctx context.Context, alertID int64, reason string) error
 }
 
 // Dispatcher fans an alert out to its monitor's channels, retrying each
@@ -66,6 +71,12 @@ func (d *Dispatcher) WithMetrics(m *metrics.Metrics) *Dispatcher {
 // monitor. Channel failures are recorded and logged, never fatal: one bad
 // channel must not block the others or the poller.
 func (d *Dispatcher) Dispatch(ctx context.Context, a Alert) {
+	// Maintenance windows suppress delivery, not detection: the alert is
+	// already persisted and stays visible, it is only marked and skipped.
+	// The check happens here, before fan-out, so nothing is delivered.
+	if d.suppressed(ctx, a) {
+		return
+	}
 	channels, err := d.store.ListChannelsForMonitor(ctx, a.MonitorID)
 	if err != nil {
 		d.log.Error("list channels for alert", "alert_id", a.ID, "monitor_id", a.MonitorID, "err", err)
@@ -74,6 +85,30 @@ func (d *Dispatcher) Dispatch(ctx context.Context, a Alert) {
 	for _, ch := range channels {
 		d.deliver(ctx, a, ch)
 	}
+}
+
+// suppressed reports whether a maintenance window covers the alert, marking
+// the persisted alert with the window's reason when it does. A lookup error
+// fails open (delivery proceeds) so a transient store problem cannot silence
+// real alerts.
+func (d *Dispatcher) suppressed(ctx context.Context, a Alert) bool {
+	at := a.CreatedAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+	w, err := d.store.ActiveMaintenanceWindow(ctx, a.MonitorID, a.ContractID, at)
+	if err != nil {
+		d.log.Error("check maintenance window", "alert_id", a.ID, "monitor_id", a.MonitorID, "err", err)
+		return false
+	}
+	if w == nil {
+		return false
+	}
+	if err := d.store.SetAlertSuppressed(ctx, a.ID, w.Reason); err != nil {
+		d.log.Error("mark alert suppressed", "alert_id", a.ID, "window_id", w.ID, "err", err)
+	}
+	d.log.Info("alert suppressed by maintenance window", "alert_id", a.ID, "window_id", w.ID, "scope", w.Scope)
+	return true
 }
 
 func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {

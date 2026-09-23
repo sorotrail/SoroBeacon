@@ -34,7 +34,7 @@ curl -s -X PATCH localhost:8080/api/v1/monitors/1 -d '{"enabled": false}'
 | `PATCH /monitors/{id}/rules/{ruleID}` | Partial update; params re-validated. |
 | `DELETE /monitors/{id}/rules/{ruleID}` | Delete. |
 
-Params for the built-in types: [`event_emitted`](../rules/event-emitted.md), [`value_threshold`](../rules/value-threshold.md). Invalid params are rejected with `400` at create/update time.
+Params for the built-in types: [`event_emitted`](../rules/event-emitted.md), [`value_threshold`](../rules/value-threshold.md), [`token_event`](../rules/token-event.md), [`self_transfer`](../rules/self-transfer.md), [`time_window`](../rules/time-window.md). Invalid params are rejected with `400` at create/update time.
 
 ## Channels
 
@@ -46,7 +46,20 @@ Params for the built-in types: [`event_emitted`](../rules/event-emitted.md), [`v
 | `DELETE /channels/{id}` | Delete. |
 | `POST /channels/{id}/test` | Send a synthetic alert through the channel right now. `200 {"status":"sent"}` or `502 {"status":"failed","error":"..."}`. |
 
-Config shapes per type: [Discord](../channels/discord.md) · [Slack](../channels/slack.md) · [Telegram](../channels/telegram.md) · [Email](../channels/email.md) · [Webhook](../channels/webhook.md)
+Config shapes per type: [Discord](../channels/discord.md) · [Slack](../channels/slack.md) · [Telegram](../channels/telegram.md) · [ntfy](../channels/ntfy.md) · [Email](../channels/email.md) · [Webhook](../channels/webhook.md)
+
+## Maintenance windows
+
+| Method & path | Description |
+| --- | --- |
+| `POST /maintenance-windows` | Create. Body: `reason`, `scope` (`global`/`monitor`/`contract`), `start_at`, `end_at`, plus `monitor_id` or `contract_id` for those scopes. `end_at` must be after `start_at`. |
+| `GET /maintenance-windows` | List. `?active=true` filters to windows containing now; `?upcoming=true` to future windows. |
+| `GET /maintenance-windows/{id}` | Get one. |
+| `PATCH /maintenance-windows/{id}` | Partial update; re-validated. |
+| `DELETE /maintenance-windows/{id}` | Delete. |
+
+Alerts raised inside a window are still stored; they are marked `suppressed`
+with the window's reason and not delivered. See [Maintenance windows](../guides/maintenance-windows.md).
 
 ## Alerts
 

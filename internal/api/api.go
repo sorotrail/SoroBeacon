@@ -129,6 +129,14 @@ func (s *Server) Routes() chi.Router {
 		r.Post("/{id}/test", s.testChannel)
 	})
 
+	r.Route("/maintenance-windows", func(r chi.Router) {
+		r.Post("/", s.createMaintenanceWindow)
+		r.Get("/", s.listMaintenanceWindows)
+		r.Get("/{id}", s.getMaintenanceWindow)
+		r.Patch("/{id}", s.updateMaintenanceWindow)
+		r.Delete("/{id}", s.deleteMaintenanceWindow)
+	})
+
 	r.Get("/alerts", s.listAlerts)
 	r.Get("/alerts/{id}/deliveries", s.listDeliveries)
 	r.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)

@@ -13,9 +13,10 @@ Soroban RPC nodes only retain events for roughly **24 hours to 7 days**. Histori
 | Piece | What you get |
 | --- | --- |
 | **Monitors** | Watch one or more contract addresses per monitor |
-| **Rules** | [`event_emitted`](rules/event-emitted.md) and [`value_threshold`](rules/value-threshold.md), evaluated against every event |
-| **Channels** | [Discord](channels/discord.md), [Slack](channels/slack.md), [Telegram](channels/telegram.md), [email](channels/email.md), [HMAC-signed webhooks](channels/webhook.md) |
+| **Rules** | [`event_emitted`](rules/event-emitted.md), [`value_threshold`](rules/value-threshold.md), [`token_event`](rules/token-event.md), [`self_transfer`](rules/self-transfer.md) and [`time_window`](rules/time-window.md), evaluated against every event |
+| **Channels** | [Discord](channels/discord.md), [Slack](channels/slack.md), [Telegram](channels/telegram.md), [ntfy](channels/ntfy.md), [email](channels/email.md), [HMAC-signed webhooks](channels/webhook.md) |
 | **Delivery** | Retries with exponential backoff, every attempt recorded |
+| **Silences** | [Maintenance windows](guides/maintenance-windows.md) suppress delivery while keeping the alert record |
 | **Dedup** | An alert fires at most once per `(rule, event)` — restarts never double-notify |
 | **Dashboard** | Server-rendered UI to manage monitors, channels, and alert history |
 

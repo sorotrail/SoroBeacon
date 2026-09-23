@@ -601,8 +601,8 @@ func (p *Postgres) CreateAlert(ctx context.Context, a *Alert) (bool, error) {
 func (p *Postgres) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	var a Alert
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, created_at FROM alerts WHERE id = $1`, id,
-	).Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt)
+		`SELECT id, monitor_id, rule_id, event_id, payload, created_at, suppressed, suppression_reason FROM alerts WHERE id = $1`, id,
+	).Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt, &a.Suppressed, &a.SuppressionReason)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -619,7 +619,7 @@ func alertSort(s string) string {
 }
 
 func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at FROM alerts WHERE TRUE`
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at, suppressed, suppression_reason FROM alerts WHERE TRUE`
 	args := []any{}
 	n := 0
 	arg := func(v any) string {
@@ -668,7 +668,7 @@ func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, erro
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Alert, error) {
 		var a Alert
-		err := row.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt)
+		err := row.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt, &a.Suppressed, &a.SuppressionReason)
 		return a, err
 	})
 }
@@ -701,6 +701,121 @@ func (p *Postgres) ListDeliveryAttempts(ctx context.Context, alertID int64, stat
 		err := row.Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.Status, &d.ResponseSnippet, &d.AttemptedAt)
 		return d, err
 	})
+}
+
+// --- maintenance windows ---
+
+func (p *Postgres) CreateMaintenanceWindow(ctx context.Context, w *MaintenanceWindow) error {
+	return mapErr(p.pool.QueryRow(ctx,
+		`INSERT INTO maintenance_windows (reason, scope, monitor_id, contract_id, start_at, end_at)
+		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at`,
+		w.Reason, w.Scope, w.MonitorID, w.ContractID, w.StartAt.UTC(), w.EndAt.UTC(),
+	).Scan(&w.ID, &w.CreatedAt))
+}
+
+func (p *Postgres) GetMaintenanceWindow(ctx context.Context, id int64) (*MaintenanceWindow, error) {
+	return scanMaintenanceWindow(p.pool.QueryRow(ctx,
+		`SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		 FROM maintenance_windows WHERE id = $1`, id))
+}
+
+func (p *Postgres) ListMaintenanceWindows(ctx context.Context, f MaintenanceWindowFilter) ([]MaintenanceWindow, error) {
+	q := `SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		 FROM maintenance_windows WHERE TRUE`
+	args := []any{}
+	n := 0
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	if f.Active || f.Upcoming {
+		at := f.At
+		if at.IsZero() {
+			at = time.Now()
+		}
+		if f.Active {
+			q += ` AND start_at <= ` + arg(at.UTC()) + ` AND end_at > ` + arg(at.UTC())
+		} else {
+			q += ` AND start_at > ` + arg(at.UTC())
+		}
+	}
+	q += ` ORDER BY start_at DESC, id DESC LIMIT ` + arg(pageLimit(f.Limit))
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (MaintenanceWindow, error) {
+		w, err := scanMaintenanceWindow(row)
+		if err != nil {
+			return MaintenanceWindow{}, err
+		}
+		return *w, nil
+	})
+}
+
+func (p *Postgres) UpdateMaintenanceWindow(ctx context.Context, w *MaintenanceWindow) error {
+	tag, err := p.pool.Exec(ctx,
+		`UPDATE maintenance_windows
+		 SET reason = $2, scope = $3, monitor_id = $4, contract_id = $5, start_at = $6, end_at = $7
+		 WHERE id = $1`,
+		w.ID, w.Reason, w.Scope, w.MonitorID, w.ContractID, w.StartAt.UTC(), w.EndAt.UTC())
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *Postgres) DeleteMaintenanceWindow(ctx context.Context, id int64) error {
+	return p.deleteByID(ctx, "maintenance_windows", id)
+}
+
+// ActiveMaintenanceWindow is the delivery path's single indexed lookup: a
+// window is active when [start_at, end_at) covers at and its scope covers
+// the alert. The most specific scope wins (contract, then monitor, then
+// global) so a contract's reason is preferred over a broader one's.
+func (p *Postgres) ActiveMaintenanceWindow(ctx context.Context, monitorID int64, contractID string, at time.Time) (*MaintenanceWindow, error) {
+	w, err := scanMaintenanceWindow(p.pool.QueryRow(ctx,
+		`SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		 FROM maintenance_windows
+		 WHERE start_at <= $1 AND end_at > $1
+		   AND (scope = 'global'
+		        OR (scope = 'monitor' AND monitor_id = $2)
+		        OR (scope = 'contract' AND contract_id = $3))
+		 ORDER BY CASE scope WHEN 'contract' THEN 0 WHEN 'monitor' THEN 1 ELSE 2 END, start_at DESC
+		 LIMIT 1`, at.UTC(), monitorID, contractID))
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+func (p *Postgres) SetAlertSuppressed(ctx context.Context, alertID int64, reason string) error {
+	tag, err := p.pool.Exec(ctx,
+		`UPDATE alerts SET suppressed = TRUE, suppression_reason = $2 WHERE id = $1`,
+		alertID, reason)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func scanMaintenanceWindow(r rowScanner) (*MaintenanceWindow, error) {
+	var w MaintenanceWindow
+	err := r.Scan(&w.ID, &w.Reason, &w.Scope, &w.MonitorID, &w.ContractID, &w.StartAt, &w.EndAt, &w.CreatedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return &w, nil
 }
 
 // --- ingest state ---

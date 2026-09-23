@@ -76,6 +76,6 @@ Evaluators must be stateless and concurrency-safe. Decoded events use a small va
 * Secret encryption at rest for `channels.config`
 * API authentication middleware
 * Rule types: absence-of-event ("no heartbeat for N minutes"), frequency ("more than N matches in M minutes")
-* Channels: Matrix, PagerDuty, ntfy.sh
+* Channels: Matrix, PagerDuty
 * Contract-spec-aware decoding (named event fields via `stellar.Decoder`)
 * A richer dashboard

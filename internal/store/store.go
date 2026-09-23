@@ -67,6 +67,53 @@ type Alert struct {
 	// alert row. Zero skips the stamp so callers that only persist an
 	// alert (tests, retries) do not invent a wall-clock match time.
 	LedgerClosedAt time.Time `json:"-"`
+	// Suppressed is true when a maintenance window was active when the
+	// alert was dispatched. Detection still happened and the row is still
+	// persisted; SuppressionReason carries the window's reason.
+	Suppressed        bool   `json:"suppressed"`
+	SuppressionReason string `json:"suppression_reason,omitempty"`
+}
+
+// Maintenance window scopes. A window suppresses matching alerts for its
+// scope only: global (everything), monitor (one monitor), contract (one
+// contract ID across monitors).
+const (
+	MaintenanceScopeGlobal   = "global"
+	MaintenanceScopeMonitor  = "monitor"
+	MaintenanceScopeContract = "contract"
+)
+
+// ValidMaintenanceScope reports whether s names a scope the store accepts.
+func ValidMaintenanceScope(s string) bool {
+	return s == MaintenanceScopeGlobal || s == MaintenanceScopeMonitor || s == MaintenanceScopeContract
+}
+
+// MaintenanceWindow is a time-bounded silence. Alerts raised inside
+// [StartAt, EndAt) for its scope are persisted but not delivered.
+// MonitorID and ContractID are set only when the scope calls for them.
+type MaintenanceWindow struct {
+	ID         int64     `json:"id"`
+	Reason     string    `json:"reason"`
+	Scope      string    `json:"scope"`
+	MonitorID  *int64    `json:"monitor_id,omitempty"`
+	ContractID *string   `json:"contract_id,omitempty"`
+	StartAt    time.Time `json:"start_at"`
+	EndAt      time.Time `json:"end_at"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// MaintenanceWindowFilter narrows ListMaintenanceWindows. Zero values mean
+// "no constraint".
+//
+// Active, when true, restricts the listing to windows whose [start, end)
+// interval contains At (defaulting to now when At is zero). Upcoming, when
+// true, restricts it to windows that start after At. Both false lists every
+// window.
+type MaintenanceWindowFilter struct {
+	Active   bool
+	Upcoming bool
+	At       time.Time
+	Limit    int
 }
 
 // Status values persisted on delivery_attempts.status. Anything else is
@@ -245,6 +292,22 @@ type Alerts interface {
 	DeleteExpiredAlerts(ctx context.Context, cutoff time.Time, limit int) (deleted int64, err error)
 }
 
+// MaintenanceWindows persists alert-silencing windows and marks suppressed
+// alerts. ActiveMaintenanceWindow is the one check on the delivery path.
+type MaintenanceWindows interface {
+	CreateMaintenanceWindow(ctx context.Context, w *MaintenanceWindow) error
+	GetMaintenanceWindow(ctx context.Context, id int64) (*MaintenanceWindow, error)
+	ListMaintenanceWindows(ctx context.Context, f MaintenanceWindowFilter) ([]MaintenanceWindow, error)
+	UpdateMaintenanceWindow(ctx context.Context, w *MaintenanceWindow) error
+	DeleteMaintenanceWindow(ctx context.Context, id int64) error
+	// ActiveMaintenanceWindow returns the most specific window covering
+	// (monitorID, contractID) at time at, or nil when none is active.
+	ActiveMaintenanceWindow(ctx context.Context, monitorID int64, contractID string, at time.Time) (*MaintenanceWindow, error)
+	// SetAlertSuppressed marks a persisted alert as silenced, recording
+	// the reason so the operator can see why it was not delivered.
+	SetAlertSuppressed(ctx context.Context, alertID int64, reason string) error
+}
+
 // Ingest persists the poller checkpoint.
 type Ingest interface {
 	GetIngestState(ctx context.Context) (IngestState, error)
@@ -257,6 +320,7 @@ type Store interface {
 	Rules
 	Channels
 	Alerts
+	MaintenanceWindows
 	Ingest
 	GetStats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error

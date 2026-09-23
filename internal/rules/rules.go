@@ -41,6 +41,8 @@ func NewRegistry() *Registry {
 	r.Register(TypeEventEmitted, EventEmitted{})
 	r.Register(TypeValueThreshold, ValueThreshold{})
 	r.Register(TypeTokenEvent, TokenEvent{})
+	r.Register(TypeSelfTransfer, SelfTransfer{})
+	r.Register(TypeTimeWindow, TimeWindow{})
 	return r
 }
 

@@ -164,7 +164,7 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 		pages:       map[string]*template.Template{},
 		silentAfter: 24 * time.Hour,
 	}
-	for _, page := range []string{"index", "monitors", "monitor", "channels", "alerts", "alert", "error"} {
+	for _, page := range []string{"index", "monitors", "monitor", "channels", "alerts", "alert", "maintenance", "error"} {
 		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, fmt.Errorf("parse template %s: %w", page, err)
@@ -239,6 +239,10 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/alerts/{id}/deliveries", s.alertDeliveries)
 	r.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)
 	r.Get("/alerts/{id}", s.alertDetail)
+
+	r.Get("/maintenance", s.maintenance)
+	r.Post("/maintenance", s.createMaintenance)
+	r.Post("/maintenance/{id}/delete", s.deleteMaintenance)
 	r.NotFound(s.notFound)
 	return r
 }
@@ -249,11 +253,12 @@ func (s *Server) Routes() chi.Router {
 // intentionally maps to "" (Overview has no distinct nav highlight of its
 // own beyond the brand link).
 var navSection = map[string]string{
-	"monitors": "monitors",
-	"monitor":  "monitors",
-	"channels": "channels",
-	"alerts":   "alerts",
-	"alert":    "alerts",
+	"monitors":    "monitors",
+	"monitor":     "monitors",
+	"channels":    "channels",
+	"alerts":      "alerts",
+	"alert":       "alerts",
+	"maintenance": "maintenance",
 }
 
 func (s *Server) render(w http.ResponseWriter, r *http.Request, page string, data any) {
@@ -936,6 +941,120 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fmt.Fprint(w, "✅ sent")
+}
+
+// maintenanceRow is a window plus its computed status for the listing.
+type maintenanceRow struct {
+	store.MaintenanceWindow
+	Active bool
+}
+
+// maintenance lists active and upcoming windows. Past windows are omitted:
+// the page is a control surface for what is silencing alerts now and what
+// is about to, not a history of every window ever created.
+func (s *Server) maintenance(w http.ResponseWriter, r *http.Request) {
+	now := time.Now()
+	active, err := s.store.ListMaintenanceWindows(r.Context(), store.MaintenanceWindowFilter{Active: true, At: now, Limit: 100})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	upcoming, err := s.store.ListMaintenanceWindows(r.Context(), store.MaintenanceWindowFilter{Upcoming: true, At: now, Limit: 100})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	rows := make([]maintenanceRow, 0, len(active)+len(upcoming))
+	for _, w := range active {
+		rows = append(rows, maintenanceRow{MaintenanceWindow: w, Active: true})
+	}
+	for _, w := range upcoming {
+		rows = append(rows, maintenanceRow{MaintenanceWindow: w})
+	}
+	monitors, err := s.store.ListMonitors(r.Context(), false)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.render(w, r, "maintenance", map[string]any{
+		"Title": "Maintenance", "Windows": rows, "Monitors": monitors,
+	})
+}
+
+func (s *Server) createMaintenance(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	reason := strings.TrimSpace(r.FormValue("reason"))
+	if reason == "" {
+		http.Error(w, "reason is required", http.StatusBadRequest)
+		return
+	}
+	scope := r.FormValue("scope")
+	if !store.ValidMaintenanceScope(scope) {
+		http.Error(w, "invalid scope", http.StatusBadRequest)
+		return
+	}
+	start, err := parseUTCInput(r.FormValue("start_at"))
+	if err != nil {
+		http.Error(w, "start_at must be YYYY-MM-DDTHH:MM (UTC)", http.StatusBadRequest)
+		return
+	}
+	end, err := parseUTCInput(r.FormValue("end_at"))
+	if err != nil {
+		http.Error(w, "end_at must be YYYY-MM-DDTHH:MM (UTC)", http.StatusBadRequest)
+		return
+	}
+	if !end.After(start) {
+		http.Error(w, "end_at must be after start_at", http.StatusBadRequest)
+		return
+	}
+	mw := store.MaintenanceWindow{Reason: reason, Scope: scope, StartAt: start, EndAt: end}
+	switch scope {
+	case store.MaintenanceScopeMonitor:
+		id, err := strconv.ParseInt(r.FormValue("monitor_id"), 10, 64)
+		if err != nil || id == 0 {
+			http.Error(w, "monitor_id is required for monitor scope", http.StatusBadRequest)
+			return
+		}
+		mw.MonitorID = &id
+	case store.MaintenanceScopeContract:
+		cid := strings.TrimSpace(r.FormValue("contract_id"))
+		if cid == "" {
+			http.Error(w, "contract_id is required for contract scope", http.StatusBadRequest)
+			return
+		}
+		mw.ContractID = &cid
+	}
+	if err := s.store.CreateMaintenanceWindow(r.Context(), &mw); err != nil {
+		s.fail(w, err)
+		return
+	}
+	http.Redirect(w, r, "/maintenance", http.StatusSeeOther)
+}
+
+func (s *Server) deleteMaintenance(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := s.store.DeleteMaintenanceWindow(r.Context(), id); err != nil {
+		s.fail(w, err)
+		return
+	}
+	http.Redirect(w, r, "/maintenance", http.StatusSeeOther)
+}
+
+// parseUTCInput parses the dashboard's datetime-local value as UTC, matching
+// the UTC-only interpretation the API uses for start_at/end_at.
+func parseUTCInput(v string) (time.Time, error) {
+	t, err := time.Parse("2006-01-02T15:04", strings.TrimSpace(v))
+	if err != nil {
+		return time.Time{}, err
+	}
+	return t.UTC(), nil
 }
 
 func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
