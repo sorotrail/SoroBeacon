@@ -233,9 +233,9 @@ func TestLostSessionStopsTheJob(t *testing.T) {
 		_, stops, _ := job.counts()
 		return stops == 1
 	})
-	if st := l.Status(); st.Leader {
-		t.Fatalf("status after losing the session = %+v, want not leader", st)
-	}
+	// The loop publishes the demotion immediately after the job returns, so
+	// wait for it rather than reading the status the instant the job stops.
+	waitFor(t, "the lost lease to be reported", func() bool { return !l.Status().Leader })
 
 	// The lock died with the session, so there is nothing to unlock.
 	if unlocks, _ := sess.calls(); unlocks != 0 {
