@@ -96,7 +96,9 @@ What to expect:
   reads are not blocked by an in-flight write.
 - **One instance.** Do not point several SoroBeacon processes at the same file,
   and do not put it on a network filesystem — SQLite's locking assumes a local
-  disk. Use Postgres for multi-instance deployments.
+  disk. Use Postgres for multi-instance deployments. A SQLite deployment also
+  has no leader election (advisory locks are Postgres-only): the instance polls
+  unconditionally and `/api/v1/health` reports `"leader_election": false`.
 - **Cooldown semantics are unchanged.** Postgres uses `SELECT ... FOR UPDATE`;
   SQLite enforces the same one-alert-per-window rule with its single writer.
   The shared conformance suite runs both.
@@ -108,27 +110,55 @@ managed backups and replication.
 
 ## Multi-instance deployment
 
-Running more than one SoroBeacon instance today is **not formally supported**.
-Each instance independently:
+Several instances are supported: they all serve the API and the dashboard, and
+they elect **one** poller between them. Without that election every instance
+polls the same contracts, races the same checkpoint, and dispatches its own
+copy of every alert — which is what made the product single-instance until
+leader election landed.
 
-- Polls the same RPC node
-- Stores data into the same Postgres database
-- Evaluates rules and dispatches alerts
+Instances compete for a Postgres **session-level advisory lock**
+(`pg_try_advisory_lock`, key `0x534F4245434F4E`) in `internal/lease`. There is
+no lock table, no migration and no coordinator process, and because advisory
+locks are scoped to a database, every instance must use the same
+`DATABASE_URL`. The holder runs the ingest loop and the retention pruner; the
+others serve HTTP and wait.
 
-The database has a dedup guard: alerts are unique on `(rule_id, event_id)`, so
-two instances evaluating the same rule against the same event will produce only
-one alert. However, there are caveats:
+How fast leadership moves:
 
-- **Checkpoint racing:** Both instances may advance `ingest_state.last_ledger`
-  past the same events, potentially skipping events neither processes.
-- **Delivery duplication:** The same alert may be dispatched twice (once per
-  instance) if both instances create the alert before the dedup guard triggers.
-  The `delivery_attempts` table will record two attempts.
+| Event | What releases the lock | Time to a new poller |
+|---|---|---|
+| Leader exits gracefully (SIGTERM) | It releases the lock explicitly on the way out | ~1 lease interval (3s) |
+| Leader is killed (SIGKILL, OOM, node loss) | The lock goes when its database session disappears | ~1 lease interval (3s) |
+| Leader loses its connection to Postgres | It detects the dead session on the next renewal, stops polling, and the lock is already free | ~1 lease interval (3s) |
+| Leader is partitioned from Postgres while the server still sees the session | Nobody: it stops polling (safe) and a waiting instance cannot take a lock the server still considers held, until Postgres reaps the session on its TCP keepalive timers | up to the `tcp_keepalives_*` timers |
 
-If you need horizontal scaling, the recommended approach is a single instance
-with a SoroTrail indexer (`SOURCE_MODE=sorotrail`), which acts as a durable
-event queue that multiple SoroBeacon instances can share. This is the design
-intended for future multi-instance support.
+The last row is deliberate. The lease prefers *at most* one poller over *always*
+one: a stalled cluster sends no alerts, while a duplicated one sends every
+alert twice, and the second failure is the one users notice.
+
+Details worth knowing before you scale:
+
+- **Each instance holds one dedicated connection** for the lease, outside the
+  `DATABASE_MAX_CONNS` pool. A session-level lock cannot be pinned on a pooled
+  connection, so the lease dials its own and never shares it.
+- **A follower is healthy.** `/api/v1/health` reports `leader`,
+  `leader_election` and `leader_since`; the overview page shows the role.
+  Readiness does not fail for not polling, and the deploy order does not
+  matter — whichever instance wins the lock polls.
+- **The hand-over is ordered.** A demoted leader cancels the poller and waits
+  for the cycle to return before giving the lock up, so the new leader never
+  starts while the old one is still mid-cycle.
+- **PgBouncer:** the lock needs a session, so point `DATABASE_URL` at a direct
+  connection or use `pool_mode=session`. A transaction-pooled PgBouncer cannot
+  hold a session-level advisory lock, and no instance would poll.
+- **Throughput does not scale with replicas.** The lease elects one poller, so
+  adding instances buys availability, not ingestion. For more headroom use a
+  SoroTrail indexer (`SOURCE_MODE=sorotrail`), which stores events durably past
+  the RPC's window and serves them to whichever instance holds the lease.
+
+The dedup guard (`alerts` unique on `(rule_id, event_id)`) and the cooldown's
+`SELECT ... FOR UPDATE` still apply across instances, but with the lease they
+are no longer load-bearing: only one instance polls at a time.
 
 ## Database growth: alerts and delivery attempts
 
@@ -172,9 +202,11 @@ appropriate `ALERT_RETENTION` value.
   constants in the store package control how often and how many rows are deleted
   per retention cycle. These are set to reasonable defaults but have not been
   tuned for very large databases.
-- **Multi-instance coordination:** As noted above, running multiple instances
-  against the same database is not actively supported. The dedup guard prevents
-  double alerts, but checkpoint consistency is not guaranteed.
+- **Multi-instance coordination:** Several instances now elect a single poller
+  and are supported (see above). What is not measured is behaviour during a
+  sustained Postgres partition, where the lease deliberately stops polling
+  rather than risk two pollers: the recovery time is whatever the server's TCP
+  keepalive configuration takes to reap the stale session.
 
 If you hit limits that are not covered here, please file an issue so we can
 measure and document the behavior.

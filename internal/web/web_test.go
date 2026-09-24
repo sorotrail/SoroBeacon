@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sorotrail/sorobeacon/internal/buildinfo"
+	"github.com/sorotrail/sorobeacon/internal/lease"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
 	"github.com/sorotrail/sorobeacon/internal/rules"
@@ -526,6 +527,78 @@ func TestOverviewWaitingCopyBeforeFirstPoll(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "waiting for the first successful poll") {
 		t.Fatalf("overview should wait for first poll, got %s", body)
+	}
+}
+
+type stubLeader struct{ st lease.Status }
+
+func (s stubLeader) Status() lease.Status { return s.st }
+
+// fetchOverview renders the overview page once and returns the HTML.
+func fetchOverview(t *testing.T, s *Server) string {
+	t.Helper()
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	res, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
+}
+
+// An operator has to be able to tell which replica is polling. A follower that
+// said "waiting for the first successful poll" forever would read as a stuck
+// instance rather than one deliberately standing by.
+func TestOverviewShowsPollerLeadership(t *testing.T) {
+	at := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name    string
+		st      lease.Status
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "leader",
+			st:   lease.Status{Enabled: true, Leader: true, Since: at},
+			want: []string{"Poller leadership", "<b>leader</b>", "2026-09-24 12:00:00 UTC"},
+		},
+		{
+			name:    "follower",
+			st:      lease.Status{Enabled: true},
+			want:    []string{"<b>follower</b>", "another instance holds the poller lease"},
+			notWant: []string{"waiting for the first successful poll"},
+		},
+		{
+			name: "single node",
+			st:   lease.Status{Leader: true, Since: at},
+			want: []string{"<b>single node</b>", "waiting for the first successful poll"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			html := fetchOverview(t, newTestServer(t).WithLeadership(stubLeader{st: tt.st}))
+			for _, want := range tt.want {
+				if !strings.Contains(html, want) {
+					t.Fatalf("overview missing %q in:\n%s", want, html)
+				}
+			}
+			for _, notWant := range tt.notWant {
+				if strings.Contains(html, notWant) {
+					t.Fatalf("overview should not say %q when it is a follower", notWant)
+				}
+			}
+		})
+	}
+}
+
+func TestOverviewOmitsLeadershipWhenNotWired(t *testing.T) {
+	if html := fetchOverview(t, newTestServer(t)); strings.Contains(html, "Poller leadership") {
+		t.Fatalf("overview without a lease should not mention leadership, got:\n%s", html)
 	}
 }
 

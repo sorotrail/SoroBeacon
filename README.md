@@ -137,6 +137,54 @@ see the [configuration guide](docs/getting-started/configuration.md#encrypting-c
 > Set it to require `Authorization: Bearer <token>` on `/api/v1` and a
 > sign-in on the dashboard, or keep the listener on a trusted network.
 
+## Deployment
+
+### Several instances (high availability)
+
+Every instance serves the API and the dashboard; exactly one of them polls.
+Instances compete for a Postgres session-level advisory lock
+(`pg_try_advisory_lock`, key `0x534F4245434F4E`), and the holder runs the ingest
+loop and the retention pruner. There is no extra table, no migration and no
+coordinator process to run — a second instance is just a second instance:
+
+```sh
+# Two replicas of the same deployment, one poller between them.
+docker compose up -d --scale sorobeacon=2
+```
+
+- **One poller, always.** Without the lease, two replicas ingest the same
+  events and race the same checkpoint, so every alert is delivered twice and
+  each instance believes the other's progress is its own.
+- **Failover is bounded by the lease interval (3s)** — the follower's next
+  attempt to take the lock. A leader that exits gracefully releases the lock on
+  the way out; a leader that is killed frees it when its database session
+  disappears. There is no long fixed timer in either path.
+- **A demoted leader stops polling.** Its poller context is cancelled and the
+  lock is not given up until the poller has returned. A leader that loses its
+  database connection notices on the next renewal and stops, rather than
+  polling alongside the new leader — that overlap is the split-brain case that
+  duplicates alerts.
+- **The lease uses one dedicated connection per instance**, outside the
+  `DATABASE_MAX_CONNS` pool, because an advisory lock lives on the session that
+  took it and a pooled connection cannot be pinned for that.
+- **A follower is healthy.** `GET /api/v1/health` reports `leader`,
+  `leader_election` and `leader_since` so an operator can see which replica
+  polls, and the overview page says the same. A follower answers every other
+  endpoint normally and never fails readiness for not polling.
+- **PgBouncer needs session pooling.** Leader election holds a session-level
+  lock, so `DATABASE_URL` must reach Postgres directly or through a
+  session-pooled PgBouncer; in transaction pooling mode the lock cannot be
+  held. Followers then never promote, and no instance polls.
+
+### SQLite: a single node, no election
+
+A `sqlite://` `DATABASE_URL` is single-node by construction: one file on one
+machine, and no advisory locks to take. SoroBeacon runs the poller
+unconditionally and `GET /api/v1/health` reports `"leader": true` with
+`"leader_election": false`. Do not point several instances at one SQLite file —
+use Postgres when you want more than one. See
+[capacity and scaling](docs/operations/scaling.md).
+
 ## HTTP API
 
 All endpoints are under `/api/v1`.
@@ -324,6 +372,7 @@ internal/rules      RuleEvaluator interface + event_emitted, value_threshold,
                     token_event, frequency_threshold
 internal/notify     Notifier interface + 7 channels + retrying dispatcher
 internal/poller     ingest loop: poll -> decode -> match -> alert -> dispatch
+internal/lease      Postgres advisory-lock leader election for the poller
 internal/api        chi JSON API
 internal/web        html/template + htmx dashboard
 ```

@@ -18,6 +18,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/api"
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/config"
+	"github.com/sorotrail/sorobeacon/internal/lease"
 	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
@@ -89,6 +90,26 @@ func run() error {
 	defer st.Close()
 	log.Info("database ready", "backend", store.BackendName(cfg.DatabaseURL))
 
+	// Leadership. Every instance serves the API and the dashboard, but only the
+	// one holding the lease runs the ingest loop: two pollers ingest the same
+	// events and race the same checkpoint, so alerts arrive twice and each
+	// instance believes the other's progress is its own. Postgres supplies the
+	// election as a session advisory lock, which needs no table and no
+	// migration. A SQLite database cannot be shared between machines and has no
+	// advisory locks, so a SQLite deployment is always the poller.
+	//
+	// Failing to build the lease is fatal rather than a silent fall back to
+	// "everyone polls", which is the bug this prevents.
+	var leader *lease.Lease
+	if store.BackendName(cfg.DatabaseURL) == "postgres" {
+		leader, err = lease.NewPostgres(cfg.DatabaseURL, lease.Options{}, log)
+		if err != nil {
+			return err
+		}
+	} else {
+		leader = lease.SingleNode(log)
+	}
+
 	// Pipeline: event source -> rules -> alerts -> channels. The source is
 	// the single seam between the poller and wherever events come from.
 	var src poller.EventSource
@@ -148,6 +169,7 @@ func run() error {
 	// HTTP: JSON API under /api/v1, dashboard at /.
 	apiSrv := api.New(st, registry, factory, health, log).
 		WithPoller(p).
+		WithLeadership(leader).
 		WithReadyzLagThreshold(cfg.ReadyzLagThreshold).
 		WithRateLimit(api.RateLimitConfig{
 			RPS:            cfg.RateLimitRPS,
@@ -160,7 +182,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	webSrv.WithPoller(p).WithSilentAfter(cfg.MonitorSilentAfter).WithAuth(authn)
+	webSrv.WithPoller(p).WithLeadership(leader).WithSilentAfter(cfg.MonitorSilentAfter).WithAuth(authn)
 	root := chi.NewRouter()
 	// RequestLog must sit outside Recoverer so a panic still emits the
 	// access line after chi writes 500. reqid first so the line can
@@ -193,10 +215,22 @@ func run() error {
 			errCh <- err
 		}
 	}()
-	go p.Run(ctx)
-	if cfg.AlertRetention > 0 {
-		go store.RunAlertPruner(ctx, st, cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, log)
+	// The poller — and the retention pruner, which also writes on a schedule —
+	// run only while this instance holds the lease. Keeping them in one job
+	// means a demotion cancels the loop and the lease is not given up until the
+	// loop has genuinely returned, so a new leader cannot start polling while
+	// this one is still mid-cycle.
+	job := func(ctx context.Context) {
+		if cfg.AlertRetention > 0 {
+			go store.RunAlertPruner(ctx, st, cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, log)
+		}
+		p.Run(ctx)
 	}
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		leader.Run(ctx, job)
+	}()
 
 	select {
 	case <-ctx.Done():
@@ -207,7 +241,12 @@ func run() error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return httpSrv.Shutdown(shutdownCtx)
+	err = httpSrv.Shutdown(shutdownCtx)
+	// Wait for the election loop to finish before exiting: on the way out it
+	// releases the advisory lock, so the surviving instances promote at once
+	// instead of waiting for this session to disappear.
+	<-leaderDone
+	return err
 }
 
 // warnIfChannelConfigUnencrypted logs one warning at startup when

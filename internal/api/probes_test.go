@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/sorotrail/sorobeacon/internal/lease"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
 	"github.com/sorotrail/sorobeacon/internal/rules"
@@ -252,6 +253,83 @@ func TestHealthIncludesPollerFieldsWhenReady(t *testing.T) {
 	}
 	if body["last_successful_poll"] != "2026-09-22T00:00:00Z" {
 		t.Fatalf("last_successful_poll = %v", body["last_successful_poll"])
+	}
+}
+
+type stubLeader struct{ st lease.Status }
+
+func (s stubLeader) Status() lease.Status { return s.st }
+
+// A follower must report healthy: it serves the API and the dashboard exactly
+// like the leader, and a 503 would pull a perfectly useful replica out of the
+// load balancer for doing the right thing.
+func TestHealthReportsFollowerWithoutFailing(t *testing.T) {
+	s := New(&fakeStore{}, rules.NewRegistry(), notify.DefaultFactory(), &fakeRPC{}, discardLogger()).
+		WithLeadership(stubLeader{st: lease.Status{Enabled: true}})
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	code, body := decodeHealth(t, srv.URL+"/health")
+	if code != http.StatusOK {
+		t.Fatalf("health as a follower = %d, want 200", code)
+	}
+	if body["leader"] != false {
+		t.Fatalf("leader = %v, want false", body["leader"])
+	}
+	if body["leader_election"] != true {
+		t.Fatalf("leader_election = %v, want true", body["leader_election"])
+	}
+	if _, ok := body["leader_since"]; ok {
+		t.Fatalf("a follower must not report leader_since, got %+v", body)
+	}
+}
+
+func TestHealthReportsLeadershipWhenLeader(t *testing.T) {
+	at := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	s := New(&fakeStore{}, rules.NewRegistry(), notify.DefaultFactory(), &fakeRPC{}, discardLogger()).
+		WithLeadership(stubLeader{st: lease.Status{Enabled: true, Leader: true, Since: at}})
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	code, body := decodeHealth(t, srv.URL+"/health")
+	if code != http.StatusOK {
+		t.Fatalf("health as the leader = %d, want 200", code)
+	}
+	if body["leader"] != true {
+		t.Fatalf("leader = %v, want true", body["leader"])
+	}
+	if body["leader_since"] != "2026-09-24T12:00:00Z" {
+		t.Fatalf("leader_since = %v", body["leader_since"])
+	}
+}
+
+// A single-node deployment has no election to run, but it is still the poller;
+// the probe says both rather than leaving an operator guessing.
+func TestHealthReportsSingleNodeAsLeader(t *testing.T) {
+	s := New(&fakeStore{}, rules.NewRegistry(), notify.DefaultFactory(), &fakeRPC{}, discardLogger()).
+		WithLeadership(stubLeader{st: lease.Status{Leader: true, Since: time.Now()}})
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	_, body := decodeHealth(t, srv.URL+"/health")
+	if body["leader"] != true || body["leader_election"] != false {
+		t.Fatalf("single-node health = leader %v, leader_election %v; want true/false",
+			body["leader"], body["leader_election"])
+	}
+}
+
+func TestHealthOmitsLeadershipWhenNotWired(t *testing.T) {
+	srv := httptest.NewServer(newProbeServer(&fakeStore{}, &fakeRPC{}))
+	defer srv.Close()
+
+	code, body := decodeHealth(t, srv.URL+"/health")
+	if code != http.StatusOK {
+		t.Fatalf("health = %d, want 200", code)
+	}
+	for _, key := range []string{"leader", "leader_election", "leader_since"} {
+		if _, ok := body[key]; ok {
+			t.Fatalf("health without a lease must omit %q, got %+v", key, body)
+		}
 	}
 }
 

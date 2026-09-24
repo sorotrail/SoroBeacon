@@ -10,6 +10,9 @@ EventSource ──page──▶ poller ─▶ rules engine ─▶ alerts ─▶ 
                            └── ingest_state ────── Postgres or SQLite ───────┴── delivery_attempts ─┘
 ```
 
+Only the instance holding the poller lease (`internal/lease`) runs the ingest
+loop, while every instance serves the API and dashboard.
+
 The two backends share one `store.Store` interface, one behavioural
 conformance suite (`internal/store/conformance_test.go`), and one
 channel-config encryption envelope. They differ in DDL (parallel migration
@@ -44,6 +47,27 @@ line in `cmd/sorobeacon`'s mode switch. Nothing in the poller changes.
 * Source failures back off exponentially, capped at 10× the poll interval.
 * In `rpc` mode the poller verifies the RPC's network passphrase at startup
   against the configured one and refuses to start on mismatch.
+
+## Leader election (`internal/lease`)
+
+Every instance serves the API and the dashboard; exactly one polls. Instances
+compete for a Postgres session-level advisory lock (`pg_try_advisory_lock`,
+key `0x534F4245434F4E`), so the election needs no table, no migration and no
+coordinator process — and it is Postgres-only, which is why a `sqlite://`
+deployment uses `lease.SingleNode`: no election, the instance is the poller.
+
+The holder runs `poller.Run` (and the retention pruner); the losers run nothing
+but their HTTP servers. The lock belongs to the session that took it, which is
+what makes failover prompt rather than timer-driven: a leader that exits
+releases it explicitly, and a leader that dies frees it when its session goes.
+
+`Lease.Run(ctx, job)` runs `job` in its own goroutine for exactly as long as
+the lock is held, renewing every three seconds. A renewal that fails — the
+session died, the connection was cut, the lock was released elsewhere — cancels
+`job` and waits for it to return *before* the lock is given up, so the next
+leader never starts polling while this one is mid-cycle. That ordering is the
+split-brain guard: the failure it prevents is two instances ingesting the same
+events and delivering every alert twice.
 
 ## Observability (`internal/metrics`, `internal/reqid`, `internal/buildinfo`)
 
