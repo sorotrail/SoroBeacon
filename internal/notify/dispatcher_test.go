@@ -45,6 +45,43 @@ func (f *fakeDispatchStore) RecordDeliveryAttempt(_ context.Context, d *store.De
 	return nil
 }
 
+func (f *fakeDispatchStore) ListChannelsByIDs(_ context.Context, ids []int64) ([]store.Channel, error) {
+	wanted := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		wanted[id] = true
+	}
+	var out []store.Channel
+	for _, ch := range f.channels {
+		if wanted[ch.ID] && ch.Enabled {
+			out = append(out, ch)
+		}
+	}
+	return out, nil
+}
+
+// The dispatch tests exercise the flat fan-out, so no policy is attached.
+func (f *fakeDispatchStore) GetEscalationPolicyForMonitor(context.Context, int64) (*store.EscalationPolicy, error) {
+	return nil, store.ErrNotFound
+}
+
+func (f *fakeDispatchStore) GetEscalationPolicy(context.Context, int64) (*store.EscalationPolicy, error) {
+	return nil, store.ErrNotFound
+}
+
+func (f *fakeDispatchStore) ScheduleEscalation(context.Context, int64, int64, json.RawMessage, int, time.Time) error {
+	return nil
+}
+
+func (f *fakeDispatchStore) DueEscalations(context.Context, time.Time, int) ([]store.EscalationRun, error) {
+	return nil, nil
+}
+
+func (f *fakeDispatchStore) AdvanceEscalation(context.Context, int64, int, time.Time) error {
+	return nil
+}
+
+func (f *fakeDispatchStore) CompleteEscalation(context.Context, int64) error { return nil }
+
 func newTestDispatcher(t *testing.T, st *fakeDispatchStore, n Notifier) *Dispatcher {
 	t.Helper()
 	f := &Factory{constructors: map[string]Constructor{}}

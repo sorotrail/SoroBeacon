@@ -216,6 +216,58 @@
         }
       }
     },
+    "/monitors/{id}/escalation": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "get": {
+        "summary": "Get a monitor's escalation policy",
+        "description": "Returns the ordered escalation steps attached to the monitor. 404 when the monitor has no policy, in which case alerts fan out to every attached channel.",
+        "responses": {
+          "200": {
+            "description": "Escalation policy",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/EscalationPolicy" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "put": {
+        "summary": "Create or replace a monitor's escalation policy",
+        "description": "Replaces the whole policy atomically. Steps fire in order; a step's delay is relative to the alert for the first step and to the previous step thereafter. An unknown channel id is 400.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/EscalationInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The stored policy",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/EscalationPolicy" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "summary": "Delete a monitor's escalation policy",
+        "description": "Removes the policy so the monitor fans out flat again. 404 when the monitor has no policy.",
+        "responses": {
+          "204": { "description": "Deleted" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/monitors/{id}/rules": {
       "parameters": [
         { "$ref": "#/components/parameters/ID" }
@@ -589,6 +641,26 @@
         }
       }
     },
+    "/alerts/{id}/acknowledge": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "post": {
+        "summary": "Acknowledge an alert",
+        "description": "Stamps the alert acknowledged and stops any escalation attached to it, so later steps do not fire. Idempotent; 404 for a missing alert.",
+        "responses": {
+          "200": {
+            "description": "The acknowledged alert",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Alert" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/health": {
       "get": {
         "summary": "Combined health report",
@@ -926,7 +998,12 @@
           "event_id": { "type": "string" },
           "event_name": { "type": "string" },
           "payload": { "type": "object" },
-          "created_at": { "type": "string", "format": "date-time" }
+          "created_at": { "type": "string", "format": "date-time" },
+          "acknowledged_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When an operator acknowledged the alert; null until then. Acknowledgement stops escalation."
+          }
         }
       },
       "DeliveryAttempt": {
@@ -940,6 +1017,53 @@
           },
           "response_snippet": { "type": "string" },
           "attempted_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "EscalationStep": {
+        "type": "object",
+        "properties": {
+          "position": { "type": "integer", "description": "0-based place in the policy" },
+          "delay": { "type": "string", "description": "Go duration before this step fires, e.g. 5m" },
+          "channel_ids": {
+            "type": "array",
+            "items": { "type": "integer", "format": "int64" }
+          }
+        }
+      },
+      "EscalationPolicy": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "monitor_id": { "type": "integer", "format": "int64" },
+          "steps": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/EscalationStep" }
+          },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "EscalationInput": {
+        "type": "object",
+        "required": ["steps"],
+        "properties": {
+          "steps": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Ordered escalation steps. The first fires immediately; each later step waits its delay after the previous one fired.",
+            "items": {
+              "type": "object",
+              "required": ["channel_ids"],
+              "properties": {
+                "delay": { "type": "string", "description": "Go duration, e.g. 5m. Omitted or empty fires immediately." },
+                "channel_ids": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": { "type": "integer", "format": "int64" }
+                }
+              }
+            }
+          }
         }
       },
       "Version": {

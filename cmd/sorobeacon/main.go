@@ -192,6 +192,9 @@ func run() error {
 		}
 	}()
 	go p.Run(ctx)
+	// Escalation steps are driven by their persisted next-due time, so this
+	// loop is what resumes an escalation that was mid-flight at restart.
+	go dispatcher.RunEscalations(ctx)
 	if cfg.AlertRetention > 0 {
 		go store.RunAlertPruner(ctx, st, cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, log)
 	}

@@ -14,6 +14,11 @@ import (
 // ErrNotFound is returned when a requested row does not exist.
 var ErrNotFound = errors.New("not found")
 
+// ErrChannelInUse is returned when a channel cannot be deleted because an
+// escalation policy step still references it. The API maps it to 409 so the
+// operator can detach it first rather than be left with a dangling reference.
+var ErrChannelInUse = errors.New("channel is referenced by an escalation policy")
+
 // Monitor watches one or more Soroban contracts.
 type Monitor struct {
 	ID          int64     `json:"id"`
@@ -77,6 +82,10 @@ type Alert struct {
 	// previous alert. CreateAlert also folds it into Payload so the stored
 	// alert and the dispatched notification both report it.
 	SuppressedSinceLast int64 `json:"-"`
+	// AcknowledgedAt is when an operator acknowledged the alert. Nil means it
+	// has not been acknowledged, so an escalation attached to it keeps
+	// running. Acknowledging stops escalation.
+	AcknowledgedAt *time.Time `json:"acknowledged_at"`
 }
 
 // AlertOutcome reports what CreateAlert did with a match.
@@ -123,6 +132,41 @@ type IngestState struct {
 	LastLedger uint32    `json:"last_ledger"`
 	LastCursor string    `json:"last_cursor"`
 	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// EscalationStep is one step of an escalation policy: after Delay elapses it
+// notifies ChannelIDs. Delay is relative to the alert for the first step and
+// to the previous step thereafter, so a zero delay fires immediately.
+type EscalationStep struct {
+	// Position is the step's 0-based place in the policy.
+	Position int `json:"position"`
+	// DelaySeconds is how long to wait before this step fires.
+	DelaySeconds int64 `json:"delay_seconds"`
+	// ChannelIDs are the channels this step notifies.
+	ChannelIDs []int64 `json:"channel_ids"`
+}
+
+// EscalationPolicy is the ordered escalation attached to one monitor. A
+// monitor has at most one policy; a monitor without one keeps the flat
+// channel fan-out it has always had.
+type EscalationPolicy struct {
+	ID        int64            `json:"id"`
+	MonitorID int64            `json:"monitor_id"`
+	Steps     []EscalationStep `json:"steps"`
+	CreatedAt time.Time        `json:"created_at"`
+	UpdatedAt time.Time        `json:"updated_at"`
+}
+
+// EscalationRun is one pending escalation step the scheduler should fire:
+// the alert it belongs to, the step index, and when it is due. Snapshot is
+// the notification payload captured when the escalation started, so a step
+// delivered after a restart does not have to be rebuilt from scratch.
+type EscalationRun struct {
+	AlertID   int64           `json:"alert_id"`
+	PolicyID  int64           `json:"policy_id"`
+	NextStep  int             `json:"next_step"`
+	NextDueAt time.Time       `json:"next_due_at"`
+	Snapshot  json.RawMessage `json:"-"`
 }
 
 // AlertFilter narrows ListAlerts. Zero values mean "no constraint".
@@ -273,6 +317,9 @@ type Channels interface {
 	DeleteChannel(ctx context.Context, id int64) error
 	// ListChannelsForMonitor returns the enabled channels a monitor alerts to.
 	ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]Channel, error)
+	// ListChannelsByIDs returns the enabled channels among ids, ordered by id,
+	// so an escalation step can notify its channel set in one query.
+	ListChannelsByIDs(ctx context.Context, ids []int64) ([]Channel, error)
 }
 
 // Alerts persists alerts and delivery attempts.
@@ -303,6 +350,33 @@ type Ingest interface {
 	SetIngestState(ctx context.Context, s IngestState) error
 }
 
+// Escalations persists monitor escalation policies and the per-alert
+// scheduling state that keeps a tiered notification going across restarts.
+type Escalations interface {
+	// GetEscalationPolicyForMonitor returns the policy attached to a monitor,
+	// or ErrNotFound when the monitor has none (and therefore fans out flat).
+	GetEscalationPolicyForMonitor(ctx context.Context, monitorID int64) (*EscalationPolicy, error)
+	// GetEscalationPolicy returns a policy by its own id, used by the
+	// scheduler to load the steps for a due escalation.
+	GetEscalationPolicy(ctx context.Context, policyID int64) (*EscalationPolicy, error)
+	// SetEscalationPolicy replaces the monitor's policy with steps in one
+	// transaction, so the old policy can never be observed half-deleted.
+	SetEscalationPolicy(ctx context.Context, monitorID int64, steps []EscalationStep) (*EscalationPolicy, error)
+	DeleteEscalationPolicy(ctx context.Context, monitorID int64) error
+	// ScheduleEscalation records the next due step for an alert. Re-scheduling
+	// the same alert replaces the pending schedule rather than duplicating it.
+	ScheduleEscalation(ctx context.Context, alertID, policyID int64, snapshot json.RawMessage, nextStep int, nextDue time.Time) error
+	// DueEscalations returns unacknowledged, unfinished escalations whose next
+	// step is due at or before now, oldest due first.
+	DueEscalations(ctx context.Context, now time.Time, limit int) ([]EscalationRun, error)
+	// AdvanceEscalation moves a pending escalation to its next step.
+	AdvanceEscalation(ctx context.Context, alertID int64, nextStep int, nextDue time.Time) error
+	// CompleteEscalation clears a pending escalation once all steps have fired.
+	CompleteEscalation(ctx context.Context, alertID int64) error
+	// AcknowledgeAlert stamps an alert acknowledged and stops its escalation.
+	AcknowledgeAlert(ctx context.Context, alertID int64) error
+}
+
 // Store is everything the application needs from persistence.
 type Store interface {
 	Monitors
@@ -310,6 +384,7 @@ type Store interface {
 	Channels
 	Alerts
 	Ingest
+	Escalations
 	GetStats(ctx context.Context) (Stats, error)
 	// AlertCountsByDay returns UTC calendar-day alert totals for `days`
 	// consecutive days ending today (UTC). Days with no alerts are present
