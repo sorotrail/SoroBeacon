@@ -152,6 +152,25 @@ func run() error {
 		}
 	}()
 	go p.Run(ctx)
+	// sorobeacon_seconds_since_last_poll only climbs if something ticks it;
+	// the poll loop itself is blocked inside a cycle, so a separate
+	// low-frequency ticker reads the last successful poll time. It stays at
+	// zero until the first successful poll, so a cold start is not reported
+	// as a stall.
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if at := p.Position().LastSuccessfulPoll; !at.IsZero() {
+					m.TickPollAge(time.Since(at).Seconds())
+				}
+			}
+		}
+	}()
 	if cfg.AlertRetention > 0 {
 		go store.RunAlertPruner(ctx, st, cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, log)
 	}

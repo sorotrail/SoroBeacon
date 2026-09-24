@@ -23,10 +23,11 @@ type Metrics struct {
 	pollDuration  prometheus.Histogram
 	pollLagLedger prometheus.Gauge
 
-	eventsScanned  prometheus.Counter
-	eventsMatched  prometheus.Counter
-	alertsFired    prometheus.Counter
-	deliveries     *prometheus.CounterVec
+	eventsScanned   prometheus.Counter
+	eventsMatched   prometheus.Counter
+	ruleEvaluations prometheus.Counter
+	alertsFired     prometheus.Counter
+	deliveries      *prometheus.CounterVec
 	httpDuration   *prometheus.HistogramVec
 	lastPollAgoSec prometheus.Gauge
 }
@@ -63,6 +64,11 @@ func New() *Metrics {
 			Help: "Events that matched at least one monitor rule.",
 		}),
 
+		ruleEvaluations: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_rule_evaluations_total",
+			Help: "Rule evaluations: each event checked against each of its monitor's enabled rules.",
+		}),
+
 		alertsFired: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "sorobeacon_alerts_fired_total",
 			Help: "Alerts created by rule matches.",
@@ -85,8 +91,8 @@ func New() *Metrics {
 		}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
-		m.eventsScanned, m.eventsMatched, m.alertsFired, m.deliveries,
-		m.httpDuration, m.lastPollAgoSec)
+		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired,
+		m.deliveries, m.httpDuration, m.lastPollAgoSec)
 	return m
 }
 
@@ -137,6 +143,17 @@ func (m *Metrics) RecordEvents(scanned, matched int) {
 	m.eventsMatched.Add(float64(matched))
 }
 
+// RecordRuleEvaluations counts the rule evaluations (one per event × enabled
+// rule) in the cycle that just ran. It is deliberately separate from
+// RecordEvents so a monitor with many rules is distinguishable from a busy
+// contract.
+func (m *Metrics) RecordRuleEvaluations(n int) {
+	if m == nil {
+		return
+	}
+	m.ruleEvaluations.Add(float64(n))
+}
+
 // RecordAlert counts one alert fired.
 func (m *Metrics) RecordAlert() {
 	if m == nil {
@@ -184,9 +201,13 @@ func (m *Metrics) Middleware(next http.Handler) http.Handler {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
+		// Fall back to the raw path if no route-pattern provider is wired: a
+		// nil function must not panic the whole server over a metric.
 		route := r.URL.Path
-		if p := RoutePattern(r); p != "" {
-			route = p
+		if RoutePattern != nil {
+			if p := RoutePattern(r); p != "" {
+				route = p
+			}
 		}
 		m.httpDuration.WithLabelValues(route, r.Method, strconv.Itoa(rec.status)).
 			Observe(time.Since(start).Seconds())

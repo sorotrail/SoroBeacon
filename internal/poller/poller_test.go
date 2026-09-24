@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
@@ -489,4 +492,46 @@ func TestPollIgnoresEventsFromUnwatchedContracts(t *testing.T) {
 
 	require.NoError(t, p.Poll(context.Background()))
 	assert.Empty(t, st.alerts)
+}
+
+// scrapeMetrics renders a Metrics endpoint so tests can assert on the text.
+func scrapeMetrics(t *testing.T, m *metrics.Metrics) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	return rec.Body.String()
+}
+
+// TestPollRecordsPipelineMetrics pins the poller's hooks into internal/metrics:
+// the scanned → evaluated → matched → alerted funnel and the poll outcome are
+// all visible on the endpoint after a cycle.
+func TestPollRecordsPipelineMetrics(t *testing.T) {
+	m := metrics.New()
+	rpc := &fakeRPC{latest: 6000, responses: []*stellar.GetEventsResult{{
+		Events: []stellar.Event{
+			transferEvent("ev-1", 5990, "1"),
+			transferEvent("ev-2", 5991, "1"),
+			{ID: "ev-3", ContractID: contractA, Ledger: 5992, Type: "contract",
+				TopicJSON: []json.RawMessage{json.RawMessage(`{"symbol": "mint"}`)}},
+		},
+		LatestLedger: 6000,
+	}}}
+	st := newFakeStore()
+	st.state.LastLedger = 5500
+	seedMonitor(st, `{"event_name": "transfer"}`)
+	p := newTestPoller(rpc, st, &fakeDispatcher{}).WithMetrics(m)
+
+	require.NoError(t, p.Poll(context.Background()))
+	// Run is the timing loop plus this recording step; call it directly so the
+	// assertion does not depend on sleeping.
+	p.recordCycle(true, 0)
+
+	body := scrapeMetrics(t, m)
+	assert.Contains(t, body, "sorobeacon_events_scanned_total 3")
+	assert.Contains(t, body, "sorobeacon_events_matched_total 2")
+	assert.Contains(t, body, "sorobeacon_rule_evaluations_total 3")
+	assert.Contains(t, body, "sorobeacon_alerts_fired_total 2")
+	assert.Contains(t, body, `sorobeacon_polls_total{outcome="ok"} 1`)
+	assert.Contains(t, body, "sorobeacon_poll_lag_ledgers 0")
 }

@@ -59,9 +59,11 @@ type Poller struct {
 	log      *slog.Logger
 	// metrics is optional instrumentation; nil-safe, see internal/metrics.
 	metrics *metrics.Metrics
-	// scanned/matched accumulate per-cycle counts for metrics.
-	scanned int
-	matched int
+	// scanned/matched/evaluations accumulate per-cycle counts for metrics.
+	// They are only touched from the single Run goroutine.
+	scanned     int
+	matched     int
+	evaluations int
 	// pos is the last successful poll snapshot, stored as Position.
 	// atomic.Value so HTTP handlers can read it without a mutex.
 	pos atomic.Value
@@ -117,11 +119,10 @@ func (p *Poller) Run(ctx context.Context) {
 		case <-time.After(delay):
 		}
 
-		p.scanned, p.matched = 0, 0
+		p.scanned, p.matched, p.evaluations = 0, 0, 0
 		start := time.Now()
 		err := p.Poll(ctx)
-		p.metrics.RecordPoll(err == nil, time.Since(start))
-		p.metrics.RecordEvents(p.scanned, p.matched)
+		p.recordCycle(err == nil, time.Since(start))
 		if err != nil {
 			if ctx.Err() != nil {
 				continue
@@ -132,6 +133,15 @@ func (p *Poller) Run(ctx context.Context) {
 		}
 		delay = p.interval
 	}
+}
+
+// recordCycle publishes the counters a completed cycle accumulated. Split out
+// from Run so the instrumentation can be asserted without driving the timing
+// loop (which is the only thing Run adds over Poll).
+func (p *Poller) recordCycle(ok bool, took time.Duration) {
+	p.metrics.RecordPoll(ok, took)
+	p.metrics.RecordEvents(p.scanned, p.matched)
+	p.metrics.RecordRuleEvaluations(p.evaluations)
 }
 
 // Poll runs one ingest cycle. Exported so tests (and one-shot tools) can
@@ -244,6 +254,7 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 			continue
 		}
 		for _, rule := range ruleList {
+			p.evaluations++
 			matched, err := p.registry.Evaluate(ctx, rule.Type, decoded, rule.Params)
 			if err != nil {
 				p.log.Warn("rule evaluation failed", "rule_id", rule.ID, "event_id", decoded.ID, "err", err)
@@ -251,7 +262,6 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 			}
 			if matched {
 				p.matched++
-				p.metrics.RecordAlert()
 				p.fireAlert(ctx, m, rule, decoded)
 			}
 		}
@@ -305,6 +315,9 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 			"rule_id", rule.ID, "event_id", ev.ID, "cooldown", alert.Cooldown)
 		return
 	}
+	// Count only alerts that actually reached the store: a deduplicated or
+	// cooldown-suppressed match is not an alert.
+	p.metrics.RecordAlert()
 	logAttrs := []any{"alert_id", alert.ID, "monitor", m.Name, "rule_id", rule.ID, "event_id", ev.ID}
 	if alert.SuppressedSinceLast > 0 {
 		logAttrs = append(logAttrs, "suppressed_since_last", alert.SuppressedSinceLast)

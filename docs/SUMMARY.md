@@ -33,6 +33,7 @@
 
 * [Architecture](reference/architecture.md)
 * [HTTP API](reference/api.md)
+* [Metrics](reference/metrics.md)
 
 ## 🔌 Contributing
 

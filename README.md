@@ -111,10 +111,15 @@ implementing two methods. See
 
 ### Observability
 
-`/metrics` serves Prometheus instrumentation: poll outcomes and duration,
-poll lag behind the chain tip, seconds since the last poll, the
-events-scanned → events-matched → alerts-fired funnel, deliveries by
-channel and outcome, and HTTP request duration by route pattern.
+`/metrics` serves Prometheus text format on the HTTP listener, always on. The
+metric names are `sorobeacon_polls_total`, `sorobeacon_poll_duration_seconds`,
+`sorobeacon_poll_lag_ledgers`, `sorobeacon_seconds_since_last_poll`,
+`sorobeacon_events_scanned_total`, `sorobeacon_events_matched_total`,
+`sorobeacon_rule_evaluations_total`, `sorobeacon_alerts_fired_total`,
+`sorobeacon_alert_deliveries_total` and
+`sorobeacon_http_request_duration_seconds`; the
+[metrics reference](docs/reference/metrics.md) lists each one's labels and
+meaning, and the cardinality rules.
 `/api/v1/livez` and `/api/v1/readyz` are orchestration probes (liveness
 checks nothing; readiness checks the database and the event source with
 per-dependency detail). `/api/v1/version` reports the version, commit and
