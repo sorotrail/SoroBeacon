@@ -43,13 +43,16 @@ func (s *SQLite) resetConformance(ctx context.Context) error {
 		 DELETE FROM rules;
 		 DELETE FROM channels;
 		 DELETE FROM monitors;
+		 DELETE FROM saved_searches;
+		 DELETE FROM monitor_templates;
 		 UPDATE ingest_state SET last_ledger = 0, last_cursor = '' WHERE id = 1`); err != nil {
 		return err
 	}
 	// sqlite_sequence only exists once a table with AUTOINCREMENT has been
 	// written to; before that its absence is not an error.
 	_, _ = s.db.ExecContext(ctx,
-		`DELETE FROM sqlite_sequence WHERE name IN ('monitors','rules','channels','alerts','delivery_attempts')`)
+		`DELETE FROM sqlite_sequence
+		 WHERE name IN ('monitors','rules','channels','alerts','delivery_attempts','saved_searches','monitor_templates')`)
 	return nil
 }
 

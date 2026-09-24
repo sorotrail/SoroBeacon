@@ -1144,3 +1144,275 @@ func (s *SQLite) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCoun
 	}
 	return out, rows.Err()
 }
+
+// --- saved searches ---
+
+// CreateSavedSearch inserts one saved search and fills in its id and
+// created_at. Promoting it to default clears the previous default in the same
+// transaction: saved_searches_default_idx allows a single default row, and
+// holding one BEGIN IMMEDIATE transaction across the clear and the insert is
+// what keeps two concurrent writers from each seeing "no default" and both
+// setting one. The Postgres path gets the same guarantee from its unique
+// index, so a race fails loudly there rather than persisting silently.
+func (s *SQLite) CreateSavedSearch(ctx context.Context, search *SavedSearch) error {
+	filter, err := json.Marshal(search.Filter)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
+
+	if search.IsDefault {
+		if _, err := tx.ExecContext(ctx, `UPDATE saved_searches SET is_default = 0 WHERE is_default = 1`); err != nil {
+			return mapSQLiteErr(err)
+		}
+	}
+	var created string
+	if err := tx.QueryRowContext(ctx,
+		`INSERT INTO saved_searches (name, filter, is_default) VALUES (?, ?, ?) RETURNING id, created_at`,
+		search.Name, string(filter), boolToInt(search.IsDefault),
+	).Scan(&search.ID, &created); err != nil {
+		return mapSQLiteErr(err)
+	}
+	if search.CreatedAt, err = parseSQLiteTime(created); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ListSavedSearches returns every saved search ordered by name, matching the
+// order the Postgres backend returns and the web layer renders.
+func (s *SQLite) ListSavedSearches(ctx context.Context) ([]SavedSearch, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, filter, is_default, created_at FROM saved_searches ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []SavedSearch
+	for rows.Next() {
+		search, err := scanSQLiteSavedSearch(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, search)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) GetSavedSearch(ctx context.Context, id int64) (*SavedSearch, error) {
+	search, err := scanSQLiteSavedSearch(s.db.QueryRowContext(ctx,
+		`SELECT id, name, filter, is_default, created_at FROM saved_searches WHERE id = ?`, id))
+	if err != nil {
+		return nil, err
+	}
+	return &search, nil
+}
+
+func (s *SQLite) DeleteSavedSearch(ctx context.Context, id int64) error {
+	return s.deleteByID(ctx, "saved_searches", id)
+}
+
+// SetDefaultSearch makes one search the default and clears any other, in one
+// transaction for the same reason CreateSavedSearch does. An unknown id is
+// ErrNotFound rather than a silent success, so a stale bookmark fails loudly.
+func (s *SQLite) SetDefaultSearch(ctx context.Context, id int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
+
+	if _, err := tx.ExecContext(ctx, `UPDATE saved_searches SET is_default = 0 WHERE is_default = 1`); err != nil {
+		return mapSQLiteErr(err)
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE saved_searches SET is_default = 1 WHERE id = ?`, id)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit()
+}
+
+// ClearDefaultSearch drops the default flag from one saved search, leaving no
+// default behind. An unknown id is ErrNotFound.
+func (s *SQLite) ClearDefaultSearch(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE saved_searches SET is_default = 0 WHERE id = ?`, id)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// scanSQLiteSavedSearch reads one saved_searches row. is_default is stored as
+// INTEGER 0/1, and a filter that no longer decodes degrades to the zero filter
+// rather than failing the whole list, exactly as the Postgres backend does.
+func scanSQLiteSavedSearch(r rowScanner) (SavedSearch, error) {
+	var search SavedSearch
+	var filter string
+	var isDefault int64
+	var created string
+	if err := r.Scan(&search.ID, &search.Name, &filter, &isDefault, &created); err != nil {
+		return SavedSearch{}, mapSQLiteErr(err)
+	}
+	search.IsDefault = isDefault != 0
+	_ = json.Unmarshal([]byte(filter), &search.Filter)
+	var err error
+	if search.CreatedAt, err = parseSQLiteTime(created); err != nil {
+		return SavedSearch{}, err
+	}
+	return search, nil
+}
+
+// --- monitor templates ---
+
+// templateJSON holds the three JSON-encoded columns of monitor_templates.
+type templateJSON struct {
+	rules      string
+	channelIDs string
+	parameters string
+}
+
+// encodeTemplateJSON renders a template's rules, channel ids and parameters
+// for storage. Postgres keeps channel_ids in a BIGINT[]; SQLite has no array
+// type, so the ids travel as a JSON array in TEXT — the encoding
+// monitors.contract_ids already uses. A nil slice encodes as [] rather than
+// null so a read returns an empty slice, which is what the Postgres array
+// gives back, and the web layer can range over it either way.
+func encodeTemplateJSON(tmpl *MonitorTemplate) (templateJSON, error) {
+	rules, err := json.Marshal(tmpl.Rules)
+	if err != nil {
+		return templateJSON{}, err
+	}
+	channelIDs := tmpl.ChannelIDs
+	if channelIDs == nil {
+		channelIDs = []int64{}
+	}
+	ids, err := json.Marshal(channelIDs)
+	if err != nil {
+		return templateJSON{}, err
+	}
+	params, err := json.Marshal(tmpl.Parameters)
+	if err != nil {
+		return templateJSON{}, err
+	}
+	return templateJSON{rules: string(rules), channelIDs: string(ids), parameters: string(params)}, nil
+}
+
+func (s *SQLite) CreateMonitorTemplate(ctx context.Context, tmpl *MonitorTemplate) error {
+	encoded, err := encodeTemplateJSON(tmpl)
+	if err != nil {
+		return err
+	}
+	var created string
+	if err := s.db.QueryRowContext(ctx,
+		`INSERT INTO monitor_templates (name, description, rules, channel_ids, parameters)
+		 VALUES (?, ?, ?, ?, ?) RETURNING id, created_at`,
+		tmpl.Name, tmpl.Description, encoded.rules, encoded.channelIDs, encoded.parameters,
+	).Scan(&tmpl.ID, &created); err != nil {
+		return mapSQLiteErr(err)
+	}
+	tmpl.CreatedAt, err = parseSQLiteTime(created)
+	return err
+}
+
+func (s *SQLite) GetMonitorTemplate(ctx context.Context, id int64) (*MonitorTemplate, error) {
+	tmpl, err := scanSQLiteMonitorTemplate(s.db.QueryRowContext(ctx,
+		`SELECT id, name, description, rules, channel_ids, parameters, created_at
+		 FROM monitor_templates WHERE id = ?`, id))
+	if err != nil {
+		return nil, err
+	}
+	return &tmpl, nil
+}
+
+// ListMonitorTemplates returns every template ordered by name, matching the
+// Postgres backend and the order the template picker shows.
+func (s *SQLite) ListMonitorTemplates(ctx context.Context) ([]MonitorTemplate, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, description, rules, channel_ids, parameters, created_at
+		 FROM monitor_templates ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []MonitorTemplate
+	for rows.Next() {
+		tmpl, err := scanSQLiteMonitorTemplate(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, tmpl)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) UpdateMonitorTemplate(ctx context.Context, tmpl *MonitorTemplate) error {
+	encoded, err := encodeTemplateJSON(tmpl)
+	if err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE monitor_templates SET name = ?, description = ?, rules = ?, channel_ids = ?, parameters = ?
+		 WHERE id = ?`,
+		tmpl.Name, tmpl.Description, encoded.rules, encoded.channelIDs, encoded.parameters, tmpl.ID)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *SQLite) DeleteMonitorTemplate(ctx context.Context, id int64) error {
+	return s.deleteByID(ctx, "monitor_templates", id)
+}
+
+// scanSQLiteMonitorTemplate reads one monitor_templates row and decodes its
+// JSON columns. It mirrors scanSQLiteMonitor: a column that no longer decodes
+// names the offending row instead of returning half a template.
+func scanSQLiteMonitorTemplate(r rowScanner) (MonitorTemplate, error) {
+	var tmpl MonitorTemplate
+	var rules, channelIDs, parameters, created string
+	if err := r.Scan(&tmpl.ID, &tmpl.Name, &tmpl.Description, &rules, &channelIDs, &parameters, &created); err != nil {
+		return MonitorTemplate{}, mapSQLiteErr(err)
+	}
+	if err := json.Unmarshal([]byte(rules), &tmpl.Rules); err != nil {
+		return MonitorTemplate{}, fmt.Errorf("monitor template %d: bad rules: %w", tmpl.ID, err)
+	}
+	if err := json.Unmarshal([]byte(channelIDs), &tmpl.ChannelIDs); err != nil {
+		return MonitorTemplate{}, fmt.Errorf("monitor template %d: bad channel_ids: %w", tmpl.ID, err)
+	}
+	if tmpl.ChannelIDs == nil {
+		tmpl.ChannelIDs = []int64{}
+	}
+	if err := json.Unmarshal([]byte(parameters), &tmpl.Parameters); err != nil {
+		return MonitorTemplate{}, fmt.Errorf("monitor template %d: bad parameters: %w", tmpl.ID, err)
+	}
+	var err error
+	if tmpl.CreatedAt, err = parseSQLiteTime(created); err != nil {
+		return MonitorTemplate{}, err
+	}
+	return tmpl, nil
+}

@@ -61,6 +61,8 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("GetStats", func(t *testing.T) { testGetStats(t, newStore) })
 	t.Run("AlertCountsByDayZeroFillAndWindow", func(t *testing.T) { testAlertCountsByDay(t, newStore) })
 	t.Run("DuplicateMonitorCopiesRulesChannelsDisabledUniqueName", func(t *testing.T) { testDuplicateMonitor(t, newStore) })
+	t.Run("SavedSearchesCRUDAndSingleDefault", func(t *testing.T) { testSavedSearches(t, newStore) })
+	t.Run("MonitorTemplatesCRUD", func(t *testing.T) { testMonitorTemplates(t, newStore) })
 	t.Run("ChannelConfigNoKeyStaysPlaintext", func(t *testing.T) { testChannelConfigNoKey(t, newStore) })
 	t.Run("ChannelConfigEncryptedAtRest", func(t *testing.T) { testChannelConfigEncrypted(t, newStore) })
 	t.Run("ChannelConfigLegacyPlaintextThenReencrypts", func(t *testing.T) { testChannelConfigLegacy(t, newStore) })
@@ -954,6 +956,178 @@ func testDuplicateMonitor(t *testing.T, newStore conformanceFactory) {
 
 	_, err = st.DuplicateMonitor(ctx, 999999)
 	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+// testSavedSearches covers the named alert filters: CRUD, the name ordering
+// the sidebar relies on, the structured filter round-trip, and the "at most one
+// default" rule. Postgres enforces that rule with a partial unique index and
+// SQLite with a filtered one plus a single clear-then-set transaction; both
+// must leave exactly the same rows behind.
+func testSavedSearches(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	empty, err := st.ListSavedSearches(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, empty)
+
+	zeta := &SavedSearch{
+		Name:   "zeta treasury",
+		Filter: SavedSearchFilter{ContractID: "CAAA", Sort: "created_at_desc"},
+	}
+	require.NoError(t, st.CreateSavedSearch(ctx, zeta))
+	assert.NotZero(t, zeta.ID)
+	assert.False(t, zeta.CreatedAt.IsZero())
+	assert.False(t, zeta.IsDefault, "a search is not the default unless it asks to be")
+
+	alpha := &SavedSearch{
+		Name:      "alpha defaults",
+		Filter:    SavedSearchFilter{MonitorID: 7, RuleID: 9},
+		IsDefault: true,
+	}
+	require.NoError(t, st.CreateSavedSearch(ctx, alpha))
+
+	list, err := st.ListSavedSearches(ctx)
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	assert.Equal(t, "alpha defaults", list[0].Name, "list is ordered by name")
+	assert.Equal(t, "zeta treasury", list[1].Name)
+
+	got, err := st.GetSavedSearch(ctx, alpha.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "alpha defaults", got.Name)
+	assert.True(t, got.IsDefault)
+	assert.EqualValues(t, 7, got.Filter.MonitorID)
+	assert.EqualValues(t, 9, got.Filter.RuleID)
+
+	got, err = st.GetSavedSearch(ctx, zeta.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "CAAA", got.Filter.ContractID)
+	assert.Equal(t, "created_at_desc", got.Filter.Sort)
+
+	// Creating a second default must clear the first, not fail on the unique
+	// index and not leave two defaults behind.
+	beta := &SavedSearch{Name: "beta", IsDefault: true}
+	require.NoError(t, st.CreateSavedSearch(ctx, beta))
+	got, err = st.GetSavedSearch(ctx, alpha.ID)
+	require.NoError(t, err)
+	assert.False(t, got.IsDefault, "a new default clears the previous one")
+	got, err = st.GetSavedSearch(ctx, beta.ID)
+	require.NoError(t, err)
+	assert.True(t, got.IsDefault)
+
+	// Moving the default back is the same operation from the other side.
+	require.NoError(t, st.SetDefaultSearch(ctx, alpha.ID))
+	got, err = st.GetSavedSearch(ctx, beta.ID)
+	require.NoError(t, err)
+	assert.False(t, got.IsDefault)
+	got, err = st.GetSavedSearch(ctx, alpha.ID)
+	require.NoError(t, err)
+	assert.True(t, got.IsDefault)
+
+	// Clearing leaves no default at all.
+	require.NoError(t, st.ClearDefaultSearch(ctx, alpha.ID))
+	got, err = st.GetSavedSearch(ctx, alpha.ID)
+	require.NoError(t, err)
+	assert.False(t, got.IsDefault)
+
+	// Unknown ids are ErrNotFound, never a silent success: a stale bookmark
+	// or a deleted search must be reported to the caller.
+	assert.ErrorIs(t, st.SetDefaultSearch(ctx, 999999), ErrNotFound)
+	assert.ErrorIs(t, st.ClearDefaultSearch(ctx, 999999), ErrNotFound)
+	_, err = st.GetSavedSearch(ctx, 999999)
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	require.NoError(t, st.DeleteSavedSearch(ctx, beta.ID))
+	_, err = st.GetSavedSearch(ctx, beta.ID)
+	assert.ErrorIs(t, err, ErrNotFound)
+	assert.ErrorIs(t, st.DeleteSavedSearch(ctx, beta.ID), ErrNotFound)
+}
+
+// testMonitorTemplates covers template CRUD. Instantiation copies a template
+// rather than referencing it, so this only pins storage: every field, including
+// the rules and their params, must survive a write and a read on both backends.
+func testMonitorTemplates(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	empty, err := st.ListMonitorTemplates(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, empty)
+
+	tmpl := &MonitorTemplate{
+		Name:        "zeta usdc",
+		Description: "watch a USDC contract",
+		Rules: []MonitorTemplateRule{
+			{Type: "event_emitted", Params: json.RawMessage(`{"event_name":"transfer"}`)},
+			{Type: "value_threshold", Params: json.RawMessage(`{"comparison":"gt","threshold":1000}`)},
+		},
+		ChannelIDs: []int64{3, 5},
+		Parameters: []TemplateParameter{
+			{Name: "contract_id", Description: "the contract to watch", Required: true},
+			{Name: "threshold", Default: "1000"},
+		},
+	}
+	require.NoError(t, st.CreateMonitorTemplate(ctx, tmpl))
+	assert.NotZero(t, tmpl.ID)
+	assert.False(t, tmpl.CreatedAt.IsZero())
+
+	// A template with no channels attached is legal: the operator picks them
+	// when instantiating. The ids are an explicit empty slice because the API
+	// layer normalises an absent channel_ids to one before calling the store.
+	plain := &MonitorTemplate{Name: "alpha basic", ChannelIDs: []int64{}}
+	require.NoError(t, st.CreateMonitorTemplate(ctx, plain))
+
+	got, err := st.GetMonitorTemplate(ctx, tmpl.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "zeta usdc", got.Name)
+	assert.Equal(t, "watch a USDC contract", got.Description)
+	require.Len(t, got.Rules, 2)
+	assert.Equal(t, "event_emitted", got.Rules[0].Type)
+	assert.JSONEq(t, `{"event_name":"transfer"}`, string(got.Rules[0].Params))
+	assert.Equal(t, "value_threshold", got.Rules[1].Type)
+	assert.JSONEq(t, `{"comparison":"gt","threshold":1000}`, string(got.Rules[1].Params))
+	assert.Equal(t, []int64{3, 5}, got.ChannelIDs)
+	require.Len(t, got.Parameters, 2)
+	assert.Equal(t, "contract_id", got.Parameters[0].Name)
+	assert.Equal(t, "the contract to watch", got.Parameters[0].Description)
+	assert.True(t, got.Parameters[0].Required)
+	assert.Equal(t, "1000", got.Parameters[1].Default)
+
+	got, err = st.GetMonitorTemplate(ctx, plain.ID)
+	require.NoError(t, err)
+	assert.Empty(t, got.ChannelIDs, "no attached channels reads as an empty slice, not an error")
+	assert.Empty(t, got.Rules)
+
+	list, err := st.ListMonitorTemplates(ctx)
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	assert.Equal(t, "alpha basic", list[0].Name, "list is ordered by name")
+	assert.Equal(t, "zeta usdc", list[1].Name)
+	assert.Equal(t, []int64{3, 5}, list[1].ChannelIDs)
+
+	tmpl.Name = "zeta usdc v2"
+	tmpl.Description = "renamed"
+	tmpl.ChannelIDs = []int64{5}
+	tmpl.Rules = tmpl.Rules[:1]
+	require.NoError(t, st.UpdateMonitorTemplate(ctx, tmpl))
+	got, err = st.GetMonitorTemplate(ctx, tmpl.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "zeta usdc v2", got.Name)
+	assert.Equal(t, "renamed", got.Description)
+	assert.Equal(t, []int64{5}, got.ChannelIDs)
+	require.Len(t, got.Rules, 1)
+	assert.Equal(t, tmpl.CreatedAt, got.CreatedAt, "updating must not restamp created_at")
+
+	ghost := &MonitorTemplate{ID: 999999, Name: "ghost"}
+	assert.ErrorIs(t, st.UpdateMonitorTemplate(ctx, ghost), ErrNotFound)
+	_, err = st.GetMonitorTemplate(ctx, 999999)
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	require.NoError(t, st.DeleteMonitorTemplate(ctx, tmpl.ID))
+	_, err = st.GetMonitorTemplate(ctx, tmpl.ID)
+	assert.ErrorIs(t, err, ErrNotFound)
+	assert.ErrorIs(t, st.DeleteMonitorTemplate(ctx, tmpl.ID), ErrNotFound)
 }
 
 // The four channel-config tests below run against both backends so the
