@@ -592,7 +592,7 @@
     "/health": {
       "get": {
         "summary": "Combined health report",
-        "description": "Legacy combined check; prefer /livez and /readyz. Exempt from authentication so probes and the docker-compose healthcheck keep working.",
+        "description": "Legacy combined check; prefer /livez and /readyz. Exempt from authentication so probes and the docker-compose healthcheck keep working. Reports `leader` (whether this instance holds the poller lease), `leader_election` (whether a lease exists to hold at all; false for a single-node/ SQLite deployment) and `leader_since`. A follower is healthy: it serves the API and dashboard and returns 200.",
         "security": [],
         "responses": {
           "200": { "description": "Healthy" },

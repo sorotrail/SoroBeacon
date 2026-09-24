@@ -57,6 +57,15 @@ The `DATABASE_MAX_CONNS`, `DATABASE_MIN_CONNS`,
 the **Postgres** pool. Setting any of them with a `sqlite` URL is a startup
 error rather than a setting that silently does nothing.
 
+A SQLite deployment is also exempt from leader election. Several SoroBeacon
+instances sharing a Postgres database elect a single poller between them with a
+session-level advisory lock, which SQLite does not have — and a SQLite file
+cannot be shared between machines anyway. So the instance polls
+unconditionally, and `GET /api/v1/health` reports `"leader": true` alongside
+`"leader_election": false` to say that nothing was elected. See
+[Deployment](../README.md#deployment) for the Postgres behaviour and its
+failover timings.
+
 ## API authentication
 
 | Variable | Type | Default | Required | What it does |

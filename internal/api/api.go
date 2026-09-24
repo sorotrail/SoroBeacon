@@ -16,6 +16,7 @@ import (
 
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/buildinfo"
+	"github.com/sorotrail/sorobeacon/internal/lease"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
 	"github.com/sorotrail/sorobeacon/internal/reqid"
@@ -38,6 +39,13 @@ type PositionReader interface {
 	Position() poller.Position
 }
 
+// LeaderReader reports this instance's leader-election status. Only the
+// instance holding the lease polls, so /health exposes it: that is how an
+// operator tells a standby replica from one that has stopped working.
+type LeaderReader interface {
+	Status() lease.Status
+}
+
 // DefaultMaxBodyBytes is 1 MiB, matching config.DefaultHTTPMaxBodyBytes.
 // Used when New is not followed by WithMaxBodyBytes.
 const DefaultMaxBodyBytes int64 = 1 << 20
@@ -49,6 +57,7 @@ type Server struct {
 	rpc                HealthChecker
 	log                *slog.Logger
 	poller             PositionReader
+	leader             LeaderReader
 	readyzLagThreshold uint32
 	rateLimit          RateLimitConfig
 	maxBodyBytes       int64
@@ -76,6 +85,14 @@ func (s *Server) WithMaxBodyBytes(n int64) *Server {
 // WithPoller attaches the ingest-position source used by /health and /readyz.
 func (s *Server) WithPoller(p PositionReader) *Server {
 	s.poller = p
+	return s
+}
+
+// WithLeadership attaches the leader-election status reported by /health. Not
+// wiring it leaves the leadership fields out, exactly as an older deployment
+// behaved.
+func (s *Server) WithLeadership(r LeaderReader) *Server {
+	s.leader = r
 	return s
 }
 
@@ -394,7 +411,24 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		out["rpc_latest_ledger"] = h.LatestLedger
 	}
 	s.attachPoller(out)
+	s.attachLeadership(out)
 	writeJSON(w, status, out)
+}
+
+// attachLeadership adds whether this instance holds the poller lease. A
+// follower is healthy — it serves the API and the dashboard normally — so this
+// only reports the role; it never changes the status code. Absent when no
+// lease is wired.
+func (s *Server) attachLeadership(out map[string]any) {
+	if s.leader == nil {
+		return
+	}
+	st := s.leader.Status()
+	out["leader"] = st.Leader
+	out["leader_election"] = st.Enabled
+	if st.Leader && !st.Since.IsZero() {
+		out["leader_since"] = st.Since.UTC().Format(time.RFC3339)
+	}
 }
 
 // attachPoller adds last processed / chain ledger / lag / last poll time

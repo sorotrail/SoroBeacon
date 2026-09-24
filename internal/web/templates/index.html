@@ -20,6 +20,9 @@
   </div>
   {{end}}
 </section>
+{{if .Leadership}}
+<p class="muted">Poller leadership: <b>{{.Leadership.Role}}</b>{{if .Leadership.Leader}} since {{formatTime .Leadership.Since .Timezone}}{{end}}</p>
+{{end}}
 {{if .Poller}}
 <div class="stats">
   <div class="stat"><b>{{.Poller.Lag}}</b> ledger lag</div>
@@ -27,6 +30,10 @@
   <div class="stat"><b>{{.Poller.LatestChainLedger}}</b> chain tip</div>
 </div>
 <p class="muted">Last successful poll: {{formatTime .Poller.LastSuccessfulPoll .Timezone}}</p>
+{{else if .Leadership.Leader}}
+<p class="muted">Poller lag: waiting for the first successful poll.</p>
+{{else if .Leadership}}
+<p class="muted">Poller lag: this instance is not polling; another instance holds the poller lease.</p>
 {{else}}
 <p class="muted">Poller lag: waiting for the first successful poll.</p>
 {{end}}
