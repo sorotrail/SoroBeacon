@@ -560,7 +560,20 @@ func (p *Postgres) UpdateChannel(ctx context.Context, c *Channel) error {
 	return nil
 }
 
+// DeleteChannel removes a channel, refusing when an escalation policy step
+// still references it. The reference is checked explicitly so the caller gets
+// ErrChannelInUse (mapped to a 409) rather than a raw foreign-key error; the
+// migration's ON DELETE RESTRICT is the backstop for a concurrent policy write.
 func (p *Postgres) DeleteChannel(ctx context.Context, id int64) error {
+	var inUse bool
+	if err := p.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM escalation_step_channels WHERE channel_id = $1)`, id,
+	).Scan(&inUse); err != nil {
+		return err
+	}
+	if inUse {
+		return ErrChannelInUse
+	}
 	return p.deleteByID(ctx, "channels", id)
 }
 
@@ -571,6 +584,23 @@ func (p *Postgres) ListChannelsForMonitor(ctx context.Context, monitorID int64) 
 		 JOIN monitor_channels mc ON mc.channel_id = c.id
 		 WHERE mc.monitor_id = $1 AND c.enabled
 		 ORDER BY c.id`, monitorID)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, p.scanChannel)
+}
+
+// ListChannelsByIDs returns the enabled channels among ids, ordered by id, so
+// an escalation step can resolve its channel set in one query. Disabled
+// channels are omitted rather than erroring, matching ListChannelsForMonitor:
+// a paused destination simply stops receiving alerts.
+func (p *Postgres) ListChannelsByIDs(ctx context.Context, ids []int64) ([]Channel, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := p.pool.Query(ctx,
+		`SELECT id, name, type, config, enabled, created_at FROM channels
+		  WHERE id = ANY($1) AND enabled ORDER BY id`, uniqueIDs(ids))
 	if err != nil {
 		return nil, err
 	}
@@ -689,8 +719,8 @@ func (p *Postgres) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 func (p *Postgres) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	var a Alert
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, created_at FROM alerts WHERE id = $1`, id,
-	).Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt)
+		`SELECT id, monitor_id, rule_id, event_id, payload, created_at, acknowledged_at FROM alerts WHERE id = $1`, id,
+	).Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt, &a.AcknowledgedAt)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -707,7 +737,7 @@ func alertSort(s string) string {
 }
 
 func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at FROM alerts WHERE TRUE`
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at, acknowledged_at FROM alerts WHERE TRUE`
 	args := []any{}
 	n := 0
 	arg := func(v any) string {
@@ -756,7 +786,7 @@ func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, erro
 	}
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Alert, error) {
 		var a Alert
-		err := row.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt)
+		err := row.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt, &a.AcknowledgedAt)
 		return a, err
 	})
 }
