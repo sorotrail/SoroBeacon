@@ -794,7 +794,7 @@
           "monitor_id": { "type": "integer", "format": "int64" },
           "type": {
             "type": "string",
-            "enum": ["event_emitted", "value_threshold", "token_event"]
+            "enum": ["event_emitted", "value_threshold", "token_event", "absence_of_event"]
           },
           "params": { "type": "object" },
           "enabled": { "type": "boolean" }
@@ -806,7 +806,7 @@
         "properties": {
           "type": {
             "type": "string",
-            "enum": ["event_emitted", "value_threshold", "token_event"]
+            "enum": ["event_emitted", "value_threshold", "token_event", "absence_of_event"]
           },
           "params": {
             "type": "object",

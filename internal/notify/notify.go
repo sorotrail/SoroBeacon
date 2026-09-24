@@ -30,6 +30,12 @@ type Alert struct {
 	TxHash      string          `json:"tx_hash"`
 	Payload     json.RawMessage `json:"payload,omitempty"`
 	CreatedAt   time.Time       `json:"created_at"`
+	// Silence is set by absence-of-event rules: how long the event they wait
+	// for had been missing when the alert fired. Zero for event-driven alerts.
+	// The message template switches on it, because an absence alert has no
+	// ledger, no transaction and no matching event — reporting those as empty
+	// fields reads like a broken alert rather than a contract gone quiet.
+	Silence time.Duration `json:"silence,omitempty"`
 }
 
 // Notifier sends one alert to one destination. Implementations should
@@ -95,11 +101,16 @@ func (f *Factory) New(channelType string, config json.RawMessage) (Notifier, err
 var defaultTemplate = template.Must(template.New("alert").Parse(strings.TrimSpace(`
 🔔 SoroBeacon alert: {{.MonitorName}}
 Rule: {{.RuleType}} (#{{.RuleID}})
-Contract: {{.ContractID}}
-{{- if .EventName}}
+{{- if .ContractID}}
+Contract: {{.ContractID}}{{end}}
+{{- if .Silence}}
+No {{.EventName}} for {{.Silence}}
+{{- else if .EventName}}
 Event: {{.EventName}}{{end}}
-Ledger: {{.Ledger}}
-Tx: {{.TxHash}}
+{{- if .Ledger}}
+Ledger: {{.Ledger}}{{end}}
+{{- if .TxHash}}
+Tx: {{.TxHash}}{{end}}
 Event ID: {{.EventID}}
 At: {{.CreatedAt.UTC.Format "2006-01-02 15:04:05"}} UTC
 `)))

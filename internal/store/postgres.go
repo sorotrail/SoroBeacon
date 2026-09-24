@@ -476,6 +476,35 @@ func (p *Postgres) DeleteRule(ctx context.Context, id int64) error {
 	return p.deleteByID(ctx, "rules", id)
 }
 
+// --- absence-of-event state ---
+
+func (p *Postgres) ListAbsenceState(ctx context.Context) ([]AbsenceState, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT rule_id, event_name, last_seen_at FROM rule_absence_state`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (AbsenceState, error) {
+		var s AbsenceState
+		err := row.Scan(&s.RuleID, &s.EventName, &s.LastSeen)
+		return s, err
+	})
+}
+
+func (p *Postgres) RecordAbsenceSeen(ctx context.Context, ruleID int64, eventName string, at time.Time) error {
+	// GREATEST is what makes the clock monotonic in one statement: the sweep
+	// and the rearm path both write here, and neither may move a clock that a
+	// newer event already advanced.
+	_, err := p.pool.Exec(ctx,
+		`INSERT INTO rule_absence_state (rule_id, event_name, last_seen_at, updated_at)
+		 VALUES ($1, $2, $3, now())
+		 ON CONFLICT (rule_id, event_name) DO UPDATE
+		 SET last_seen_at = GREATEST(rule_absence_state.last_seen_at, EXCLUDED.last_seen_at),
+		     updated_at   = now()`,
+		ruleID, eventName, at.UTC())
+	return err
+}
+
 // --- channels ---
 
 func (p *Postgres) CreateChannel(ctx context.Context, c *Channel) error {

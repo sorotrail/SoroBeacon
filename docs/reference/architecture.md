@@ -5,7 +5,7 @@ One Go process, three pipeline stages, Postgres for state:
 ```
 EventSource ──page──▶ poller ─▶ rules engine ─▶ alerts ─▶ dispatcher ─▶ channels
  (RPC or SoroTrail)        │                              │                   │
-                           └── ingest_state ── Postgres ──┴── delivery_attempts ─┘
+                           └── ingest_state, rule_absence_state ── Postgres ──┴── delivery_attempts ─┘
 ```
 
 ## Event sources (`internal/poller`, `internal/sorotrail`)
@@ -33,6 +33,7 @@ line in `cmd/sorobeacon`'s mode switch. Nothing in the poller changes.
 * The source's cursors are followed until it reports no more events; then the checkpoint (`ingest_state.last_ledger`) advances to the minimum `latestLedger` the source reported.
 * **Cold start** begins at the source's tip (an RPC retains only ~1–7 days of events, so deep backfill is impossible there; an indexer holds everything, but a fresh monitor has no reason to replay the past). **Warm start** resumes at `last_ledger + 1`.
 * Source failures back off exponentially, capped at 10× the poll interval.
+* After a cycle that **succeeded**, the poller also runs the absence sweep (see below). A failed cycle skips it: "we could not look" is not "nothing happened".
 * In `rpc` mode the poller verifies the RPC's network passphrase at startup
   against the configured one and refuses to start on mismatch.
 
@@ -58,6 +59,8 @@ The RPC client requests `xdrFormat: "json"` so topics and values arrive readable
 
 Each event is checked against every enabled rule of every monitor watching its contract. A match inserts an alert with `ON CONFLICT (rule_id, event_id) DO NOTHING` — the database-level dedup guard that makes ingestion idempotent across restarts and replays.
 
+Rules come in two shapes, and a type belongs to exactly one. A `RuleEvaluator` (the default) decides whether one arriving event matches. An `AbsenceEvaluator` — currently only [`absence_of_event`](../rules/absence-of-event.md) — watches for an event that never arrives, so a matching event merely re-arms it and the poller's sweep fires it once the configured window has elapsed. The sweep stores each rule's last-seen clock in `rule_absence_state` and event ids derived from the silent window itself, so the same dedup guard collapses repeated sweeps and survives restarts.
+
 ## Delivery (`internal/notify`)
 
 The dispatcher fans each new alert out to the monitor's enabled channels. Per channel: up to 3 attempts with exponential backoff (1s → 2s → 4s), and **every attempt** — success or failure, with a response snippet — is recorded in `delivery_attempts`. One misbehaving channel never blocks the others or the poller.
@@ -73,6 +76,7 @@ The dispatcher fans each new alert out to the monitor's enabled channels. Per ch
 | `alerts` | One row per rule match; unique on `(rule_id, event_id)` |
 | `delivery_attempts` | Every delivery try with status and response snippet |
 | `ingest_state` | Single-row poller checkpoint (last ledger, cursor) |
+| `rule_absence_state` | Last-seen clock per absence rule, one row per `(rule_id, event_name)` |
 
 Migrations are embedded in the binary and applied automatically at startup (golang-migrate).
 

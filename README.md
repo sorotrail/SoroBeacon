@@ -155,7 +155,7 @@ curl -s -X DELETE localhost:8080/api/v1/monitors/1
 
 ### Rules
 
-Three rule types ship:
+Four rule types ship:
 
 **`event_emitted`** — match on event name (the first topic, by Soroban
 convention) and/or exact topic values:
@@ -202,6 +202,20 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
     "event": "transfer",
     "from": "GDW6...SENDER",
     "min_amount": "1000000000"
+  }
+}'
+```
+
+**`absence_of_event`** — the inverse of `event_emitted`: fire when the event
+*stops* arriving. `window` is how long silence is tolerated. Each silence
+alerts once, not once per poll, and the clock survives a restart:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "absence_of_event",
+  "params": {
+    "event_name": "heartbeat",
+    "window": "30m"
   }
 }'
 ```
@@ -268,7 +282,7 @@ cmd/sorobeacon      wiring + graceful shutdown
 internal/config     env config
 internal/stellar    RPC client (getEvents/getLatestLedger/getHealth) + ScVal decoder
 internal/store      Postgres (pgx) + embedded golang-migrate migrations
-internal/rules      RuleEvaluator interface + event_emitted, value_threshold
+internal/rules      RuleEvaluator/AbsenceEvaluator interfaces + the built-in rule types
 internal/notify     Notifier interface + 5 channels + retrying dispatcher
 internal/poller     ingest loop: poll -> decode -> match -> alert -> dispatch
 internal/api        chi JSON API

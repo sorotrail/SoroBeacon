@@ -5,7 +5,8 @@ SoroBeacon's core is deliberately small; features are meant to arrive as impleme
 | To add… | Implement | Register / wire in |
 | --- | --- | --- |
 | a notification channel | `notify.Notifier` | `DefaultFactory` in `internal/notify/notify.go` |
-| a rule type | `rules.RuleEvaluator` | `NewRegistry` in `internal/rules/rules.go` |
+| a per-event rule type | `rules.RuleEvaluator` | `NewRegistry` in `internal/rules/rules.go` |
+| a timer-driven rule type | `rules.AbsenceEvaluator` | `NewRegistry` in `internal/rules/rules.go`, via `RegisterAbsence` |
 | a different event source | `stellar.Client` | `cmd/sorobeacon/main.go` |
 | smarter event decoding | `stellar.Decoder` | `cmd/sorobeacon/main.go` |
 | another database | `store.Store` (or a sub-interface) | `cmd/sorobeacon/main.go` |
@@ -50,19 +51,27 @@ Rules of the road:
 
 ## Adding a rule type
 
+Most rule types are evaluated against each incoming event:
+
 ```go
-// internal/rules/absence.go
-type Absence struct{}
+// internal/rules/burst.go
+type Burst struct{}
 
-func (Absence) Validate(params json.RawMessage) error { ... }
+func (Burst) Validate(params json.RawMessage) error { ... }
 
-func (Absence) Evaluate(ctx context.Context, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error) { ... }
+func (Burst) Evaluate(ctx context.Context, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error) { ... }
 ```
 
 Register it in `NewRegistry`:
 
 ```go
-r.Register("absence", Absence{})
+r.Register("burst", Burst{})
+```
+
+A type that cannot be answered by an event — `absence_of_event` is the built-in example, and "more than N matches in M minutes" is the same shape — implements `rules.AbsenceEvaluator` instead and is registered with `RegisterAbsence`. The poller then re-arms it on matching events and fires it from its periodic sweep (`Poller.SweepAbsence`), never from `Evaluate`:
+
+```go
+r.RegisterAbsence(rules.TypeAbsenceOfEvent, rules.Absence{})
 ```
 
 Evaluators must be stateless and concurrency-safe. Decoded events use a small value vocabulary (`nil`, `bool`, `string`, `*big.Int`, `[]byte`, `[]any`, `map[string]any`); build on the helpers in `internal/stellar`:
@@ -73,7 +82,7 @@ Evaluators must be stateless and concurrency-safe. Decoded events use a small va
 
 ## Wanted (open by design)
 
-* Rule types: absence-of-event ("no heartbeat for N minutes"), frequency ("more than N matches in M minutes")
+* Rule types: frequency ("more than N matches in M minutes"), and richer absence triggers (topic filters on the awaited event, per-contract windows)
 * Channels: Matrix, PagerDuty, ntfy.sh
 * Contract-spec-aware decoding (named event fields via `stellar.Decoder`)
 * A richer dashboard

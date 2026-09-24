@@ -13,7 +13,7 @@ Soroban RPC nodes only retain events for roughly **24 hours to 7 days**. Histori
 | Piece | What you get |
 | --- | --- |
 | **Monitors** | Watch one or more contract addresses per monitor |
-| **Rules** | [`event_emitted`](rules/event-emitted.md) and [`value_threshold`](rules/value-threshold.md), evaluated against every event |
+| **Rules** | [`event_emitted`](rules/event-emitted.md), [`value_threshold`](rules/value-threshold.md) and [`token_event`](rules/token-event.md) evaluated against every event, plus [`absence_of_event`](rules/absence-of-event.md) for a contract gone quiet |
 | **Channels** | [Discord](channels/discord.md), [Slack](channels/slack.md), [Telegram](channels/telegram.md), [email](channels/email.md), [HMAC-signed webhooks](channels/webhook.md) |
 | **Delivery** | Retries with exponential backoff, every attempt recorded |
 | **Dedup** | An alert fires at most once per `(rule, event)` — restarts never double-notify |

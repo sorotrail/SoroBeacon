@@ -61,7 +61,7 @@ curl -s -X PATCH localhost:8080/api/v1/monitors/1 -d '{"enabled": false}'
 | `PATCH /monitors/{id}/rules/{ruleID}` | Partial update; params re-validated. |
 | `DELETE /monitors/{id}/rules/{ruleID}` | Delete. |
 
-Params for the built-in types: [`event_emitted`](../rules/event-emitted.md), [`value_threshold`](../rules/value-threshold.md). Invalid params are rejected with `400` at create/update time.
+Params for the built-in types: [`event_emitted`](../rules/event-emitted.md), [`value_threshold`](../rules/value-threshold.md), [`token_event`](../rules/token-event.md), [`absence_of_event`](../rules/absence-of-event.md). Invalid params are rejected with `400` at create/update time.
 
 ## Channels
 

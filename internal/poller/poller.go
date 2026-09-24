@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -40,6 +41,10 @@ type Store interface {
 	CreateAlert(ctx context.Context, a *store.Alert) (bool, error)
 	GetIngestState(ctx context.Context) (store.IngestState, error)
 	SetIngestState(ctx context.Context, s store.IngestState) error
+	// The absence-of-event rules need a clock that outlives the process: see
+	// SweepAbsence.
+	ListAbsenceState(ctx context.Context) ([]store.AbsenceState, error)
+	RecordAbsenceSeen(ctx context.Context, ruleID int64, eventName string, at time.Time) error
 }
 
 // Dispatcher receives every newly created alert. Implemented by
@@ -59,6 +64,11 @@ type Poller struct {
 	log      *slog.Logger
 	// metrics is optional instrumentation; nil-safe, see internal/metrics.
 	metrics *metrics.Metrics
+	// now is the clock the absence rules are measured against, both when an
+	// event re-arms one and when the sweep checks for silence. It is a field
+	// rather than a direct time.Now() call so a test can step time instead of
+	// sleeping through a real window; production leaves it at New's default.
+	now func() time.Time
 	// scanned/matched accumulate per-cycle counts for metrics.
 	scanned int
 	matched int
@@ -95,6 +105,7 @@ func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval 
 		dispatch: d,
 		interval: interval,
 		log:      log,
+		now:      time.Now,
 	}
 }
 
@@ -131,6 +142,15 @@ func (p *Poller) Run(ctx context.Context) {
 			continue
 		}
 		delay = p.interval
+
+		// The absence sweep rides the same tick, but only after a cycle that
+		// actually succeeded: a failed cycle means "we could not look", not
+		// "nothing happened", and alerting on silence during an outage of the
+		// very thing we watch through would be a false alarm about the one
+		// situation we cannot currently observe.
+		if err := p.SweepAbsence(ctx, p.now()); err != nil {
+			p.log.Error("absence sweep failed", "err", err)
+		}
 	}
 }
 
@@ -244,6 +264,13 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 			continue
 		}
 		for _, rule := range ruleList {
+			// An absence rule is re-armed by a matching event and fired by
+			// the sweep; evaluating it here would be asking the wrong
+			// question (and, for a rule with no event to see, always "no").
+			if abs, ok := p.registry.Absence(rule.Type); ok {
+				p.observeAbsence(ctx, rule, abs, decoded)
+				continue
+			}
 			matched, err := p.registry.Evaluate(ctx, rule.Type, decoded, rule.Params)
 			if err != nil {
 				p.log.Warn("rule evaluation failed", "rule_id", rule.ID, "event_id", decoded.ID, "err", err)
@@ -306,6 +333,182 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 		Payload:     payload,
 		CreatedAt:   alert.CreatedAt,
 	})
+}
+
+// --- absence-of-event rules ---
+
+// stateKey identifies one absence rule's clock: the rule plus the event
+// pattern it waits for. Keying on the pattern as well as the rule means
+// editing a rule from "heartbeat" to "ping" starts a fresh clock instead of
+// measuring ping's silence from heartbeat's last appearance.
+type stateKey struct {
+	ruleID    int64
+	eventName string
+}
+
+// SweepAbsence fires the absence rules whose window has elapsed. It is the
+// other half of the rules engine: where handleEvent reacts to events that
+// arrived, this reacts to the ones that did not, which is why it runs on a
+// timer instead of on arrival.
+//
+// now is passed in (rather than read here) so the caller's clock and the
+// rearm clock in observeAbsence are the same one; Run passes the poller's.
+// The window id comes from the stored last-seen instant, so every sweep
+// inside one silent window produces the same synthetic event id and the
+// existing (rule_id, event_id) unique index turns the repeat into a no-op.
+func (p *Poller) SweepAbsence(ctx context.Context, now time.Time) error {
+	monitors, err := p.store.ListMonitors(ctx, true)
+	if err != nil {
+		return err
+	}
+	if len(monitors) == 0 {
+		return nil
+	}
+
+	// One read for every clock: the table holds at most one row per absence
+	// rule, and looking each rule up individually would mean a query per rule
+	// on every tick.
+	states, err := p.store.ListAbsenceState(ctx)
+	if err != nil {
+		return err
+	}
+	stored := make(map[stateKey]time.Time, len(states))
+	for _, s := range states {
+		stored[stateKey{ruleID: s.RuleID, eventName: s.EventName}] = s.LastSeen
+	}
+
+	for _, m := range monitors {
+		ruleList, err := p.store.ListRules(ctx, m.ID, true)
+		if err != nil {
+			p.log.Error("absence sweep: list rules", "monitor_id", m.ID, "err", err)
+			continue
+		}
+		for _, rule := range ruleList {
+			abs, ok := p.registry.Absence(rule.Type)
+			if !ok {
+				continue // an event-driven rule: not this sweep's business
+			}
+			spec, err := abs.Spec(rule.Params)
+			if err != nil {
+				// Stored params predate this rule's validation, or were
+				// written straight into the database. Skip rather than guess: a
+				// window we cannot read is one we cannot measure.
+				p.log.Warn("absence sweep: unusable params", "rule_id", rule.ID, "err", err)
+				continue
+			}
+
+			key := stateKey{ruleID: rule.ID, eventName: spec.EventName}
+			lastSeen, armed := stored[key]
+			if !armed {
+				// Never observed this rule before: arm it now instead of firing.
+				// Without this a brand-new rule would either fire immediately
+				// (nothing has been seen yet, so any window "has elapsed") or
+				// never fire at all; either way the operator would get an alert
+				// about silence that started before the rule existed. The
+				// baseline is persisted, so the next restart resumes from it.
+				if err := p.store.RecordAbsenceSeen(ctx, rule.ID, spec.EventName, now); err != nil {
+					p.log.Error("absence sweep: arm rule", "rule_id", rule.ID, "err", err)
+				}
+				continue
+			}
+
+			silent := now.Sub(lastSeen)
+			if silent < spec.Window {
+				continue
+			}
+			p.fireAbsence(ctx, m, rule, spec, lastSeen, silent)
+		}
+	}
+	return nil
+}
+
+// observeAbsence advances a rule's clock when the event it is waiting for
+// arrives. The clock is wall-clock time, not the event's ledger close time:
+// the sweep compares it with wall clock, and upstream mode (SOURCE_MODE=
+// sorotrail) never populates LedgerClosedAt, so the measurement must not
+// depend on which event source is wired.
+func (p *Poller) observeAbsence(ctx context.Context, rule store.Rule, abs rules.AbsenceEvaluator, ev *stellar.DecodedEvent) {
+	spec, err := abs.Spec(rule.Params)
+	if err != nil {
+		p.log.Warn("absence rule has unusable params", "rule_id", rule.ID, "err", err)
+		return
+	}
+	if !abs.Matches(ev, spec) {
+		return
+	}
+	if err := p.store.RecordAbsenceSeen(ctx, rule.ID, spec.EventName, p.now()); err != nil {
+		p.log.Error("record absence seen", "rule_id", rule.ID, "event_name", spec.EventName, "err", err)
+	}
+}
+
+// fireAbsence persists one absence alert and hands it to the dispatcher.
+//
+// LedgerClosedAt is deliberately left zero: that field means "the ledger close
+// time of the event that matched", and there is no such event here. Leaving it
+// zero keeps monitors.last_matched_at honest (the dashboard reads it as chain
+// time), instead of inventing a wall-clock match time for a monitor that, by
+// definition, matched nothing.
+func (p *Poller) fireAbsence(ctx context.Context, m store.Monitor, rule store.Rule, spec rules.AbsenceSpec, lastSeen time.Time, silent time.Duration) {
+	payload, err := json.Marshal(map[string]any{
+		// Every contract the monitor watches: the rule is monitor-scoped, so
+		// silence is "none of them emitted this", not "one contract went
+		// quiet".
+		"contract_ids":       m.ContractIDs,
+		"event_name":         spec.EventName,
+		"window_seconds":     int64(spec.Window.Seconds()),
+		"last_seen_at":       lastSeen.UTC().Format(time.RFC3339),
+		"silent_for_seconds": int64(silent.Seconds()),
+	})
+	if err != nil {
+		p.log.Error("marshal absence payload", "rule_id", rule.ID, "err", err)
+		return
+	}
+
+	alert := &store.Alert{
+		MonitorID: m.ID,
+		RuleID:    rule.ID,
+		EventID:   AbsenceEventID(lastSeen),
+		Payload:   payload,
+	}
+	created, err := p.store.CreateAlert(ctx, alert)
+	if err != nil {
+		p.log.Error("create alert", "rule_id", rule.ID, "event_id", alert.EventID, "err", err)
+		return
+	}
+	if !created {
+		return // dedup: this silent window has already alerted
+	}
+	p.metrics.RecordAlert()
+	p.log.Info("absence alert created",
+		"alert_id", alert.ID, "monitor", m.Name, "rule_id", rule.ID,
+		"event_name", spec.EventName, "silent_for", silent)
+
+	p.dispatch.Dispatch(ctx, notify.Alert{
+		ID:          alert.ID,
+		MonitorID:   m.ID,
+		MonitorName: m.Name,
+		RuleID:      rule.ID,
+		RuleType:    rule.Type,
+		EventID:     alert.EventID,
+		EventName:   spec.EventName,
+		Silence:     silent,
+		Payload:     payload,
+		CreatedAt:   alert.CreatedAt,
+	})
+}
+
+// AbsenceEventID is the synthetic event id for one silent window: derived from
+// the instant silence started (the stored last-seen time), never from a TOID,
+// because there is no event to take one from.
+//
+// Deriving it from the window rather than from the sweep means the alert's own
+// dedup guard does the de-duplication: every sweep in the same window writes
+// the same id and inserts nothing, and once the awaited event returns the next
+// window starts from a new clock and so produces a new id — which is what
+// re-arms the rule. It is also stable across a restart, since the clock it is
+// built from lives in the database.
+func AbsenceEventID(lastSeen time.Time) string {
+	return "absence-" + strconv.FormatInt(lastSeen.UTC().UnixNano(), 10)
 }
 
 // buildFilters packs contract IDs into getEvents filters, respecting the

@@ -253,6 +253,61 @@ func TestRuleCRUDAndCascade(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound)
 }
 
+func TestAbsenceStateRoundTrip(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+	r := &Rule{MonitorID: m.ID, Type: "absence_of_event",
+		Params: json.RawMessage(`{"event_name":"heartbeat","window":"30m"}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, r))
+
+	// No clock exists until a sweep arms one.
+	states, err := st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, states)
+
+	armed := time.Now().UTC().Truncate(time.Millisecond)
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "heartbeat", armed))
+
+	states, err = st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	require.Len(t, states, 1)
+	assert.Equal(t, r.ID, states[0].RuleID)
+	assert.Equal(t, "heartbeat", states[0].EventName)
+	assert.True(t, states[0].LastSeen.Equal(armed), "got %s, want %s", states[0].LastSeen, armed)
+
+	// The clock is monotonic: a replayed or out-of-order observation is a
+	// no-op rather than a way to make a rule look fresher than it is.
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "heartbeat", armed.Add(-time.Hour)))
+	states, err = st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	require.Len(t, states, 1)
+	assert.True(t, states[0].LastSeen.Equal(armed), "an older instant must not move the clock back")
+
+	later := armed.Add(5 * time.Minute)
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "heartbeat", later))
+	states, err = st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	require.Len(t, states, 1)
+	assert.True(t, states[0].LastSeen.Equal(later), "a newer observation advances the clock")
+
+	// Awaiting a different event starts a second clock instead of reusing the
+	// old one: this is what stops an edit from measuring one event's silence
+	// from another's last appearance.
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "ping", later))
+	states, err = st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	assert.Len(t, states, 2, "one row per (rule, awaited event)")
+
+	// Deleting the rule takes its clocks with it.
+	require.NoError(t, st.DeleteMonitor(ctx, m.ID))
+	states, err = st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, states)
+}
+
 func TestCreateRules_Atomic(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

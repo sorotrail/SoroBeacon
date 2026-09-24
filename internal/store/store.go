@@ -94,6 +94,21 @@ type DeliveryAttempt struct {
 	AttemptedAt     time.Time `json:"attempted_at"`
 }
 
+// AbsenceState is the last time a rule saw the event it is waiting for.
+// Absence-of-event rules are driven by a periodic sweep rather than by event
+// arrival, so the sweep needs one of these per (rule, awaited pattern); there
+// is no event to compare against, only a clock.
+//
+// LastSeen is the wall-clock instant the process saw the awaited event, or —
+// for a rule that has never seen it — the instant the rule was first observed
+// by a sweep. Either way it is persisted, so a restart resumes measuring
+// silence instead of resetting the clock.
+type AbsenceState struct {
+	RuleID    int64     `json:"rule_id"`
+	EventName string    `json:"event_name"`
+	LastSeen  time.Time `json:"last_seen_at"`
+}
+
 // IngestState is the poller's checkpoint: the last fully processed ledger
 // and, mid-page, the last getEvents cursor.
 type IngestState struct {
@@ -252,6 +267,21 @@ type Ingest interface {
 	SetIngestState(ctx context.Context, s IngestState) error
 }
 
+// Absence persists the last-seen clocks that absence-of-event rules measure
+// silence against.
+type Absence interface {
+	// ListAbsenceState returns every stored clock. The sweep reads them all
+	// in one query: the table holds at most one row per absence rule, and a
+	// per-rule lookup would mean a query per rule on every tick.
+	ListAbsenceState(ctx context.Context) ([]AbsenceState, error)
+	// RecordAbsenceSeen advances the clock for (ruleID, eventName) to at.
+	// It never moves the clock backwards: a replayed or out-of-order event
+	// must not make a rule look fresher than it is, and the sweep's initial
+	// baseline write must not undo a real observation. Writing an older
+	// instant is therefore a no-op rather than an error.
+	RecordAbsenceSeen(ctx context.Context, ruleID int64, eventName string, at time.Time) error
+}
+
 // Store is everything the application needs from persistence.
 type Store interface {
 	Monitors
@@ -259,6 +289,7 @@ type Store interface {
 	Channels
 	Alerts
 	Ingest
+	Absence
 	GetStats(ctx context.Context) (Stats, error)
 	Ping(ctx context.Context) error
 	Close()
