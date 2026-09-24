@@ -69,3 +69,74 @@ jobs:
       - uses: golangci/golangci-lint-action@v9.3.0
         with:
           version: v2.12.2
+
+  # The Helm chart is a deployment artifact like any other, so it is linted and
+  # rendered on every change instead of rotting until someone tries to install
+  # it. Mirrors the job in the sibling SoroTrail repository.
+  helm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+        with:
+          version: v3.15.0
+      # database.url is required (values.schema.json), so every render and
+      # lint below passes one unless the case is specifically about it being
+      # missing.
+      - name: Helm lint (defaults)
+        run: helm lint deploy/helm/sorobeacon --set database.url=postgres://user:pass@host:5432/db
+      # A deliberately-invalid value: values.schema.json must reject it. If
+      # lint succeeds here, the schema stopped being applied and this step
+      # fails the build.
+      - name: Helm lint (invalid replicaCount — schema must reject)
+        run: |
+          if helm lint deploy/helm/sorobeacon \
+               --set database.url=postgres://user:pass@host:5432/db \
+               --set replicaCount=not-a-number; then
+            echo "::error::values.schema.json did not reject a non-numeric replicaCount"
+            exit 1
+          fi
+      # Same for a missing database configuration: neither database.url nor
+      # database.existingSecret is set, so the schema must reject the render.
+      - name: Helm lint (missing database configuration — schema must reject)
+        run: |
+          if helm lint deploy/helm/sorobeacon; then
+            echo "::error::values.schema.json did not reject a missing database configuration"
+            exit 1
+          fi
+      - name: Helm template render (defaults)
+        run: |
+          helm template sorobeacon deploy/helm/sorobeacon \
+            --set database.url=postgres://user:pass@host:5432/db \
+            > /dev/null
+      - name: Helm template render (existing secret)
+        run: |
+          helm template sorobeacon deploy/helm/sorobeacon \
+            --set database.existingSecret=my-db-secret \
+            > /dev/null
+      - name: Helm template render (production values)
+        run: |
+          helm template sorobeacon deploy/helm/sorobeacon \
+            --set database.existingSecret=my-db-secret \
+            --set auth.existingSecret=my-auth-secret \
+            --set replicaCount=3 \
+            --set config.network=mainnet \
+            --set config.rpcUrl=https://soroban-mainnet.example.org \
+            --set config.logLevel=warn \
+            --set config.alertRetention=90d \
+            --set config.rateLimitRps=10 \
+            --set config.rateLimitBurst=20 \
+            --set migrations.enabled=true \
+            --set resources.requests.cpu=250m \
+            --set resources.requests.memory=256Mi \
+            --set resources.limits.cpu=1000m \
+            --set resources.limits.memory=512Mi \
+            > /dev/null
+      - name: Helm template render (image tag override)
+        run: |
+          helm template sorobeacon deploy/helm/sorobeacon \
+            --set database.url=postgres://user:pass@host:5432/db \
+            --set image.tag=v1.2.3 \
+            --set config.pollInterval=30s \
+            > /dev/null

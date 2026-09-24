@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sorobeacon.fullname" . }}
+  labels:
+    {{- include "sorobeacon.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "sorobeacon.selectorLabels" . | nindent 6 }}
+  # maxUnavailable: 0 keeps the previous version serving until its replacement
+  # passes its readiness probe, so an upgrade never has a window with no
+  # ready pod. The replacement applies its own migrations on startup, which is
+  # why migrations must stay backwards-compatible for one release.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "sorobeacon.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "sorobeacon.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          # The whole non-secret configuration arrives as one ConfigMap, so
+          # what a pod is actually running with is readable with
+          # `kubectl describe configmap` rather than by diffing a spec.
+          envFrom:
+            - configMapRef:
+                name: {{ include "sorobeacon.fullname" . }}
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sorobeacon.databaseSecretName" . }}
+                  key: {{ include "sorobeacon.databaseSecretKey" . }}
+            {{- if or .Values.auth.apiToken .Values.auth.existingSecret }}
+            - name: API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sorobeacon.authSecretName" . }}
+                  key: {{ include "sorobeacon.authAPITokenKey" . }}
+            {{- end }}
+            {{- if or .Values.auth.configEncryptionKey .Values.auth.existingSecret }}
+            - name: CONFIG_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sorobeacon.authSecretName" . }}
+                  key: {{ include "sorobeacon.authConfigEncryptionKeyKey" . }}
+            {{- end }}
+          # Startup probe: /api/v1/livez only answers once the process has
+          # applied its migrations and bound the listener, so this both proves
+          # the schema is current and stops the liveness probe from restarting
+          # a pod that is simply still migrating. 30 x 5s allows a 150s
+          # migration window.
+          startupProbe:
+            httpGet:
+              path: /api/v1/livez
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          # Liveness checks nothing but the process itself, deliberately: a
+          # database or RPC outage must not restart-loop the pod, it must only
+          # take it out of the Service (that is what readiness is for).
+          livenessProbe:
+            httpGet:
+              path: /api/v1/livez
+              port: http
+            periodSeconds: 15
+            failureThreshold: 3
+          # Readiness checks the database and the event source with
+          # per-dependency detail, so a pod that cannot reach either stops
+          # receiving dashboard and API traffic.
+          readinessProbe:
+            httpGet:
+              path: /api/v1/readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,203 @@
+# SoroBeacon Helm values.
+#
+# Every environment variable internal/config reads has a key here, carrying
+# the same default the application itself uses when the variable is unset —
+# so `helm install` with no overrides produces exactly the behaviour of
+# running the binary with an empty environment (plus DATABASE_URL). The
+# operator reference for what each variable does is docs/configuration.md.
+
+# Number of pod replicas. Alert ingestion is safe to run on more than one:
+# per-rule state (cooldowns, frequency windows) is enforced in Postgres and
+# alert creation is deduplicated on (rule_id, event_id).
+replicaCount: 1
+
+image:
+  # Container image repository.
+  repository: ghcr.io/sorotrail/sorobeacon
+  pullPolicy: IfNotPresent
+  # Overrides the image tag. Defaults to the chart's appVersion.
+  tag: ""
+
+# Secrets for pulling images from private registries.
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Create a dedicated ServiceAccount for the pod. SoroBeacon needs no
+  # Kubernetes API access, so this exists only to keep the pod off the
+  # namespace's default ServiceAccount.
+  create: true
+  annotations: {}
+  # Use an existing ServiceAccount instead of creating one.
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  # The image's own user is non-root; pinning a UID keeps the pod stable
+  # even if the image's USER directive changes.
+  runAsUser: 10001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  # The binary writes nothing to disk — configuration is environment
+  # variables, templates and migrations are embedded, and alerts live in
+  # Postgres. Flip this to false only if a future version needs scratch space.
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+service:
+  type: ClusterIP
+  port: 80
+  # Container port. Must match config.httpAddr below (the app's HTTP_ADDR).
+  targetPort: 8080
+
+# CPU/memory requests and limits.
+# ref: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# ── Application configuration (ConfigMap) ────────────────────────────────────
+#
+# Non-secret environment variables. These land in a ConfigMap that the pod
+# consumes with envFrom, so the whole effective configuration is visible in
+# `kubectl describe configmap` instead of being buried in a deployment spec.
+#
+config:
+  # Which Stellar network to monitor: testnet | mainnet | futurenet | custom.
+  # A network's passphrase is its identity, and SoroBeacon verifies at startup
+  # that the RPC endpoint belongs to the configured network, refusing to start
+  # on a mismatch — so a mainnet endpoint behind testnet config fails fast
+  # rather than silently evaluating rules against the wrong chain.
+  network: "testnet"
+  # Stellar RPC endpoint (JSON-RPC 2.0). Defaults to the testnet preset; for
+  # mainnet point this at a provider URL, since public mainnet nodes are
+  # rate-limited.
+  rpcUrl: "https://soroban-testnet.stellar.org"
+  # Network passphrase. Required with network: custom, optional override
+  # otherwise. Empty means "use the preset for `network`".
+  networkPassphrase: ""
+  # Where events come from: rpc (poll a Stellar RPC node directly) or
+  # sorotrail (read a SoroTrail indexer, which retains events past the RPC's
+  # ~1-7 day window and can be shared by several SoroBeacon instances).
+  sourceMode: "rpc"
+  # SoroTrail indexer base URL. Required when sourceMode is sorotrail.
+  sorotrailUrl: ""
+  # API + dashboard listen address. Must match service.targetPort.
+  httpAddr: ":8080"
+  # Maximum request body size for API write endpoints (POST/PATCH/PUT), in
+  # bytes. GET/HEAD/OPTIONS are not limited.
+  httpMaxBodyBytes: 1048576
+  # How often the poller calls getEvents (minimum 1s).
+  pollInterval: "5s"
+  # Minimum slog level: debug | info | warn | error. Logs are JSON on stdout.
+  logLevel: "info"
+  # How long since a monitor's last match before the dashboard marks it
+  # silent.
+  monitorSilentAfter: "24h"
+  # Ledger lag at which /readyz fails. 0 disables the check, so a lagging
+  # poller cannot take itself out of a load balancer without opting in.
+  readyzLagThreshold: 0
+  # Per-client API token-bucket refill rate. 0 disables the limiter. Health
+  # and readiness probes are always exempt.
+  rateLimitRps: 0
+  # Per-client bucket size. 0 means "derive it from rateLimitRps".
+  rateLimitBurst: 0
+  # Key clients by X-Forwarded-For instead of the socket address. Only enable
+  # behind a proxy that overwrites the header, or a spoofed value defeats the
+  # limiter.
+  rateLimitTrustForwarded: false
+  # Comma-separated browser Origins allowed to call the API cross-origin.
+  # Empty disables CORS; the dashboard is same-origin and never needs it.
+  corsAllowedOrigins: ""
+  # How long to keep alerts (and their cascaded delivery attempts), e.g. 90d
+  # or 24h. Empty keeps history forever, so an upgrade never starts deleting
+  # anything by accident.
+  alertRetention: ""
+
+# ── Database ─────────────────────────────────────────────────────────────────
+#
+# SoroBeacon requires an EXTERNAL PostgreSQL instance. The chart deliberately
+# does not bundle Postgres, so you keep control of backups, HA and upgrades.
+# Recommended operators:
+#   * CloudNativePG        https://cloudnative-pg.io
+#   * Zalando Postgres     https://github.com/zalando/postgres-operator
+#
+# The connection string is a secret (it usually embeds a password), so it is
+# never a plain ConfigMap entry: it comes from a Secret, either one this chart
+# manages or one you already have.
+database:
+  # Name of an existing Secret holding the connection string. When set, the
+  # chart references it and does not create its own. Use this when the
+  # database credentials are managed outside the release (External Secrets,
+  # Sealed Secrets, a manually created Secret).
+  existingSecret: ""
+  # Key within that Secret. Only used when existingSecret is set.
+  existingSecretKey: "DATABASE_URL"
+  # Inline connection string, stored in the chart-managed Secret. Ignored when
+  # existingSecret is set. Required otherwise.
+  url: ""
+  # pgx pool tuning. 0 (and an empty duration) keeps the driver default, so a
+  # small node can lower maxConns without a code change and a busy instance
+  # behind PgBouncer can raise it. maxConns must not be below minConns.
+  maxConns: 0
+  minConns: 0
+  # Go durations, e.g. 1h / 30m.
+  maxConnLifetime: ""
+  maxConnIdleTime: ""
+
+# ── Credentials (Secret) ─────────────────────────────────────────────────────
+auth:
+  # API_TOKEN: static bearer token(s) for /api/v1 and the dashboard sign-in,
+  # comma-separated so a token can be rotated without downtime. Empty leaves
+  # the API and dashboard open, which is how the docker-compose quickstart
+  # works — set it on anything reachable beyond a trusted network.
+  apiToken: ""
+  # CONFIG_ENCRYPTION_KEY: base64 AES-GCM key that encrypts channel config at
+  # rest. Channel config holds webhook URLs, bot tokens and SMTP credentials,
+  # so this is the key that protects them; losing it makes the encrypted rows
+  # unrecoverable, so back it up with the database. Generate with
+  # `openssl rand -base64 32`.
+  configEncryptionKey: ""
+  # Name of an existing Secret holding the two values above, so they can be
+  # managed outside the release. When set, apiToken/configEncryptionKey are
+  # ignored.
+  existingSecret: ""
+  # Keys within that Secret. Only used when existingSecret is set.
+  apiTokenKey: "API_TOKEN"
+  configEncryptionKeyKey: "CONFIG_ENCRYPTION_KEY"
+
+# ── Migrations ───────────────────────────────────────────────────────────────
+#
+# SoroBeacon applies its embedded migrations itself, during startup and before
+# it binds the HTTP listener, so a pod cannot serve traffic on a stale schema
+# even with this hook disabled. Concurrent replicas are serialised by
+# golang-migrate's Postgres advisory lock.
+#
+# Enabling the hook adds a pre-install/pre-upgrade Job that runs the same
+# migration path once, before the Deployment is rolled. A broken migration then
+# fails the release while the previous version is still serving, instead of
+# crash-looping the new pods. It is off by default because the in-pod migration
+# already runs before traffic, and the hook costs an extra short-lived pod per
+# release. See deploy/helm/sorobeacon/README.md for the full rationale.
+migrations:
+  enabled: false
+  # How many times the hook pod is retried before the release fails. Each
+  # attempt retries the database wait itself, so this can stay small.
+  backoffLimit: 3
+  # Upper bound on the hook, in seconds. Must stay below Helm's
+  # --timeout (default 5m) or the release times out before the Job does.
+  activeDeadlineSeconds: 300

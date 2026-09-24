@@ -1,0 +1,153 @@
+{{- /*
+Optional migration hook.
+
+Why a hook rather than an init container: SoroBeacon has no migrate-only mode
+— it applies its embedded migrations during startup, before it binds the HTTP
+listener. An init container would therefore have to start the whole server,
+wait for it, and kill it, once per pod per replica, duplicating work the main
+container already does. A pre-upgrade hook runs the same migration path once,
+before the Deployment is rolled, so a broken migration fails the release while
+the previous version is still serving instead of crash-looping the new pods.
+
+Why these hook-scoped resources rather than the release's ConfigMap and Secret:
+Helm runs pre-install hooks *before* the rest of the release is created, so
+referencing the release's ConfigMap or Secret here would leave the hook pod
+stuck in ContainerCreating. The hook therefore ships its own copies, rendered
+from the same helpers so they cannot drift from the released values.
+*/ -}}
+{{- if .Values.migrations.enabled -}}
+{{- $migrateName := printf "%s-migrate" (include "sorobeacon.fullname" .) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $migrateName }}
+  labels:
+    {{- include "sorobeacon.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+data:
+  {{- include "sorobeacon.configData" . | nindent 2 }}
+{{- if or (not .Values.database.existingSecret) (and (not .Values.auth.existingSecret) (or .Values.auth.apiToken .Values.auth.configEncryptionKey)) }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $migrateName }}
+  labels:
+    {{- include "sorobeacon.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+type: Opaque
+stringData:
+  {{- if not .Values.database.existingSecret }}
+  DATABASE_URL: {{ required "database.url is required unless database.existingSecret names a Secret that already holds the connection string" .Values.database.url | quote }}
+  {{- end }}
+  {{- if and (not .Values.auth.existingSecret) .Values.auth.apiToken }}
+  API_TOKEN: {{ .Values.auth.apiToken | quote }}
+  {{- end }}
+  {{- if and (not .Values.auth.existingSecret) .Values.auth.configEncryptionKey }}
+  CONFIG_ENCRYPTION_KEY: {{ .Values.auth.configEncryptionKey | quote }}
+  {{- end }}
+{{- end }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $migrateName }}
+  labels:
+    {{- include "sorobeacon.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrations.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "sorobeacon.migrateSelectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              # The app binds its listener only after store.Migrate returns,
+              # so a reachable /api/v1/livez proves every embedded migration is
+              # applied. The process is then stopped — this container exists
+              # only to run that startup path once.
+              attempt=1
+              while [ "$attempt" -le 3 ]; do
+                sorobeacon &
+                pid=$!
+                ready=0
+                waited=0
+                while [ "$waited" -lt 60 ]; do
+                  if wget -q -O- "http://127.0.0.1:8080/api/v1/livez" >/dev/null 2>&1; then
+                    ready=1
+                    break
+                  fi
+                  # A dead process (bad migration, database unreachable)
+                  # will never become ready: stop waiting and retry.
+                  kill -0 "$pid" 2>/dev/null || break
+                  waited=$((waited + 1))
+                  sleep 1
+                done
+                kill -TERM "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+                if [ "$ready" -eq 1 ]; then
+                  echo "sorobeacon: schema is up to date"
+                  exit 0
+                fi
+                echo "sorobeacon: migration attempt ${attempt} did not complete" >&2
+                attempt=$((attempt + 1))
+                sleep 2
+              done
+              echo "sorobeacon: migrations did not complete; see the pod logs above" >&2
+              exit 1
+          envFrom:
+            - configMapRef:
+                name: {{ $migrateName }}
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ if .Values.database.existingSecret }}{{ .Values.database.existingSecret }}{{ else }}{{ $migrateName }}{{ end }}
+                  key: {{ include "sorobeacon.databaseSecretKey" . }}
+            {{- if or .Values.auth.apiToken .Values.auth.existingSecret }}
+            - name: API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ if .Values.auth.existingSecret }}{{ .Values.auth.existingSecret }}{{ else }}{{ $migrateName }}{{ end }}
+                  key: {{ include "sorobeacon.authAPITokenKey" . }}
+            {{- end }}
+            {{- if or .Values.auth.configEncryptionKey .Values.auth.existingSecret }}
+            - name: CONFIG_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ if .Values.auth.existingSecret }}{{ .Values.auth.existingSecret }}{{ else }}{{ $migrateName }}{{ end }}
+                  key: {{ include "sorobeacon.authConfigEncryptionKeyKey" . }}
+            {{- end }}
+            # The probe above is what signals completion, so pin the port
+            # rather than inheriting whatever config.httpAddr says.
+            - name: HTTP_ADDR
+              value: ":8080"
+            # The hook exists only to migrate. Taking the poll interval past
+            # its own lifetime means this pod never ingests or alerts, so it
+            # cannot affect monitor state while it is up.
+            - name: POLL_INTERVAL
+              value: "24h"
+{{- end }}

@@ -1,0 +1,321 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["database"],
+  "properties": {
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of pod replicas."
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Container image repository."
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"],
+          "description": "Image pull policy."
+        },
+        "tag": {
+          "type": "string",
+          "description": "Image tag override. Defaults to the chart's appVersion."
+        }
+      },
+      "additionalProperties": false
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+      "description": "Secrets for pulling images from private registries."
+    },
+    "nameOverride": {
+      "type": "string",
+      "description": "Override the chart name."
+    },
+    "fullnameOverride": {
+      "type": "string",
+      "description": "Override the full release name."
+    },
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "create": {
+          "type": "boolean",
+          "description": "Create a dedicated ServiceAccount for the pod."
+        },
+        "annotations": {
+          "type": "object",
+          "description": "Annotations for the ServiceAccount."
+        },
+        "name": {
+          "type": "string",
+          "description": "Use an existing ServiceAccount instead of creating one."
+        }
+      },
+      "additionalProperties": false
+    },
+    "podAnnotations": {
+      "type": "object",
+      "description": "Annotations applied to the pod."
+    },
+    "podSecurityContext": {
+      "type": "object",
+      "description": "Pod-level security context."
+    },
+    "securityContext": {
+      "type": "object",
+      "description": "Container-level security context."
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["ClusterIP", "NodePort", "LoadBalancer"],
+          "description": "Kubernetes Service type."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Service port."
+        },
+        "targetPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Container port to forward to. Must match config.httpAddr."
+        }
+      },
+      "additionalProperties": false
+    },
+    "resources": {
+      "type": "object",
+      "description": "CPU/memory requests and limits.",
+      "properties": {
+        "requests": {
+          "type": "object",
+          "properties": {
+            "cpu": { "type": "string" },
+            "memory": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        "limits": {
+          "type": "object",
+          "properties": {
+            "cpu": { "type": "string" },
+            "memory": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "nodeSelector": {
+      "type": "object",
+      "description": "Node selector for pod scheduling."
+    },
+    "tolerations": {
+      "type": "array",
+      "description": "Tolerations for pod scheduling."
+    },
+    "affinity": {
+      "type": "object",
+      "description": "Affinity rules for pod scheduling."
+    },
+    "config": {
+      "type": "object",
+      "description": "Non-secret application configuration, rendered into a ConfigMap.",
+      "properties": {
+        "network": {
+          "type": "string",
+          "enum": ["testnet", "mainnet", "futurenet", "custom"],
+          "description": "Stellar network to monitor."
+        },
+        "rpcUrl": {
+          "type": "string",
+          "format": "uri",
+          "description": "Stellar RPC endpoint (JSON-RPC 2.0 over http/https)."
+        },
+        "networkPassphrase": {
+          "type": "string",
+          "description": "Override the network passphrase. Required when network is custom."
+        },
+        "sourceMode": {
+          "type": "string",
+          "enum": ["rpc", "sorotrail"],
+          "description": "Where events come from."
+        },
+        "sorotrailUrl": {
+          "type": "string",
+          "description": "SoroTrail indexer base URL. Required when sourceMode is sorotrail."
+        },
+        "httpAddr": {
+          "type": "string",
+          "pattern": "^:?[0-9]+$|^[^:]+:[0-9]+$",
+          "description": "HTTP listen address (host:port). Must match service.targetPort."
+        },
+        "httpMaxBodyBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum API write-body size in bytes."
+        },
+        "pollInterval": {
+          "type": "string",
+          "pattern": "^[0-9]+(ms|s|m|h)$",
+          "description": "How often the poller calls getEvents (Go duration, minimum 1s)."
+        },
+        "logLevel": {
+          "type": "string",
+          "enum": ["debug", "info", "warn", "error"],
+          "description": "Minimum slog level."
+        },
+        "monitorSilentAfter": {
+          "type": "string",
+          "pattern": "^[0-9]+(ms|s|m|h)$",
+          "description": "How long since a monitor's last match before it is shown as silent."
+        },
+        "readyzLagThreshold": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Ledger lag at which /readyz fails. 0 disables the check."
+        },
+        "rateLimitRps": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Per-client API requests per second. 0 disables the limiter."
+        },
+        "rateLimitBurst": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Per-client token-bucket size. 0 derives it from rateLimitRps."
+        },
+        "rateLimitTrustForwarded": {
+          "anyOf": [
+            { "type": "boolean" },
+            { "type": "string", "enum": ["true", "false"] }
+          ],
+          "description": "Key clients by X-Forwarded-For. Only behind a trusted proxy."
+        },
+        "corsAllowedOrigins": {
+          "type": "string",
+          "description": "Comma-separated browser origins allowed to call the API. Empty disables CORS."
+        },
+        "alertRetention": {
+          "type": "string",
+          "description": "How long to keep alerts, e.g. 90d or 24h. Empty keeps history forever."
+        }
+      },
+      "additionalProperties": false
+    },
+    "database": {
+      "type": "object",
+      "description": "External Postgres connection. Either url or existingSecret must be set.",
+      "anyOf": [
+        {
+          "properties": { "url": { "minLength": 1 } },
+          "required": ["url"]
+        },
+        {
+          "properties": { "existingSecret": { "minLength": 1 } },
+          "required": ["existingSecret"]
+        }
+      ],
+      "properties": {
+        "existingSecret": {
+          "type": "string",
+          "description": "Name of an existing Secret holding the connection string."
+        },
+        "existingSecretKey": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Key within the existing Secret that holds the connection string."
+        },
+        "url": {
+          "type": "string",
+          "description": "Inline Postgres connection string. Ignored when existingSecret is set."
+        },
+        "maxConns": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "pgx pool MaxConns. 0 uses the driver default."
+        },
+        "minConns": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "pgx pool MinConns. 0 uses the driver default."
+        },
+        "maxConnLifetime": {
+          "type": "string",
+          "description": "pgx pool MaxConnLifetime (Go duration). Empty uses the driver default."
+        },
+        "maxConnIdleTime": {
+          "type": "string",
+          "description": "pgx pool MaxConnIdleTime (Go duration). Empty uses the driver default."
+        }
+      },
+      "additionalProperties": false
+    },
+    "auth": {
+      "type": "object",
+      "properties": {
+        "apiToken": {
+          "type": "string",
+          "description": "API_TOKEN value(s), comma-separated. Empty leaves the API open."
+        },
+        "configEncryptionKey": {
+          "type": "string",
+          "description": "CONFIG_ENCRYPTION_KEY: base64 AES-GCM key for channel config at rest."
+        },
+        "existingSecret": {
+          "type": "string",
+          "description": "Name of an existing Secret holding the two credentials above."
+        },
+        "apiTokenKey": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Key within the existing Secret that holds API_TOKEN."
+        },
+        "configEncryptionKeyKey": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Key within the existing Secret that holds CONFIG_ENCRYPTION_KEY."
+        }
+      },
+      "additionalProperties": false
+    },
+    "migrations": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Run migrations in a pre-install/pre-upgrade hook Job."
+        },
+        "backoffLimit": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Job retry budget before the release fails."
+        },
+        "activeDeadlineSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Upper bound on the hook, in seconds."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
