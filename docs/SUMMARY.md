@@ -43,6 +43,7 @@
 * [Architecture](reference/architecture.md)
 * [HTTP API](reference/api.md)
 * [CLI flags (environment variables)](reference/cli.md)
+* [Prometheus metrics](reference/metrics.md)
 
 ## 🔌 Contributing
 
