@@ -12,17 +12,36 @@
 {{end}}
 {{if .Channels}}
 <table>
-  <tr><th>ID</th><th>Name</th><th>Type</th><th>Status</th><th>Created</th><th></th></tr>
+  <tr><th>ID</th><th>Name</th><th>Type</th><th>Status</th><th>Health</th><th>Created</th><th></th></tr>
   {{range .Channels}}
-  <tr>
+  <tr{{if .AutoDisabled}} class="attention"{{end}}>
     <td>{{.ID}}</td>
     <td>{{.Name}}</td>
     <td>{{.Type}}</td>
     <td>{{if .Enabled}}<span class="pill on">enabled</span>{{else}}<span class="pill off">disabled</span>{{end}}</td>
+    <td>
+      {{/* Auto-disable is the state worth shouting about: the channel is off
+           and nobody chose that, so it says why and repeats the last error. */}}
+      {{if .AutoDisabled}}
+        <span class="pill silent">auto-disabled</span>
+        <div class="muted">Turned off after {{.ConsecutivePermanentFailures}} consecutive failures that will not clear on their own. Re-enable it to start delivering again.</div>
+        {{if .LastError}}<div class="muted">Last error: {{.LastError}}</div>{{end}}
+      {{else if not .Enabled}}
+        <span class="muted">Disabled by an operator.</span>
+      {{else if .ConsecutiveFailures}}
+        <span class="pill never">failing ({{.ConsecutiveFailures}})</span>
+        {{if .LastError}}<div class="muted">Last error: {{.LastError}}</div>{{end}}
+      {{else if .LastSuccessAt}}
+        <span class="muted">Last success {{relTimePtr .LastSuccessAt}}.</span>
+      {{else}}
+        <span class="muted">No deliveries yet.</span>
+      {{end}}
+    </td>
     <td>{{formatTime .CreatedAt $.Timezone}}{{with relTime .CreatedAt}} <span class="muted">({{.}})</span>{{end}}</td>
     <td>
       <button hx-post="/channels/{{.ID}}/test" hx-target="#test-result-{{.ID}}" hx-swap="innerHTML">Send test</button>
       <span id="test-result-{{.ID}}" class="muted"></span>
+      <form class="inline" method="post" action="/channels/{{.ID}}/toggle"><button>{{if .Enabled}}Disable{{else}}Enable{{end}}</button></form>
       <form class="inline" method="post" action="/channels/{{.ID}}/delete"
             onsubmit="return confirm('Delete channel {{.Name}}?')"><button>Delete</button></form>
     </td>

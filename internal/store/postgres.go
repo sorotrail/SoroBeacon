@@ -496,8 +496,13 @@ func (p *Postgres) CreateChannel(ctx context.Context, c *Channel) error {
 func (p *Postgres) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 	var c Channel
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, name, type, config, enabled, created_at FROM channels WHERE id = $1`, id,
-	).Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.Enabled, &c.CreatedAt)
+		`SELECT id, name, type, config, enabled, created_at,
+		        consecutive_failures, consecutive_permanent_failures, last_error,
+		        last_error_at, last_success_at, disabled_at
+		 FROM channels WHERE id = $1`, id,
+	).Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.Enabled, &c.CreatedAt,
+		&c.ConsecutiveFailures, &c.ConsecutivePermanentFailures, &c.LastError,
+		&c.LastErrorAt, &c.LastSuccessAt, &c.DisabledAt)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -508,7 +513,9 @@ func (p *Postgres) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 }
 
 func (p *Postgres) ListChannels(ctx context.Context, enabledOnly bool) ([]Channel, error) {
-	q := `SELECT id, name, type, config, enabled, created_at FROM channels`
+	q := `SELECT id, name, type, config, enabled, created_at,
+		        consecutive_failures, consecutive_permanent_failures, last_error,
+		        last_error_at, last_success_at, disabled_at FROM channels`
 	if enabledOnly {
 		q += ` WHERE enabled`
 	}
@@ -521,7 +528,9 @@ func (p *Postgres) ListChannels(ctx context.Context, enabledOnly bool) ([]Channe
 }
 
 func (p *Postgres) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel, error) {
-	q := `SELECT id, name, type, config, enabled, created_at FROM channels WHERE TRUE`
+	q := `SELECT id, name, type, config, enabled, created_at,
+		        consecutive_failures, consecutive_permanent_failures, last_error,
+		        last_error_at, last_success_at, disabled_at FROM channels WHERE TRUE`
 	args := []any{}
 	n := 0
 	arg := func(v any) string {
@@ -551,8 +560,22 @@ func (p *Postgres) UpdateChannel(ctx context.Context, c *Channel) error {
 	if err != nil {
 		return err
 	}
+	// Turning a channel back on clears the health state that auto-disable
+	// set, in the same statement, so the channel cannot re-disable on the
+	// next failure because of counters accumulated before it was fixed. The
+	// `NOT enabled` test reads the pre-update value, so this fires on a
+	// genuine off-to-on transition only: renaming a channel that is still
+	// failing must not quietly wipe the evidence. This write is the one way
+	// back from auto-disable, which is what makes re-enabling explicit.
 	tag, err := p.pool.Exec(ctx,
-		`UPDATE channels SET name = $2, type = $3, config = $4, enabled = $5 WHERE id = $1`,
+		`UPDATE channels SET
+		   name = $2, type = $3, config = $4, enabled = $5,
+		   consecutive_failures = CASE WHEN $5 AND NOT enabled THEN 0 ELSE consecutive_failures END,
+		   consecutive_permanent_failures = CASE WHEN $5 AND NOT enabled THEN 0 ELSE consecutive_permanent_failures END,
+		   last_error = CASE WHEN $5 AND NOT enabled THEN '' ELSE last_error END,
+		   last_error_at = CASE WHEN $5 AND NOT enabled THEN NULL ELSE last_error_at END,
+		   disabled_at = CASE WHEN $5 AND NOT enabled THEN NULL ELSE disabled_at END
+		 WHERE id = $1`,
 		c.ID, c.Name, c.Type, config, c.Enabled)
 	if err != nil {
 		return err
@@ -563,13 +586,57 @@ func (p *Postgres) UpdateChannel(ctx context.Context, c *Channel) error {
 	return nil
 }
 
+// RecordChannelHealth applies one delivery outcome to a channel's health
+// counters. Everything happens in a single statement so concurrent
+// dispatches cannot lose an increment, and the auto-disable decision is made
+// against the value the row actually has rather than one read earlier.
+func (p *Postgres) RecordChannelHealth(ctx context.Context, channelID int64, u ChannelHealthUpdate) error {
+	if u.At.IsZero() {
+		u.At = time.Now()
+	}
+	permanent := u.Permanent && !u.Success
+	if _, err := p.pool.Exec(ctx,
+		`UPDATE channels SET
+		   consecutive_failures = CASE WHEN $2 THEN 0 ELSE consecutive_failures + 1 END,
+		   consecutive_permanent_failures = CASE
+		     WHEN $2 THEN 0
+		     WHEN $3 THEN consecutive_permanent_failures + 1
+		     ELSE consecutive_permanent_failures
+		   END,
+		   -- The casts are load-bearing: without them the parameter is offered a
+		   -- NULL branch to resolve against and Postgres reads $5 as text.
+		   last_error = CASE WHEN $2 THEN '' ELSE $4::text END,
+		   last_error_at = CASE WHEN $2 THEN NULL ELSE $5::timestamptz END,
+		   last_success_at = CASE WHEN $2 THEN $5::timestamptz ELSE last_success_at END,
+		   -- A success clears the auto-disable marker only once the channel is
+		   -- actually back on, so a test send through a still-disabled channel
+		   -- cannot make the dashboard claim an operator turned it off.
+		   disabled_at = CASE
+		     WHEN $2 THEN CASE WHEN enabled THEN NULL ELSE disabled_at END
+		     WHEN $3 AND $6::int > 0 AND consecutive_permanent_failures + 1 >= $6::int THEN COALESCE(disabled_at, $5::timestamptz)
+		     ELSE disabled_at
+		   END,
+		   enabled = CASE
+		     WHEN $2 THEN enabled
+		     WHEN $3 AND $6::int > 0 AND consecutive_permanent_failures + 1 >= $6::int THEN false
+		     ELSE enabled
+		   END
+		 WHERE id = $1`,
+		channelID, u.Success, permanent, u.Error, u.At, u.DisableAfter); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (p *Postgres) DeleteChannel(ctx context.Context, id int64) error {
 	return p.deleteByID(ctx, "channels", id)
 }
 
 func (p *Postgres) ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]Channel, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at
+		`SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at,
+		        c.consecutive_failures, c.consecutive_permanent_failures, c.last_error,
+		        c.last_error_at, c.last_success_at, c.disabled_at
 		 FROM channels c
 		 JOIN monitor_channels mc ON mc.channel_id = c.id
 		 WHERE mc.monitor_id = $1 AND c.enabled
@@ -584,7 +651,9 @@ func (p *Postgres) ListChannelsForMonitor(ctx context.Context, monitorID int64) 
 // caller up the stack (API, dashboard, dispatcher) sees plaintext.
 func (p *Postgres) scanChannel(row pgx.CollectableRow) (Channel, error) {
 	var c Channel
-	if err := row.Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.Enabled, &c.CreatedAt); err != nil {
+	if err := row.Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.Enabled, &c.CreatedAt,
+		&c.ConsecutiveFailures, &c.ConsecutivePermanentFailures, &c.LastError,
+		&c.LastErrorAt, &c.LastSuccessAt, &c.DisabledAt); err != nil {
 		return c, err
 	}
 	if err := decryptChannel(p.cipher, &c); err != nil {
@@ -1061,7 +1130,7 @@ func (p *Postgres) CreateMonitorTemplate(ctx context.Context, t *MonitorTemplate
 	paramsJSON, _ := json.Marshal(t.Parameters)
 	return p.pool.QueryRow(ctx,
 		`INSERT INTO monitor_templates (name, description, rules, channel_ids, parameters) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
-		t.Name, t.Description, rulesJSON, t.ChannelIDs, paramsJSON).Scan(&t.ID, &t.CreatedAt)
+		t.Name, t.Description, rulesJSON, templateChannelIDs(t.ChannelIDs), paramsJSON).Scan(&t.ID, &t.CreatedAt)
 }
 
 func (p *Postgres) GetMonitorTemplate(ctx context.Context, id int64) (*MonitorTemplate, error) {
@@ -1110,7 +1179,7 @@ func (p *Postgres) UpdateMonitorTemplate(ctx context.Context, t *MonitorTemplate
 	paramsJSON, _ := json.Marshal(t.Parameters)
 	tag, err := p.pool.Exec(ctx,
 		`UPDATE monitor_templates SET name=$1, description=$2, rules=$3, channel_ids=$4, parameters=$5 WHERE id=$6`,
-		t.Name, t.Description, rulesJSON, t.ChannelIDs, paramsJSON, t.ID)
+		t.Name, t.Description, rulesJSON, templateChannelIDs(t.ChannelIDs), paramsJSON, t.ID)
 	if err != nil {
 		return err
 	}

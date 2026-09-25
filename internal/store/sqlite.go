@@ -670,6 +670,14 @@ func (s *SQLite) DeleteRule(ctx context.Context, id int64) error {
 
 // --- channels ---
 
+// sqliteChannelCols is the column list every single-table channel read uses,
+// in the order scanChannel expects. Delivery health is read alongside the
+// channel so the dashboard can show why a channel is failing without a second
+// query per row; spelling the list once keeps the four readers from drifting.
+const sqliteChannelCols = `id, name, type, config, enabled, created_at,
+	 consecutive_failures, consecutive_permanent_failures, last_error,
+	 last_error_at, last_success_at, disabled_at`
+
 func (s *SQLite) CreateChannel(ctx context.Context, c *Channel) error {
 	config, err := configForWrite(s.cipher, c.ID, c.Name, c.Config)
 	if err != nil {
@@ -689,7 +697,7 @@ func (s *SQLite) CreateChannel(ctx context.Context, c *Channel) error {
 
 func (s *SQLite) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 	channels, err := s.queryChannels(ctx,
-		`SELECT id, name, type, config, enabled, created_at FROM channels WHERE id = ?`, id)
+		`SELECT `+sqliteChannelCols+` FROM channels WHERE id = ?`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -700,7 +708,7 @@ func (s *SQLite) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 }
 
 func (s *SQLite) ListChannels(ctx context.Context, enabledOnly bool) ([]Channel, error) {
-	q := `SELECT id, name, type, config, enabled, created_at FROM channels`
+	q := `SELECT ` + sqliteChannelCols + ` FROM channels`
 	if enabledOnly {
 		q += ` WHERE enabled = 1`
 	}
@@ -709,7 +717,7 @@ func (s *SQLite) ListChannels(ctx context.Context, enabledOnly bool) ([]Channel,
 }
 
 func (s *SQLite) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel, error) {
-	q := `SELECT id, name, type, config, enabled, created_at FROM channels WHERE 1 = 1`
+	q := `SELECT ` + sqliteChannelCols + ` FROM channels WHERE 1 = 1`
 	args := []any{}
 	if f.EnabledOnly {
 		q += ` AND enabled = 1`
@@ -729,7 +737,9 @@ func (s *SQLite) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel,
 
 func (s *SQLite) ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]Channel, error) {
 	return s.queryChannels(ctx,
-		`SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at
+		`SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at,
+		        c.consecutive_failures, c.consecutive_permanent_failures, c.last_error,
+		        c.last_error_at, c.last_success_at, c.disabled_at
 		 FROM channels c
 		 JOIN monitor_channels mc ON mc.channel_id = c.id
 		 WHERE mc.monitor_id = ? AND c.enabled = 1
@@ -754,13 +764,18 @@ func (s *SQLite) queryChannels(ctx context.Context, query string, args ...any) (
 }
 
 // scanChannel reads one channels row and decrypts its config, so every caller
-// up the stack (API, dashboard, dispatcher) sees plaintext.
+// up the stack (API, dashboard, dispatcher) sees plaintext. The three health
+// timestamps are nullable, so a channel that has never failed (or never
+// succeeded) keeps a nil pointer rather than a fabricated zero time.
 func (s *SQLite) scanChannel(r rowScanner) (Channel, error) {
 	var c Channel
 	var config string
 	var enabled int64
 	var created string
-	if err := r.Scan(&c.ID, &c.Name, &c.Type, &config, &enabled, &created); err != nil {
+	var lastErrorAt, lastSuccessAt, disabledAt sql.NullString
+	if err := r.Scan(&c.ID, &c.Name, &c.Type, &config, &enabled, &created,
+		&c.ConsecutiveFailures, &c.ConsecutivePermanentFailures, &c.LastError,
+		&lastErrorAt, &lastSuccessAt, &disabledAt); err != nil {
 		return c, mapSQLiteErr(err)
 	}
 	var err error
@@ -769,19 +784,56 @@ func (s *SQLite) scanChannel(r rowScanner) (Channel, error) {
 	}
 	c.Enabled = enabled != 0
 	c.Config = json.RawMessage(config)
+	if c.LastErrorAt, err = parseSQLiteTimePtr(lastErrorAt); err != nil {
+		return c, err
+	}
+	if c.LastSuccessAt, err = parseSQLiteTimePtr(lastSuccessAt); err != nil {
+		return c, err
+	}
+	if c.DisabledAt, err = parseSQLiteTimePtr(disabledAt); err != nil {
+		return c, err
+	}
 	if err := decryptChannel(s.cipher, &c); err != nil {
 		return c, err
 	}
 	return c, nil
 }
 
+// parseSQLiteTimePtr reverses a nullable timestamp column. NULL and the empty
+// string both mean "never", which is a nil pointer and never an error.
+func parseSQLiteTimePtr(ns sql.NullString) (*time.Time, error) {
+	if !ns.Valid || ns.String == "" {
+		return nil, nil
+	}
+	t, err := parseSQLiteTime(ns.String)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// UpdateChannel mirrors the Postgres implementation, including the health
+// reset. Turning a channel back on clears the state auto-disable left behind,
+// in the same statement, so a channel cannot re-disable on its next failure
+// because of counters accumulated before it was fixed. `enabled = 0` reads the
+// pre-update value (SQL set expressions all see the old row), so this fires on
+// a genuine off-to-on transition only: renaming a channel that is still
+// failing must not quietly wipe the evidence. ?4 is the enabled flag, reused
+// the way the Postgres version reuses $5.
 func (s *SQLite) UpdateChannel(ctx context.Context, c *Channel) error {
 	config, err := configForWrite(s.cipher, c.ID, c.Name, c.Config)
 	if err != nil {
 		return err
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE channels SET name = ?, type = ?, config = ?, enabled = ? WHERE id = ?`,
+		`UPDATE channels SET
+		   name = ?1, type = ?2, config = ?3, enabled = ?4,
+		   consecutive_failures = CASE WHEN ?4 AND enabled = 0 THEN 0 ELSE consecutive_failures END,
+		   consecutive_permanent_failures = CASE WHEN ?4 AND enabled = 0 THEN 0 ELSE consecutive_permanent_failures END,
+		   last_error = CASE WHEN ?4 AND enabled = 0 THEN '' ELSE last_error END,
+		   last_error_at = CASE WHEN ?4 AND enabled = 0 THEN NULL ELSE last_error_at END,
+		   disabled_at = CASE WHEN ?4 AND enabled = 0 THEN NULL ELSE disabled_at END
+		 WHERE id = ?5`,
 		c.Name, c.Type, string(config), boolToInt(c.Enabled), c.ID)
 	if err != nil {
 		return mapSQLiteErr(err)
@@ -792,6 +844,48 @@ func (s *SQLite) UpdateChannel(ctx context.Context, c *Channel) error {
 	}
 	if n == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// RecordChannelHealth applies one delivery outcome to a channel's health
+// counters, mirroring the Postgres implementation. Everything happens in a
+// single statement so concurrent dispatches cannot lose an increment, and the
+// auto-disable decision is made against the value the row actually has rather
+// than one read earlier. Booleans go in as 0/1 because SQLite has no boolean
+// type; the numbered parameters stand in for the Postgres $n references.
+func (s *SQLite) RecordChannelHealth(ctx context.Context, channelID int64, u ChannelHealthUpdate) error {
+	if u.At.IsZero() {
+		u.At = time.Now()
+	}
+	permanent := u.Permanent && !u.Success
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE channels SET
+		   consecutive_failures = CASE WHEN ?1 THEN 0 ELSE consecutive_failures + 1 END,
+		   consecutive_permanent_failures = CASE
+		     WHEN ?1 THEN 0
+		     WHEN ?2 THEN consecutive_permanent_failures + 1
+		     ELSE consecutive_permanent_failures
+		   END,
+		   last_error = CASE WHEN ?1 THEN '' ELSE ?3 END,
+		   last_error_at = CASE WHEN ?1 THEN NULL ELSE ?4 END,
+		   last_success_at = CASE WHEN ?1 THEN ?4 ELSE last_success_at END,
+		   -- A success clears the auto-disable marker only once the channel is
+		   -- actually back on, so a test send through a still-disabled channel
+		   -- cannot make the dashboard claim an operator turned it off.
+		   disabled_at = CASE
+		     WHEN ?1 THEN CASE WHEN enabled = 1 THEN NULL ELSE disabled_at END
+		     WHEN ?2 AND ?5 > 0 AND consecutive_permanent_failures + 1 >= ?5 THEN COALESCE(disabled_at, ?4)
+		     ELSE disabled_at
+		   END,
+		   enabled = CASE
+		     WHEN ?1 THEN enabled
+		     WHEN ?2 AND ?5 > 0 AND consecutive_permanent_failures + 1 >= ?5 THEN 0
+		     ELSE enabled
+		   END
+		 WHERE id = ?6`,
+		boolToInt(u.Success), boolToInt(permanent), u.Error, sqliteTimeString(u.At), u.DisableAfter, channelID); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1245,6 +1339,20 @@ func (s *SQLite) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCoun
 
 // --- saved searches ---
 
+// CreateSavedSearch mirrors the Postgres implementation. Clearing the old
+// default and inserting the new one share a transaction here (the Postgres
+// version does them as two statements) because the partial unique index on
+// is_default = 1 otherwise rejects the insert instead of swapping the default.
+func (s *SQLite) CreateSavedSearch(ctx context.Context, search *SavedSearch) error {
+	filter, _ := json.Marshal(search.Filter)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
+
+	if search.IsDefault {
+		if _, err := tx.ExecContext(ctx, `UPDATE saved_searches SET is_default = 0 WHERE is_default = 1`); err != nil {
 func (s *SQLite) CreateSavedSearch(ctx context.Context, ss *SavedSearch) error {
 	filter, err := json.Marshal(ss.Filter)
 	if err != nil {
@@ -1256,6 +1364,15 @@ func (s *SQLite) CreateSavedSearch(ctx context.Context, ss *SavedSearch) error {
 		}
 	}
 	var created string
+	if err := tx.QueryRowContext(ctx,
+		`INSERT INTO saved_searches (name, filter, is_default) VALUES (?, ?, ?) RETURNING id, created_at`,
+		search.Name, string(filter), boolToInt(search.IsDefault)).Scan(&search.ID, &created); err != nil {
+		return mapSQLiteErr(err)
+	}
+	if search.CreatedAt, err = parseSQLiteTime(created); err != nil {
+		return err
+	}
+	return tx.Commit()
 	if err := s.db.QueryRowContext(ctx,
 		`INSERT INTO saved_searches (name, filter, is_default) VALUES (?, ?, ?) RETURNING id, created_at`,
 		ss.Name, string(filter), boolToInt(ss.IsDefault)).Scan(&ss.ID, &created); err != nil {
@@ -1274,6 +1391,11 @@ func (s *SQLite) ListSavedSearches(ctx context.Context) ([]SavedSearch, error) {
 	defer func() { _ = rows.Close() }()
 	var out []SavedSearch
 	for rows.Next() {
+		search, err := scanSQLiteSavedSearch(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, search)
 		ss, err := scanSQLiteSavedSearch(rows)
 		if err != nil {
 			return nil, err
@@ -1284,11 +1406,34 @@ func (s *SQLite) ListSavedSearches(ctx context.Context) ([]SavedSearch, error) {
 }
 
 func (s *SQLite) GetSavedSearch(ctx context.Context, id int64) (*SavedSearch, error) {
+	search, err := scanSQLiteSavedSearch(s.db.QueryRowContext(ctx,
 	ss, err := scanSQLiteSavedSearch(s.db.QueryRowContext(ctx,
 		`SELECT id, name, filter, is_default, created_at FROM saved_searches WHERE id = ?`, id))
 	if err != nil {
 		return nil, err
 	}
+	return &search, nil
+}
+
+// scanSQLiteSavedSearch reads one saved_searches row. The filter is stored as
+// JSON text; a filter that fails to parse leaves the zero value rather than
+// failing the read, matching the Postgres backend, where a stale reference in a
+// saved filter must not take the whole list down.
+func scanSQLiteSavedSearch(r rowScanner) (SavedSearch, error) {
+	var s SavedSearch
+	var filter string
+	var isDefault int64
+	var created string
+	if err := r.Scan(&s.ID, &s.Name, &filter, &isDefault, &created); err != nil {
+		return s, mapSQLiteErr(err)
+	}
+	s.IsDefault = isDefault != 0
+	_ = json.Unmarshal([]byte(filter), &s.Filter)
+	var err error
+	if s.CreatedAt, err = parseSQLiteTime(created); err != nil {
+		return s, err
+	}
+	return s, nil
 	return &ss, nil
 }
 
@@ -1313,6 +1458,9 @@ func (s *SQLite) DeleteSavedSearch(ctx context.Context, id int64) error {
 	return s.deleteByID(ctx, "saved_searches", id)
 }
 
+// SetDefaultSearch promotes one saved search and demotes the previous default
+// in one transaction, so the partial unique index is never violated and two
+// callers cannot both believe they set the default.
 // SetDefaultSearch clears any existing default and sets the requested row in
 // one transaction, so the partial unique index never sees two defaults.
 func (s *SQLite) SetDefaultSearch(ctx context.Context, id int64) error {
@@ -1356,6 +1504,33 @@ func (s *SQLite) ClearDefaultSearch(ctx context.Context, id int64) error {
 
 // --- monitor templates ---
 
+// monitor_templates stores rules, channel_ids and parameters as JSON text:
+// SQLite has no array or JSON column type, so the Postgres BIGINT[] and JSONB
+// columns collapse into text that the store marshals on the way in and parses
+// on the way out.
+
+func (s *SQLite) CreateMonitorTemplate(ctx context.Context, tpl *MonitorTemplate) error {
+	rulesJSON, err := json.Marshal(tpl.Rules)
+	if err != nil {
+		return err
+	}
+	paramsJSON, err := json.Marshal(tpl.Parameters)
+	if err != nil {
+		return err
+	}
+	channelsJSON, err := json.Marshal(templateChannelIDs(tpl.ChannelIDs))
+	if err != nil {
+		return err
+	}
+	var created string
+	if err := s.db.QueryRowContext(ctx,
+		`INSERT INTO monitor_templates (name, description, rules, channel_ids, parameters)
+		 VALUES (?, ?, ?, ?, ?) RETURNING id, created_at`,
+		tpl.Name, tpl.Description, string(rulesJSON), string(channelsJSON), string(paramsJSON),
+	).Scan(&tpl.ID, &created); err != nil {
+		return mapSQLiteErr(err)
+	}
+	tpl.CreatedAt, err = parseSQLiteTime(created)
 func (s *SQLite) CreateMonitorTemplate(ctx context.Context, t *MonitorTemplate) error {
 	rulesJSON, _ := json.Marshal(t.Rules)
 	channelJSON, _ := json.Marshal(t.ChannelIDs)
@@ -1372,6 +1547,13 @@ func (s *SQLite) CreateMonitorTemplate(ctx context.Context, t *MonitorTemplate) 
 }
 
 func (s *SQLite) GetMonitorTemplate(ctx context.Context, id int64) (*MonitorTemplate, error) {
+	tpl, err := scanSQLiteTemplate(s.db.QueryRowContext(ctx,
+		`SELECT id, name, description, rules, channel_ids, parameters, created_at
+		 FROM monitor_templates WHERE id = ?`, id))
+	if err != nil {
+		return nil, err
+	}
+	return &tpl, nil
 	t, err := scanSQLiteTemplate(s.db.QueryRowContext(ctx,
 		`SELECT id, name, description, rules, channel_ids, parameters, created_at FROM monitor_templates WHERE id = ?`, id))
 	if err != nil {
@@ -1382,6 +1564,8 @@ func (s *SQLite) GetMonitorTemplate(ctx context.Context, id int64) (*MonitorTemp
 
 func (s *SQLite) ListMonitorTemplates(ctx context.Context) ([]MonitorTemplate, error) {
 	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, description, rules, channel_ids, parameters, created_at
+		 FROM monitor_templates ORDER BY name`)
 		`SELECT id, name, description, rules, channel_ids, parameters, created_at FROM monitor_templates ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -1389,6 +1573,11 @@ func (s *SQLite) ListMonitorTemplates(ctx context.Context) ([]MonitorTemplate, e
 	defer func() { _ = rows.Close() }()
 	var out []MonitorTemplate
 	for rows.Next() {
+		tpl, err := scanSQLiteTemplate(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, tpl)
 		t, err := scanSQLiteTemplate(rows)
 		if err != nil {
 			return nil, err
@@ -1398,6 +1587,45 @@ func (s *SQLite) ListMonitorTemplates(ctx context.Context) ([]MonitorTemplate, e
 	return out, rows.Err()
 }
 
+// scanSQLiteTemplate reads one monitor_templates row and parses the three JSON
+// columns. ChannelIDs is normalised to an empty slice so a caller ranging over
+// it never has to nil-check, exactly as the Postgres backend does.
+func scanSQLiteTemplate(r rowScanner) (MonitorTemplate, error) {
+	var tpl MonitorTemplate
+	var rulesJSON, channelsJSON, paramsJSON string
+	var created string
+	if err := r.Scan(&tpl.ID, &tpl.Name, &tpl.Description, &rulesJSON, &channelsJSON, &paramsJSON, &created); err != nil {
+		return tpl, mapSQLiteErr(err)
+	}
+	_ = json.Unmarshal([]byte(rulesJSON), &tpl.Rules)
+	_ = json.Unmarshal([]byte(channelsJSON), &tpl.ChannelIDs)
+	_ = json.Unmarshal([]byte(paramsJSON), &tpl.Parameters)
+	if tpl.ChannelIDs == nil {
+		tpl.ChannelIDs = []int64{}
+	}
+	var err error
+	if tpl.CreatedAt, err = parseSQLiteTime(created); err != nil {
+		return tpl, err
+	}
+	return tpl, nil
+}
+
+func (s *SQLite) UpdateMonitorTemplate(ctx context.Context, tpl *MonitorTemplate) error {
+	rulesJSON, err := json.Marshal(tpl.Rules)
+	if err != nil {
+		return err
+	}
+	paramsJSON, err := json.Marshal(tpl.Parameters)
+	if err != nil {
+		return err
+	}
+	channelsJSON, err := json.Marshal(templateChannelIDs(tpl.ChannelIDs))
+	if err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE monitor_templates SET name = ?, description = ?, rules = ?, channel_ids = ?, parameters = ? WHERE id = ?`,
+		tpl.Name, tpl.Description, string(rulesJSON), string(channelsJSON), string(paramsJSON), tpl.ID)
 func scanSQLiteTemplate(r rowScanner) (MonitorTemplate, error) {
 	var t MonitorTemplate
 	var rulesJSON, channelJSON, paramsJSON, created string

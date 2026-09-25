@@ -372,6 +372,7 @@
       },
       "patch": {
         "summary": "Update a channel",
+        "description": "A partial update. Setting `enabled: true` on a channel that was off is the only way out of an auto-disable, and clears its failure counters in the same write so it does not immediately re-disable.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1048,7 +1049,36 @@
             "enum": ["discord", "slack", "telegram", "email", "webhook"]
           },
           "config": { "type": "object" },
-          "enabled": { "type": "boolean" }
+          "enabled": { "type": "boolean" },
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Deliveries that have failed since the last success. One success resets it to 0."
+          },
+          "consecutive_permanent_failures": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Permanent failures (401/403/404) since the last success. This is what auto-disable counts; a transient 5xx or timeout neither increments nor clears it."
+          },
+          "last_error": {
+            "type": "string",
+            "description": "Most recent failure message, empty once a delivery succeeds. Never contains channel config."
+          },
+          "last_error_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When last_error was recorded. Absent if there has been no failure since the last success."
+          },
+          "last_success_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Last delivery that succeeded. Absent until the first one."
+          },
+          "disabled_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Set when health tracking auto-disabled the channel, absent when it is on or an operator disabled it. Cleared only by explicitly re-enabling the channel."
+          }
         }
       },
       "ChannelInput": {

@@ -109,6 +109,76 @@ type Channel struct {
 	Config    json.RawMessage `json:"-"`
 	Enabled   bool            `json:"enabled"`
 	CreatedAt time.Time       `json:"created_at"`
+
+	// The fields below are delivery health, derived from outcomes rather than
+	// configured (see RecordChannelHealth and migration 0009). They answer
+	// "is this channel still working?", which delivery_attempts could only
+	// answer one alert at a time.
+	//
+	// ConsecutiveFailures counts failed deliveries since the last success.
+	ConsecutiveFailures int64 `json:"consecutive_failures"`
+	// ConsecutivePermanentFailures counts permanent failures (401/403/404)
+	// since the last success, and is what auto-disable triggers on. A
+	// transient failure neither increments nor clears it, so a revoked
+	// credential is not hidden by an unrelated 5xx in the middle.
+	ConsecutivePermanentFailures int64 `json:"consecutive_permanent_failures"`
+	// LastError is the most recent failure message. It never holds channel
+	// config: the notifiers redact URLs and tokens before building it.
+	LastError string `json:"last_error,omitempty"`
+	// LastErrorAt is when LastError was recorded, nil if there has been no
+	// failure since the last success.
+	LastErrorAt *time.Time `json:"last_error_at,omitempty"`
+	// LastSuccessAt is the last successful delivery, nil until the first one.
+	LastSuccessAt *time.Time `json:"last_success_at,omitempty"`
+	// DisabledAt is set when health tracking turned the channel off, and only
+	// then. It is what makes the dashboard say "auto-disabled" rather than
+	// "disabled", and it is cleared by an explicit re-enable.
+	DisabledAt *time.Time `json:"disabled_at,omitempty"`
+}
+
+// AutoDisabled reports whether health tracking, rather than an operator,
+// turned this channel off. Such a channel is kept out of dispatch by
+// enabled=false and comes back only through an explicit re-enable.
+func (c Channel) AutoDisabled() bool { return c.DisabledAt != nil }
+
+// HealthStatus is the coarse state the dashboard shows: "auto_disabled" when
+// health tracking turned the channel off, "disabled" when an operator did,
+// "failing" while deliveries are failing but the channel is still on, and
+// "ok" otherwise.
+func (c Channel) HealthStatus() string {
+	switch {
+	case c.DisabledAt != nil:
+		return "auto_disabled"
+	case !c.Enabled:
+		return "disabled"
+	case c.ConsecutiveFailures > 0:
+		return "failing"
+	default:
+		return "ok"
+	}
+}
+
+// ChannelHealthUpdate is one delivery outcome folded into a channel's health
+// counters. The store applies it as a single UPDATE that both increments and
+// (when the threshold is reached) disables, so several poller instances
+// dispatching at once can neither lose a count nor disable twice.
+type ChannelHealthUpdate struct {
+	// Success clears the counters and the last error. It never re-enables a
+	// channel: putting one back in rotation is an operator's decision, taken
+	// through the channel update path.
+	Success bool
+	// Permanent marks a failure the channel will not recover from on its own
+	// (401/403/404). Only permanent failures move a channel toward
+	// auto-disable; a 5xx or a timeout is the provider having a bad day.
+	Permanent bool
+	// Error is the failure message recorded as last_error. It must already be
+	// free of credentials — notifiers build their errors that way.
+	Error string
+	// DisableAfter is the number of consecutive permanent failures at which
+	// the channel is auto-disabled. Zero (the default) never auto-disables.
+	DisableAfter int
+	// At is when the outcome happened. Zero means now.
+	At time.Time
 }
 
 // Alert records one rule match on one event. EventID is the source event's
@@ -369,6 +439,11 @@ type Channels interface {
 	DeleteChannel(ctx context.Context, id int64) error
 	// ListChannelsForMonitor returns the enabled channels a monitor alerts to.
 	ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]Channel, error)
+	// RecordChannelHealth folds one delivery outcome into a channel's health
+	// counters, auto-disabling it once DisableAfter consecutive permanent
+	// failures have accumulated. Unknown channel ids are ignored rather than
+	// an error: a channel deleted mid-dispatch is a race, not a bug.
+	RecordChannelHealth(ctx context.Context, channelID int64, u ChannelHealthUpdate) error
 }
 
 // Alerts persists alerts and delivery attempts.
@@ -458,6 +533,16 @@ type TemplateParameter struct {
 	Description string `json:"description,omitempty"`
 	Required    bool   `json:"required"`
 	Default     string `json:"default,omitempty"`
+}
+
+// templateChannelIDs normalises a template's channel list for storage. A nil
+// slice would be written as SQL NULL (Postgres) or JSON null (SQLite), and
+// channel_ids is NOT NULL: an empty list means "no channels", not "unknown".
+func templateChannelIDs(ids []int64) []int64 {
+	if ids == nil {
+		return []int64{}
+	}
+	return ids
 }
 
 // MonitorTemplates persists monitor templates.

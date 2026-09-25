@@ -129,6 +129,7 @@ type retryStore struct {
 	alert    *store.Alert
 	channel  *store.Channel
 	attempts []store.DeliveryAttempt
+	health   []channelHealthCall
 }
 
 func (s *retryStore) GetAlert(context.Context, int64) (*store.Alert, error) {
@@ -150,6 +151,10 @@ func (s *retryStore) RecordDeliveryAttempt(_ context.Context, d *store.DeliveryA
 	d.ID = int64(len(s.attempts) + 1)
 	d.AttemptedAt = time.Now()
 	s.attempts = append(s.attempts, *d)
+	return nil
+}
+func (s *retryStore) RecordChannelHealth(_ context.Context, channelID int64, u store.ChannelHealthUpdate) error {
+	s.health = append(s.health, channelHealthCall{channelID: channelID, update: u})
 	return nil
 }
 func (s *retryStore) GetMonitor(context.Context, int64) (*store.Monitor, error) {

@@ -13,6 +13,22 @@ import (
 // httpClient is shared by all outbound webhook-style notifiers.
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 
+// HTTPStatusError is a non-2xx answer from a webhook-style destination. It is
+// typed so channel health tracking can tell a permanent failure from a
+// transient one without matching on message text: 401/403/404 mean the
+// credential or the endpoint is gone and retrying can only fail again, while
+// a 5xx or a 429 is the provider having a bad day. Body is the truncated
+// response snippet, and it never holds channel config because the request URL
+// is not part of it.
+type HTTPStatusError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("status %d: %s", e.StatusCode, e.Body)
+}
+
 // postJSON POSTs a JSON body and treats any non-2xx status as an error.
 // Error messages include a truncated response body but never the URL,
 // since webhook URLs are secrets.
@@ -41,7 +57,7 @@ func requestJSON(ctx context.Context, method, url string, body []byte, headers m
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode > 299 {
 		snippet, _ := io.ReadAll(io.LimitReader(res.Body, 300))
-		return fmt.Errorf("status %d: %s", res.StatusCode, string(snippet))
+		return &HTTPStatusError{StatusCode: res.StatusCode, Body: string(snippet)}
 	}
 	return nil
 }

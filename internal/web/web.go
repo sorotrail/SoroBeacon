@@ -75,6 +75,7 @@ var templateFuncs = template.FuncMap{
 	"decodedEvent": decodedEvent,
 	"truncateID":   truncateID,
 	"relTime":      relTime,
+	"relTimePtr":   relTimePtr,
 }
 
 const tsLayout = "2006-01-02 15:04:05"
@@ -105,6 +106,16 @@ func formatTime(t time.Time, tz string) template.HTML {
 //
 // Rounding: seconds under a minute, minutes under an hour, hours under a
 // day, then whole days.
+// relTimePtr is relTime for the nullable timestamps channel health carries.
+// html/template does not dereference a pointer for you, so a nil-safe wrapper
+// keeps the channels table readable.
+func relTimePtr(t *time.Time, now ...time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return relTime(*t, now...)
+}
+
 func relTime(t time.Time, now ...time.Time) string {
 	ref := time.Now()
 	if len(now) > 0 && !now[0].IsZero() {
@@ -247,6 +258,7 @@ func (s *Server) Routes() chi.Router {
 	r.Post("/channels", s.createChannel)
 	r.Post("/channels/{id}/delete", s.deleteChannel)
 	r.Post("/channels/{id}/test", s.testChannel)
+	r.Post("/channels/{id}/toggle", s.toggleChannel)
 
 	r.Get("/rulebuilder/{type}", s.ruleBuilderFields)
 
@@ -986,12 +998,42 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:   time.Now(),
 		})
 	}
+	// Record the outcome like the API's test endpoint does, so a channel that
+	// has just been fixed stops being reported as broken the moment the
+	// operator proves it works. A bookkeeping failure is logged, not shown:
+	// the send is what the operator asked about.
+	if err := s.store.RecordChannelHealth(r.Context(), ch.ID, notify.TestHealthUpdate(err, time.Now())); err != nil {
+		s.log.Error("record channel health", "channel_id", ch.ID, "err", err)
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err != nil {
 		fmt.Fprintf(w, "❌ %s", template.HTMLEscapeString(err.Error()))
 		return
 	}
 	fmt.Fprint(w, "✅ sent")
+}
+
+// toggleChannel flips a channel's enabled flag. Turning one back on goes
+// through the same store write the API uses, so a channel that auto-disable
+// parked comes back with its failure count cleared instead of re-disabling on
+// the next failure.
+func (s *Server) toggleChannel(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	ch, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	ch.Enabled = !ch.Enabled
+	if err := s.store.UpdateChannel(r.Context(), ch); err != nil {
+		s.fail(w, err)
+		return
+	}
+	http.Redirect(w, r, "/channels", http.StatusSeeOther)
 }
 
 func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {

@@ -50,6 +50,7 @@ var configRequired = []string{
 	"POLL_INTERVAL",
 	"HTTP_ADDR",
 	"CORS_ALLOWED_ORIGINS",
+	"CHANNEL_DISABLE_AFTER_FAILURES",
 	"LOG_LEVEL",
 	"## Database",
 	"## RPC / event source",

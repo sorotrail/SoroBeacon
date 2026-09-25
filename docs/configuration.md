@@ -176,6 +176,62 @@ Archive objects contain only alert rows (contract id, event, payload, ledger); c
 | --- | --- | --- | --- | --- |
 | `LOG_LEVEL` | enum | `info` | optional | Minimum `log/slog` level: `debug` \| `info` \| `warn` (or `warning`) \| `error`. Logs are structured JSON on stdout. |
 
+## Channel health
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `CHANNEL_DISABLE_AFTER_FAILURES` | integer | `0` (never auto-disable) | optional | How many consecutive **permanent** channel failures take a channel out of rotation. Negative, fractional and non-numeric values are a startup error. |
+
+### What channel health tracks
+
+A channel whose bot token was revoked fails on every alert, forever, and
+nothing used to surface that short of reading `delivery_attempts` one alert at
+a time. So the usual discovery route was "we noticed we stopped getting
+alerts". Every delivery now folds its outcome into the channel:
+
+| Field | Meaning |
+| --- | --- |
+| `consecutive_failures` | Deliveries that have failed since the last success. One success resets it to 0. |
+| `consecutive_permanent_failures` | Permanent failures (401/403/404) since the last success. This is what auto-disable counts. A transient failure neither increments *nor* clears it, so an unrelated 5xx cannot hide a revoked credential behind it. |
+| `last_error` | The most recent failure message, cleared by the next success. Notifiers redact URLs and tokens before building these, so it never contains channel config. |
+| `last_error_at` / `last_success_at` | When that failure or success happened. |
+| `disabled_at` | Set only when health tracking turned the channel off. This is what makes the dashboard say *auto-disabled* rather than *disabled*. |
+
+All of it is derived, so it can always be rebuilt from delivery history, and it
+is exposed on `GET /api/v1/channels` and on the dashboard's
+[channels page](guides/dashboard.md).
+
+### Permanent versus transient
+
+Failures are split by kind, because auto-disabling is a destructive answer to a
+temporary problem:
+
+- **Permanent** — `401`, `403`, `404`, and SMTP 5xx replies. The credential or
+the endpoint is gone and retrying can only ever fail again. Only these count
+toward `CHANNEL_DISABLE_AFTER_FAILURES`.
+- **Transient** — `5xx`, `429`, timeouts, connection errors, and anything
+unrecognised. They are counted and reported, but never held against the
+channel: taking a channel out of rotation because a provider had a bad
+afternoon turns a short outage into silently lost alerts.
+
+### Auto-disable and re-enabling
+
+The threshold defaults to **off**, and turning it on is a deliberate act. When
+the threshold is reached the channel is disabled, stamped with `disabled_at`,
+and removed from the delivery path; the dashboard marks the row and repeats the
+last error.
+
+Getting back is **explicit**: `PATCH /api/v1/channels/{id}` with
+`{"enabled": true}` (or the *Enable* button on the dashboard). That write clears
+the counters and `disabled_at` in the same statement, so the channel does not
+immediately re-disable on its next failure. Renaming a channel, or editing its
+config, deliberately does **not** clear anything — otherwise a cosmetic edit
+would wipe the evidence of a channel that is still dropping alerts. A
+delivery retried by hand, or a test send, does move the counters, so an
+operator who has just fixed a channel can watch it clear; a test send never
+carries the disable threshold, so a diagnostic click cannot switch alerting
+off.
+
 ## Not environment variables
 
 | Thing | Where it lives |

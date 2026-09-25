@@ -68,8 +68,8 @@ Params for the built-in types: [`event_emitted`](../rules/event-emitted.md), [`v
 | Method & path | Description |
 | --- | --- |
 | `POST /channels` | Create. Body: `name`, `type`, `config` (validated per type), optional `enabled`. |
-| `GET /channels` / `GET /channels/{id}` | List / get. **`config` is never returned.** |
-| `PATCH /channels/{id}` | Partial update; config re-validated. |
+| `GET /channels` / `GET /channels/{id}` | List / get. **`config` is never returned.** Each channel also carries its delivery health: `consecutive_failures`, `consecutive_permanent_failures`, `last_error`, `last_error_at`, `last_success_at` and `disabled_at` (set only by auto-disable). |
+| `PATCH /channels/{id}` | Partial update; config re-validated. Setting `enabled: true` on a channel that was off is the only way out of an auto-disable, and clears its failure counters in the same write. |
 | `DELETE /channels/{id}` | Delete. |
 | `POST /channels/{id}/test` | Send a synthetic alert through the channel right now. `200 {"status":"sent"}` or `502 {"status":"failed","error":"..."}`. |
 

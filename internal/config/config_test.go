@@ -27,6 +27,7 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("CORS_ALLOWED_ORIGINS", "")
 	t.Setenv("CONFIG_ENCRYPTION_KEY", "")
 	t.Setenv("API_TOKEN", "")
+	t.Setenv("CHANNEL_DISABLE_AFTER_FAILURES", "")
 
 	cfg, err := Load()
 	require.NoError(t, err)
@@ -126,6 +127,52 @@ func TestLoadRejectsInvalidReadyzLagThreshold(t *testing.T) {
 
 	_, err := Load()
 	assert.ErrorContains(t, err, "READYZ_LAG_THRESHOLD")
+}
+
+// Auto-disabling a channel is a destructive answer to a temporary problem, so
+// it is off unless an operator asks for it and nothing else can turn it on.
+func TestLoadChannelDisableAfterFailures(t *testing.T) {
+	t.Run("defaults to never auto-disabling", func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://x")
+		t.Setenv("CHANNEL_DISABLE_AFTER_FAILURES", "")
+
+		cfg, err := Load()
+
+		require.NoError(t, err)
+		assert.Zero(t, cfg.ChannelDisableAfterFailures)
+	})
+
+	t.Run("reads the threshold", func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://x")
+		t.Setenv("CHANNEL_DISABLE_AFTER_FAILURES", "5")
+
+		cfg, err := Load()
+
+		require.NoError(t, err)
+		assert.Equal(t, 5, cfg.ChannelDisableAfterFailures)
+	})
+
+	t.Run("zero is a valid way to spell off", func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://x")
+		t.Setenv("CHANNEL_DISABLE_AFTER_FAILURES", "0")
+
+		cfg, err := Load()
+
+		require.NoError(t, err)
+		assert.Zero(t, cfg.ChannelDisableAfterFailures)
+	})
+
+	for _, value := range []string{"-1", "two", "2.5"} {
+		t.Run("rejects "+value, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://x")
+			t.Setenv("CHANNEL_DISABLE_AFTER_FAILURES", value)
+
+			_, err := Load()
+
+			require.Error(t, err)
+			assert.ErrorContains(t, err, "CHANNEL_DISABLE_AFTER_FAILURES")
+		})
+	}
 }
 
 func TestLoadAcceptsHTTPAndHTTPSRPCURLs(t *testing.T) {
@@ -417,6 +464,7 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"reorg_tracking_window",
 		"reorg_confirmation_depth",
 		"api_token_count",
+		"channel_disable_after_failures",
 	}, keys)
 }
 

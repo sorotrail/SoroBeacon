@@ -67,6 +67,17 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("ChannelConfigEncryptedAtRest", func(t *testing.T) { testChannelConfigEncrypted(t, newStore) })
 	t.Run("ChannelConfigLegacyPlaintextThenReencrypts", func(t *testing.T) { testChannelConfigLegacy(t, newStore) })
 	t.Run("ChannelConfigDecryptFailureNamesChannel", func(t *testing.T) { testChannelConfigDecryptFailure(t, newStore) })
+	t.Run("ChannelHealthCountsByKind", func(t *testing.T) { testChannelHealthCountsByKind(t, newStore) })
+	t.Run("ChannelHealthSuccessResets", func(t *testing.T) { testChannelHealthSuccessResets(t, newStore) })
+	t.Run("ChannelHealthAutoDisablesOnPermanentFailures", func(t *testing.T) { testChannelHealthAutoDisablesOnPermanentFailures(t, newStore) })
+	t.Run("ChannelHealthWithoutThresholdNeverDisables", func(t *testing.T) { testChannelHealthWithoutThresholdNeverDisables(t, newStore) })
+	t.Run("ChannelHealthTransientFailuresNeverDisable", func(t *testing.T) { testChannelHealthTransientFailuresNeverDisable(t, newStore) })
+	t.Run("ChannelHealthTransientDoesNotMaskPermanentStreak", func(t *testing.T) { testChannelHealthTransientDoesNotMaskPermanentStreak(t, newStore) })
+	t.Run("UpdateChannelReenableClearsHealth", func(t *testing.T) { testUpdateChannelReenableClearsHealth(t, newStore) })
+	t.Run("UpdateChannelRenameKeepsHealth", func(t *testing.T) { testUpdateChannelRenameKeepsHealth(t, newStore) })
+	t.Run("ChannelHealthUnknownChannelIgnored", func(t *testing.T) { testChannelHealthUnknownChannelIsIgnored(t, newStore) })
+	t.Run("SavedSearchCRUDAndSingleDefault", func(t *testing.T) { testSavedSearchCRUD(t, newStore) })
+	t.Run("MonitorTemplateCRUD", func(t *testing.T) { testMonitorTemplateCRUD(t, newStore) })
 }
 
 // TestClampAlertSeriesDays pins the overview-chart window bounds. It is pure
@@ -1228,4 +1239,126 @@ func testChannelConfigDecryptFailure(t *testing.T, newStore conformanceFactory) 
 	_, err = st.ListChannels(ctx, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "pager")
+}
+
+func testSavedSearchCRUD(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	first := &SavedSearch{Name: "alpha", Filter: SavedSearchFilter{ContractID: "CAAA", Sort: "created_at"}}
+	require.NoError(t, st.CreateSavedSearch(ctx, first))
+	assert.NotZero(t, first.ID)
+	assert.False(t, first.CreatedAt.IsZero())
+
+	got, err := st.GetSavedSearch(ctx, first.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "alpha", got.Name)
+	assert.Equal(t, SavedSearchFilter{ContractID: "CAAA", Sort: "created_at"}, got.Filter, "the filter must survive the round trip")
+	assert.False(t, got.IsDefault)
+
+	// Listing is ordered by name, not by insertion order.
+	second := &SavedSearch{Name: "beta", Filter: SavedSearchFilter{MonitorID: 7}, IsDefault: true}
+	require.NoError(t, st.CreateSavedSearch(ctx, second))
+	list, err := st.ListSavedSearches(ctx)
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	assert.Equal(t, []string{"alpha", "beta"}, []string{list[0].Name, list[1].Name})
+
+	// At most one search is the default at a time, and promoting one demotes
+	// the other rather than failing on a unique index.
+	require.NoError(t, st.SetDefaultSearch(ctx, first.ID))
+	first, err = st.GetSavedSearch(ctx, first.ID)
+	require.NoError(t, err)
+	second, err = st.GetSavedSearch(ctx, second.ID)
+	require.NoError(t, err)
+	assert.True(t, first.IsDefault)
+	assert.False(t, second.IsDefault, "promoting a search must demote the previous default")
+
+	require.NoError(t, st.ClearDefaultSearch(ctx, first.ID))
+	first, err = st.GetSavedSearch(ctx, first.ID)
+	require.NoError(t, err)
+	assert.False(t, first.IsDefault)
+
+	// A default inserted while another is set must take over, not collide.
+	third := &SavedSearch{Name: "gamma", IsDefault: true}
+	require.NoError(t, st.SetDefaultSearch(ctx, second.ID))
+	require.NoError(t, st.CreateSavedSearch(ctx, third))
+	third, err = st.GetSavedSearch(ctx, third.ID)
+	require.NoError(t, err)
+	second, err = st.GetSavedSearch(ctx, second.ID)
+	require.NoError(t, err)
+	assert.True(t, third.IsDefault)
+	assert.False(t, second.IsDefault)
+
+	require.NoError(t, st.DeleteSavedSearch(ctx, third.ID))
+	_, err = st.GetSavedSearch(ctx, third.ID)
+	assert.ErrorIs(t, err, ErrNotFound)
+	assert.ErrorIs(t, st.DeleteSavedSearch(ctx, third.ID), ErrNotFound)
+	assert.ErrorIs(t, st.SetDefaultSearch(ctx, 99999), ErrNotFound)
+	assert.ErrorIs(t, st.ClearDefaultSearch(ctx, 99999), ErrNotFound)
+}
+
+// assertJSONEqual compares two values by their JSON rendering. Both backends
+// store JSON as text, but Postgres normalises it: a JSONB column rewrites
+// whitespace and key order, so only the parsed values are comparable.
+func assertJSONEqual(t *testing.T, want, got any, msgAndArgs ...any) {
+	t.Helper()
+	wantJSON, err := json.Marshal(want)
+	require.NoError(t, err)
+	gotJSON, err := json.Marshal(got)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(wantJSON), string(gotJSON), msgAndArgs...)
+}
+
+func testMonitorTemplateCRUD(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	tpl := &MonitorTemplate{
+		Name:        "standard",
+		Description: "the usual handful of rules",
+		Rules: []MonitorTemplateRule{
+			{Type: "contract_event", Params: json.RawMessage(`{"topic":"transfer"}`)},
+			{Type: "frequency_threshold", Params: json.RawMessage(`{"count":5}`)},
+		},
+		ChannelIDs: []int64{3, 1},
+		Parameters: []TemplateParameter{{Name: "contract", Description: "contract id", Required: true}},
+	}
+	require.NoError(t, st.CreateMonitorTemplate(ctx, tpl))
+	assert.NotZero(t, tpl.ID)
+	assert.False(t, tpl.CreatedAt.IsZero())
+
+	got, err := st.GetMonitorTemplate(ctx, tpl.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "standard", got.Name)
+	assert.Equal(t, "the usual handful of rules", got.Description)
+	// Compared as JSON, not bytes: Postgres stores rules in a JSONB column,
+	// which re-renders them ({"a":1} comes back as {"a": 1}), so a byte
+	// comparison would fail on Postgres and pass on SQLite. The values are
+	// what must match.
+	assertJSONEqual(t, tpl.Rules, got.Rules, "rules must survive the round trip")
+	assert.Equal(t, []int64{3, 1}, got.ChannelIDs, "channel ids must keep their order")
+	assert.Equal(t, tpl.Parameters, got.Parameters)
+
+	got.Name = "renamed"
+	got.ChannelIDs = nil
+	require.NoError(t, st.UpdateMonitorTemplate(ctx, got))
+	reread, err := st.GetMonitorTemplate(ctx, tpl.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "renamed", reread.Name)
+	assert.Equal(t, []int64{}, reread.ChannelIDs, "no channels reads back as empty, never nil")
+
+	// A second template is listed alongside the first, ordered by name.
+	other := &MonitorTemplate{Name: "aaa", Rules: []MonitorTemplateRule{}, ChannelIDs: []int64{}, Parameters: []TemplateParameter{}}
+	require.NoError(t, st.CreateMonitorTemplate(ctx, other))
+	list, err := st.ListMonitorTemplates(ctx)
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	assert.Equal(t, []string{"aaa", "renamed"}, []string{list[0].Name, list[1].Name})
+
+	require.NoError(t, st.DeleteMonitorTemplate(ctx, other.ID))
+	_, err = st.GetMonitorTemplate(ctx, other.ID)
+	assert.ErrorIs(t, err, ErrNotFound)
+	assert.ErrorIs(t, st.DeleteMonitorTemplate(ctx, other.ID), ErrNotFound)
+	assert.ErrorIs(t, st.UpdateMonitorTemplate(ctx, &MonitorTemplate{ID: 99999}), ErrNotFound)
 }

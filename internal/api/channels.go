@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"slices"
@@ -207,8 +208,25 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:   time.Now(),
 	}
 	if err := notifier.Send(r.Context(), testAlert); err != nil {
+		s.recordChannelTestHealth(r.Context(), ch.ID, err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"status": "failed", "error": err.Error()})
 		return
 	}
+	s.recordChannelTestHealth(r.Context(), ch.ID, nil)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "sent"})
+}
+
+// recordChannelTestHealth folds a test send's outcome into the channel's
+// health, so an operator who has just fixed a channel watches it clear and one
+// who tests a still-broken channel sees the count keep climbing. Leaving it
+// out would make the reported health disagree with the button the operator
+// just pressed.
+//
+// A bookkeeping failure is logged, not returned: the send is what the caller
+// asked about, and health is derived state.
+func (s *Server) recordChannelTestHealth(ctx context.Context, channelID int64, sendErr error) {
+	u := notify.TestHealthUpdate(sendErr, time.Now())
+	if err := s.store.RecordChannelHealth(ctx, channelID, u); err != nil {
+		s.log.Error("record channel health", "channel_id", channelID, "err", err)
+	}
 }

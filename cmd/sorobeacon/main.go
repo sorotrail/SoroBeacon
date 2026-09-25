@@ -152,6 +152,14 @@ func run() error {
 			return records, nil
 		})))
 	factory := notify.DefaultFactory()
+	// Channel health: delivery outcomes are folded into each channel so a
+	// revoked token surfaces as a broken channel instead of as silence. The
+	// threshold is off unless the operator sets it — auto-disabling a channel
+	// is a destructive answer to a temporary problem.
+	dispatcher := notify.NewDispatcher(st, factory, log).
+		WithMetrics(m).
+		WithDisableAfterFailures(cfg.ChannelDisableAfterFailures)
+	p := poller.New(src, st, registry, dispatcher, cfg.PollInterval, log).WithMetrics(m)
 	dispatcher := notify.NewDispatcher(st, factory, log).WithMetrics(m)
 	p := poller.New(src, st, registry, dispatcher, cfg.PollInterval, log).
 		WithMetrics(m).
