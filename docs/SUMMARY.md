@@ -12,6 +12,7 @@
 ## 🧭 Guides
 
 * [Monitors & alerts](guides/monitors-and-alerts.md)
+* [The life of an alert](guides/alert-lifecycle.md)
 * [The dashboard](guides/dashboard.md)
 * [Monitoring a token contract](guides/monitoring-a-token.md)
 * [Choosing and combining rule types](guides/writing-rules.md)
