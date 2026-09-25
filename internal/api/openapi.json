@@ -636,6 +636,21 @@
         }
       }
     },
+    "/rule-types": {
+      "get": {
+        "summary": "List rule types and parameter schemas",
+        "responses": {
+          "200": {
+            "description": "Registered rule types",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RuleTypesResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/stats": {
       "get": {
         "summary": "Service statistics",
@@ -914,6 +929,39 @@
       }
     },
     "schemas": {
+      "RuleTypesResponse": {
+        "type": "object",
+        "required": ["rule_types"],
+        "properties": {
+          "rule_types": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/RuleType" }
+          }
+        }
+      },
+      "RuleType": {
+        "type": "object",
+        "required": ["type", "parameters"],
+        "properties": {
+          "type": { "type": "string" },
+          "parameters": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/RuleParameter" }
+          }
+        }
+      },
+      "RuleParameter": {
+        "type": "object",
+        "required": ["name", "type", "required", "default", "description"],
+        "properties": {
+          "name": { "type": "string" },
+          "type": { "type": "string", "enum": ["string", "number", "object", "select"] },
+          "required": { "type": "boolean" },
+          "default": { "type": "string" },
+          "description": { "type": "string" },
+          "options": { "type": "array", "items": { "type": "string" } }
+        }
+      },
       "Error": {
         "type": "object",
         "required": ["error"],

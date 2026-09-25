@@ -169,6 +169,7 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/livez", s.livez)
 	r.Get("/readyz", s.readyz)
 	r.Get("/version", s.version)
+	r.Get("/rule-types", s.listRuleTypes)
 	r.Get("/stats", s.stats)
 	r.Get("/stats/alerts-daily", s.alertsDaily)
 
