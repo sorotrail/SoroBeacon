@@ -109,12 +109,29 @@ func (d *Dispatcher) Dispatch(ctx context.Context, a Alert) {
 		return
 	}
 	for _, ch := range channels {
+		if !severityMeetsThreshold(a.Severity, ch.MinSeverity) {
+			d.log.Debug("channel skipped due to severity filter", "alert_id", a.ID, "channel_id", ch.ID, "alert_severity", a.Severity, "channel_min_severity", ch.MinSeverity)
+			continue
+		}
 		if d.digest != nil && digestEnabled(ch) {
 			d.enqueueDigest(ctx, a, ch)
 			continue
 		}
 		d.deliver(ctx, a, ch)
 	}
+}
+
+// severityMeetsThreshold reports whether the alert severity meets or exceeds
+// the channel's minimum severity. Empty channel minimum means no filter.
+func severityMeetsThreshold(alertSeverity string, channelMinSeverity store.Severity) bool {
+	if channelMinSeverity == "" {
+		return true
+	}
+	// Empty alert severity defaults to warning for backwards compatibility.
+	if alertSeverity == "" {
+		alertSeverity = string(store.SeverityWarning)
+	}
+	return store.Severity(alertSeverity).MeetsThreshold(channelMinSeverity)
 }
 
 // enqueueDigest persists an alert for a channel's next digest flush. The
@@ -197,11 +214,14 @@ func (d *Dispatcher) flushDigest(ctx context.Context, ch store.Channel, pending 
 			ids = append(ids, p.ID)
 			continue
 		}
-		alerts = append(alerts, a)
+		// Only include alerts that meet the channel's severity threshold.
+		if severityMeetsThreshold(a.Severity, ch.MinSeverity) {
+			alerts = append(alerts, a)
+		}
 		ids = append(ids, p.ID)
 	}
 	if len(alerts) == 0 {
-		d.clearDigest(ctx, ch.ID, ids)
+		d.log.Debug("digest skipped: no alerts meet channel severity threshold", "channel_id", ch.ID, "channel_min_severity", ch.MinSeverity)
 		return
 	}
 
@@ -338,6 +358,10 @@ func GateRetry(attempts []store.DeliveryAttempt, channelID int64, ch store.Chann
 // Unlike Dispatch it does not loop with backoff: the operator asked for
 // one try and the HTTP handler returns that outcome on the same request.
 func (d *Dispatcher) Retry(ctx context.Context, a Alert, ch store.Channel) *store.DeliveryAttempt {
+	if !severityMeetsThreshold(a.Severity, ch.MinSeverity) {
+		d.log.Debug("retry skipped due to severity filter", "alert_id", a.ID, "channel_id", ch.ID, "alert_severity", a.Severity, "channel_min_severity", ch.MinSeverity)
+		return d.record(ctx, a.ID, ch.ID, "failed", "alert severity below channel minimum")
+	}
 	if d.rateLimiter != nil {
 		if err := d.rateLimiter.Wait(ctx, ch.ID, ch.Type, 0); err != nil {
 			if d.metrics != nil {

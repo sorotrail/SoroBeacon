@@ -12,6 +12,13 @@
   <input type="number" id="rule_id" name="rule_id" value="{{if .SelectedRule}}{{.SelectedRule}}{{end}}" min="1" placeholder="id">
   <label for="contract_id">Contract</label>
   <input type="search" id="contract_id" name="contract_id" value="{{.ContractID}}" placeholder="contract id">
+  <label for="severity">Severity</label>
+  <select id="severity" name="severity">
+    <option value="">All severities</option>
+    <option value="info" {{if eq .Severity "info"}}selected{{end}}>Info</option>
+    <option value="warning" {{if eq .Severity "warning"}}selected{{end}}>Warning</option>
+    <option value="critical" {{if eq .Severity "critical"}}selected{{end}}>Critical</option>
+  </select>
   <label for="sort">Sort</label>
   <select id="sort" name="sort">
     <option value="created_at_desc" {{if eq .Sort "created_at_desc"}}selected{{end}}>Newest</option>
@@ -22,12 +29,13 @@
 <p class="export"><a href="{{.ExportHref}}">Export CSV</a> | <a href="/searches">Saved searches</a></p>
 {{if .Alerts}}
 <table>
-  <tr><th>ID</th><th>Monitor</th><th>Rule</th><th>Event</th><th>Payload</th><th>Deliveries</th><th>At</th></tr>
+  <tr><th>ID</th><th>Monitor</th><th>Rule</th><th>Severity</th><th>Event</th><th>Payload</th><th>Deliveries</th><th>At</th></tr>
   {{range .Alerts}}
   <tr>
     <td><a href="/alerts/{{.ID}}">{{.ID}}</a></td>
     <td>{{index $.MonitorNames .MonitorID}}</td>
     <td>#{{.RuleID}}</td>
+    <td>{{if .Severity}}<span class="pill {{severityClass .Severity}}">{{.Severity}}</span>{{else}}<span class="pill warning">warning</span>{{end}}</td>
     <td>{{template "copyID" .EventID}}</td>
     <td><details><summary>view</summary>{{decodedEvent .Payload}}<pre>{{prettyJSON .Payload}}</pre></details></td>
     <td>
@@ -41,7 +49,7 @@
   {{end}}
 </table>
 {{if .OlderHref}}<p><a href="{{.OlderHref}}">Older →</a></p>{{end}}
-{{else if or .SelectedMonitor .SelectedRule .ContractID}}<p class="muted">No alerts match these filters.</p>
+{{else if or .SelectedMonitor .SelectedRule .ContractID .Severity}}<p class="muted">No alerts match these filters.</p>
 {{else if eq .Empty "no_monitors"}}
 <section class="empty">
   <h2>Nothing is being watched yet</h2>

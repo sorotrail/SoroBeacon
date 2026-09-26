@@ -70,11 +70,12 @@ type monitorListRow struct {
 
 // templateFuncs are available to every page template.
 var templateFuncs = template.FuncMap{
-	"prettyJSON":   prettyJSON,
-	"formatTime":   formatTime,
-	"decodedEvent": decodedEvent,
-	"truncateID":   truncateID,
-	"relTime":      relTime,
+	"prettyJSON":    prettyJSON,
+	"formatTime":    formatTime,
+	"decodedEvent":  decodedEvent,
+	"truncateID":    truncateID,
+	"relTime":       relTime,
+	"severityClass": severityClass,
 }
 
 const tsLayout = "2006-01-02 15:04:05"
@@ -130,6 +131,18 @@ func relTime(t time.Time, now ...time.Time) string {
 	default:
 		n := int(d / (24 * time.Hour))
 		return fmt.Sprintf("%dd ago", n)
+	}
+}
+
+// severityClass returns a CSS class for the given severity level.
+func severityClass(severity string) string {
+	switch severity {
+	case "critical":
+		return "critical"
+	case "info":
+		return "info"
+	default:
+		return "warning"
 	}
 }
 
@@ -1054,6 +1067,12 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 		f.RuleID = selectedRule
 	}
 	f.ContractID = strings.TrimSpace(q.Get("contract_id"))
+	severity := strings.TrimSpace(q.Get("severity"))
+	if severity != "" {
+		if parsed, ok := store.ParseSeverity(severity); ok {
+			f.Severity = parsed
+		}
+	}
 	switch q.Get("sort") {
 	case "created_at_asc", "created_at_desc":
 		f.Sort = q.Get("sort")
@@ -1094,13 +1113,13 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 	data := map[string]any{
 		"Title": "Alerts", "Alerts": alerts, "Monitors": monitors,
 		"MonitorNames": names, "SelectedMonitor": selected,
-		"SelectedRule": selectedRule, "ContractID": f.ContractID, "Sort": sort,
-		"ExportHref": alertExportHref(selected, selectedRule, f.ContractID, f.Sort),
+		"SelectedRule": selectedRule, "ContractID": f.ContractID, "Severity": severity, "Sort": sort,
+		"ExportHref": alertExportHref(selected, selectedRule, f.ContractID, severity, f.Sort),
 		"Empty":      emptyKind(monitors, channels, alerts),
 	}
 	if next != "" {
 		// template.URL so filter query separators are not %26-escaped.
-		data["OlderHref"] = template.URL("/alerts?" + alertFilterQuery(selected, selectedRule, f.ContractID, f.Sort) + "cursor=" + next)
+		data["OlderHref"] = template.URL("/alerts?" + alertFilterQuery(selected, selectedRule, f.ContractID, severity, f.Sort) + "cursor=" + next)
 	}
 	s.render(w, r, "alerts", data)
 }
@@ -1109,18 +1128,18 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 // the list currently on screen, pointed at the JSON API's /alerts.csv. The
 // cursor is deliberately dropped — an export is the whole filtered set, not
 // just the page after the one being viewed.
-func alertExportHref(monitorID, ruleID int64, contractID, sort string) template.URL {
-	q := strings.TrimSuffix(alertFilterQuery(monitorID, ruleID, contractID, sort), "&")
+func alertExportHref(monitorID, ruleID int64, contractID, severity, sort string) template.URL {
+	q := strings.TrimSuffix(alertFilterQuery(monitorID, ruleID, contractID, severity, sort), "&")
 	if q == "" {
 		return template.URL("/api/v1/alerts.csv")
 	}
 	return template.URL("/api/v1/alerts.csv?" + q)
 }
 
-// alertFilterQuery is the monitor/rule/contract/sort prefix preserved on
+// alertFilterQuery is the monitor/rule/contract/severity/sort prefix preserved on
 // the Older paging link. Empty when every control is at its default, so
 // the existing `?cursor=` link stays stable.
-func alertFilterQuery(monitorID, ruleID int64, contractID, sort string) string {
+func alertFilterQuery(monitorID, ruleID int64, contractID, severity, sort string) string {
 	v := url.Values{}
 	if monitorID != 0 {
 		v.Set("monitor_id", strconv.FormatInt(monitorID, 10))
@@ -1130,6 +1149,9 @@ func alertFilterQuery(monitorID, ruleID int64, contractID, sort string) string {
 	}
 	if contractID != "" {
 		v.Set("contract_id", contractID)
+	}
+	if severity != "" {
+		v.Set("severity", severity)
 	}
 	if sort != "" && sort != "created_at_desc" {
 		v.Set("sort", sort)
@@ -1193,6 +1215,7 @@ func (s *Server) retryDelivery(w http.ResponseWriter, r *http.Request) {
 		EventID:   alert.EventID,
 		Payload:   alert.Payload,
 		CreatedAt: alert.CreatedAt,
+		Severity:  string(alert.Severity),
 	}
 	if m, merr := s.store.GetMonitor(r.Context(), alert.MonitorID); merr == nil && m != nil {
 		na.MonitorName = m.Name

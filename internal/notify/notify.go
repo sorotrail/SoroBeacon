@@ -33,6 +33,9 @@ type Alert struct {
 	TxHash      string          `json:"tx_hash"`
 	Payload     json.RawMessage `json:"payload,omitempty"`
 	CreatedAt   time.Time       `json:"created_at"`
+	// Severity is the alert severity (info, warning, critical). Empty means
+	// warning for backwards compatibility.
+	Severity string `json:"severity,omitempty"`
 	// Digest carries a pre-rendered summary when this Alert represents a
 	// channel digest rather than a single event. RenderText returns it
 	// verbatim, so every text channel sends the same summary without
@@ -71,6 +74,7 @@ const (
 	TypeTwilio    = "twilio"
 	TypeSignal    = "signal"
 	TypeWebex     = "webex"
+	TypeDingTalk  = "dingtalk"
 )
 
 // DefaultFactory returns a Factory with the built-in channel types.
@@ -87,6 +91,7 @@ func DefaultFactory() *Factory {
 	f.Register(TypeTwilio, NewTwilio)
 	f.Register(TypeSignal, NewSignal)
 	f.Register(TypeWebex, NewWebex)
+	f.Register(TypeDingTalk, NewDingTalk)
 	return f
 }
 
