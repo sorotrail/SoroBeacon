@@ -41,6 +41,16 @@ type Alert struct {
 	// verbatim, so every text channel sends the same summary without
 	// needing a digest-specific method.
 	Digest string `json:"digest,omitempty"`
+	// GroupCount is the number of alerts in the current grouping
+	// window. It is > 1 for suppressed alerts that are part of a
+	// group and not delivered individually. Zero means grouping is
+	// disabled or not applicable.
+	GroupCount int64 `json:"group_count,omitempty"`
+	// WindowStart and WindowEnd bound the grouping window. They are
+	// set when grouping is enabled so the delivered message can show
+	// the window bounds and total count.
+	WindowStart time.Time `json:"window_start,omitempty"`
+	WindowEnd   time.Time `json:"window_end,omitempty"`
 }
 
 // Notifier sends one alert to one destination. Implementations should

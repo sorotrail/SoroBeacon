@@ -888,6 +888,22 @@ func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, erro
 	return pgx.CollectRows(rows, scanAlert)
 }
 
+// ListAlertsStream streams alerts matching the filter, calling the callback
+// for each one. This is a simple implementation that loads all alerts and
+// iterates; a true streaming implementation would use a cursor.
+func (p *Postgres) ListAlertsStream(ctx context.Context, f AlertFilter, cb func(Alert) error) error {
+	alerts, err := p.ListAlerts(ctx, f)
+	if err != nil {
+		return err
+	}
+	for _, a := range alerts {
+		if err := cb(a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // scanAlert reads one alerts row. It is shared by ListAlerts and ExpiredAlerts
 // so the column order and the ledger/retracted_at mapping cannot drift.
 func scanAlert(row pgx.CollectableRow) (Alert, error) {

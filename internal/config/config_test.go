@@ -527,6 +527,9 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"otlp_tracing_enabled",
 		"otlp_service_name",
 		"otlp_sample_rate",
+		"graphql_playground_enabled",
+		"graphql_max_depth",
+		"graphql_max_complexity",
 	}, keys)
 }
 
