@@ -76,6 +76,13 @@ func (EventEmitted) ParamSchema() []FieldSchema {
 	}
 }
 
+func (*ContractAllowlist) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "contract_ids", Type: "object", Required: true, Description: "Allowlisted contract IDs (JSON array); most useful AND-combined with a payload rule inside a composite rule"},
+		{Name: "exclude", Type: "select", Description: "Invert into a denylist (default false)", Options: []string{"true", "false"}, Default: "false"},
+	}
+}
+
 func (ValueThreshold) ParamSchema() []FieldSchema {
 	return []FieldSchema{
 		{Name: "event_name", Type: "string", Description: "Only consider events with this name"},
