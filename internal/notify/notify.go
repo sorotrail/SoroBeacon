@@ -71,6 +71,7 @@ const (
 	TypeTwilio    = "twilio"
 	TypeSignal    = "signal"
 	TypeWebex     = "webex"
+	TypeLark      = "lark"
 )
 
 // DefaultFactory returns a Factory with the built-in channel types.
@@ -87,6 +88,7 @@ func DefaultFactory() *Factory {
 	f.Register(TypeTwilio, NewTwilio)
 	f.Register(TypeSignal, NewSignal)
 	f.Register(TypeWebex, NewWebex)
+	f.Register(TypeLark, NewLark)
 	return f
 }
 
