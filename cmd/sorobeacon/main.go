@@ -19,6 +19,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/sorotrail/sorobeacon/internal/api"
+	"github.com/sorotrail/sorobeacon/internal/api/graphql"
 	"github.com/sorotrail/sorobeacon/internal/archive"
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/broadcast"
@@ -263,6 +264,18 @@ func run() error {
 	root.Handle("/metrics", m.Handler())
 	root.Mount("/api/v1", apiSrv.Routes())
 	root.Mount("/", webSrv.Routes())
+
+	// GraphQL endpoint at /graphql
+	graphqlResolver := graphql.NewResolver(st, log)
+	graphqlConfig := graphql.DefaultServerConfig()
+	graphqlConfig.EnablePlayground = cfg.GraphQL.EnablePlayground
+	graphqlConfig.MaxDepth = cfg.GraphQL.MaxDepth
+	graphqlConfig.MaxComplexity = cfg.GraphQL.MaxComplexity
+	root.Handle("/graphql", graphql.NewHandler(graphqlResolver, graphqlConfig))
+	if cfg.GraphQL.EnablePlayground {
+		root.Handle("/graphql/playground", graphql.PlaygroundHandler("/graphql"))
+		log.Info("GraphQL playground enabled", "path", "/graphql/playground")
+	}
 
 	httpSrv := &http.Server{
 		Addr:              cfg.HTTPAddr,

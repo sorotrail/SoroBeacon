@@ -32,11 +32,15 @@ const (
 	// DefaultMonitorSilentAfter is how long since last_matched_at before
 	// the monitors list treats a monitor as silent.
 	DefaultMonitorSilentAfter = 24 * time.Hour
-	// DefaultReorgTrackingWindow is how many recent ledger hashes the poller
-	// keeps for reorg detection. 128 ledgers is roughly ten minutes on
-	// Stellar and a few getLedgers pages per cycle — cheap, and deep enough
-	// to cover the practical reorg depth.
-	DefaultReorgTrackingWindow uint32 = 128
+// DefaultReorgTrackingWindow is how many recent ledger hashes the poller
+// keeps for reorg detection. 128 ledgers is roughly ten minutes on
+// Stellar and a few getLedgers pages per cycle — cheap, and deep enough
+// to cover the practical reorg depth.
+DefaultReorgTrackingWindow uint32 = 128
+// DefaultGraphQLMaxDepth is the maximum query depth for GraphQL.
+// DefaultGraphQLMaxComplexity is the maximum query complexity for GraphQL.
+DefaultGraphQLMaxDepth     = 10
+DefaultGraphQLMaxComplexity = 1000
 )
 
 // Config holds all runtime configuration. Every field maps to one
@@ -170,6 +174,9 @@ type Config struct {
 	// validates it when the pruner is built.
 	ArchiveURL string
 
+	// GraphQL is the GraphQL endpoint configuration.
+	GraphQL GraphQLConfig
+
 	// NotifyRateLimitSlackRPS is the max requests per second for Slack channels
 	// (NOTIFY_RATE_LIMIT_SLACK_RPS, default 1.0, citing Slack API tier 2 / webhooks guidelines ~1 msg/sec).
 	NotifyRateLimitSlackRPS float64
@@ -202,6 +209,21 @@ type OTLPConfig struct {
 // "off unless OTLP_ENDPOINT is set" rule lives, so the wiring in main and
 // the tests cannot drift apart.
 func (o OTLPConfig) Enabled() bool { return o.Endpoint != "" }
+
+// GraphQLConfig is the GraphQL endpoint configuration.
+type GraphQLConfig struct {
+	// EnablePlayground serves the GraphQL playground at /graphql/playground.
+	// Default false for security.
+	EnablePlayground bool
+	// MaxDepth limits the maximum query depth. Default 10.
+	MaxDepth int
+	// MaxComplexity limits the maximum query complexity. Default 1000.
+	MaxComplexity int
+}
+
+// Enabled reports whether the GraphQL endpoint is enabled.
+// The endpoint is always available; this controls the playground only.
+func (g GraphQLConfig) PlaygroundEnabled() bool { return g.EnablePlayground }
 
 // Load reads configuration from the environment. DATABASE_URL is the only
 // required variable; everything else has a sensible default.
@@ -439,6 +461,35 @@ func Load() (Config, error) {
 		}
 		cfg.OTLP.SampleRate = r
 	}
+	// GraphQL configuration
+	cfg.GraphQL.EnablePlayground = false
+	if v := os.Getenv("GRAPHQL_PLAYGROUND"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			cfg.GraphQL.EnablePlayground = true
+		case "0", "false", "no", "off":
+			cfg.GraphQL.EnablePlayground = false
+		default:
+			return cfg, fmt.Errorf("invalid GRAPHQL_PLAYGROUND %q (want true|false)", v)
+		}
+	}
+	cfg.GraphQL.MaxDepth = DefaultGraphQLMaxDepth
+	if v := os.Getenv("GRAPHQL_MAX_DEPTH"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 50 {
+			return cfg, fmt.Errorf("invalid GRAPHQL_MAX_DEPTH %q (want an integer between 1 and 50)", v)
+		}
+		cfg.GraphQL.MaxDepth = n
+	}
+	cfg.GraphQL.MaxComplexity = DefaultGraphQLMaxComplexity
+	if v := os.Getenv("GRAPHQL_MAX_COMPLEXITY"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 10000 {
+			return cfg, fmt.Errorf("invalid GRAPHQL_MAX_COMPLEXITY %q (want an integer between 1 and 10000)", v)
+		}
+		cfg.GraphQL.MaxComplexity = n
+	}
+
 	if v := os.Getenv("NOTIFY_RATE_LIMIT_SLACK_RPS"); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
@@ -560,6 +611,9 @@ func (c Config) LogAttrs() []slog.Attr {
 		slog.Bool("otlp_tracing_enabled", c.OTLP.Endpoint != ""),
 		slog.String("otlp_service_name", c.OTLP.ServiceName),
 		slog.Float64("otlp_sample_rate", c.OTLP.SampleRate),
+		slog.Bool("graphql_playground_enabled", c.GraphQL.EnablePlayground),
+		slog.Int("graphql_max_depth", c.GraphQL.MaxDepth),
+		slog.Int("graphql_max_complexity", c.GraphQL.MaxComplexity),
 	}
 }
 
