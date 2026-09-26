@@ -191,6 +191,10 @@ type Alert struct {
 	EventID   string          `json:"event_id"`
 	Payload   json.RawMessage `json:"payload"`
 	CreatedAt time.Time       `json:"created_at"`
+	// InhibitedByRuleID is set when an inhibition rule suppressed this
+	// alert's delivery. Nil means delivered (or never subjected to
+	// inhibition); the alert row itself is always stored.
+	InhibitedByRuleID *int64 `json:"inhibited_by_rule_id,omitempty"`
 	// Severity is the alert severity copied from the rule at creation time.
 	// It is stored so changing a rule's severity later does not rewrite
 	// history.
@@ -673,6 +677,7 @@ type Store interface {
 	Rules
 	Channels
 	Alerts
+	Inhibitions
 	Ingest
 	Backfills
 	Ledgers
@@ -685,6 +690,15 @@ type Store interface {
 	// consecutive days ending today (UTC). Days with no alerts are present
 	// with count 0 so a chart has no gaps. Bucketing is done in SQL.
 	AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCount, error)
+	// GroupAlerts creates or increments the alert group for key
+	// with windowStart and returns whether the alert should be
+	// delivered immediately (first alert in the window) and the
+	// current group count. Grouping is off when window duration is
+	// zero, which callers enforce before invoking this method.
+	GroupAlerts(ctx context.Context, key string, windowStart time.Time) (shouldDeliver bool, currentCount int64, err error)
+	// CreateAlertGroup creates or increments the alert group row
+	// identified by key and windowStart. Returns the new count.
+	CreateAlertGroup(ctx context.Context, key string, windowStart time.Time) (int64, error)
 	Ping(ctx context.Context) error
 	Close()
 }

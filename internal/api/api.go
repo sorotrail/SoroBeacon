@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/sorotrail/sorobeacon/internal/auth"
+	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/buildinfo"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
@@ -52,15 +53,30 @@ type Server struct {
 	readyzLagThreshold uint32
 	rateLimit          RateLimitConfig
 	maxBodyBytes       int64
+	// broadcaster fans newly created alerts out to live SSE subscribers on
+	// GET /alerts/stream. main hands it the same instance the poller
+	// publishes into; the New default is an empty one so the endpoint works
+	// (and simply stays quiet) even when nothing drives it.
+	broadcaster *broadcast.Broadcaster
+	// streamHeartbeat is the SSE keep-alive interval, see stream.go.
+	streamHeartbeat time.Duration
 	// auth verifies bearer tokens and dashboard sessions. Nil (the New
 	// default until WithAuth is called, or when no API_TOKEN is set) means
 	// every request is allowed.
-	auth *auth.Authenticator
+	a     *auth.Authenticator
+	auth  *auth.Authenticator
+	roles *auth.RoleEnforcer
 }
 
-// New wires an API server. Rate limiting stays off until WithRateLimit.
+// New wires an API server. Rate limiting stays off until WithRateLimit, and
+// live alerts stay quiet until WithBroadcaster shares the poller's fan-out.
 func New(st store.Store, reg *rules.Registry, f *notify.Factory, rpc HealthChecker, log *slog.Logger) *Server {
-	return &Server{store: st, registry: reg, factory: f, rpc: rpc, log: log, maxBodyBytes: DefaultMaxBodyBytes}
+	return &Server{
+		store: st, registry: reg, factory: f, rpc: rpc, log: log,
+		maxBodyBytes:    DefaultMaxBodyBytes,
+		broadcaster:     broadcast.New(broadcast.DefaultBuffer),
+		streamHeartbeat: defaultStreamHeartbeat,
+	}
 }
 
 // WithMaxBodyBytes sets the write-endpoint body limit applied by
@@ -100,7 +116,14 @@ func (s *Server) WithRateLimit(cfg RateLimitConfig) *Server {
 // existed. main builds one authenticator and shares it with the dashboard,
 // so a session minted at /login also satisfies this middleware.
 func (s *Server) WithAuth(a *auth.Authenticator) *Server {
+	s.a = a
 	s.auth = a
+	return s
+}
+
+// WithRoles attaches role enforcement to the API router.
+func (s *Server) WithRoles(re *auth.RoleEnforcer) *Server {
+	s.roles = re
 	return s
 }
 
@@ -114,6 +137,7 @@ func (s *Server) Routes() chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer, MaxBodyMiddleware(s.maxBodyBytes))
 	r.Use(AuthMiddleware(s.auth))
+	r.Use(auth.RoleMiddleware(s.roles, auth.RoleViewer))
 	r.Use(RateLimitMiddleware(s.rateLimit))
 	// Innermost, so only authenticated, rate-limited requests are audited
 	// and an audit failure never blocks the request.
@@ -133,6 +157,7 @@ func (s *Server) Routes() chi.Router {
 			r.Patch("/", s.updateMonitor)
 			r.Delete("/", s.deleteMonitor)
 			r.Post("/duplicate", s.duplicateMonitor)
+			r.Post("/rules/dry-run", s.dryRun)
 			r.Post("/rules", s.createRule)
 			r.Get("/rules", s.listRules)
 			r.Post("/rules/bulk", s.createRulesBulk)
@@ -148,6 +173,12 @@ func (s *Server) Routes() chi.Router {
 		r.Patch("/{id}", s.updateChannel)
 		r.Delete("/{id}", s.deleteChannel)
 		r.Post("/{id}/test", s.testChannel)
+	})
+
+	r.Route("/inhibitions", func(r chi.Router) {
+		r.Post("/", s.createInhibition)
+		r.Get("/", s.listInhibitions)
+		r.Delete("/{sourceID}/{targetID}", s.deleteInhibition)
 	})
 
 	r.Route("/templates", func(r chi.Router) {
@@ -166,7 +197,11 @@ func (s *Server) Routes() chi.Router {
 	r.Post("/ingest", s.ingest)
 
 	r.Get("/alerts", s.listAlerts)
+	// Registered before /alerts.csv and the /alerts/{id}/... routes for
+	// readability; chi matches the static segment either way.
+	r.Get("/alerts/stream", s.streamAlerts)
 	r.Get("/alerts.csv", s.exportAlertsCSV)
+	r.Get("/alerts/export", s.exportAlertsNDJSON)
 	r.Get("/alerts/{id}/deliveries", s.listDeliveries)
 	r.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)
 	r.Get("/health", s.health)

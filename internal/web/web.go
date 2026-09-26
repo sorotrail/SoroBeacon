@@ -57,7 +57,9 @@ type Server struct {
 	// auth gates every page on a dashboard session once a token is
 	// configured. Nil (until WithAuth, or with no API_TOKEN) leaves the
 	// dashboard open.
-	auth *auth.Authenticator
+	a     *auth.Authenticator
+	auth  *auth.Authenticator
+	roles *auth.RoleEnforcer
 }
 
 // monitorListRow is a monitor plus the last-matched cue rendered on the
@@ -229,12 +231,19 @@ func (s *Server) monitorRows(monitors []store.Monitor, tz string, now time.Time)
 	return out
 }
 
+// WithRoles attaches role enforcement to the dashboard router.
+func (s *Server) WithRoles(re *auth.RoleEnforcer) *Server {
+	s.roles = re
+	return s
+}
+
 // Routes returns the dashboard router, mounted at / by cmd/sorobeacon.
 func (s *Server) Routes() chi.Router {
 	r := chi.NewRouter()
 	// Registered before any route, so the gate covers everything below it.
 	// With no token configured it is the identity function.
 	r.Use(s.authMiddleware())
+	r.Use(auth.RoleMiddleware(s.roles, auth.RoleViewer))
 	r.Get(loginPath, s.loginPage)
 	r.Post(loginPath, s.login)
 	r.Post(logoutPath, s.logout)

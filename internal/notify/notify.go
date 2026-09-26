@@ -158,6 +158,9 @@ Ledger: {{.Ledger}}
 Tx: {{.TxHash}}
 Event ID: {{.EventID}}
 At: {{.CreatedAt.UTC.Format "2006-01-02 15:04:05"}} UTC
+{{- if gt .GroupCount 0}}
+Group: {{.GroupCount}} alert(s) in window {{.WindowStart.UTC.Format "2006-01-02T15:04:05Z"}} to {{.WindowEnd.UTC.Format "2006-01-02T15:04:05Z"}}
+{{- end}}
 `)))
 
 // RenderText renders the default plain-text message for an alert. A digest
