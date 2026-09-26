@@ -69,6 +69,11 @@ type Config struct {
 	// DatabaseMaxConnIdleTime is the pgx pool MaxConnIdleTime. Zero
 	// means use the driver default (DATABASE_MAX_CONN_IDLE_TIME).
 	DatabaseMaxConnIdleTime time.Duration
+	// ReplicaDatabaseURL is a second Postgres connection string serving the
+	// read-only queries the store routes (REPLICA_DATABASE_URL). Empty means
+	// no replica: every read stays on DatabaseURL, which is how every
+	// deployment behaved before replica routing existed.
+	ReplicaDatabaseURL string
 	// ConfigEncryptionKey is the decoded AES-GCM key used to encrypt
 	// channels.config at rest (CONFIG_ENCRYPTION_KEY, base64). Nil means
 	// encryption is disabled and configs stay plaintext, preserving the
@@ -375,6 +380,22 @@ func Load() (Config, error) {
 	cfg.DatabaseMinConns = minConns
 	cfg.DatabaseMaxConnLifetime = maxLifetime
 	cfg.DatabaseMaxConnIdleTime = maxIdle
+
+	// Read-replica routing is Postgres-only and off unless asked for. Both
+	// failures below are startup errors rather than warnings: an operator who
+	// sets REPLICA_DATABASE_URL believes reads are being routed, and a
+	// deployment that silently serves everything from the primary while
+	// claiming otherwise is worse than one that refuses to boot.
+	replicaURL := strings.TrimSpace(os.Getenv("REPLICA_DATABASE_URL"))
+	if sqliteBackend && replicaURL != "" {
+		return cfg, fmt.Errorf("REPLICA_DATABASE_URL has no effect on a sqlite DATABASE_URL: SQLite serves reads and writes from one file; unset it or use Postgres")
+	}
+	if replicaURL != "" {
+		if err := validateReplicaDatabaseURL(replicaURL, cfg.DatabaseURL); err != nil {
+			return cfg, err
+		}
+	}
+	cfg.ReplicaDatabaseURL = replicaURL
 	key, err := parseEncryptionKey(os.Getenv("CONFIG_ENCRYPTION_KEY"))
 	if err != nil {
 		return cfg, err
@@ -526,6 +547,9 @@ const redacted = "[redacted]"
 func (c Config) LogAttrs() []slog.Attr {
 	return []slog.Attr{
 		slog.String("database_url", redactDatabaseURL(c.DatabaseURL)),
+		// Redacted the same way: the replica URL carries its own credentials,
+		// and the redaction keeps only scheme, host and database name.
+		slog.String("replica_database_url", redactDatabaseURL(c.ReplicaDatabaseURL)),
 		slog.String("http_addr", c.HTTPAddr),
 		slog.String("source_mode", c.SourceMode),
 		slog.String("poll_interval", c.PollInterval.String()),
@@ -664,6 +688,30 @@ func validateDatabaseURL(raw string) error {
 	default:
 		return fmt.Errorf("DATABASE_URL scheme %q (host %s) is not supported (%s)", u.Scheme, u.Host, supported)
 	}
+}
+
+// validateReplicaDatabaseURL checks REPLICA_DATABASE_URL. The replica must be
+// a Postgres URL — there is no replica concept for SQLite, which
+// Load rejects before calling this — and it must not be the primary itself.
+// Pointing both at the same string is almost always a half-finished edit, and
+// it is worth failing on: it looks like routing is on in every log line and
+// every metric label, while every "replica" read lands on the primary. An
+// operator who genuinely wants one database behind two pools should say so
+// with two URLs.
+func validateReplicaDatabaseURL(replicaURL, primaryURL string) error {
+	u, err := url.Parse(replicaURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("REPLICA_DATABASE_URL is not a parseable URL (want a postgres connection string, e.g. postgres://user:pass@replica-host:5432/sorobeacon)")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "postgres", "postgresql":
+	default:
+		return fmt.Errorf("REPLICA_DATABASE_URL scheme %q is not supported: reads can only be routed to a Postgres replica", u.Scheme)
+	}
+	if replicaURL == primaryURL {
+		return fmt.Errorf("REPLICA_DATABASE_URL is identical to DATABASE_URL; unset it to read from the primary, or point it at the replica")
+	}
+	return nil
 }
 
 // isSQLiteURL reports whether raw selects the SQLite backend. It is a

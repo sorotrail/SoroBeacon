@@ -41,6 +41,10 @@ type Metrics struct {
 	throttles      *prometheus.CounterVec
 	httpDuration   *prometheus.HistogramVec
 	lastPollAgoSec prometheus.Gauge
+
+	storeReads     *prometheus.CounterVec
+	storeFallbacks prometheus.Counter
+	replicaEnabled prometheus.Gauge
 }
 
 // New returns a Metrics with its own registry, so multiple instances (e.g.
@@ -120,11 +124,31 @@ func New() *Metrics {
 			Name: "sorobeacon_seconds_since_last_poll",
 			Help: "Seconds since the poller last completed a cycle. Grows without bound when polling has stopped.",
 		}),
+
+		// Where read-only queries actually went. The pool label is the closed
+		// set {primary, replica}, so cardinality is bounded; watching the ratio
+		// is how an operator confirms replica routing is doing anything, and
+		// the fallback counter is how they see it stop.
+		storeReads: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_store_reads_total",
+			Help: "Read-only store queries by the pool that served them.",
+		}, []string{"pool"}),
+
+		storeFallbacks: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_store_replica_fallbacks_total",
+			Help: "Read-only queries that were served by the primary because the replica was unavailable.",
+		}),
+
+		replicaEnabled: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_store_replica_enabled",
+			Help: "1 when a read replica is configured and routing, 0 when every read goes to the primary.",
+		}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
 		m.eventsScanned, m.eventsMatched, m.alertsFired, m.deliveries, m.throttles,
 		m.httpDuration, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
-		m.reorgsTotal, m.lastReorgLedger)
+		m.reorgsTotal, m.lastReorgLedger,
+		m.storeReads, m.storeFallbacks, m.replicaEnabled)
 	return m
 }
 

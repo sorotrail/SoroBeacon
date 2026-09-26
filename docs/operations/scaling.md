@@ -106,6 +106,69 @@ What to expect:
 Use Postgres when you need multiple instances, more writers than one, or
 managed backups and replication.
 
+## Read replicas
+
+Postgres is the bottleneck for the dashboard's read traffic: the alert search,
+the monitor list, the headline stats and the alert-counts-by-day chart all hit
+the same pool the poller uses to write alerts. `REPLICA_DATABASE_URL` gives
+those reads a second pool, pointed at a streaming replica:
+
+```sh
+REPLICA_DATABASE_URL=postgres://sorobeacon:…@replica-host:5432/sorobeacon
+```
+
+Four reads are routed, all of them dashboard-facing and none of them
+read-after-write:
+
+| Query | Where it appears |
+| --- | --- |
+| `ListMonitorsPage` | the monitor list / its search |
+| `ListAlerts` | the alert search in the API and the dashboard |
+| `GetStats` | the headline counters |
+| `AlertCountsByDay` | the alert chart's daily totals |
+
+Everything else stays on the primary, deliberately. The reads that back the
+store's own writes — a monitor or channel read back right after it was
+created, a just-delivered alert and its delivery attempts — would show the
+caller its own edit missing. The poller's bookkeeping (`GetIngestState`,
+`LedgerHashes`) is worse than a display problem: a stale row there can make
+the poller re-scan or skip ledgers. `ExpiredAlerts` is read by the pruner to
+decide what to archive and delete, and those two decisions have to agree on the
+same row set.
+
+What to expect:
+
+- **Off by default.** Unset, Postgres holds one pool and every query goes to
+  it — the behaviour of every deployment that predates this setting.
+- **A replica that is down is not an outage.** Once the process is up, a
+  replica that stops answering is detected per query and the read is replayed
+  once on the primary. The cost is one extra round trip, not a failed request.
+  Only a connection-level failure counts: a query the replica *answered* with
+  an error (a missing relation, a permission, a statement timeout) is reported
+  rather than replayed, because the primary would return the same error and the
+  fallback would hide it.
+- **A replica that cannot be reached at boot is a startup error.** An operator
+  who set the variable believes reads are being routed; booting into
+  everything-on-the-primary while every log line claims otherwise is the worse
+  failure.
+- **Readiness follows the primary only.** `/readyz` stays green while the
+  replica is down, because the instance can still serve traffic through the
+  fallback. Watch the replica with the metrics below instead of with readiness.
+- **The replica must be at least as new as the primary's schema.** Migrations
+  run against `DATABASE_URL`; a replica created from a base backup taken before
+  a migration will answer routed queries with `column does not exist`, which is
+  reported rather than silently falling back.
+
+Metrics on `/metrics`:
+
+- `sorobeacon_store_reads_total{pool="primary|replica"}` — where routed reads
+  actually landed. If the `replica` series stays flat, routing is not happening.
+- `sorobeacon_store_replica_fallbacks_total` — reads that had to be replayed on
+  the primary. A steady rate means the replica is unreachable or too far behind
+  to be worth routing to.
+- `sorobeacon_store_replica_enabled` — `1` when a replica is configured, `0`
+  when everything reads from the primary.
+
 ## Multi-instance deployment
 
 Running more than one SoroBeacon instance today is **not formally supported**.

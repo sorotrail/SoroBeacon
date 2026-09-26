@@ -58,6 +58,10 @@ The `DATABASE_MAX_CONNS`, `DATABASE_MIN_CONNS`,
 the **Postgres** pool. Setting any of them with a `sqlite` URL is a startup
 error rather than a setting that silently does nothing.
 
+`REPLICA_DATABASE_URL` points the read-only dashboard queries at a Postgres
+read replica and is likewise rejected with a `sqlite` URL. It is off by
+default; see [Read replicas](operations/scaling.md#read-replicas).
+
 ## API authentication
 
 | Variable | Type | Default | Required | What it does |
