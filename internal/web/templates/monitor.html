@@ -16,11 +16,12 @@
 <h2>Rules</h2>
 {{if .Rules}}
 <table>
-  <tr><th>ID</th><th>Type</th><th>Params</th><th>Status</th><th></th></tr>
+  <tr><th>ID</th><th>Type</th><th>Severity</th><th>Params</th><th>Status</th><th></th></tr>
   {{range .Rules}}
   <tr>
     <td>{{.ID}}</td>
     <td>{{.Type}}</td>
+    <td>{{if .Severity}}<span class="pill {{severityClass .Severity}}">{{.Severity}}</span>{{else}}<span class="pill warning">warning</span>{{end}}</td>
     <td><code>{{printf "%s" .Params}}</code></td>
     <td>{{if .Enabled}}<span class="pill on">enabled</span>{{else}}<span class="pill off">disabled</span>{{end}}</td>
     <td>
@@ -58,6 +59,12 @@
       <label for="params">Params (JSON)</label>
       <textarea id="params" name="params" rows="4">{"event_name": "transfer"}</textarea>
     </details>
+    <label for="severity">Severity</label>
+    <select id="severity" name="severity">
+      <option value="info">Info</option>
+      <option value="warning" selected>Warning</option>
+      <option value="critical">Critical</option>
+    </select>
     <div id="params-preview" class="muted" style="margin:.5rem 0"></div>
     <p><button>Add rule</button></p>
   </form>

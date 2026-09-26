@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/sorotrail/sorobeacon/internal/secrets"
 )
 
 // Defaults used when the corresponding environment variable is unset.
@@ -19,6 +21,10 @@ const (
 	DefaultRPCURL       = "https://soroban-testnet.stellar.org"
 	DefaultPollInterval = 5 * time.Second
 	DefaultHTTPAddr     = ":8080"
+	// DefaultOTLPSampleRate keeps every trace when tracing is enabled.
+	// Sampling is an operator lever for busy deployments, not a way to hide
+	// spans by default: the whole feature is off unless OTLP_ENDPOINT is set.
+	DefaultOTLPSampleRate = 1.0
 	// DefaultHTTPMaxBodyBytes is 1 MiB. Rule params are nested JSON and
 	// channel configs are small; 1 MiB is well above any legitimate write
 	// payload while bounding unauthenticated POSTs on a small instance.
@@ -117,6 +123,11 @@ type Config struct {
 	// MonitorSilentAfter is how long since last_matched_at before the
 	// dashboard marks a monitor silent. Default 24h.
 	MonitorSilentAfter time.Duration
+	// OTLP is the OpenTelemetry tracing configuration. Endpoint empty (the
+	// default, OTLP_ENDPOINT unset) disables tracing entirely: no exporter,
+	// no exporter goroutines, no measurable overhead — spans collapse to
+	// no-ops. When set it is the OTLP/HTTP base URL spans are shipped to.
+	OTLP OTLPConfig
 	// GRPCAddr is the listen address for the optional gRPC server
 	// (GRPC_ADDR). Empty (the default) disables gRPC entirely so existing
 	// deployments do not open a new port without opting in.
@@ -130,13 +141,63 @@ type Config struct {
 	// be before it may alert (REORG_CONFIRMATION_DEPTH, default 0). Zero
 	// alerts immediately, the historical default.
 	ReorgConfirmationDepth uint32
+	// SecretsProvider selects the external secret provider used to resolve
+	// ${secret:...} references in channel configs (SECRETS_PROVIDER).
+	// Empty (the default) disables external secrets: references are then
+	// treated as literals, so an upgrade changes nothing.
+	SecretsProvider string
+	// SecretsCacheTTL is how long a resolved secret is reused
+	// (SECRETS_CACHE_TTL, default secrets.DefaultTTL). Zero disables
+	// caching so every construction re-fetches.
+	SecretsCacheTTL time.Duration
+	// VaultAddr is the HashiCorp Vault address (VAULT_ADDR); required when
+	// SecretsProvider is "vault".
+	VaultAddr string
+	// VaultToken is the Vault token (VAULT_TOKEN). It is a credential and
+	// is never logged.
+	VaultToken string
+	// VaultNamespace is the optional Vault Enterprise namespace
+	// (VAULT_NAMESPACE).
+	VaultNamespace string
 	// ArchiveURL is where retention copies alerts before deleting them
 	// (ARCHIVE_URL). Empty (the default) leaves archiving off, so retention
 	// behaves exactly as it did before the feature. A local directory path,
 	// file://, dir:// or s3://bucket/prefix are accepted; the archive package
 	// validates it when the pruner is built.
 	ArchiveURL string
+
+	// NotifyRateLimitSlackRPS is the max requests per second for Slack channels
+	// (NOTIFY_RATE_LIMIT_SLACK_RPS, default 1.0, citing Slack API tier 2 / webhooks guidelines ~1 msg/sec).
+	NotifyRateLimitSlackRPS float64
+	// NotifyRateLimitTelegramRPS is the max requests per second for Telegram channels
+	// (NOTIFY_RATE_LIMIT_TELEGRAM_RPS, default 30.0, citing Telegram Bot API limit of 30 msg/sec).
+	NotifyRateLimitTelegramRPS float64
+	// NotifyRateLimitPagerDutyRPS is the max requests per second for PagerDuty channels
+	// (NOTIFY_RATE_LIMIT_PAGERDUTY_RPS, default 2.0, citing PagerDuty Events API v2 rate limit ~2 requests/sec).
+	NotifyRateLimitPagerDutyRPS float64
+	// NotifyRateLimitDefaultRPS is the default max requests per second for any other channel
+	// (NOTIFY_RATE_LIMIT_DEFAULT_RPS, default 5.0).
+	NotifyRateLimitDefaultRPS float64
 }
+
+// OTLPConfig is the tracing slice of the configuration. It is a struct so a
+// stage that needs the endpoint does not pull the whole Config in.
+type OTLPConfig struct {
+	// Endpoint is the OTLP/HTTP base URL (OTLP_ENDPOINT, e.g.
+	// http://localhost:4318). Empty disables tracing.
+	Endpoint string
+	// ServiceName is the service.name resource attribute
+	// (OTLP_SERVICE_NAME). Empty falls back to "sorobeacon".
+	ServiceName string
+	// SampleRate is the fraction of traces kept, in [0,1]
+	// (OTLP_SAMPLE_RATE). Defaults to 1 (keep everything).
+	SampleRate float64
+}
+
+// Enabled reports whether tracing is switched on. The single place the
+// "off unless OTLP_ENDPOINT is set" rule lives, so the wiring in main and
+// the tests cannot drift apart.
+func (o OTLPConfig) Enabled() bool { return o.Endpoint != "" }
 
 // Load reads configuration from the environment. DATABASE_URL is the only
 // required variable; everything else has a sensible default.
@@ -147,15 +208,19 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		Network:            net,
-		RPCURL:             net.RPCURL,
-		RPCURLs:            net.RPCURLs,
-		DatabaseURL:        os.Getenv("DATABASE_URL"),
-		PollInterval:       DefaultPollInterval,
-		HTTPAddr:           getenv("HTTP_ADDR", DefaultHTTPAddr),
-		HTTPMaxBodyBytes:   DefaultHTTPMaxBodyBytes,
-		LogLevel:           slog.LevelInfo,
-		MonitorSilentAfter: DefaultMonitorSilentAfter,
+		Network:                     net,
+		RPCURL:                      net.RPCURL,
+		RPCURLs:                     net.RPCURLs,
+		DatabaseURL:                 os.Getenv("DATABASE_URL"),
+		PollInterval:                DefaultPollInterval,
+		HTTPAddr:                    getenv("HTTP_ADDR", DefaultHTTPAddr),
+		HTTPMaxBodyBytes:            DefaultHTTPMaxBodyBytes,
+		LogLevel:                    slog.LevelInfo,
+		MonitorSilentAfter:          DefaultMonitorSilentAfter,
+		NotifyRateLimitSlackRPS:     1.0,  // Slack webhooks / tier 2 rate limit ~1 rps
+		NotifyRateLimitTelegramRPS:  30.0, // Telegram Bot API limit ~30 rps
+		NotifyRateLimitPagerDutyRPS: 2.0,  // PagerDuty Events API v2 rate limit ~2 rps
+		NotifyRateLimitDefaultRPS:   5.0,  // General default rps
 		// Detection is on by default; confirmation depth off, so a monitor
 		// alerts exactly as soon as it did before this feature.
 		ReorgTrackingWindow:    DefaultReorgTrackingWindow,
@@ -345,7 +410,93 @@ func Load() (Config, error) {
 	}
 	cfg.ArchiveURL = strings.TrimSpace(os.Getenv("ARCHIVE_URL"))
 
+	// Tracing is off unless OTLP_ENDPOINT is set; see telemetry.Config.
+	cfg.OTLP.Endpoint = os.Getenv("OTLP_ENDPOINT")
+	if cfg.OTLP.Endpoint != "" {
+		u, err := url.Parse(cfg.OTLP.Endpoint)
+		if err != nil || !u.IsAbs() || u.Host == "" ||
+			(u.Scheme != "http" && u.Scheme != "https") {
+			return cfg, fmt.Errorf(
+				"invalid OTLP_ENDPOINT %q: must be an absolute http or https URL",
+				cfg.OTLP.Endpoint,
+			)
+		}
+	}
+	cfg.OTLP.ServiceName = os.Getenv("OTLP_SERVICE_NAME")
+	cfg.OTLP.SampleRate = DefaultOTLPSampleRate
+	if v := os.Getenv("OTLP_SAMPLE_RATE"); v != "" {
+		r, err := strconv.ParseFloat(v, 64)
+		if err != nil || r < 0 || r > 1 || math.IsNaN(r) || math.IsInf(r, 0) {
+			return cfg, fmt.Errorf("invalid OTLP_SAMPLE_RATE %q (want a number in [0, 1])", v)
+		}
+		cfg.OTLP.SampleRate = r
+	}
+	if v := os.Getenv("NOTIFY_RATE_LIMIT_SLACK_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_SLACK_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitSlackRPS = rps
+	}
+	if v := os.Getenv("NOTIFY_RATE_LIMIT_TELEGRAM_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_TELEGRAM_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitTelegramRPS = rps
+	}
+	if v := os.Getenv("NOTIFY_RATE_LIMIT_PAGERDUTY_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_PAGERDUTY_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitPagerDutyRPS = rps
+	}
+	if v := os.Getenv("NOTIFY_RATE_LIMIT_DEFAULT_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_DEFAULT_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitDefaultRPS = rps
+	}
+
+	if err := loadSecrets(&cfg); err != nil {
+		return cfg, err
+	}
+
 	return cfg, nil
+}
+
+// loadSecrets reads the external-secret provider configuration. The active
+// provider is validated here so a typo or a missing Vault address fails
+// startup rather than the first alert that references a secret.
+func loadSecrets(cfg *Config) error {
+	cfg.SecretsProvider = strings.ToLower(strings.TrimSpace(os.Getenv("SECRETS_PROVIDER")))
+	switch cfg.SecretsProvider {
+	case "", "env", "vault":
+	default:
+		return fmt.Errorf("invalid SECRETS_PROVIDER %q (want env|vault, or unset to disable external secrets)", cfg.SecretsProvider)
+	}
+
+	cfg.SecretsCacheTTL = secrets.DefaultTTL
+	if v := os.Getenv("SECRETS_CACHE_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SECRETS_CACHE_TTL %q: %w", v, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("SECRETS_CACHE_TTL %q is negative", v)
+		}
+		cfg.SecretsCacheTTL = d
+	}
+
+	cfg.VaultAddr = strings.TrimRight(strings.TrimSpace(os.Getenv("VAULT_ADDR")), "/")
+	cfg.VaultToken = os.Getenv("VAULT_TOKEN")
+	cfg.VaultNamespace = strings.TrimSpace(os.Getenv("VAULT_NAMESPACE"))
+	if cfg.SecretsProvider == "vault" && cfg.VaultAddr == "" {
+		return fmt.Errorf("VAULT_ADDR is required when SECRETS_PROVIDER=vault")
+	}
+	return nil
 }
 
 // validateHTTPAddr checks HTTP_ADDR is a host:port pair with a numeric
@@ -388,11 +539,18 @@ func (c Config) LogAttrs() []slog.Attr {
 		slog.String("sorotrail_url", c.SoroTrailURL),
 		slog.String("cors_allowed_origins", strings.Join(c.CORSAllowedOrigins, ",")),
 		slog.Bool("config_encryption_enabled", len(c.ConfigEncryptionKey) > 0),
+		// The provider name, never the token or any resolved value.
+		slog.String("secrets_provider", c.SecretsProvider),
+		slog.String("secrets_cache_ttl", c.SecretsCacheTTL.String()),
+		slog.Bool("vault_token_configured", c.VaultToken != ""),
 		slog.Uint64("reorg_tracking_window", uint64(c.ReorgTrackingWindow)),
 		slog.Uint64("reorg_confirmation_depth", uint64(c.ReorgConfirmationDepth)),
 		// The count, never the tokens themselves: LogAttrs is the one place
 		// configuration is printed, and an API token is a credential.
 		slog.Int("api_token_count", len(c.APITokens)),
+		slog.Bool("otlp_tracing_enabled", c.OTLP.Endpoint != ""),
+		slog.String("otlp_service_name", c.OTLP.ServiceName),
+		slog.Float64("otlp_sample_rate", c.OTLP.SampleRate),
 	}
 }
 
