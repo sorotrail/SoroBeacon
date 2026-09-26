@@ -275,6 +275,128 @@ func TestJSONTemplateComplexTemplate(t *testing.T) {
 	assert.True(t, createdAtUnix < 2000000000, "timestamp should be a valid Unix time")
 }
 
+func TestNewJSONTemplateValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     string
+		wantErr string
+	}{
+		{
+			name:    "missing url",
+			cfg:     `{"body_template":"{}"}`,
+			wantErr: "url is required",
+		},
+		{
+			name:    "missing body_template",
+			cfg:     `{"url":"https://example.com"}`,
+			wantErr: "body_template is required",
+		},
+		{
+			name:    "invalid method",
+			cfg:     `{"url":"https://example.com", "body_template":"{}", "method":"DELETE"}`,
+			wantErr: "method must be one of POST, PUT, PATCH",
+		},
+		{
+			name:    "malformed template",
+			cfg:     `{"url":"https://example.com", "body_template":"{{"}`,
+			wantErr: "invalid body_template",
+		},
+		{
+			name:    "valid default method",
+			cfg:     `{"url":"https://example.com", "body_template":"{}"}`,
+			wantErr: "",
+		},
+		{
+			name:    "valid put method",
+			cfg:     `{"url":"https://example.com", "body_template":"{}", "method":"PUT"}`,
+			wantErr: "",
+		},
+		{
+			name:    "valid patch method",
+			cfg:     `{"url":"https://example.com", "body_template":"{}", "method":"PATCH"}`,
+			wantErr: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			not, err := NewJSONTemplate(json.RawMessage(tt.cfg))
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				assert.Nil(t, not)
+			} else {
+				require.NoError(t, err)
+				assert.NotNil(t, not)
+			}
+		})
+	}
+}
+
+func TestJSONTemplateSend(t *testing.T) {
+	var receivedBody string
+	var receivedMethod string
+	var receivedAuth string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedMethod = r.Method
+		receivedAuth = r.Header.Get("Authorization")
+		bs, _ := io.ReadAll(r.Body)
+		receivedBody = string(bs)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := map[string]any{
+		"url":           srv.URL,
+		"method":        "PUT",
+		"headers":       map[string]string{"Authorization": "Bearer secret-token"},
+		"body_template": `{"title": "{{.MonitorName}}", "ref": "{{.EventID}}"}`,
+	}
+	raw, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	not, err := NewJSONTemplate(raw)
+	require.NoError(t, err)
+
+	alert := Alert{
+		ID:          123,
+		MonitorName: "Token Watcher",
+		EventID:     "evt_abc123",
+		CreatedAt:   time.Now(),
+	}
+
+	err = not.Send(context.Background(), alert)
+	require.NoError(t, err)
+
+	assert.Equal(t, "PUT", receivedMethod)
+	assert.Equal(t, "Bearer secret-token", receivedAuth)
+	assert.JSONEq(t, `{"title": "Token Watcher", "ref": "evt_abc123"}`, receivedBody)
+}
+
+func TestJSONTemplateNon2xxResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("bad request body payload"))
+	}))
+	defer srv.Close()
+
+	cfg := map[string]any{
+		"url":           srv.URL,
+		"body_template": `{"ok": true}`,
+	}
+	raw, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	not, err := NewJSONTemplate(raw)
+	require.NoError(t, err)
+
+	err = not.Send(context.Background(), Alert{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "status 400")
+	assert.Contains(t, err.Error(), "bad request body payload")
+}
+
 // mustParseTime parses a time string for test setup; panics on error.
 func mustParseTime(t *testing.T, s string) time.Time {
 	t.Helper()

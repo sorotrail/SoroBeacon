@@ -1,87 +1,82 @@
 package notify
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net/http"
 	"strings"
 	"text/template"
 )
 
-// jsonTemplateConfig holds the configuration for the JSON template channel.
-type jsonTemplateConfig struct {
+// JSONTemplate is a generic notification channel that sends an HTTP request
+// with a custom JSON body rendered via a Go text/template.
+type JSONTemplate struct {
+	url          string
+	method       string
+	headers      map[string]string
+	bodyTemplate *template.Template
+}
+
+// JSONTemplateConfig defines the configuration shape for the jsontemplate channel.
+type JSONTemplateConfig struct {
 	URL          string            `json:"url"`
 	Method       string            `json:"method"`
 	Headers      map[string]string `json:"headers"`
 	BodyTemplate string            `json:"body_template"`
 }
 
-// JSONTemplate renders a user-supplied Go text/template against the alert and
-// sends the result to a configured URL with configured headers.
-type JSONTemplate struct {
-	cfg         jsonTemplateConfig
-	bodyTpl     *template.Template
-	allowedMethods map[string]struct{}
-}
-
-// NewJSONTemplate builds a JSON template notifier from channel config.
+// NewJSONTemplate creates a new JSONTemplate notifier from raw JSON config.
 func NewJSONTemplate(config json.RawMessage) (Notifier, error) {
-	var cfg jsonTemplateConfig
+	var cfg JSONTemplateConfig
 	if err := json.Unmarshal(config, &cfg); err != nil {
-		return nil, fmt.Errorf("jsontemplate: invalid config: %w", err)
+		return nil, fmt.Errorf("jsontemplate: parse config: %w", err)
 	}
 
-	if cfg.URL == "" {
-		return nil, fmt.Errorf("jsontemplate: url is required")
-	}
-	if strings.TrimSpace(cfg.BodyTemplate) == "" {
-		return nil, fmt.Errorf("jsontemplate: body_template is required")
-	}
-
-	// Parse the template once at construction time so a malformed template
-	// fails when the channel is created, not on the first alert.
-	bodyTpl, err := template.New("body").Parse(cfg.BodyTemplate)
-	if err != nil {
-		return nil, fmt.Errorf("jsontemplate: invalid body_template: %w", err)
+	if strings.TrimSpace(cfg.URL) == "" {
+		return nil, errors.New("jsontemplate: url is required")
 	}
 
 	method := strings.ToUpper(strings.TrimSpace(cfg.Method))
 	if method == "" {
-		method = http.MethodPost
+		method = "POST"
+	}
+	if method != "POST" && method != "PUT" && method != "PATCH" {
+		return nil, fmt.Errorf("jsontemplate: method must be one of POST, PUT, PATCH, got %q", cfg.Method)
 	}
 
-	allowedMethods := map[string]struct{}{
-		http.MethodPost:  {},
-		http.MethodPut:   {},
-		http.MethodPatch: {},
+	if strings.TrimSpace(cfg.BodyTemplate) == "" {
+		return nil, errors.New("jsontemplate: body_template is required")
 	}
-	if _, ok := allowedMethods[method]; !ok {
-		return nil, fmt.Errorf("jsontemplate: method must be one of POST, PUT, PATCH")
+
+	tmpl, err := template.New("body_template").Parse(cfg.BodyTemplate)
+	if err != nil {
+		return nil, fmt.Errorf("jsontemplate: invalid body_template: %w", err)
 	}
-	cfg.Method = method
 
 	return &JSONTemplate{
-		cfg:            cfg,
-		bodyTpl:        bodyTpl,
-		allowedMethods: allowedMethods,
+		url:          cfg.URL,
+		method:       method,
+		headers:      cfg.Headers,
+		bodyTemplate: tmpl,
 	}, nil
 }
 
-// Send renders the body template with the alert data and sends it to the
-// configured endpoint.
+// Send renders the template against the alert and executes the HTTP request.
 func (j *JSONTemplate) Send(ctx context.Context, a Alert) error {
-	var body strings.Builder
-	if err := j.bodyTpl.Execute(&body, a); err != nil {
+	var buf bytes.Buffer
+	if err := j.bodyTemplate.Execute(&buf, a); err != nil {
 		return fmt.Errorf("jsontemplate: render body: %w", err)
 	}
 
-	// Use the shared HTTP client with the configured method and headers.
-	// Header values are secrets: they must never appear in errors, logs, or
-	// delivery response_snippets. The http.requestJSON function already
-	// redacts the URL from errors; we must also avoid logging headers.
-	if err := requestJSON(ctx, j.cfg.Method, j.cfg.URL, []byte(body.String()), j.cfg.Headers); err != nil {
-		return fmt.Errorf("jsontemplate: %w", err)
+	headers := make(map[string]string)
+	for k, v := range j.headers {
+		headers[k] = v
 	}
-	return nil
+	if headers["Content-Type"] == "" {
+		headers["Content-Type"] = "application/json"
+	}
+
+	return requestJSON(ctx, j.method, j.url, buf.Bytes(), headers)
 }

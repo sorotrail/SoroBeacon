@@ -10,7 +10,6 @@ configuration.
 
 ## Setup
 
-```sh
 curl -s -X POST localhost:8080/api/v1/channels -d '{
   "name": "incident-api",
   "type": "jsontemplate",
@@ -24,7 +23,6 @@ curl -s -X POST localhost:8080/api/v1/channels -d '{
     "body_template": "{\"title\": \"{{.MonitorName}}\", \"ref\": \"{{.EventID}}\", \"severity\": \"high\"}"
   }
 }'
-```
 
 ## Config
 
@@ -43,18 +41,18 @@ the exported `notify.Alert` fields.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `.ID` | integer | Alert id. |
-| `.MonitorID` | integer | Monitor that produced the alert. |
+| `.ID` | integer (`int64`) | Alert id. |
+| `.MonitorID` | integer (`int64`) | Monitor that produced the alert. |
 | `.MonitorName` | string | Monitor's display name. |
-| `.RuleID` | integer | Rule id. |
+| `.RuleID` | integer (`int64`) | Rule id. |
 | `.RuleType` | string | Rule type, e.g. `value_threshold`. |
 | `.EventID` | string | Source event's TOID-based id. |
 | `.ContractID` | string | Contract that emitted the event. |
 | `.EventName` | string | Event name (first topic); may be empty. |
-| `.Ledger` | integer | Ledger the event was in. |
+| `.Ledger` | integer (`uint32`) | Ledger the event was in. |
 | `.TxHash` | string | Transaction hash. |
-| `.Payload` | string | The stored alert payload as raw JSON. |
-| `.CreatedAt` | time | When the alert was created (`time.Time`; use `.CreatedAt.Unix` for a Unix timestamp, or `.CreatedAt.UTC.Format \"2006-01-02 15:04:05\"` for a formatted string). |
+| `.Payload` | string (`json.RawMessage`) | The stored alert payload as raw JSON. |
+| `.CreatedAt` | time (`time.Time`) | When the alert was created (`time.Time`; use `.CreatedAt.Unix` for a Unix timestamp, or `.CreatedAt.UTC.Format \"2006-01-02 15:04:05\"` for a formatted string). |
 
 Standard Go `text/template` syntax and built-in functions (`printf`, `index`,
 `if`/`else`, `range`, …) are available. Templates are not sandboxed: treat a
@@ -72,33 +70,43 @@ are already JSON-safe (numbers, booleans, or pre-escaped strings). If you must
 interpolate a raw string into a JSON string context, wrap it with `printf
 \"%q\"` to JSON-escape it:
 
-```json
 "body_template": "{\"message\": {{printf \"%q\" .MonitorName}}}"
-```
 
 ## Worked examples
 
-### Example 1: Minimal incident payload for a ticketing system
+### Example 1: Pushing to a Custom Incident Management API
 
-```sh
 curl -s -X POST localhost:8080/api/v1/channels -d '{
-  "name": "jira-bridge",
+  "name": "incident-api",
   "type": "jsontemplate",
   "config": {
-    "url": "https://jira.example.com/rest/api/2/issue/",
+    "url": "https://api.example.com/v1/incidents",
     "method": "POST",
     "headers": {
-      "Authorization": "Basic <base64-credentials>",
+      "Authorization": "Bearer secret-api-token",
       "Content-Type": "application/json"
     },
-    "body_template": "{\"fields\": {\"project\": {\"key\": \"OPS\"}, \"summary\": \"{{.MonitorName}}: {{.RuleType}}\", \"description\": \"Event {{.EventID}} on contract {{.ContractID}} at ledger {{.Ledger}}\", \"issuetype\": {\"name\": \"Task\"}}}"
+    "body_template": "{\"service\": \"sorobeacon\", \"summary\": \"Alert in {{.MonitorName}}\", \"details\": {\"contract\": \"{{.ContractID}}\", \"event_id\": \"{{.EventID}}\", \"ledger\": {{.Ledger}}}}"
   }
 }'
-```
 
-### Example 2: Slack-compatible payload for a custom Slack app
+### Example 2: Updating Status with PUT and Custom JSON
 
-```sh
+curl -s -X POST localhost:8080/api/v1/channels -d '{
+  "name": "internal-webhook",
+  "type": "jsontemplate",
+  "config": {
+    "url": "https://internal.monitoring.local/webhook",
+    "method": "PUT",
+    "headers": {
+      "X-API-Key": "my-internal-key"
+    },
+    "body_template": "{\"event_id\": \"{{.EventID}}\", \"status\": \"triggered\", \"timestamp\": \"{{.CreatedAt.UTC.Format \"2006-01-02T15:04:05Z07:00\"}}\"}"
+  }
+}'
+
+### Example 3: Slack-compatible payload for a custom Slack app
+
 curl -s -X POST localhost:8080/api/v1/channels -d '{
   "name": "slack-custom",
   "type": "jsontemplate",
@@ -112,7 +120,6 @@ curl -s -X POST localhost:8080/api/v1/channels -d '{
     "body_template": "{\"channel\": \"#alerts\", \"text\": \"{{printf \"%q\" .MonitorName}} fired {{.RuleType}} (event {{.EventID}})\", \"blocks\": [{\"type\": \"section\", \"text\": {\"type\": \"mrkdwn\", \"text\": \"*{{.MonitorName}}*\\nRule: {{.RuleType}}\\nContract: {{.ContractID}}\\nLedger: {{.Ledger}}\\nTx: {{.TxHash}}\"}}]}"
   }
 }'
-```
 
 > **Note:** The Slack example uses `printf "%q"` to JSON-escape the monitor
 > name in the plain-text fallback, and manual `\n` escapes inside the markdown
