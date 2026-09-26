@@ -1,6 +1,18 @@
 # Configuration
 
-All configuration comes from environment variables. `.env.example` in the repo is a ready-to-copy template. The complete operator table (types, required vs optional, secrets, `SOURCE_MODE`-only variables) is [Environment variable reference](../configuration.md).
+All configuration is loaded in layers: `CONFIG_FILE` is read first, then the process environment overrides it, and both sit above the built-in defaults. This keeps a checked-in YAML file convenient for a long-lived deployment while preserving emergency overrides via `systemd Environment=`, `docker -e`, or a shell export. `.env.example` in the repo is still a ready-to-copy template for environment-only deployments.
+
+SoroBeacon reads YAML from `CONFIG_FILE` and accepts the same keys as the environment variables documented in [Environment variable reference](../configuration.md). The file format is intentionally simple: top-level keys map to the same variable names, for example `DATABASE_URL`, `HTTP_ADDR`, `POLL_INTERVAL`, and `API_TOKEN`.
+
+Precedence is explicit:
+
+1. environment variables
+2. `CONFIG_FILE`
+3. built-in defaults
+
+This order means a file can be committed with sane defaults, while one-off emergency overrides in the environment still win.
+
+The file is a convenience for operators; do not put secrets in it unless you have to. Settings that are credentials or tokens — especially `DATABASE_URL`, `API_TOKEN`, `CONFIG_ENCRYPTION_KEY`, and any webhook, SMTP, or Slack credentials that end up inside a channel `config` — should remain in a secret manager or a strict-mode `0600` file, not in a committed YAML document. Parse errors must not echo a secret value to logs.
 
 | Variable | Default | Description |
 | --- | --- | --- |

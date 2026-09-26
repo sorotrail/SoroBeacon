@@ -1,8 +1,11 @@
 # Environment variable reference
 
-All runtime configuration is environment variables. There is no config
-file. Copy [`.env.example`](../.env.example) and edit it, or set the
-variables in the process environment / systemd `EnvironmentFile=`.
+All runtime configuration is loaded from the environment and an optional
+YAML config file. Copy [`.env.example`](../.env.example) and edit it, or
+set the variables in the process environment / systemd `EnvironmentFile=`.
+If `CONFIG_FILE` is set, its values are used as defaults and environment
+variables override them; the built-in defaults are used only when neither
+layer sets a value.
 
 This page is the operator reference for **every variable
 `internal/config` actually reads**. Channel secrets (webhook URLs, bot
