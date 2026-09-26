@@ -278,6 +278,24 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 }'
 ```
 
+**`address_watchlist`** — match any SEP-41 token event whose from or to
+address is on a configured list. "Did these specific addresses move anything"
+becomes one rule instead of one `token_event` rule per address. `match` is
+`from`, `to` or `either` (the default); matching is exact and case-sensitive;
+the address set is built once, so a watchlist of hundreds of addresses costs
+no more per event than one of two:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "address_watchlist",
+  "params": {
+    "addresses": ["GDW6...ACCOUNT", "GBXG...EXCHANGE"],
+    "match": "either",
+    "event": "transfer"
+  }
+}'
+```
+
 Every rule type also accepts an optional `cooldown` (a Go duration string such
 as `"5m"`): the first match alerts, further matches in the window are counted
 and dropped, and the next alert reports `suppressed_since_last`. It survives a

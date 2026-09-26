@@ -6,7 +6,8 @@ are the authority). Each rule also has a page of its own with matching
 semantics and more examples — [event\_emitted](event-emitted.md),
 [value\_threshold](value-threshold.md), [token\_event](token-event.md),
 [frequency\_threshold](frequency-threshold.md), [topic\_regex](topic-regex.md),
-and the cross-cutting [cooldown](cooldown.md).
+[address\_watchlist](address-watchlist.md), and the cross-cutting
+[cooldown](cooldown.md).
 
 ## Conventions that apply to every rule type
 
@@ -134,6 +135,31 @@ Complete, valid params document:
 {
   "pattern": "^swap_",
   "position": 0
+}
+```
+
+## address\_watchlist
+
+SEP-41 events whose from or to address appears on a configured watchlist.
+See the [rule page](address-watchlist.md) for matching semantics.
+
+| Param | JSON type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `addresses` | array of string | yes | — | Non-empty list of Stellar addresses (account `G...` or contract `C...` strkeys). At most 1024 entries. |
+| `match` | string | no | `either` | Which slot(s) to watch: `from`, `to`, or `either`. |
+| `event` | string | no | unset (all SEP-41 events) | Restrict to one SEP-41 event: `transfer`, `mint`, `burn`, `clawback`, `set_admin`, or `*`. |
+
+Matching is exact and case-sensitive — no partial or prefix matching. The
+address set is built once and memoised, so a long watchlist does not scan
+linearly per event.
+
+Complete, valid params document:
+
+```json
+{
+  "addresses": ["GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"],
+  "match": "either",
+  "event": "transfer"
 }
 ```
 

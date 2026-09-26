@@ -16,6 +16,7 @@ explains what actually happens, straight from the code.
 | "Did a SEP-41 token do something (transfer/mint/burn/…, optionally to/from/amount)?" | [`token_event`](../rules/token-event.md) |
 | "Is it happening *too often*?" | [`frequency_threshold`](../rules/frequency-threshold.md) |
 | "Did any event in a *family* happen (a pattern, not one exact name)?" | [`topic_regex`](../rules/topic-regex.md) |
+| "Did any of *these addresses* move anything?" | [`address_watchlist`](../rules/address-watchlist.md) |
 
 More precisely:
 
@@ -48,6 +49,10 @@ More precisely:
   rule per name. Patterns are unanchored RE2 matched against a topic's
   string value; non-string topics never match. See its
   [reference page](../rules/topic-regex.md).
+* **`address_watchlist` is for a set of addresses**: one rule replaces what
+  would otherwise be one `token_event` rule per address, watching the from
+  and/or to slot of any SEP-41 event against a list that can run to hundreds
+  of addresses. See its [reference page](../rules/address-watchlist.md).
 
 Any rule type can carry a `cooldown` — see [rule cooldown](../rules/cooldown.md).
 
@@ -206,4 +211,5 @@ here is the second user topic. Verified: `201`.
 * [`token_event`](../rules/token-event.md)
 * [`frequency_threshold`](../rules/frequency-threshold.md)
 * [`topic_regex`](../rules/topic-regex.md)
+* [`address_watchlist`](../rules/address-watchlist.md)
 * [`cooldown` (cross-cutting)](../rules/cooldown.md)

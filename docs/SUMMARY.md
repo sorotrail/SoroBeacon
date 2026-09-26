@@ -24,6 +24,7 @@
 * [token\_event](rules/token-event.md)
 * [frequency\_threshold](rules/frequency-threshold.md)
 * [topic\_regex](rules/topic-regex.md)
+* [address\_watchlist](rules/address-watchlist.md)
 * [Rule cooldown](rules/cooldown.md)
 
 ## 📣 Channel reference
