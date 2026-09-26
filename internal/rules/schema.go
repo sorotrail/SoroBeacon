@@ -85,6 +85,12 @@ func (ValueThreshold) ParamSchema() []FieldSchema {
 	}
 }
 
+func (EventNameGlob) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "patterns", Type: "object", Required: true, Description: "Glob patterns matched against the whole event name (JSON array, e.g. [\"swap_*\"])"},
+	}
+}
+
 func (TokenEvent) ParamSchema() []FieldSchema {
 	return []FieldSchema{
 		{Name: "event", Type: "select", Required: true, Description: "SEP-41 event type", Options: []string{"transfer", "mint", "burn", "clawback", "set_admin", "*"}},
