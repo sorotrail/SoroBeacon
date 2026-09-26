@@ -171,7 +171,7 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 		silentAfter: 24 * time.Hour,
 	}
 	for _, page := range []string{"index", "monitors", "monitor", "channels", "alerts", "alert", "login", "error", "rulebuilder", "searches"} {
-		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/"+page+".html")
+		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/shortcuts.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, fmt.Errorf("parse template %s: %w", page, err)
 		}

@@ -406,6 +406,37 @@ func TestNavHighlightsActivePage(t *testing.T) {
 	}
 }
 
+func TestDashboardRendersKeyboardShortcuts(t *testing.T) {
+	srv := httptest.NewServer(newTestServer(t).Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/alerts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	for _, want := range []string{
+		`id="shortcuts-dialog"`,
+		`role="dialog"`,
+		`aria-modal="true"`,
+		`data-shortcuts-close`,
+		`data-shortcut-filter`,
+		`event.key === '?'`,
+		`event.key === '/'`,
+		`event.key === 'Escape'`,
+		`target.matches('input, textarea, select')`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("shortcuts markup missing %q", want)
+		}
+	}
+}
+
 type duplicateWebStore struct {
 	emptyStore
 	gotID int64
