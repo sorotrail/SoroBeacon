@@ -43,6 +43,17 @@ func NetworkByName(name string) *Network {
 	return nil
 }
 
+// NetworkNames lists the networks' names in order. Logs, metrics labels and
+// error messages go through this rather than printing Network values, so a
+// passphrase can never end up in a log line by accident.
+func NetworkNames(nets []Network) []string {
+	names := make([]string, 0, len(nets))
+	for _, n := range nets {
+		names = append(names, n.Name)
+	}
+	return names
+}
+
 // ParseNetwork resolves the NETWORK, RPC_URL, RPC_URLS and
 // NETWORK_PASSPHRASE variables into a Network. The rules are:
 //
@@ -59,27 +70,119 @@ func NetworkByName(name string) *Network {
 //
 // Both spellings are fine on their own. Only when neither is set (and the
 // network has no preset) is an endpoint missing.
+//
+// This parses the single-network case, which is also what an instance that
+// lists several networks still resolves for its primary; ParseNetworks is the
+// entry point the rest of the multi-network code uses.
 func ParseNetwork(getenv func(string) string) (Network, error) {
 	name := strings.ToLower(strings.TrimSpace(getenv("NETWORK")))
 	if name == "" {
 		name = "testnet"
 	}
+	return buildNetwork(getenv, name, "NETWORK", false)
+}
+
+// ParseNetworks resolves the list of networks an instance polls, primary first.
+//
+// NETWORKS is a comma-separated list of network names in the same vocabulary
+// NETWORK uses (testnet|mainnet|futurenet|custom). Unset — the case every
+// existing deployment is in — this returns exactly one network parsed by
+// ParseNetwork, so the single-network configuration keeps working unchanged
+// rather than becoming a special case the rest of the code has to handle.
+//
+// The first entry is the primary: the one RPC_URL, RPC_URLS and
+// NETWORK_PASSPHRASE configure. That is what lets NETWORK=mainnet keep meaning
+// what it means today while NETWORKS adds chains around it, and it is why
+// setting NETWORK *and* a list that starts elsewhere is an error rather than a
+// silent re-ordering — RPC_URL pointing at a chain nobody named is the one
+// misconfiguration that makes every monitor evaluate the wrong network.
+//
+// Every later entry takes its own suffixed variables (RPC_URL_MAINNET,
+// RPC_URLS_MAINNET, NETWORK_PASSPHRASE_MAINNET) and otherwise uses that
+// network's public preset. Suffixed names rather than a `name=url` list syntax
+// so one variable holds one value: a paired list would have to be split on both
+// commas and equals signs, and an equals sign is legal in a query string, so
+// its parse would be the ambiguous kind.
+func ParseNetworks(getenv func(string) string) ([]Network, error) {
+	raw := strings.TrimSpace(getenv("NETWORKS"))
+	if raw == "" {
+		net, err := ParseNetwork(getenv)
+		if err != nil {
+			return nil, err
+		}
+		return []Network{net}, nil
+	}
+
+	var names []string
+	seen := map[string]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		name := strings.ToLower(strings.TrimSpace(part))
+		if name == "" {
+			continue // a stray or trailing comma is not a network
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("invalid NETWORKS: %q listed twice", name)
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("invalid NETWORKS: set but contains no network names (use comma-separated testnet|mainnet|futurenet|custom names, or unset it to poll only NETWORK)")
+	}
+
+	if explicit := strings.ToLower(strings.TrimSpace(getenv("NETWORK"))); explicit != "" && explicit != names[0] {
+		return nil, fmt.Errorf(
+			"NETWORKS must start with NETWORK=%q: its first entry is the primary network that RPC_URL and NETWORK_PASSPHRASE configure (got %q)",
+			explicit, names[0])
+	}
+
+	nets := make([]Network, 0, len(names))
+	for i, name := range names {
+		net, err := buildNetwork(getenv, name, "NETWORKS", i > 0)
+		if err != nil {
+			return nil, err
+		}
+		nets = append(nets, net)
+	}
+	return nets, nil
+}
+
+// buildNetwork turns one already-normalised network name into a Network,
+// reading that network's endpoint and passphrase overrides.
+//
+// varLabel names the variable the name came from, so a bad list entry is
+// reported against NETWORKS rather than NETWORK. suffixed selects the
+// per-network variable names (see ParseNetworks).
+func buildNetwork(getenv func(string) string, name, varLabel string, suffixed bool) (Network, error) {
+	// varName is the single place that knows which variable belongs to this
+	// network, so the checks below and their error messages cannot disagree
+	// about the name an operator should set.
+	varName := func(key string) string {
+		if !suffixed {
+			return key
+		}
+		return key + "_" + strings.ToUpper(name)
+	}
+	get := func(key string) string { return getenv(varName(key)) }
 
 	var net Network
 	switch name {
 	case "testnet", "mainnet", "futurenet":
-		preset := NetworkByName(name)
-		net = *preset
+		net = *NetworkByName(name)
 	case "custom":
 		net = Network{Name: "custom"}
 	default:
-		return Network{}, fmt.Errorf("invalid NETWORK %q (want testnet|mainnet|futurenet|custom)", name)
+		return Network{}, fmt.Errorf("invalid %s entry %q (want testnet|mainnet|futurenet|custom)", varLabel, name)
 	}
+	net.Name = name
 
-	if v := getenv("RPC_URL"); v != "" {
+	if v := get("RPC_URL"); v != "" {
+		if !validRPCURL(v) {
+			return Network{}, fmt.Errorf("invalid %s %q: must be an absolute http or https URL", varName("RPC_URL"), v)
+		}
 		net.RPCURL = v
 	}
-	if v := getenv("NETWORK_PASSPHRASE"); v != "" {
+	if v := get("NETWORK_PASSPHRASE"); v != "" {
 		net.Passphrase = v
 	}
 
@@ -87,9 +190,9 @@ func ParseNetwork(getenv func(string) string) (Network, error) {
 	// list is the operator saying which endpoints to use and in what order
 	// to fail over. RPC_URL never stops working on its own — it just becomes
 	// the single-entry case of the same list.
-	urls, err := ParseRPCURLs(getenv("RPC_URLS"))
+	urls, err := ParseRPCURLs(get("RPC_URLS"))
 	if err != nil {
-		return Network{}, err
+		return Network{}, fmt.Errorf("%s: %w", varName("RPC_URLS"), err)
 	}
 	switch {
 	case len(urls) > 0:
@@ -100,10 +203,11 @@ func ParseNetwork(getenv func(string) string) (Network, error) {
 	}
 
 	if net.RPCURL == "" {
-		return Network{}, fmt.Errorf("RPC_URL is required when NETWORK=%s (or set RPC_URLS to a comma-separated list)", name)
+		return Network{}, fmt.Errorf("%s is required when %s includes %s (or set %s to a comma-separated list)",
+			varName("RPC_URL"), varLabel, name, varName("RPC_URLS"))
 	}
 	if net.Passphrase == "" {
-		return Network{}, fmt.Errorf("NETWORK_PASSPHRASE is required when NETWORK=custom")
+		return Network{}, fmt.Errorf("%s is required when %s includes %s", varName("NETWORK_PASSPHRASE"), varLabel, name)
 	}
 	return net, nil
 }

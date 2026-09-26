@@ -16,17 +16,21 @@ import (
 // a template leaves its instances untouched.
 
 type templateInput struct {
-	Name        string                    `json:"name"`
-	Description string                    `json:"description"`
+	Name        string                      `json:"name"`
+	Description string                      `json:"description"`
 	Rules       []store.MonitorTemplateRule `json:"rules"`
-	ChannelIDs  []int64                   `json:"channel_ids"`
-	Parameters  []store.TemplateParameter  `json:"parameters"`
+	ChannelIDs  []int64                     `json:"channel_ids"`
+	Parameters  []store.TemplateParameter   `json:"parameters"`
 }
 
 type instantiateInput struct {
-	Name         string            `json:"name"`
-	ContractIDs  []string          `json:"contract_ids"`
-	Parameters   map[string]string `json:"parameters"`
+	Name        string            `json:"name"`
+	ContractIDs []string          `json:"contract_ids"`
+	Parameters  map[string]string `json:"parameters"`
+	// Network is optional: a template is chain-agnostic text, so an
+	// instance defaults to the primary network and names a chain only when
+	// the operator wants one of the other polled networks.
+	Network *string `json:"network,omitempty"`
 }
 
 type bulkInstantiateInput struct {
@@ -308,10 +312,15 @@ func (s *Server) buildMonitorFromTemplate(tmpl *store.MonitorTemplate, in instan
 			}
 		}
 	}
+	network, netErr := s.networkDetail(in.Network)
+	if netErr != nil {
+		problems = append(problems, *netErr)
+	}
 	m := &store.Monitor{
 		Name:        name,
 		ContractIDs: in.ContractIDs,
 		Enabled:     true,
+		Network:     network,
 	}
 	return m, problems
 }

@@ -124,6 +124,7 @@
   <a href="/monitors" {{if eq .Active "monitors"}}class="active"{{end}}>Monitors</a>
   <a href="/channels" {{if eq .Active "channels"}}class="active"{{end}}>Channels</a>
   <a href="/alerts" {{if eq .Active "alerts"}}class="active"{{end}}>Alerts</a>
+  <a href="/tokens" {{if eq .Active "tokens"}}class="active"{{end}}>Tokens</a>
   <form class="theme" method="post" action="/theme">
     <label>Theme
       <select name="theme" aria-label="Theme" onchange="this.form.submit()">

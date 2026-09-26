@@ -1,11 +1,27 @@
 {{define "content"}}
 <h1>Sign in</h1>
 {{if .Error}}<p><span class="pill off">{{.Error}}</span></p>{{end}}
+{{if .SSO}}
+<form method="get" action="/login/oidc">
+  <input type="hidden" name="next" value="{{.Next}}">
+  <p><button type="submit">Sign in with {{.SSO}}</button></p>
+</form>
+{{end}}
+{{if .LocalLogin}}
 <form method="post" action="/login">
   <input type="hidden" name="next" value="{{.Next}}">
   <label for="token">API token</label>
-  <input type="password" id="token" name="token" autocomplete="current-password" required autofocus>
+  <input type="password" id="token" name="token" autocomplete="current-password" required{{if not .SSO}} autofocus{{end}}>
   <p><button type="submit">Sign in</button></p>
 </form>
-<p class="muted">Sign in with one of the tokens configured in <code>API_TOKEN</code>. There are no separate dashboard accounts: the session lasts {{.SessionHours}} hours and ends when SoroBeacon restarts.</p>
+{{end}}
+<p class="muted">
+  {{- if .SSO -}}
+  Your identity provider decides who may sign in; there are no separate dashboard accounts.
+  {{- else -}}
+  Sign in with one of the tokens configured in <code>API_TOKEN</code>. There are no separate dashboard accounts.
+  {{- end -}}
+  {{- if .LocalLogin}} A token from <code>API_TOKEN</code> or <code>WORKSPACE_TOKENS</code> also works here.{{end -}}
+  The session lasts {{.SessionHours}} hours and ends when SoroBeacon restarts.
+</p>
 {{end}}

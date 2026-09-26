@@ -20,6 +20,10 @@ type importInput struct {
 	ContractIDs []string `json:"contract_ids"`
 	ChannelIDs  []int64  `json:"channel_ids,omitempty"`
 	Enabled     *bool    `json:"enabled,omitempty"`
+	// Network names the chain the batch belongs to. A contract ID is only
+	// meaningful on one chain, so an import that says nothing lands on the
+	// primary network.
+	Network *string `json:"network,omitempty"`
 }
 
 type importRowResult struct {
@@ -31,8 +35,8 @@ type importRowResult struct {
 }
 
 // importContracts handles POST /monitors/import. It accepts either JSON or CSV.
-// JSON: {"name":"prefix","contract_ids":["C1","C2",...],"channel_ids":[1],"enabled":true}
-// CSV: one contract ID per line (no header).
+// JSON: {"name":"prefix","contract_ids":["C1","C2",...],"channel_ids":[1],"enabled":true,"network":"testnet"}
+// CSV: one contract ID per line (no header); ?name= and ?network= query params.
 //
 // Design: all-or-nothing. Every contract is validated before any is written,
 // so a file with a bad ID on the last row does not leave partial state.
@@ -53,6 +57,9 @@ func (s *Server) importContracts(w http.ResponseWriter, r *http.Request) {
 		in.Name = r.URL.Query().Get("name")
 		if in.Name == "" {
 			in.Name = "imported"
+		}
+		if net := r.URL.Query().Get("network"); net != "" {
+			in.Network = &net
 		}
 	default:
 		if !readJSON(w, r, &in) {
@@ -109,10 +116,24 @@ func (s *Server) importContracts(w http.ResponseWriter, r *http.Request) {
 	}
 	in.ContractIDs = unique
 
+	// The network is validated with the rest of the batch: an import that
+	// names an unpolled chain must not half-create monitors.
+	network, netErr := s.networkDetail(in.Network)
+	if netErr != nil {
+		writeValidation(w, r, []FieldError{*netErr})
+		return
+	}
+
 	// Check for already-monitored contracts by listing existing monitors.
+	// The check is per network: one contract ID is a different contract on
+	// another chain, and watching it there is exactly what a multi-network
+	// deployment does.
 	existing, _ := s.store.ListMonitors(r.Context(), false)
 	existingContracts := make(map[string]bool)
 	for _, m := range existing {
+		if m.Network != network {
+			continue
+		}
 		for _, cid := range m.ContractIDs {
 			existingContracts[cid] = true
 		}
@@ -138,6 +159,7 @@ func (s *Server) importContracts(w http.ResponseWriter, r *http.Request) {
 			Name:        fmt.Sprintf("%s-%s", in.Name, truncateForName(cid)),
 			ContractIDs: []string{cid},
 			Enabled:     enabled,
+			Network:     network,
 		}
 		if err := s.store.CreateMonitor(r.Context(), &m); err != nil {
 			results = append(results, importRowResult{
@@ -198,4 +220,3 @@ func truncateForName(contractID string) string {
 	}
 	return contractID[:6] + contractID[len(contractID)-6:]
 }
-

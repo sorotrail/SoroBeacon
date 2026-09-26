@@ -72,9 +72,16 @@ func (s *Server) importContractsWeb(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	network := s.networkChoice(r.FormValue("network"))
+
 	existing, _ := s.store.ListMonitors(r.Context(), false)
 	existingContracts := make(map[string]bool)
 	for _, m := range existing {
+		// A contract ID means a different contract on another chain, so an
+		// existing watch only blocks a re-import on its own network.
+		if m.Network != network {
+			continue
+		}
 		for _, cid := range m.ContractIDs {
 			existingContracts[cid] = true
 		}
@@ -93,6 +100,7 @@ func (s *Server) importContractsWeb(w http.ResponseWriter, r *http.Request) {
 			Name:        fmt.Sprintf("%s-%s", name, suffix),
 			ContractIDs: []string{cid},
 			Enabled:     true,
+			Network:     network,
 		}
 		if err := s.store.CreateMonitor(r.Context(), &m); err != nil {
 			s.log.Error("web_import", "contract_id", cid, "err", err)

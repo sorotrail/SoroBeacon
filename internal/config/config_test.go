@@ -10,6 +10,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorobeacon/internal/auth"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 func TestLoadDefaults(t *testing.T) {
@@ -28,6 +31,16 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("CORS_ALLOWED_ORIGINS", "")
 	t.Setenv("CONFIG_ENCRYPTION_KEY", "")
 	t.Setenv("API_TOKEN", "")
+	t.Setenv("WORKSPACE_TOKENS", "")
+	t.Setenv("OIDC_ISSUER", "")
+	t.Setenv("OIDC_CLIENT_ID", "")
+	t.Setenv("OIDC_CLIENT_SECRET", "")
+	t.Setenv("OIDC_REDIRECT_URL", "")
+	t.Setenv("OIDC_SCOPES", "")
+	t.Setenv("OIDC_WORKSPACE", "")
+	t.Setenv("OIDC_WORKSPACE_CLAIM", "")
+	t.Setenv("OIDC_ALLOWED_DOMAINS", "")
+	t.Setenv("OIDC_LOGIN_STATE_TTL", "")
 
 	cfg, err := Load()
 	require.NoError(t, err)
@@ -54,6 +67,11 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Equal(t, DefaultMonitorSilentAfter, cfg.MonitorSilentAfter)
 	assert.Nil(t, cfg.ConfigEncryptionKey)
 	assert.Empty(t, cfg.APITokens)
+	// Unconfigured tenancy resolves to the single default workspace, which is
+	// what keeps an instance that never set WORKSPACE_TOKENS behaving as it
+	// did before workspaces existed.
+	assert.Empty(t, cfg.WorkspaceTokens)
+	assert.Equal(t, []workspace.ID{workspace.Default}, cfg.Workspaces())
 }
 
 func TestLoadRequiresDatabaseURL(t *testing.T) {
@@ -69,6 +87,27 @@ func TestLoadRequiresSoroTrailURL(t *testing.T) {
 
 	_, err := Load()
 	assert.ErrorContains(t, err, "SOROTRAIL_URL")
+}
+
+// TestLoadRejectsNetworksWithUpstreamSource: the upstream source reads one
+// SoroTrail deployment serving one chain, so a second network in the list would
+// start a poller that can never advance. Better to refuse to start than to run
+// with a chain that silently falls behind.
+func TestLoadRejectsNetworksWithUpstreamSource(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("SOURCE_MODE", "sorotrail")
+	t.Setenv("SOROTRAIL_URL", "https://trail.example")
+	t.Setenv("NETWORKS", "testnet,mainnet")
+
+	_, err := Load()
+	assert.ErrorContains(t, err, "SOURCE_MODE=sorotrail")
+
+	// One network upstream is still the normal, allowed configuration.
+	t.Setenv("NETWORKS", "")
+	t.Setenv("NETWORK", "testnet")
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"testnet"}, NetworkNames(cfg.Networks))
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -463,6 +502,11 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"reorg_tracking_window",
 		"reorg_confirmation_depth",
 		"api_token_count",
+		// Workspace names, not the credentials that select them.
+		"workspaces",
+		// Whether a provider is configured, never the issuer, client id or
+		// client secret that go with it.
+		"sso_enabled",
 	}, keys)
 }
 
@@ -492,6 +536,113 @@ func TestLoadRejectsEmptyAPITokenList(t *testing.T) {
 		_, err := Load()
 		assert.ErrorContains(t, err, "API_TOKEN")
 	}
+}
+
+func TestLoadWorkspaceTokens(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("API_TOKEN", "default-token")
+	t.Setenv("WORKSPACE_TOKENS", "acme=tok-acme, beta=tok-beta")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, []WorkspaceToken{
+		{Workspace: "acme", Token: "tok-acme"},
+		{Workspace: "beta", Token: "tok-beta"},
+	}, cfg.WorkspaceTokens)
+
+	// The bindings are what the authenticator is built from: unscoped tokens
+	// first, each one selecting the default workspace, then the scoped ones in
+	// the order they were written.
+	bindings, err := cfg.AuthBindings()
+	require.NoError(t, err)
+	assert.Equal(t, []auth.Binding{
+		{Workspace: "default", Token: "default-token"},
+		{Workspace: "acme", Token: "tok-acme"},
+		{Workspace: "beta", Token: "tok-beta"},
+	}, bindings)
+	assert.Equal(t, []workspace.ID{"default", "acme", "beta"}, cfg.Workspaces())
+}
+
+// A token cannot belong to two workspaces: resolution would then depend on
+// which configured entry the comparison happened to hit, which is the one
+// failure mode tenancy cannot have.
+func TestLoadRejectsAmbiguousWorkspaceTokens(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+
+	for name, env := range map[string][2]string{
+		"same token unscoped and scoped": {"shared-token", "acme=shared-token"},
+		"same token in two workspaces":   {"", "acme=shared-token,beta=shared-token"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("API_TOKEN", env[0])
+			t.Setenv("WORKSPACE_TOKENS", env[1])
+			_, err := Load()
+			assert.ErrorContains(t, err, "WORKSPACE_TOKENS")
+			// The conflict is reported by workspace, never by token value.
+			assert.NotContains(t, err.Error(), "shared-token")
+		})
+	}
+}
+
+func TestLoadRejectsMalformedWorkspaceTokens(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("API_TOKEN", "")
+
+	for _, tc := range []struct {
+		name, raw, wantErr string
+	}{
+		{"no separator", "just-a-token", `entry 1: no "="`},
+		// Either half can be the secret (an operator may have written the pair
+		// the other way round), so no message may echo either side.
+		{"invalid id", "Acme=Tok3nValue", "workspace id is not one"},
+		{"empty id", "=Tok3nValue", "workspace id is empty"},
+		{"empty token", "acme=", "token for workspace \"acme\" is empty"},
+		{"set but empty", ", ,", "contains no entries"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("WORKSPACE_TOKENS", tc.raw)
+			_, err := Load()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+			assert.NotContains(t, err.Error(), "Tok3nValue")
+			assert.NotContains(t, err.Error(), "just-a-token")
+			assert.NotContains(t, err.Error(), "Acme")
+		})
+	}
+}
+
+// WORKSPACE_TOKENS alone is a valid way to go multi-tenant: with no API_TOKEN
+// there is no credential for the default workspace, so its pre-existing rows
+// stop being reachable over HTTP and the table only names the tenants that
+// were configured.
+func TestLoadWorkspaceTokensWithoutAPITokens(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("API_TOKEN", "")
+	t.Setenv("WORKSPACE_TOKENS", "acme=tok-acme")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.APITokens)
+	assert.Equal(t, []workspace.ID{"acme"}, cfg.Workspaces())
+}
+
+func TestLogAttrsHidesWorkspaceTokens(t *testing.T) {
+	cfg := Config{
+		DatabaseURL:     "postgres://user:pw@host/db",
+		WorkspaceTokens: []WorkspaceToken{{Workspace: "acme", Token: "tok-acme"}},
+	}
+
+	var dump strings.Builder
+	for _, a := range cfg.LogAttrs() {
+		dump.WriteString(a.Key)
+		dump.WriteByte('=')
+		dump.WriteString(a.Value.String())
+		dump.WriteByte('\n')
+	}
+	blob := dump.String()
+
+	assert.NotContains(t, blob, "tok-acme")
+	assert.Contains(t, blob, "workspaces=[acme]")
 }
 
 // LogAttrs is the one place configuration is printed; a token is a

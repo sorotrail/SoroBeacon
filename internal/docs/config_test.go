@@ -52,6 +52,15 @@ var configRequired = []string{
 	"HTTP_ADDR",
 	"CORS_ALLOWED_ORIGINS",
 	"LOG_LEVEL",
+	"OIDC_ISSUER",
+	"OIDC_CLIENT_ID",
+	"OIDC_CLIENT_SECRET",
+	"OIDC_REDIRECT_URL",
+	"OIDC_SCOPES",
+	"OIDC_WORKSPACE",
+	"OIDC_WORKSPACE_CLAIM",
+	"OIDC_ALLOWED_DOMAINS",
+	"OIDC_LOGIN_STATE_TTL",
 	"## Database",
 	"## RPC / event source",
 	"## HTTP",
@@ -59,6 +68,12 @@ var configRequired = []string{
 	"## Logging",
 	"**required when `SOURCE_MODE=sorotrail`**",
 	"**yes**",
+	// Single sign-on is opt-in, and the reference has to say so in as many
+	// words as it says it for the source mode.
+	"single sign-on off",
+	"Authorization code with PKCE, not implicit",
+	// A secret among the new variables, marked as one.
+	"| `OIDC_CLIENT_SECRET` | **yes** |",
 }
 
 func TestConfigurationReferenceCoversEveryEnvVar(t *testing.T) {

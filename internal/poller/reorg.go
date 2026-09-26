@@ -67,7 +67,7 @@ func (p *Poller) detectReorg(ctx context.Context) (uint32, error) {
 		return 0, nil
 	}
 
-	stored, err := p.store.LedgerHashes(ctx, from, tip)
+	stored, err := p.store.LedgerHashes(ctx, p.network, from, tip)
 	if err != nil {
 		return 0, err
 	}
@@ -89,7 +89,7 @@ func (p *Poller) detectReorg(ctx context.Context) (uint32, error) {
 	}
 
 	if divergence != 0 {
-		retracted, err := p.store.RetractAlertsFromLedger(ctx, divergence, time.Now().UTC())
+		retracted, err := p.store.RetractAlertsFromLedger(ctx, p.network, divergence, time.Now().UTC())
 		if err != nil {
 			return 0, err
 		}
@@ -105,11 +105,11 @@ func (p *Poller) detectReorg(ctx context.Context) (uint32, error) {
 			"retracted_alerts", retracted)
 	}
 
-	if err := p.store.RecordLedgerHashes(ctx, observed); err != nil {
+	if err := p.store.RecordLedgerHashes(ctx, p.network, observed); err != nil {
 		return 0, err
 	}
 	if from > 1 {
-		if err := p.store.PruneLedgerHashes(ctx, from); err != nil {
+		if err := p.store.PruneLedgerHashes(ctx, p.network, from); err != nil {
 			return 0, err
 		}
 	}

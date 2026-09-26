@@ -13,6 +13,9 @@ import (
 	"time"
 
 	sqlite "modernc.org/sqlite"
+
+	"github.com/sorotrail/sorobeacon/internal/auth"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 // sqliteDriver is the database/sql driver name registered by
@@ -209,6 +212,15 @@ func mapSQLiteErr(err error) error {
 	return err
 }
 
+// EnsureWorkspace implements the Workspaces half of Store. See the interface
+// for why this is the only write to the table.
+func (s *SQLite) EnsureWorkspace(ctx context.Context, id workspace.ID) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO workspaces (id, name) VALUES (?, ?) ON CONFLICT (id) DO NOTHING`,
+		string(id), string(id))
+	return mapSQLiteErr(err)
+}
+
 // --- monitors ---
 
 func (s *SQLite) CreateMonitor(ctx context.Context, m *Monitor) error {
@@ -218,9 +230,9 @@ func (s *SQLite) CreateMonitor(ctx context.Context, m *Monitor) error {
 	}
 	var created string
 	if err := s.db.QueryRowContext(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled, priority) VALUES (?, ?, ?, ?)
+		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network) VALUES (?, ?, ?, ?, ?, ?)
 		 RETURNING id, created_at`,
-		m.Name, string(ids), boolToInt(m.Enabled), string(m.Priority.Normalized()),
+		m.Name, string(ids), boolToInt(m.Enabled), string(m.Priority.Normalized()), workspaceID(ctx), m.Network,
 	).Scan(&m.ID, &created); err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -229,21 +241,27 @@ func (s *SQLite) CreateMonitor(ctx context.Context, m *Monitor) error {
 }
 
 func (s *SQLite) GetMonitor(ctx context.Context, id int64) (*Monitor, error) {
+	ws := workspaceID(ctx)
 	m, err := scanSQLiteMonitor(s.db.QueryRowContext(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority FROM monitors WHERE id = ?`, id))
+		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network FROM monitors WHERE id = ? AND workspace_id = ?`, id, ws))
 	if err != nil {
 		return nil, err
 	}
-	m.ChannelIDs, err = s.monitorChannelIDs(ctx, id)
+	m.ChannelIDs, err = s.monitorChannelIDs(ctx, id, ws)
 	if err != nil {
 		return nil, err
 	}
 	return m, nil
 }
 
-func (s *SQLite) monitorChannelIDs(ctx context.Context, monitorID int64) ([]int64, error) {
+// monitorChannelIDs reads one monitor's attached channel ids. monitor_channels
+// carries no workspace column of its own — it is reachable only through a
+// monitor that does — so the join is what scopes the read.
+func (s *SQLite) monitorChannelIDs(ctx context.Context, monitorID int64, ws workspace.ID) ([]int64, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT channel_id FROM monitor_channels WHERE monitor_id = ? ORDER BY channel_id`, monitorID)
+		`SELECT mc.channel_id FROM monitor_channels mc
+		   JOIN monitors m ON m.id = mc.monitor_id
+		  WHERE mc.monitor_id = ? AND m.workspace_id = ? ORDER BY mc.channel_id`, monitorID, ws)
 	if err != nil {
 		return nil, err
 	}
@@ -259,13 +277,22 @@ func (s *SQLite) monitorChannelIDs(ctx context.Context, monitorID int64) ([]int6
 	return out, rows.Err()
 }
 
+// ListMonitors is the poller's watch list as well as the dashboard's, so it
+// honours the cross-tenant system scope: an ingest loop must see every
+// workspace's enabled monitors or a monitor in a second tenant would silently
+// stop being polled.
 func (s *SQLite) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority FROM monitors`
+	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network FROM monitors WHERE 1 = 1`
+	args := []any{}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND workspace_id = ?`
+		args = append(args, ws)
+	}
 	if enabledOnly {
-		q += ` WHERE enabled = 1`
+		q += ` AND enabled = 1`
 	}
 	q += ` ORDER BY id`
-	return s.queryMonitors(ctx, q)
+	return s.queryMonitors(ctx, q, args...)
 }
 
 func (s *SQLite) queryMonitors(ctx context.Context, q string, args ...any) ([]Monitor, error) {
@@ -286,13 +313,18 @@ func (s *SQLite) queryMonitors(ctx context.Context, q string, args ...any) ([]Mo
 }
 
 func (s *SQLite) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority FROM monitors WHERE 1 = 1`
-	args := []any{}
+	ws := workspaceID(ctx)
+	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network FROM monitors WHERE workspace_id = ?`
+	args := []any{ws}
 	if f.Query != "" {
 		// instr + lower is a parameterized substring match without LIKE
 		// metacharacters, so a search for "100%" cannot become a wildcard.
 		q += ` AND instr(lower(name), lower(?)) > 0`
 		args = append(args, f.Query)
+	}
+	if f.Network != "" {
+		q += ` AND network = ?`
+		args = append(args, f.Network)
 	}
 	switch {
 	case f.Enabled != nil && *f.Enabled:
@@ -304,15 +336,20 @@ func (s *SQLite) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor,
 	}
 	sort := monitorSort(f.Sort)
 	if f.AfterID != 0 {
+		// The cursor row is read under the same workspace predicate as the
+		// page, so an id belonging to another tenant cannot even be used to
+		// probe that tenant's ordering.
 		switch sort {
 		case "name":
-			q += ` AND (lower(name), id) > (SELECT lower(name), id FROM monitors WHERE id = ?)`
+			q += ` AND (lower(name), id) > (SELECT lower(name), id FROM monitors WHERE id = ? AND workspace_id = ?)`
+			args = append(args, f.AfterID, ws)
 		case "created_at":
-			q += ` AND (created_at, id) < (SELECT created_at, id FROM monitors WHERE id = ?)`
+			q += ` AND (created_at, id) < (SELECT created_at, id FROM monitors WHERE id = ? AND workspace_id = ?)`
+			args = append(args, f.AfterID, ws)
 		default:
 			q += ` AND id < ?`
+			args = append(args, f.AfterID)
 		}
-		args = append(args, f.AfterID)
 	}
 	switch sort {
 	case "name":
@@ -333,8 +370,8 @@ func (s *SQLite) UpdateMonitor(ctx context.Context, m *Monitor) error {
 		return err
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE monitors SET name = ?, contract_ids = ?, enabled = ?, priority = ? WHERE id = ?`,
-		m.Name, string(ids), boolToInt(m.Enabled), string(m.Priority.Normalized()), m.ID)
+		`UPDATE monitors SET name = ?, contract_ids = ?, enabled = ?, priority = ? WHERE id = ? AND workspace_id = ?`,
+		m.Name, string(ids), boolToInt(m.Enabled), string(m.Priority.Normalized()), m.ID, workspaceID(ctx))
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -353,13 +390,14 @@ func (s *SQLite) SetMonitorsEnabled(ctx context.Context, ids []int64, enabled bo
 	if len(uniq) == 0 {
 		return 0, []int64{}, nil
 	}
-	args := make([]any, 0, len(uniq)+1)
+	args := make([]any, 0, len(uniq)+2)
 	args = append(args, boolToInt(enabled))
 	for _, id := range uniq {
 		args = append(args, id)
 	}
+	args = append(args, workspaceID(ctx))
 	rows, err := s.db.QueryContext(ctx,
-		`UPDATE monitors SET enabled = ? WHERE id IN (`+placeholders(len(uniq))+`) RETURNING id`, args...)
+		`UPDATE monitors SET enabled = ? WHERE id IN (`+placeholders(len(uniq))+`) AND workspace_id = ? RETURNING id`, args...)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -390,8 +428,16 @@ func (s *SQLite) DeleteMonitor(ctx context.Context, id int64) error {
 	return s.deleteByID(ctx, "monitors", id)
 }
 
+// deleteByID removes one row by id from a workspace-bearing table. The table
+// name is not a parameter, so it is constrained to deletableTables rather than
+// taken from a caller; a row outside the caller's workspace reports 0 rows
+// affected, which is ErrNotFound — the same answer an id that does not exist
+// gives, so a delete cannot probe other tenants.
 func (s *SQLite) deleteByID(ctx context.Context, table string, id int64) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM `+table+` WHERE id = ?`, id)
+	if !deletableTables[table] {
+		return errUnallowlistedTable
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM `+table+` WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx))
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -405,14 +451,44 @@ func (s *SQLite) deleteByID(ctx context.Context, table string, id int64) error {
 	return nil
 }
 
+// SetMonitorChannels replaces one monitor's notification targets. Both sides
+// must belong to the caller's workspace: the monitor check is what stops one
+// tenant re-pointing another's monitor, and the channel check is what stops a
+// tenant attaching a channel it cannot see, which would route this workspace's
+// alerts to a webhook owned by someone else.
 func (s *SQLite) SetMonitorChannels(ctx context.Context, monitorID int64, channelIDs []int64) error {
+	ws := workspaceID(ctx)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM monitor_channels WHERE monitor_id = ?`, monitorID); err != nil {
+	if err := s.requireMonitorWorkspace(ctx, tx, monitorID, ws); err != nil {
+		return err
+	}
+	if len(channelIDs) > 0 {
+		uniq := uniqueIDs(channelIDs)
+		args := make([]any, 0, len(uniq)+1)
+		for _, id := range uniq {
+			args = append(args, id)
+		}
+		args = append(args, ws)
+		var count int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT count(*) FROM channels WHERE id IN (`+placeholders(len(uniq))+`) AND workspace_id = ?`, args...,
+		).Scan(&count); err != nil {
+			return err
+		}
+		if count != len(uniq) {
+			return ErrNotFound
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM monitor_channels
+		  WHERE monitor_id IN (SELECT id FROM monitors WHERE id = ? AND workspace_id = ?)`,
+		monitorID, ws); err != nil {
 		return err
 	}
 	for _, cid := range channelIDs {
@@ -432,22 +508,38 @@ func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, erro
 	}
 	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
 
+	ws := workspaceID(ctx)
 	src, err := scanSQLiteMonitor(tx.QueryRowContext(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority FROM monitors WHERE id = ?`, id))
+		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network FROM monitors WHERE id = ? AND workspace_id = ?`, id, ws))
 	if err != nil {
 		return nil, err
 	}
+	// Both sides of the attachment are checked, not just the monitor. A row
+	// attached before tenancy existed (or by a path that has since been scoped)
+	// must not be carried into the copy: that would move a channel this tenant
+	// cannot see — and whose webhook target it therefore should not start
+	// firing — onto a monitor it can. The list read here is the list copied, so
+	// the returned snapshot cannot promise an attachment the copy lacks.
 	src.ChannelIDs, err = queryInt64Column(ctx, tx,
-		`SELECT channel_id FROM monitor_channels WHERE monitor_id = ? ORDER BY channel_id`, id)
+		`SELECT mc.channel_id FROM monitor_channels mc
+		   JOIN monitors m ON m.id = mc.monitor_id
+		   JOIN channels c ON c.id = mc.channel_id
+		  WHERE mc.monitor_id = ? AND m.workspace_id = ? AND c.workspace_id = ?
+		  ORDER BY mc.channel_id`, id, ws, ws)
 	if err != nil {
 		return nil, err
 	}
 	rules, err := querySQLiteRules(ctx, tx,
-		`SELECT id, monitor_id, type, params, enabled FROM rules WHERE monitor_id = ? ORDER BY id`, id)
+		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled FROM rules r
+		   JOIN monitors m ON m.id = r.monitor_id
+		  WHERE r.monitor_id = ? AND m.workspace_id = ? ORDER BY r.id`, id, ws)
 	if err != nil {
 		return nil, err
 	}
-	names, err := queryStringColumn(ctx, tx, `SELECT name FROM monitors`)
+	// Name uniqueness is a workspace question, not a global one: two teams may
+	// each have a monitor called "Vault minter", and a copy must not be forced
+	// to "(copy 2)" because another tenant used the plain name first.
+	names, err := queryStringColumn(ctx, tx, `SELECT name FROM monitors WHERE workspace_id = ?`, ws)
 	if err != nil {
 		return nil, err
 	}
@@ -461,11 +553,12 @@ func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, erro
 		ContractIDs: src.ContractIDs,
 		Enabled:     false,                     // never inherit enabled: a duplicate must be reviewed first
 		Priority:    src.Priority.Normalized(), // priority is queue position, not a safety switch, so the copy keeps it
+		Network:     src.Network,               // the copy watches the same contract ids, which only exist on this chain
 	}
 	var created string
 	if err := tx.QueryRowContext(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled, priority) VALUES (?, ?, ?, ?) RETURNING id, created_at`,
-		dup.Name, string(ids), boolToInt(dup.Enabled), string(dup.Priority),
+		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network) VALUES (?, ?, ?, ?, ?, ?) RETURNING id, created_at`,
+		dup.Name, string(ids), boolToInt(dup.Enabled), string(dup.Priority), ws, dup.Network,
 	).Scan(&dup.ID, &created); err != nil {
 		return nil, mapSQLiteErr(err)
 	}
@@ -545,7 +638,7 @@ func scanSQLiteMonitor(r rowScanner) (*Monitor, error) {
 	var created string
 	var lastMatched sql.NullString
 	var priority string
-	if err := r.Scan(&m.ID, &m.Name, &ids, &enabled, &created, &lastMatched, &priority); err != nil {
+	if err := r.Scan(&m.ID, &m.Name, &ids, &enabled, &created, &lastMatched, &priority, &m.Network); err != nil {
 		return nil, mapSQLiteErr(err)
 	}
 	m.Priority = Priority(priority).Normalized()
@@ -568,8 +661,39 @@ func scanSQLiteMonitor(r rowScanner) (*Monitor, error) {
 }
 
 // --- rules ---
+//
+// Rules carry no workspace column of their own: their monitor_id foreign key
+// is the tenant link, so every rule query here reaches monitors. Denormalising
+// the workspace onto rules would give a row two ways to say who owns it, and
+// they can disagree.
+
+// rowQuerier is the subset of *sql.DB and *sql.Tx that reads one row, so the
+// workspace check below runs unchanged inside or outside a transaction.
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// requireMonitorWorkspace fails with ErrNotFound unless monitorID is a monitor
+// in ws. Creating a rule on a monitor the caller cannot see fails exactly as
+// creating one on a monitor that does not exist does, so the two are
+// indistinguishable to the caller.
+func (s *SQLite) requireMonitorWorkspace(ctx context.Context, q rowQuerier, monitorID int64, ws workspace.ID) error {
+	var ok int64
+	if err := q.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM monitors WHERE id = ? AND workspace_id = ?)`,
+		monitorID, ws).Scan(&ok); err != nil {
+		return mapSQLiteErr(err)
+	}
+	if ok == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
 
 func (s *SQLite) CreateRule(ctx context.Context, r *Rule) error {
+	if err := s.requireMonitorWorkspace(ctx, s.db, r.MonitorID, workspaceID(ctx)); err != nil {
+		return err
+	}
 	return mapSQLiteErr(s.db.QueryRowContext(ctx,
 		`INSERT INTO rules (monitor_id, type, params, enabled) VALUES (?, ?, ?, ?) RETURNING id`,
 		r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled),
@@ -586,7 +710,11 @@ func (s *SQLite) CreateRules(ctx context.Context, rules []*Rule) error {
 	}
 	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
 
+	ws := workspaceID(ctx)
 	for _, r := range rules {
+		if err := s.requireMonitorWorkspace(ctx, tx, r.MonitorID, ws); err != nil {
+			return err
+		}
 		if err := tx.QueryRowContext(ctx,
 			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES (?, ?, ?, ?) RETURNING id`,
 			r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled),
@@ -599,7 +727,9 @@ func (s *SQLite) CreateRules(ctx context.Context, rules []*Rule) error {
 
 func (s *SQLite) GetRule(ctx context.Context, id int64) (*Rule, error) {
 	rules, err := querySQLiteRules(ctx, s.db,
-		`SELECT id, monitor_id, type, params, enabled FROM rules WHERE id = ?`, id)
+		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled FROM rules r
+		   JOIN monitors m ON m.id = r.monitor_id
+		  WHERE r.id = ? AND m.workspace_id = ?`, id, workspaceID(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -610,12 +740,23 @@ func (s *SQLite) GetRule(ctx context.Context, id int64) (*Rule, error) {
 }
 
 func (s *SQLite) ListRules(ctx context.Context, monitorID int64, enabledOnly bool) ([]Rule, error) {
-	q := `SELECT id, monitor_id, type, params, enabled FROM rules WHERE monitor_id = ?`
-	if enabledOnly {
-		q += ` AND enabled = 1`
+	// The predicate is conditional because ListRules serves two callers with
+	// different scopes: the API (one workspace) and the poller's per-monitor
+	// rule loading, which runs under the cross-tenant system scope and would
+	// otherwise find no rules for a monitor outside the default workspace.
+	q := `SELECT r.id, r.monitor_id, r.type, r.params, r.enabled FROM rules r
+	         JOIN monitors m ON m.id = r.monitor_id
+	        WHERE r.monitor_id = ?`
+	args := []any{monitorID}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND m.workspace_id = ?`
+		args = append(args, ws)
 	}
-	q += ` ORDER BY id`
-	return querySQLiteRules(ctx, s.db, q, monitorID)
+	if enabledOnly {
+		q += ` AND r.enabled = 1`
+	}
+	q += ` ORDER BY r.id`
+	return querySQLiteRules(ctx, s.db, q, args...)
 }
 
 func querySQLiteRules(ctx context.Context, q queryer, query string, args ...any) ([]Rule, error) {
@@ -649,8 +790,9 @@ func scanSQLiteRule(r rowScanner) (Rule, error) {
 
 func (s *SQLite) UpdateRule(ctx context.Context, r *Rule) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE rules SET type = ?, params = ?, enabled = ? WHERE id = ?`,
-		r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), r.ID)
+		`UPDATE rules SET type = ?, params = ?, enabled = ? WHERE id = ?
+		  AND monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?)`,
+		r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), r.ID, workspaceID(ctx))
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -664,8 +806,25 @@ func (s *SQLite) UpdateRule(ctx context.Context, r *Rule) error {
 	return nil
 }
 
+// DeleteRule scopes through the rule's monitor, because rules carry no
+// workspace column of their own. SQLite has no DELETE ... USING, so the join is
+// written as a subquery — the same two-table check Postgres does with USING.
 func (s *SQLite) DeleteRule(ctx context.Context, id int64) error {
-	return s.deleteByID(ctx, "rules", id)
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM rules
+		  WHERE id = ? AND monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?)`,
+		id, workspaceID(ctx))
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // --- channels ---
@@ -677,9 +836,9 @@ func (s *SQLite) CreateChannel(ctx context.Context, c *Channel) error {
 	}
 	var created string
 	if err := s.db.QueryRowContext(ctx,
-		`INSERT INTO channels (name, type, config, enabled) VALUES (?, ?, ?, ?)
+		`INSERT INTO channels (name, type, config, enabled, workspace_id) VALUES (?, ?, ?, ?, ?)
 		 RETURNING id, created_at`,
-		c.Name, c.Type, string(config), boolToInt(c.Enabled),
+		c.Name, c.Type, string(config), boolToInt(c.Enabled), workspaceID(ctx),
 	).Scan(&c.ID, &created); err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -689,7 +848,8 @@ func (s *SQLite) CreateChannel(ctx context.Context, c *Channel) error {
 
 func (s *SQLite) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 	channels, err := s.queryChannels(ctx,
-		`SELECT id, name, type, config, enabled, created_at FROM channels WHERE id = ?`, id)
+		`SELECT id, name, type, config, enabled, created_at FROM channels WHERE id = ? AND workspace_id = ?`,
+		id, workspaceID(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -699,18 +859,25 @@ func (s *SQLite) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 	return &channels[0], nil
 }
 
+// ListChannels serves the dashboard listing and the notifier's startup
+// validation, so it honours the cross-tenant system scope like ListMonitors.
 func (s *SQLite) ListChannels(ctx context.Context, enabledOnly bool) ([]Channel, error) {
-	q := `SELECT id, name, type, config, enabled, created_at FROM channels`
+	q := `SELECT id, name, type, config, enabled, created_at FROM channels WHERE 1 = 1`
+	args := []any{}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND workspace_id = ?`
+		args = append(args, ws)
+	}
 	if enabledOnly {
-		q += ` WHERE enabled = 1`
+		q += ` AND enabled = 1`
 	}
 	q += ` ORDER BY id`
-	return s.queryChannels(ctx, q)
+	return s.queryChannels(ctx, q, args...)
 }
 
 func (s *SQLite) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel, error) {
-	q := `SELECT id, name, type, config, enabled, created_at FROM channels WHERE 1 = 1`
-	args := []any{}
+	q := `SELECT id, name, type, config, enabled, created_at FROM channels WHERE workspace_id = ?`
+	args := []any{workspaceID(ctx)}
 	if f.EnabledOnly {
 		q += ` AND enabled = 1`
 	}
@@ -727,13 +894,25 @@ func (s *SQLite) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel,
 	return s.queryChannels(ctx, q, args...)
 }
 
+// ListChannelsForMonitor returns the enabled channels one monitor alerts to.
+// Both sides are checked: the monitor's workspace (so a caller cannot read
+// another tenant's notification targets by id) and the channel's own, which
+// stops a stale attachment from routing this workspace's alerts into a channel
+// it does not own. The dispatcher runs cross-tenant, so the predicate is
+// conditional here as it is in ListMonitors.
 func (s *SQLite) ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]Channel, error) {
-	return s.queryChannels(ctx,
-		`SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at
-		 FROM channels c
-		 JOIN monitor_channels mc ON mc.channel_id = c.id
-		 WHERE mc.monitor_id = ? AND c.enabled = 1
-		 ORDER BY c.id`, monitorID)
+	q := `SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at
+	     FROM channels c
+	     JOIN monitor_channels mc ON mc.channel_id = c.id
+	     JOIN monitors m ON m.id = mc.monitor_id
+	     WHERE mc.monitor_id = ? AND c.enabled = 1`
+	args := []any{monitorID}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND c.workspace_id = ? AND m.workspace_id = ?`
+		args = append(args, ws, ws)
+	}
+	q += ` ORDER BY c.id`
+	return s.queryChannels(ctx, q, args...)
 }
 
 func (s *SQLite) queryChannels(ctx context.Context, query string, args ...any) ([]Channel, error) {
@@ -781,8 +960,8 @@ func (s *SQLite) UpdateChannel(ctx context.Context, c *Channel) error {
 		return err
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE channels SET name = ?, type = ?, config = ?, enabled = ? WHERE id = ?`,
-		c.Name, c.Type, string(config), boolToInt(c.Enabled), c.ID)
+		`UPDATE channels SET name = ?, type = ?, config = ?, enabled = ? WHERE id = ? AND workspace_id = ?`,
+		c.Name, c.Type, string(config), boolToInt(c.Enabled), c.ID, workspaceID(ctx))
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -866,13 +1045,39 @@ func (s *SQLite) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error
 	var id int64
 	var created string
 	err = tx.QueryRowContext(ctx,
-		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, ledger) VALUES (?, ?, ?, ?, ?)
+		// The alert's workspace and network come from its monitor rather than
+		// from ctx, exactly as in the Postgres store: the poller writes under a
+		// cross-tenant context, so a caller-supplied scope would be wrong here,
+		// and the network is what a reorg on that chain may retract and no other
+		// chain's reorg may touch.
+		// The rules join also makes the write fail when the named rule belongs
+		// to a different monitor — alerts' two foreign keys are independent, so
+		// without it an alert could name another monitor's rule and pass both.
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, ledger, workspace_id, network)
+		 SELECT ?, ?, ?, ?, ?, m.workspace_id, m.network
+		   FROM monitors m
+		   JOIN rules r ON r.id = ? AND r.monitor_id = m.id
+		  WHERE m.id = ?
 		 ON CONFLICT (rule_id, event_id) DO NOTHING
-		 RETURNING id, created_at`,
+		 RETURNING id, created_at, network`,
 		a.MonitorID, a.RuleID, a.EventID, string(jsonOrEmpty(a.Payload)), int64(a.Ledger),
-	).Scan(&id, &created)
+		a.RuleID, a.MonitorID,
+	).Scan(&id, &created, &a.Network)
 	if errors.Is(err, sql.ErrNoRows) {
-		return AlertDuplicate, nil // duplicate (rule_id, event_id): deduped
+		// No row can mean two different things: the event was already alerted
+		// on (the dedup unique index swallowed the insert), or the monitor and
+		// rule do not form a real pair. Only the first is a success, so the
+		// cooldown path's existence check runs again here for the rare case.
+		var dup int64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT EXISTS (SELECT 1 FROM alerts WHERE rule_id = ? AND event_id = ?)`,
+			a.RuleID, a.EventID).Scan(&dup); err != nil {
+			return "", err
+		}
+		if dup != 0 {
+			return AlertDuplicate, nil
+		}
+		return "", ErrNotFound
 	}
 	if err != nil {
 		return "", mapSQLiteErr(err)
@@ -910,7 +1115,8 @@ func (s *SQLite) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error
 
 func (s *SQLite) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	a, err := scanSQLiteAlert(s.db.QueryRowContext(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at FROM alerts WHERE id = ?`, id))
+		`SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at, network
+		   FROM alerts WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx)))
 	if err != nil {
 		return nil, err
 	}
@@ -918,8 +1124,16 @@ func (s *SQLite) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 }
 
 func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at FROM alerts WHERE 1 = 1`
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at, network FROM alerts WHERE 1 = 1`
 	args := []any{}
+	// Conditional because ListAlerts serves two callers with different scopes:
+	// the API listing (one workspace) and the frequency rule's match-log
+	// rebuild, which runs inside the poller's cross-tenant context keyed to one
+	// rule.
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND workspace_id = ?`
+		args = append(args, ws)
+	}
 	if f.MonitorID != 0 {
 		q += ` AND monitor_id = ?`
 		args = append(args, f.MonitorID)
@@ -931,6 +1145,10 @@ func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
 	if f.ContractID != "" {
 		q += ` AND json_extract(payload, '$.contract_id') = ?`
 		args = append(args, f.ContractID)
+	}
+	if f.Network != "" {
+		q += ` AND network = ?`
+		args = append(args, f.Network)
 	}
 	if !f.From.IsZero() {
 		q += ` AND created_at >= ?`
@@ -944,7 +1162,11 @@ func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
 	if f.AfterID != 0 {
 		// Subquery the cursor row so the comparison uses the same
 		// (created_at, id) pair the ORDER BY does; a one-sided id comparison
-		// would skip or repeat rows once two alerts share a timestamp.
+		// would skip or repeat rows once two alerts share a timestamp. The
+		// lookup stays keyed by primary key alone: this statement's workspace
+		// predicate is conditional (the poller lists across tenants), and a
+		// tenant-scoped cursor can only ever name a row the caller was already
+		// shown, so it cannot pull another workspace's rows into the page.
 		cursor := `(SELECT created_at, id FROM alerts WHERE id = ?)`
 		if sort == "created_at_asc" {
 			q += ` AND (created_at, id) > ` + cursor
@@ -983,7 +1205,7 @@ func scanSQLiteAlert(r rowScanner) (Alert, error) {
 	var created string
 	var ledger int64
 	var retracted sql.NullString
-	if err := r.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &payload, &created, &ledger, &retracted); err != nil {
+	if err := r.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &payload, &created, &ledger, &retracted, &a.Network); err != nil {
 		return a, mapSQLiteErr(err)
 	}
 	a.Payload = json.RawMessage(payload)
@@ -1002,13 +1224,24 @@ func scanSQLiteAlert(r rowScanner) (Alert, error) {
 	return a, nil
 }
 
+// RecordDeliveryAttempt attaches an attempt to its alert. The alert id is
+// re-read under the caller's workspace instead of being trusted, so an attempt
+// cannot be filed against another tenant's alert, and the single-column
+// foreign key that made the row valid still reports a missing alert.
+//
+// The predicate is conditional because the dispatcher records attempts from the
+// poller's cross-tenant context.
 func (s *SQLite) RecordDeliveryAttempt(ctx context.Context, d *DeliveryAttempt) error {
+	q := `INSERT INTO delivery_attempts (alert_id, channel_id, status, response_snippet)
+		  SELECT a.id, ?, ?, ? FROM alerts a WHERE a.id = ?`
+	args := []any{d.ChannelID, d.Status, d.ResponseSnippet, d.AlertID}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND a.workspace_id = ?`
+		args = append(args, ws)
+	}
 	var attempted string
-	if err := s.db.QueryRowContext(ctx,
-		`INSERT INTO delivery_attempts (alert_id, channel_id, status, response_snippet)
-		 VALUES (?, ?, ?, ?) RETURNING id, attempted_at`,
-		d.AlertID, d.ChannelID, d.Status, d.ResponseSnippet,
-	).Scan(&d.ID, &attempted); err != nil {
+	if err := s.db.QueryRowContext(ctx, q+`
+		 RETURNING id, attempted_at`, args...).Scan(&d.ID, &attempted); err != nil {
 		return mapSQLiteErr(err)
 	}
 	t, err := parseSQLiteTime(attempted)
@@ -1019,17 +1252,22 @@ func (s *SQLite) RecordDeliveryAttempt(ctx context.Context, d *DeliveryAttempt) 
 	return nil
 }
 
+// ListDeliveryAttempts scopes through its alert: delivery_attempts carries no
+// workspace column, and an alert id only means anything inside the workspace
+// that can see the alert behind it.
 func (s *SQLite) ListDeliveryAttempts(ctx context.Context, alertID int64, status string) ([]DeliveryAttempt, error) {
-	q := `SELECT id, alert_id, channel_id, status, response_snippet, attempted_at
-		 FROM delivery_attempts WHERE alert_id = ?`
-	args := []any{alertID}
+	q := `SELECT da.id, da.alert_id, da.channel_id, da.status, da.response_snippet, da.attempted_at
+	     FROM delivery_attempts da
+	     JOIN alerts a ON a.id = da.alert_id
+	     WHERE da.alert_id = ? AND a.workspace_id = ?`
+	args := []any{alertID, workspaceID(ctx)}
 	if status != "" {
 		// Applied in SQL so a busy alert does not ship every attempt just so
 		// the client can throw most of them away.
-		q += ` AND status = ?`
+		q += ` AND da.status = ?`
 		args = append(args, status)
 	}
-	q += ` ORDER BY id`
+	q += ` ORDER BY da.id`
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -1078,7 +1316,7 @@ func (s *SQLite) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int)
 		limit = DefaultPruneBatch
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at
+		`SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at, network
 		   FROM alerts WHERE created_at < ? ORDER BY created_at ASC, id ASC LIMIT ?`,
 		sqliteTimeString(cutoff), limit)
 	if err != nil {
@@ -1098,32 +1336,54 @@ func (s *SQLite) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int)
 
 // --- ledger hashes and reorg retraction ---
 
-func (s *SQLite) RecordLedgerHashes(ctx context.Context, hashes []LedgerHash) error {
+// The empty network keeps the original single-column ledger_hashes window and
+// every named network shares network_ledger_hashes, keyed (network, ledger).
+// Two chains number their ledgers independently, so one shared window would
+// report a reorganisation on nearly every cycle — and a false positive here
+// retracts real alerts. See the 0013_networks migration for the same note on
+// the Postgres side, including why starting a named network's window empty is
+// safe rather than lossy.
+
+func (s *SQLite) RecordLedgerHashes(ctx context.Context, network string, hashes []LedgerHash) error {
 	if len(hashes) == 0 {
 		return nil
 	}
+	const legacyInsert = `INSERT INTO ledger_hashes (ledger, hash) VALUES (?, ?)
+		ON CONFLICT (ledger) DO UPDATE SET hash = excluded.hash,
+		                                   observed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		WHERE ledger_hashes.hash IS NOT excluded.hash`
+	const scopedInsert = `INSERT INTO network_ledger_hashes (network, ledger, hash) VALUES (?, ?, ?)
+		ON CONFLICT (network, ledger) DO UPDATE SET hash = excluded.hash,
+		                                   observed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		WHERE network_ledger_hashes.hash IS NOT excluded.hash`
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
 	for _, h := range hashes {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO ledger_hashes (ledger, hash) VALUES (?, ?)
-			 ON CONFLICT (ledger) DO UPDATE SET hash = excluded.hash,
-			                                   observed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-			 WHERE ledger_hashes.hash IS NOT excluded.hash`,
-			int64(h.Ledger), h.Hash); err != nil {
+		var err error
+		if network == "" {
+			_, err = tx.ExecContext(ctx, legacyInsert, int64(h.Ledger), h.Hash)
+		} else {
+			_, err = tx.ExecContext(ctx, scopedInsert, network, int64(h.Ledger), h.Hash)
+		}
+		if err != nil {
 			return mapSQLiteErr(err)
 		}
 	}
 	return tx.Commit()
 }
 
-func (s *SQLite) LedgerHashes(ctx context.Context, from, to uint32) ([]LedgerHash, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT ledger, hash FROM ledger_hashes WHERE ledger >= ? AND ledger <= ? ORDER BY ledger`,
-		int64(from), int64(to))
+func (s *SQLite) LedgerHashes(ctx context.Context, network string, from, to uint32) ([]LedgerHash, error) {
+	q := `SELECT ledger, hash FROM network_ledger_hashes WHERE network = ? AND ledger >= ? AND ledger <= ? ORDER BY ledger`
+	args := []any{network, int64(from), int64(to)}
+	if network == "" {
+		q = `SELECT ledger, hash FROM ledger_hashes WHERE ledger >= ? AND ledger <= ? ORDER BY ledger`
+		args = args[1:]
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1141,15 +1401,24 @@ func (s *SQLite) LedgerHashes(ctx context.Context, from, to uint32) ([]LedgerHas
 	return out, rows.Err()
 }
 
-func (s *SQLite) PruneLedgerHashes(ctx context.Context, before uint32) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM ledger_hashes WHERE ledger < ?`, int64(before))
+func (s *SQLite) PruneLedgerHashes(ctx context.Context, network string, before uint32) error {
+	if network == "" {
+		_, err := s.db.ExecContext(ctx, `DELETE FROM ledger_hashes WHERE ledger < ?`, int64(before))
+		return err
+	}
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM network_ledger_hashes WHERE network = ? AND ledger < ?`,
+		network, int64(before))
 	return err
 }
 
-func (s *SQLite) RetractAlertsFromLedger(ctx context.Context, ledger uint32, at time.Time) (int64, error) {
+// RetractAlertsFromLedger retracts one network's alerts from `ledger` up. The
+// network predicate is what stops a testnet reorg from retracting mainnet
+// alerts that happen to sit at the same height.
+func (s *SQLite) RetractAlertsFromLedger(ctx context.Context, network string, ledger uint32, at time.Time) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE alerts SET retracted_at = ? WHERE ledger >= ? AND retracted_at IS NULL`,
-		sqliteTimeString(at), int64(ledger))
+		`UPDATE alerts SET retracted_at = ? WHERE network = ? AND ledger >= ? AND retracted_at IS NULL`,
+		sqliteTimeString(at), network, int64(ledger))
 	if err != nil {
 		return 0, err
 	}
@@ -1158,13 +1427,43 @@ func (s *SQLite) RetractAlertsFromLedger(ctx context.Context, ledger uint32, at 
 
 // --- ingest state ---
 
-func (s *SQLite) GetIngestState(ctx context.Context) (IngestState, error) {
+// GetIngestState reads one network's checkpoint. The empty network is the
+// pre-multi-network row and behaves exactly as it always did; a named network
+// reads network_ingest_state, which is seeded from that legacy row the first
+// time any network asks, so an instance that moves from one NETWORK to a
+// network list resumes at the ledger it stopped on instead of cold-starting at
+// the tip and silently missing everything in between.
+func (s *SQLite) GetIngestState(ctx context.Context, network string) (IngestState, error) {
 	var st IngestState
 	var lastLedger int64
 	var updated string
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT last_ledger, last_cursor, updated_at FROM ingest_state WHERE id = 1`,
-	).Scan(&lastLedger, &st.LastCursor, &updated); err != nil {
+
+	q := `SELECT last_ledger, last_cursor, updated_at FROM network_ingest_state WHERE network = ?`
+	args := []any{network}
+	if network == "" {
+		q = `SELECT last_ledger, last_cursor, updated_at FROM ingest_state WHERE id = 1`
+		args = nil
+	} else {
+		// Only while the per-network table is empty does the legacy checkpoint
+		// get claimed, so a second network added later cold-starts on its own
+		// chain rather than inheriting a cursor from a chain that has nothing to
+		// do with it. Both statements are DO NOTHING, so two pollers starting at
+		// the same moment cannot race into an error.
+		if _, err := s.db.ExecContext(ctx, `
+			INSERT INTO network_ingest_state (network, last_ledger, last_cursor)
+			SELECT ?, last_ledger, last_cursor FROM ingest_state
+			 WHERE id = 1 AND NOT EXISTS (SELECT 1 FROM network_ingest_state)
+			ON CONFLICT (network) DO NOTHING`, network); err != nil {
+			return st, mapSQLiteErr(err)
+		}
+		if _, err := s.db.ExecContext(ctx,
+			`INSERT INTO network_ingest_state (network) VALUES (?) ON CONFLICT (network) DO NOTHING`,
+			network); err != nil {
+			return st, mapSQLiteErr(err)
+		}
+	}
+
+	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&lastLedger, &st.LastCursor, &updated); err != nil {
 		return st, mapSQLiteErr(err)
 	}
 	st.LastLedger = uint32(lastLedger)
@@ -1175,38 +1474,114 @@ func (s *SQLite) GetIngestState(ctx context.Context) (IngestState, error) {
 	return st, nil
 }
 
-func (s *SQLite) SetIngestState(ctx context.Context, st IngestState) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE ingest_state SET last_ledger = ?, last_cursor = ?, updated_at = ? WHERE id = 1`,
-		int64(st.LastLedger), st.LastCursor, sqliteTimeString(time.Now()))
-	return err
+// SetIngestState advances one network's checkpoint. Writing a named network is
+// an upsert because the row may not exist yet: the first cycle of a newly
+// configured network has nothing to update.
+func (s *SQLite) SetIngestState(ctx context.Context, network string, st IngestState) error {
+	if network == "" {
+		_, err := s.db.ExecContext(ctx,
+			`UPDATE ingest_state SET last_ledger = ?, last_cursor = ?, updated_at = ? WHERE id = 1`,
+			int64(st.LastLedger), st.LastCursor, sqliteTimeString(time.Now()))
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO network_ingest_state (network, last_ledger, last_cursor, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT (network) DO UPDATE
+		    SET last_ledger = excluded.last_ledger,
+		        last_cursor = excluded.last_cursor,
+		        updated_at  = excluded.updated_at`,
+		network, int64(st.LastLedger), st.LastCursor, sqliteTimeString(time.Now()))
+	return mapSQLiteErr(err)
 }
 
 // --- stats ---
 
+// GetStats reports the counts for one workspace. Every figure is scoped,
+// including the rules count (rules reach a workspace through their monitor).
+// The ingest checkpoints are instance-wide and stay unscoped: they are the
+// pollers' cursors, not a tenant's data.
 func (s *SQLite) GetStats(ctx context.Context) (Stats, error) {
 	var st Stats
-	var updated string
 	// The 24h window is computed in Go and compared as text; the fixed-width
 	// timestamp format makes that a valid chronological comparison.
 	cutoff := sqliteTimeString(time.Now().UTC().Add(-24 * time.Hour))
+	ws := workspaceID(ctx)
 	err := s.db.QueryRowContext(ctx, `
 		SELECT
-			(SELECT count(*) FROM monitors),
-			(SELECT count(*) FROM rules),
-			(SELECT count(*) FROM channels),
-			(SELECT count(*) FROM alerts),
-			(SELECT count(*) FROM alerts WHERE created_at > ?),
-			(SELECT last_ledger FROM ingest_state WHERE id = 1),
-			(SELECT updated_at FROM ingest_state WHERE id = 1)`, cutoff).
-		Scan(&st.Monitors, &st.Rules, &st.Channels, &st.Alerts, &st.AlertsLast24, &st.LastLedger, &updated)
+			(SELECT count(*) FROM monitors WHERE workspace_id = ?),
+			(SELECT count(*) FROM rules r JOIN monitors m ON m.id = r.monitor_id WHERE m.workspace_id = ?),
+			(SELECT count(*) FROM channels WHERE workspace_id = ?),
+			(SELECT count(*) FROM alerts WHERE workspace_id = ?),
+			(SELECT count(*) FROM alerts WHERE workspace_id = ? AND created_at > ?)`, ws, ws, ws, ws, ws, cutoff).
+		Scan(&st.Monitors, &st.Rules, &st.Channels, &st.Alerts, &st.AlertsLast24)
 	if err != nil {
 		return st, err
 	}
-	if st.LastPollAt, err = parseSQLiteTime(updated); err != nil {
+	cps, err := s.ingestCheckpoints(ctx)
+	if err != nil {
 		return st, err
 	}
+	summarizeCheckpoints(&st, cps)
 	return st, nil
+}
+
+// ingestCheckpoints reads every network's cursor, newest poll first. The legacy
+// row competes for that ordering on the same terms as a named one, so whichever
+// checkpoint polled most recently is the one that reports where this instance
+// actually is.
+func (s *SQLite) ingestCheckpoints(ctx context.Context) ([]NetworkStats, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT network, last_ledger, updated_at FROM network_ingest_state
+		UNION ALL
+		SELECT '', last_ledger, updated_at FROM ingest_state WHERE id = 1
+		ORDER BY updated_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []NetworkStats
+	for rows.Next() {
+		var c NetworkStats
+		var lastLedger int64
+		var updated string
+		if err := rows.Scan(&c.Network, &lastLedger, &updated); err != nil {
+			return nil, err
+		}
+		c.LastLedger = uint32(lastLedger)
+		if c.LastPollAt, err = parseSQLiteTime(updated); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// AssignLegacyNetwork labels the rows written before the network column
+// existed, once, at startup, in the instance's own cross-tenant scope: an
+// operator upgrading a single-network deployment must not watch every monitor
+// vanish from the network-filtered listing. Idempotent because the predicate
+// only matches the empty value.
+func (s *SQLite) AssignLegacyNetwork(ctx context.Context, network string) (int64, error) {
+	if network == "" {
+		return 0, nil // nothing to label: no network configured
+	}
+	var total int64
+	for _, q := range []string{
+		`UPDATE monitors SET network = ? WHERE network = ''`,
+		`UPDATE alerts SET network = ? WHERE network = ''`,
+	} {
+		res, err := s.db.ExecContext(ctx, q, network)
+		if err != nil {
+			return total, mapSQLiteErr(err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
 }
 
 // AlertCountsByDay returns `days` consecutive UTC calendar days ending today,
@@ -1214,6 +1589,11 @@ func (s *SQLite) GetStats(ctx context.Context) (Stats, error) {
 // of the fixed-format timestamp, and a recursive CTE generates the window so a
 // quiet day is an explicit 0 rather than a missing bar. SQLite has no
 // generate_series, hence the CTE.
+//
+// The workspace filter belongs in the LEFT JOIN's ON clause, not the WHERE
+// clause: filtering the joined table after the fact would drop the days with no
+// alerts in this workspace and reintroduce the chart gaps the CTE exists to
+// prevent.
 func (s *SQLite) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCount, error) {
 	days = ClampAlertSeriesDays(days)
 	rows, err := s.db.QueryContext(ctx, `
@@ -1225,8 +1605,9 @@ func (s *SQLite) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCoun
 		SELECT window.day, COUNT(a.id)
 		FROM window
 		LEFT JOIN alerts a ON substr(a.created_at, 1, 10) = window.day
+			AND a.workspace_id = ?
 		GROUP BY window.day
-		ORDER BY window.day`, fmt.Sprintf("-%d days", days-1))
+		ORDER BY window.day`, fmt.Sprintf("-%d days", days-1), workspaceID(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -1250,15 +1631,20 @@ func (s *SQLite) CreateSavedSearch(ctx context.Context, ss *SavedSearch) error {
 	if err != nil {
 		return err
 	}
+	ws := workspaceID(ctx)
 	if ss.IsDefault {
-		if _, err := s.db.ExecContext(ctx, `UPDATE saved_searches SET is_default = 0 WHERE is_default = 1`); err != nil {
+		// Scoped, or making one workspace's search the default would clear every
+		// other workspace's. The same reasoning applies to the two default-search
+		// methods below.
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE saved_searches SET is_default = 0 WHERE is_default = 1 AND workspace_id = ?`, ws); err != nil {
 			return err
 		}
 	}
 	var created string
 	if err := s.db.QueryRowContext(ctx,
-		`INSERT INTO saved_searches (name, filter, is_default) VALUES (?, ?, ?) RETURNING id, created_at`,
-		ss.Name, string(filter), boolToInt(ss.IsDefault)).Scan(&ss.ID, &created); err != nil {
+		`INSERT INTO saved_searches (name, filter, is_default, workspace_id) VALUES (?, ?, ?, ?) RETURNING id, created_at`,
+		ss.Name, string(filter), boolToInt(ss.IsDefault), ws).Scan(&ss.ID, &created); err != nil {
 		return mapSQLiteErr(err)
 	}
 	ss.CreatedAt, err = parseSQLiteTime(created)
@@ -1267,7 +1653,8 @@ func (s *SQLite) CreateSavedSearch(ctx context.Context, ss *SavedSearch) error {
 
 func (s *SQLite) ListSavedSearches(ctx context.Context) ([]SavedSearch, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, filter, is_default, created_at FROM saved_searches ORDER BY name`)
+		`SELECT id, name, filter, is_default, created_at FROM saved_searches WHERE workspace_id = ? ORDER BY name`,
+		workspaceID(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -1285,7 +1672,8 @@ func (s *SQLite) ListSavedSearches(ctx context.Context) ([]SavedSearch, error) {
 
 func (s *SQLite) GetSavedSearch(ctx context.Context, id int64) (*SavedSearch, error) {
 	ss, err := scanSQLiteSavedSearch(s.db.QueryRowContext(ctx,
-		`SELECT id, name, filter, is_default, created_at FROM saved_searches WHERE id = ?`, id))
+		`SELECT id, name, filter, is_default, created_at FROM saved_searches WHERE id = ? AND workspace_id = ?`,
+		id, workspaceID(ctx)))
 	if err != nil {
 		return nil, err
 	}
@@ -1322,10 +1710,13 @@ func (s *SQLite) SetDefaultSearch(ctx context.Context, id int64) error {
 	}
 	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
 
-	if _, err := tx.ExecContext(ctx, `UPDATE saved_searches SET is_default = 0 WHERE is_default = 1`); err != nil {
+	ws := workspaceID(ctx)
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE saved_searches SET is_default = 0 WHERE is_default = 1 AND workspace_id = ?`, ws); err != nil {
 		return err
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE saved_searches SET is_default = 1 WHERE id = ?`, id)
+	res, err := tx.ExecContext(ctx,
+		`UPDATE saved_searches SET is_default = 1 WHERE id = ? AND workspace_id = ?`, id, ws)
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -1340,7 +1731,8 @@ func (s *SQLite) SetDefaultSearch(ctx context.Context, id int64) error {
 }
 
 func (s *SQLite) ClearDefaultSearch(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE saved_searches SET is_default = 0 WHERE id = ?`, id)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE saved_searches SET is_default = 0 WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx))
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -1362,8 +1754,8 @@ func (s *SQLite) CreateMonitorTemplate(ctx context.Context, t *MonitorTemplate) 
 	paramsJSON, _ := json.Marshal(t.Parameters)
 	var created string
 	if err := s.db.QueryRowContext(ctx,
-		`INSERT INTO monitor_templates (name, description, rules, channel_ids, parameters) VALUES (?, ?, ?, ?, ?) RETURNING id, created_at`,
-		t.Name, t.Description, string(rulesJSON), string(channelJSON), string(paramsJSON)).Scan(&t.ID, &created); err != nil {
+		`INSERT INTO monitor_templates (name, description, rules, channel_ids, parameters, workspace_id) VALUES (?, ?, ?, ?, ?, ?) RETURNING id, created_at`,
+		t.Name, t.Description, string(rulesJSON), string(channelJSON), string(paramsJSON), workspaceID(ctx)).Scan(&t.ID, &created); err != nil {
 		return mapSQLiteErr(err)
 	}
 	var err error
@@ -1373,7 +1765,8 @@ func (s *SQLite) CreateMonitorTemplate(ctx context.Context, t *MonitorTemplate) 
 
 func (s *SQLite) GetMonitorTemplate(ctx context.Context, id int64) (*MonitorTemplate, error) {
 	t, err := scanSQLiteTemplate(s.db.QueryRowContext(ctx,
-		`SELECT id, name, description, rules, channel_ids, parameters, created_at FROM monitor_templates WHERE id = ?`, id))
+		`SELECT id, name, description, rules, channel_ids, parameters, created_at FROM monitor_templates WHERE id = ? AND workspace_id = ?`,
+		id, workspaceID(ctx)))
 	if err != nil {
 		return nil, err
 	}
@@ -1382,7 +1775,8 @@ func (s *SQLite) GetMonitorTemplate(ctx context.Context, id int64) (*MonitorTemp
 
 func (s *SQLite) ListMonitorTemplates(ctx context.Context) ([]MonitorTemplate, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, description, rules, channel_ids, parameters, created_at FROM monitor_templates ORDER BY name`)
+		`SELECT id, name, description, rules, channel_ids, parameters, created_at FROM monitor_templates WHERE workspace_id = ? ORDER BY name`,
+		workspaceID(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -1422,8 +1816,8 @@ func (s *SQLite) UpdateMonitorTemplate(ctx context.Context, t *MonitorTemplate) 
 	channelJSON, _ := json.Marshal(t.ChannelIDs)
 	paramsJSON, _ := json.Marshal(t.Parameters)
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE monitor_templates SET name = ?, description = ?, rules = ?, channel_ids = ?, parameters = ? WHERE id = ?`,
-		t.Name, t.Description, string(rulesJSON), string(channelJSON), string(paramsJSON), t.ID)
+		`UPDATE monitor_templates SET name = ?, description = ?, rules = ?, channel_ids = ?, parameters = ? WHERE id = ? AND workspace_id = ?`,
+		t.Name, t.Description, string(rulesJSON), string(channelJSON), string(paramsJSON), t.ID, workspaceID(ctx))
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -1439,4 +1833,124 @@ func (s *SQLite) UpdateMonitorTemplate(ctx context.Context, t *MonitorTemplate) 
 
 func (s *SQLite) DeleteMonitorTemplate(ctx context.Context, id int64) error {
 	return s.deleteByID(ctx, "monitor_templates", id)
+}
+
+// --- api tokens ---
+//
+// The SQLite mirror of the Postgres section in postgres.go, including why the
+// digest arrives pre-hashed and why TokenByHash is the one read that is not
+// workspace-scoped.
+
+func (s *SQLite) CreateAPIToken(ctx context.Context, t *auth.Token) error {
+	var expiresAt any
+	if !t.ExpiresAt.IsZero() {
+		expiresAt = sqliteTimeString(t.ExpiresAt)
+	}
+	ws := workspaceID(ctx)
+	var created string
+	err := s.db.QueryRowContext(ctx,
+		`INSERT INTO api_tokens (workspace_id, name, token_hash, prefix, scopes, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?) RETURNING id, created_at`,
+		ws, t.Name, t.Hash, t.Prefix, auth.JoinScopes(t.Scopes), expiresAt).
+		Scan(&t.ID, &created)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	if t.CreatedAt, err = parseSQLiteTime(created); err != nil {
+		return err
+	}
+	t.Workspace = ws
+	return nil
+}
+
+func (s *SQLite) TokenByHash(ctx context.Context, hash string) (*auth.Token, bool, error) {
+	t, err := scanSQLiteAPIToken(s.db.QueryRowContext(ctx,
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at FROM api_tokens WHERE token_hash = ?`, hash))
+	if errors.Is(err, ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return &t, true, nil
+}
+
+func (s *SQLite) ListAPITokens(ctx context.Context) ([]auth.Token, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at FROM api_tokens WHERE workspace_id = ? ORDER BY id DESC`,
+		workspaceID(ctx))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []auth.Token
+	for rows.Next() {
+		t, err := scanSQLiteAPIToken(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) RevokeAPIToken(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE api_tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ? AND workspace_id = ?`,
+		sqliteTimeString(time.Now()), id, workspaceID(ctx))
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *SQLite) TouchAPIToken(ctx context.Context, id int64, at time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE api_tokens SET last_used_at = ? WHERE id = ? AND workspace_id = ?`,
+		sqliteTimeString(at), id, workspaceID(ctx))
+	return mapSQLiteErr(err)
+}
+
+// scanSQLiteAPIToken reads one api_tokens row; the two listings spell the
+// column order identically to it, as the alert scans do.
+// The nullable timestamps are sql.NullString because database/sql has no
+// pointer-to-pointer destination; an absent value becomes the zero time, which
+// is what auth.Token.Live and "never used" both test.
+func scanSQLiteAPIToken(r rowScanner) (auth.Token, error) {
+	var t auth.Token
+	var scopes string
+	var created string
+	var expiresAt, lastUsedAt, revokedAt sql.NullString
+	if err := r.Scan(&t.ID, &t.Workspace, &t.Name, &t.Hash, &t.Prefix, &scopes,
+		&expiresAt, &lastUsedAt, &revokedAt, &created); err != nil {
+		return t, mapSQLiteErr(err)
+	}
+	t.Scopes = auth.SplitScopes(scopes)
+	for _, col := range []struct {
+		dst *time.Time
+		val sql.NullString
+	}{
+		{&t.ExpiresAt, expiresAt}, {&t.LastUsedAt, lastUsedAt}, {&t.RevokedAt, revokedAt},
+	} {
+		if !col.val.Valid {
+			continue
+		}
+		v, err := parseSQLiteTime(col.val.String)
+		if err != nil {
+			return t, err
+		}
+		*col.dst = v
+	}
+	var err error
+	if t.CreatedAt, err = parseSQLiteTime(created); err != nil {
+		return t, err
+	}
+	return t, nil
 }

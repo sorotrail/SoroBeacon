@@ -63,10 +63,16 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("AlertCountsByDayZeroFillAndWindow", func(t *testing.T) { testAlertCountsByDay(t, newStore) })
 	t.Run("DuplicateMonitorCopiesRulesChannelsDisabledUniqueName", func(t *testing.T) { testDuplicateMonitor(t, newStore) })
 	t.Run("LedgerHashesAndAlertRetraction", func(t *testing.T) { testLedgerHashesAndRetraction(t, newStore) })
+	t.Run("NetworkOnMonitorsAndAlerts", func(t *testing.T) { testNetworkOnMonitorsAndAlerts(t, newStore) })
+	t.Run("PerNetworkIngestAndReorgWindow", func(t *testing.T) { testPerNetworkIngestAndReorgWindow(t, newStore) })
+	t.Run("AssignLegacyNetwork", func(t *testing.T) { testAssignLegacyNetwork(t, newStore) })
 	t.Run("ChannelConfigNoKeyStaysPlaintext", func(t *testing.T) { testChannelConfigNoKey(t, newStore) })
 	t.Run("ChannelConfigEncryptedAtRest", func(t *testing.T) { testChannelConfigEncrypted(t, newStore) })
 	t.Run("ChannelConfigLegacyPlaintextThenReencrypts", func(t *testing.T) { testChannelConfigLegacy(t, newStore) })
 	t.Run("ChannelConfigDecryptFailureNamesChannel", func(t *testing.T) { testChannelConfigDecryptFailure(t, newStore) })
+	t.Run("WorkspaceIsolation", func(t *testing.T) { testWorkspaceIsolation(t, newStore) })
+	t.Run("APITokens", func(t *testing.T) { testAPITokens(t, newStore) })
+	t.Run("DeleteByIDTableAllowlist", func(t *testing.T) { testDeleteByIDAllowlist(t, newStore) })
 }
 
 // TestClampAlertSeriesDays pins the overview-chart window bounds. It is pure
@@ -876,15 +882,15 @@ func testIngestState(t *testing.T, newStore conformanceFactory) {
 	st := newStore(t)
 	ctx := context.Background()
 
-	s, err := st.GetIngestState(ctx)
+	s, err := st.GetIngestState(ctx, "")
 	require.NoError(t, err)
 	assert.Zero(t, s.LastLedger)
 
 	s.LastLedger = 123456
 	s.LastCursor = "0000001-0000000"
-	require.NoError(t, st.SetIngestState(ctx, s))
+	require.NoError(t, st.SetIngestState(ctx, "", s))
 
-	got, err := st.GetIngestState(ctx)
+	got, err := st.GetIngestState(ctx, "")
 	require.NoError(t, err)
 	assert.Equal(t, uint32(123456), got.LastLedger)
 	assert.Equal(t, "0000001-0000000", got.LastCursor)
@@ -1025,32 +1031,32 @@ func testLedgerHashesAndRetraction(t *testing.T, newStore conformanceFactory) {
 	ctx := context.Background()
 
 	// Hashes upsert and read back in range order.
-	require.NoError(t, st.RecordLedgerHashes(ctx, []LedgerHash{
+	require.NoError(t, st.RecordLedgerHashes(ctx, "", []LedgerHash{
 		{Ledger: 200, Hash: "b"},
 		{Ledger: 100, Hash: "a"},
 		{Ledger: 150, Hash: "c"},
 	}))
-	hashes, err := st.LedgerHashes(ctx, 100, 200)
+	hashes, err := st.LedgerHashes(ctx, "", 100, 200)
 	require.NoError(t, err)
 	require.Len(t, hashes, 3)
 	assert.Equal(t, uint32(100), hashes[0].Ledger)
 	assert.Equal(t, "a", hashes[0].Hash)
 	assert.Equal(t, uint32(200), hashes[2].Ledger)
 
-	inRange, err := st.LedgerHashes(ctx, 120, 160)
+	inRange, err := st.LedgerHashes(ctx, "", 120, 160)
 	require.NoError(t, err)
 	require.Len(t, inRange, 1)
 	assert.Equal(t, uint32(150), inRange[0].Ledger)
 
 	// A changed hash for an existing ledger is recorded as the new value.
-	require.NoError(t, st.RecordLedgerHashes(ctx, []LedgerHash{{Ledger: 150, Hash: "c2"}}))
-	hashes, err = st.LedgerHashes(ctx, 150, 150)
+	require.NoError(t, st.RecordLedgerHashes(ctx, "", []LedgerHash{{Ledger: 150, Hash: "c2"}}))
+	hashes, err = st.LedgerHashes(ctx, "", 150, 150)
 	require.NoError(t, err)
 	require.Len(t, hashes, 1)
 	assert.Equal(t, "c2", hashes[0].Hash)
 
-	require.NoError(t, st.PruneLedgerHashes(ctx, 150))
-	hashes, err = st.LedgerHashes(ctx, 1, 1000)
+	require.NoError(t, st.PruneLedgerHashes(ctx, "", 150))
+	hashes, err = st.LedgerHashes(ctx, "", 1, 1000)
 	require.NoError(t, err)
 	require.Len(t, hashes, 2, "ledgers below the prune boundary are gone")
 	assert.Equal(t, uint32(150), hashes[0].Ledger)
@@ -1069,7 +1075,7 @@ func testLedgerHashesAndRetraction(t *testing.T, newStore conformanceFactory) {
 	require.NoError(t, err)
 
 	when := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	n, err := st.RetractAlertsFromLedger(ctx, 150, when)
+	n, err := st.RetractAlertsFromLedger(ctx, "", 150, when)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), n, "only the alert at or after the divergence is retracted")
 
@@ -1084,13 +1090,190 @@ func testLedgerHashesAndRetraction(t *testing.T, newStore conformanceFactory) {
 	assert.True(t, got.RetractedAt.Equal(when), "got %v", got.RetractedAt)
 
 	// Re-running is idempotent: already-retracted rows are not counted again.
-	n, err = st.RetractAlertsFromLedger(ctx, 150, when.Add(time.Hour))
+	n, err = st.RetractAlertsFromLedger(ctx, "", 150, when.Add(time.Hour))
 	require.NoError(t, err)
 	assert.Zero(t, n)
 
 	list, err := st.ListAlerts(ctx, AlertFilter{MonitorID: m.ID})
 	require.NoError(t, err)
 	require.Len(t, list, 2)
+}
+
+// testNetworkOnMonitorsAndAlerts pins that a monitor's network is stored,
+// returned, filterable and inherited by its alerts. The inheritance is the
+// important half: an alert's chain is a fact about the event, and letting a
+// caller set it means a mislabelled alert can be retracted by the wrong chain's
+// reorg.
+func testNetworkOnMonitorsAndAlerts(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	test := &Monitor{Name: "test-only", ContractIDs: []string{"CT1"}, Enabled: true, Network: "testnet"}
+	main := &Monitor{Name: "main-only", ContractIDs: []string{"CM1"}, Enabled: true, Network: "mainnet"}
+	legacy := &Monitor{Name: "unlabelled", ContractIDs: []string{"CL1"}, Enabled: true}
+	for _, m := range []*Monitor{test, main, legacy} {
+		require.NoError(t, st.CreateMonitor(ctx, m))
+	}
+
+	got, err := st.GetMonitor(ctx, test.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "testnet", got.Network)
+
+	list, err := st.ListMonitorsPage(ctx, ListFilter{Network: "testnet", Limit: 50})
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, "test-only", list[0].Name)
+
+	list, err = st.ListMonitorsPage(ctx, ListFilter{Limit: 50})
+	require.NoError(t, err)
+	assert.Len(t, list, 3, "an empty network filter means every chain")
+
+	// Each monitor gets one rule and one alert; the alert's network is the
+	// monitor's, whatever the caller asked for.
+	for _, m := range []*Monitor{test, main, legacy} {
+		r := &Rule{MonitorID: m.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+		require.NoError(t, st.CreateRule(ctx, r))
+		a := &Alert{MonitorID: m.ID, RuleID: r.ID, EventID: "ev-" + m.Name, Ledger: 500, Network: "caller-lies"}
+		_, err := st.CreateAlert(ctx, a)
+		require.NoError(t, err)
+	}
+
+	for _, f := range []struct {
+		network string
+		want    int
+	}{{"testnet", 1}, {"mainnet", 1}, {"", 3}} {
+		alerts, err := st.ListAlerts(ctx, AlertFilter{Network: f.network})
+		require.NoError(t, err)
+		assert.Len(t, alerts, f.want, "network=%q", f.network)
+	}
+
+	testAlerts, err := st.ListAlerts(ctx, AlertFilter{Network: "testnet"})
+	require.NoError(t, err)
+	require.Len(t, testAlerts, 1)
+	assert.Equal(t, "testnet", testAlerts[0].Network, "the monitor's network wins over the caller's")
+
+	// A copy watches the same chain: contract IDs are only meaningful on the
+	// network they were deployed to, so a copied monitor cannot be re-homed.
+	dup, err := st.DuplicateMonitor(ctx, test.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "testnet", dup.Network)
+}
+
+// testPerNetworkIngestAndReorgWindow pins that two chains sharing one instance
+// keep separate cursors and separate ledger-hash windows. Chains number their
+// ledgers independently, so a shared window would flag a divergence on nearly
+// every cycle and retract alerts that are still valid.
+func testPerNetworkIngestAndReorgWindow(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, st.SetIngestState(ctx, "testnet", IngestState{LastLedger: 100, LastCursor: "t-100"}))
+	require.NoError(t, st.SetIngestState(ctx, "mainnet", IngestState{LastLedger: 900_000, LastCursor: "m-900000"}))
+
+	got, err := st.GetIngestState(ctx, "testnet")
+	require.NoError(t, err)
+	assert.Equal(t, uint32(100), got.LastLedger)
+	assert.Equal(t, "t-100", got.LastCursor)
+
+	got, err = st.GetIngestState(ctx, "mainnet")
+	require.NoError(t, err)
+	assert.Equal(t, uint32(900_000), got.LastLedger, "each network advances on its own chain")
+
+	// The legacy row is untouched by per-network writes, so an instance that
+	// has not configured NETWORKS still resumes where it stopped.
+	got, err = st.GetIngestState(ctx, "")
+	require.NoError(t, err)
+	assert.Zero(t, got.LastLedger)
+
+	// The same ledger height on two networks is not a reorganisation.
+	wantHash := map[string]string{"testnet": "t100", "mainnet": "m100"}
+	require.NoError(t, st.RecordLedgerHashes(ctx, "testnet", []LedgerHash{{Ledger: 100, Hash: "t100"}}))
+	require.NoError(t, st.RecordLedgerHashes(ctx, "mainnet", []LedgerHash{{Ledger: 100, Hash: "m100"}}))
+
+	for net, hash := range wantHash {
+		hashes, err := st.LedgerHashes(ctx, net, 1, 1000)
+		require.NoError(t, err)
+		require.Len(t, hashes, 1, "network=%s", net)
+		assert.Equal(t, hash, hashes[0].Hash)
+	}
+
+	require.NoError(t, st.PruneLedgerHashes(ctx, "testnet", 101))
+	hashes, err := st.LedgerHashes(ctx, "testnet", 1, 1000)
+	require.NoError(t, err)
+	assert.Empty(t, hashes)
+	hashes, err = st.LedgerHashes(ctx, "mainnet", 1, 1000)
+	require.NoError(t, err)
+	assert.Len(t, hashes, 1, "pruning one window must not erase another chain's")
+
+	// Retraction is fenced to one chain even at an identical ledger.
+	mTest := &Monitor{Name: "t", ContractIDs: []string{"CT"}, Enabled: true, Network: "testnet"}
+	mMain := &Monitor{Name: "m", ContractIDs: []string{"CM"}, Enabled: true, Network: "mainnet"}
+	require.NoError(t, st.CreateMonitor(ctx, mTest))
+	require.NoError(t, st.CreateMonitor(ctx, mMain))
+	rTest := &Rule{MonitorID: mTest.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+	rMain := &Rule{MonitorID: mMain.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, rTest))
+	require.NoError(t, st.CreateRule(ctx, rMain))
+	for _, a := range []*Alert{
+		{MonitorID: mTest.ID, RuleID: rTest.ID, EventID: "t-ev", Ledger: 500},
+		{MonitorID: mMain.ID, RuleID: rMain.ID, EventID: "m-ev", Ledger: 500},
+	} {
+		_, err := st.CreateAlert(ctx, a)
+		require.NoError(t, err)
+	}
+
+	n, err := st.RetractAlertsFromLedger(ctx, "testnet", 400, time.Now().UTC())
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), n, "only the alert from the reorganised chain is retracted")
+
+	mainAlerts, err := st.ListAlerts(ctx, AlertFilter{Network: "mainnet"})
+	require.NoError(t, err)
+	require.Len(t, mainAlerts, 1)
+	assert.Nil(t, mainAlerts[0].RetractedAt)
+}
+
+// testAssignLegacyNetwork pins the one-shot relabel an upgraded single-network
+// instance performs at startup: without it its own monitors vanish from every
+// network listing and its alert history sits outside every filter.
+func testAssignLegacyNetwork(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	m := &Monitor{Name: "pre-existing", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+	r := &Rule{MonitorID: m.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, r))
+	_, err := st.CreateAlert(ctx, &Alert{MonitorID: m.ID, RuleID: r.ID, EventID: "legacy-ev"})
+	require.NoError(t, err)
+	// A row written after the feature is already labelled and must stay put.
+	kept := &Monitor{Name: "new", ContractIDs: []string{"C2"}, Enabled: true, Network: "testnet"}
+	require.NoError(t, st.CreateMonitor(ctx, kept))
+
+	changed, err := st.AssignLegacyNetwork(ctx, "mainnet")
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), changed, "the monitor and its alert are both labelled")
+
+	labelled, err := st.GetMonitor(ctx, m.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "mainnet", labelled.Network)
+
+	alerts, err := st.ListAlerts(ctx, AlertFilter{Network: "mainnet"})
+	require.NoError(t, err)
+	require.Len(t, alerts, 1)
+	assert.Equal(t, "legacy-ev", alerts[0].EventID)
+
+	unchanged, err := st.GetMonitor(ctx, kept.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "testnet", unchanged.Network, "labelled rows are never rewritten")
+
+	again, err := st.AssignLegacyNetwork(ctx, "mainnet")
+	require.NoError(t, err)
+	assert.Zero(t, again, "idempotent: a restarted instance relabels nothing")
+
+	// A second run on a different primary cannot move the first batch.
+	moved, err := st.GetMonitor(ctx, m.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "mainnet", moved.Network)
 }
 
 // The four channel-config tests below run against both backends so the

@@ -39,7 +39,17 @@ type Config struct {
 	// Network is the Stellar network to monitor — its name, passphrase
 	// and RPC endpoint, resolved from NETWORK / RPC_URL /
 	// NETWORK_PASSPHRASE by ParseNetwork.
+	//
+	// It is the *primary* network: with NETWORKS set it is that list's first
+	// entry, and it is the network the startup upgrade labels pre-multi-network
+	// monitors and alerts with. Networks holds the full list to poll.
 	Network Network
+	// Networks is every Stellar network this instance polls, primary first,
+	// from NETWORKS (falling back to NETWORK alone). It is never empty, so
+	// single-network deployments are one-element lists rather than a special
+	// case — which is what keeps the poller supervisor free of any "if there
+	// is only one" branch.
+	Networks []Network
 	// RPCURL is the first Stellar RPC endpoint (JSON-RPC 2.0 over HTTP).
 	// This is Network.RPCURL; kept as a direct field since most call sites
 	// only need the URL.
@@ -75,7 +85,18 @@ type Config struct {
 	// authentication existed, and the process logs one startup warning.
 	// Hold the tokens here, not the raw string: the values are secrets and
 	// must never be logged or echoed.
+	//
+	// These tokens are unscoped: each one selects the default workspace.
+	// WORKSPACE_TOKENS (WorkspaceTokens below) is how a shared instance
+	// hands out one token per team.
 	APITokens []string
+	// WorkspaceTokens is the parsed WORKSPACE_TOKENS list, one
+	// workspace=token binding per comma-separated entry. It is what makes an
+	// instance multi-tenant over static credentials: the credential decides
+	// which workspace a request acts on, so no client can ask for another
+	// team's data. Load rejects an entry whose id is not a valid workspace id
+	// and a token that appears twice for two different workspaces.
+	WorkspaceTokens []WorkspaceToken
 	// PollInterval is how often the poller asks the RPC for new events.
 	PollInterval time.Duration
 	// SourceMode selects where events come from: "rpc" (standalone,
@@ -132,18 +153,28 @@ type Config struct {
 	// file://, dir:// or s3://bucket/prefix are accepted; the archive package
 	// validates it when the pruner is built.
 	ArchiveURL string
+	// OIDC is the dashboard's single sign-on provider (OIDC_*). Its zero value
+	// — and any value with an empty Issuer — is SSO off, which is the behaviour
+	// of every deployment that existed before this: /login accepts a token and
+	// nothing else. See oidc.go for the variables and their validation.
+	OIDC OIDC
 }
 
 // Load reads configuration from the environment. DATABASE_URL is the only
 // required variable; everything else has a sensible default.
 func Load() (Config, error) {
-	net, err := ParseNetwork(os.Getenv)
+	nets, err := ParseNetworks(os.Getenv)
 	if err != nil {
 		return Config{}, err
 	}
+	// The primary network is the list's first entry. With NETWORKS unset that
+	// entry is exactly what ParseNetwork resolves from NETWORK, so every
+	// consumer of the single-network fields below behaves as it always did.
+	net := nets[0]
 
 	cfg := Config{
 		Network:            net,
+		Networks:           nets,
 		RPCURL:             net.RPCURL,
 		RPCURLs:            net.RPCURLs,
 		DatabaseURL:        os.Getenv("DATABASE_URL"),
@@ -190,6 +221,14 @@ func Load() (Config, error) {
 	if cfg.SourceMode == "sorotrail" && cfg.SoroTrailURL == "" {
 		return cfg, fmt.Errorf("SOROTRAIL_URL is required when SOURCE_MODE=sorotrail")
 	}
+	// The upstream source is one SoroTrail deployment reading one chain: it has
+	// no per-network request to make, so a second entry in NETWORKS would be
+	// polled by nobody. Fail here instead of starting a supervisor whose
+	// testnet unit never advances.
+	if cfg.SourceMode == "sorotrail" && len(cfg.Networks) > 1 {
+		return cfg, fmt.Errorf("NETWORKS=%s lists %d chains but SOURCE_MODE=sorotrail reads events from a single upstream deployment; use SOURCE_MODE=rpc to poll several networks",
+			strings.Join(NetworkNames(cfg.Networks), ","), len(cfg.Networks))
+	}
 
 	if v := os.Getenv("POLL_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -215,6 +254,18 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.APITokens = tokens
+
+	wsTokens, err := parseWorkspaceTokens(os.Getenv("WORKSPACE_TOKENS"))
+	if err != nil {
+		return cfg, err
+	}
+	cfg.WorkspaceTokens = wsTokens
+	// Checked at load rather than where the list is read: an ambiguous
+	// credential must fail startup, not be discovered by whichever caller
+	// asks for the bindings first.
+	if _, err := cfg.AuthBindings(); err != nil {
+		return cfg, err
+	}
 
 	if v := os.Getenv("HTTP_MAX_BODY_BYTES"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -334,6 +385,12 @@ func Load() (Config, error) {
 	}
 	cfg.ArchiveURL = strings.TrimSpace(os.Getenv("ARCHIVE_URL"))
 
+	oidc, err := parseOIDC(os.Getenv)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.OIDC = oidc
+
 	return cfg, nil
 }
 
@@ -382,6 +439,15 @@ func (c Config) LogAttrs() []slog.Attr {
 		// The count, never the tokens themselves: LogAttrs is the one place
 		// configuration is printed, and an API token is a credential.
 		slog.Int("api_token_count", len(c.APITokens)),
+		// Workspace ids are not secrets (they are names an operator chose, and
+		// they appear in log lines and URLs everywhere else), and listing them
+		// is how an operator confirms WORKSPACE_TOKENS was read as intended.
+		slog.Any("workspaces", c.Workspaces()),
+		// Whether SSO is on, and not the issuer or the client id: this is the
+		// line that answers "did my OIDC_ variables land?" without printing the
+		// client secret that sits beside them. The provider's own coordinates
+		// are logged once, with more detail, when the client is built.
+		slog.Bool("sso_enabled", c.OIDC.Enabled()),
 	}
 }
 

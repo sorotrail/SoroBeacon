@@ -68,22 +68,43 @@ func (f *fakeRPC) GetHealth(context.Context) (*stellar.Health, error) {
 // semantics the real store enforces in SQL. now is injectable so tests can
 // advance the cooldown window without sleeping.
 type fakeStore struct {
+	// mu guards every field below. The supervisor runs one poller per network
+	// concurrently against a single store, so the fake has to be safe for that
+	// too or its own test would be racy rather than the code under test.
+	mu       sync.Mutex
 	monitors []store.Monitor
 	rules    map[int64][]store.Rule // monitor id -> rules
-	state    store.IngestState
-	alerts   []store.Alert
-	dedup    map[string]bool // "ruleID/eventID"
+	// state is the "" network's checkpoint — the pre-multi-network row — and is
+	// what every single-network test below reads and writes. namedState holds
+	// the per-network checkpoints, so a multi-network test can prove two pollers
+	// sharing one store never advance each other's cursor.
+	state       store.IngestState
+	namedState  map[string]store.IngestState
+	alerts      []store.Alert
+	dedup       map[string]bool // "ruleID/eventID"
+	lastRetract []retraction    // every retraction the poller asked for, in order
 
 	now        func() time.Time
 	lastFired  map[int64]time.Time // rule id -> last alert time
 	suppressed map[int64]int64     // rule id -> matches dropped this window
-	// ledgerHashes backs the reorg-detection half of the Store interface.
+	// ledgerHashes is the "" network's reorg window; namedWindows the per-network
+	// ones. Same split as the store's two tables.
 	ledgerHashes map[uint32]string
+	namedWindows map[string]map[uint32]string
+}
+
+// retraction records one RetractAlertsFromLedger call so a test can assert which
+// network was corrected, not just that something was.
+type retraction struct {
+	network string
+	ledger  uint32
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		ledgerHashes: map[uint32]string{},
+		namedWindows: map[string]map[uint32]string{},
+		namedState:   map[string]store.IngestState{},
 		rules:        map[int64][]store.Rule{},
 		dedup:        map[string]bool{},
 		now:          time.Now,
@@ -92,7 +113,23 @@ func newFakeStore() *fakeStore {
 	}
 }
 
+// window returns one network's ledger-hash window, creating a named one on
+// first use.
+func (f *fakeStore) window(network string) map[uint32]string {
+	if network == "" {
+		return f.ledgerHashes
+	}
+	w := f.namedWindows[network]
+	if w == nil {
+		w = map[uint32]string{}
+		f.namedWindows[network] = w
+	}
+	return w
+}
+
 func (f *fakeStore) ListMonitors(_ context.Context, enabledOnly bool) ([]store.Monitor, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var out []store.Monitor
 	for _, m := range f.monitors {
 		if !enabledOnly || m.Enabled {
@@ -103,6 +140,8 @@ func (f *fakeStore) ListMonitors(_ context.Context, enabledOnly bool) ([]store.M
 }
 
 func (f *fakeStore) ListRules(_ context.Context, monitorID int64, enabledOnly bool) ([]store.Rule, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var out []store.Rule
 	for _, r := range f.rules[monitorID] {
 		if !enabledOnly || r.Enabled {
@@ -113,6 +152,8 @@ func (f *fakeStore) ListRules(_ context.Context, monitorID int64, enabledOnly bo
 }
 
 func (f *fakeStore) CreateAlert(_ context.Context, a *store.Alert) (store.AlertOutcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	key := fmt.Sprintf("%d/%s", a.RuleID, a.EventID)
 	if f.dedup[key] {
 		return store.AlertDuplicate, nil // replay, not a fresh match
@@ -127,6 +168,15 @@ func (f *fakeStore) CreateAlert(_ context.Context, a *store.Alert) (store.AlertO
 	}
 	f.dedup[key] = true
 	a.ID = int64(len(f.alerts) + 1)
+	// The real store derives an alert's network from its monitor (the INSERT is
+	// a SELECT against monitors), so the fake does too: an alert's network is
+	// never whatever the caller happened to set.
+	for _, m := range f.monitors {
+		if m.ID == a.MonitorID {
+			a.Network = m.Network
+			break
+		}
+	}
 	if a.Cooldown > 0 {
 		a.SuppressedSinceLast = f.suppressed[a.RuleID]
 		f.suppressed[a.RuleID] = 0
@@ -148,9 +198,23 @@ func (f *fakeStore) CreateAlert(_ context.Context, a *store.Alert) (store.AlertO
 	return store.AlertCreated, nil
 }
 
-func (f *fakeStore) GetIngestState(context.Context) (store.IngestState, error) { return f.state, nil }
-func (f *fakeStore) SetIngestState(_ context.Context, s store.IngestState) error {
-	f.state = s
+func (f *fakeStore) GetIngestState(_ context.Context, network string) (store.IngestState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if network == "" {
+		return f.state, nil
+	}
+	return f.namedState[network], nil
+}
+
+func (f *fakeStore) SetIngestState(_ context.Context, network string, s store.IngestState) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if network == "" {
+		f.state = s
+		return nil
+	}
+	f.namedState[network] = s
 	return nil
 }
 

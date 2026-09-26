@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/sorotrail/sorobeacon/internal/notify"
@@ -16,7 +17,8 @@ import (
 )
 
 // parseAlertFilter reads the shared alert listing query params
-// (monitor_id, rule_id, contract_id, from, to as RFC 3339, sort, limit,
+// (monitor_id, rule_id, contract_id, network, from, to as RFC 3339, sort,
+// limit,
 // cursor). GET /alerts and GET /alerts.csv both call it so the two
 // endpoints cannot drift on which params exist or how bad values are
 // reported. On failure it has already written the error envelope.
@@ -41,6 +43,11 @@ func parseAlertFilter(w http.ResponseWriter, r *http.Request) (store.AlertFilter
 		f.RuleID = id
 	}
 	f.ContractID = q.Get("contract_id")
+	// Network narrows the feed to one chain. Alerts carry the network their
+	// monitor was on, so this is a plain equality filter rather than a
+	// join back to monitors — and an alert from before networks existed
+	// matches no name, which is what "?network=" should mean: this chain's.
+	f.Network = strings.ToLower(strings.TrimSpace(q.Get("network")))
 	if v := q.Get("sort"); v != "" {
 		switch v {
 		case "created_at_desc", "created_at_asc":
@@ -132,7 +139,7 @@ const alertExportPageSize = 500
 // off column position, so new columns are appended, never inserted.
 var alertCSVHeader = []string{
 	"id", "monitor_name", "rule_id", "contract_id",
-	"event_name", "event_id", "ledger", "created_at", "payload",
+	"event_name", "event_id", "ledger", "created_at", "payload", "network",
 }
 
 // exportAlertsCSV serves GET /alerts.csv. It shares parseAlertFilter with
@@ -230,6 +237,9 @@ func alertCSVRow(a store.Alert, monitorName string) []string {
 		strconv.FormatUint(uint64(p.Ledger), 10),
 		a.CreatedAt.UTC().Format(time.RFC3339),
 		csvSafe(string(a.Payload)),
+		// Which chain's node produced the row — on a multi-network instance
+		// the same contract id in two exports means two different contracts.
+		csvSafe(a.Network),
 	}
 }
 

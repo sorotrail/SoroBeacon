@@ -41,7 +41,9 @@ func newTestPostgres(t *testing.T) conformanceStore {
 func (p *Postgres) resetConformance(ctx context.Context) error {
 	_, err := p.pool.Exec(ctx,
 		`TRUNCATE monitors, rules, channels, monitor_channels, alerts, delivery_attempts,
-		         saved_searches, monitor_templates RESTART IDENTITY CASCADE;
+		         saved_searches, monitor_templates, ledger_hashes, network_ingest_state,
+		         network_ledger_hashes
+		     RESTART IDENTITY CASCADE;
 		 UPDATE ingest_state SET last_ledger = 0, last_cursor = '' WHERE id = 1`)
 	return err
 }

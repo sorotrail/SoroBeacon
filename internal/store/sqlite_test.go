@@ -45,6 +45,9 @@ func (s *SQLite) resetConformance(ctx context.Context) error {
 		 DELETE FROM monitors;
 		 DELETE FROM saved_searches;
 		 DELETE FROM monitor_templates;
+		 DELETE FROM ledger_hashes;
+		 DELETE FROM network_ledger_hashes;
+		 DELETE FROM network_ingest_state;
 		 UPDATE ingest_state SET last_ledger = 0, last_cursor = '' WHERE id = 1`); err != nil {
 		return err
 	}
@@ -143,7 +146,7 @@ func TestSQLiteMigrateIdempotent(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(st.Close)
 
-	state, err := st.GetIngestState(context.Background())
+	state, err := st.GetIngestState(context.Background(), "")
 	require.NoError(t, err)
 	assert.Zero(t, state.LastLedger)
 }

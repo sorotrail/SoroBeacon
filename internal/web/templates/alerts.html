@@ -10,6 +10,13 @@
   </select>
   <label for="rule_id">Rule</label>
   <input type="number" id="rule_id" name="rule_id" value="{{if .SelectedRule}}{{.SelectedRule}}{{end}}" min="1" placeholder="id">
+  {{if gt (len .Networks) 1}}
+  <label for="network">Network</label>
+  <select id="network" name="network">
+    <option value="" {{if eq .Network ""}}selected{{end}}>All</option>
+    {{range .Networks}}<option value="{{.}}" {{if eq . $.Network}}selected{{end}}>{{.}}</option>{{end}}
+  </select>
+  {{end}}
   <label for="contract_id">Contract</label>
   <input type="search" id="contract_id" name="contract_id" value="{{.ContractID}}" placeholder="contract id">
   <label for="sort">Sort</label>
@@ -22,11 +29,12 @@
 <p class="export"><a href="{{.ExportHref}}">Export CSV</a> | <a href="/searches">Saved searches</a></p>
 {{if .Alerts}}
 <table>
-  <tr><th>ID</th><th>Monitor</th><th>Rule</th><th>Event</th><th>Payload</th><th>Deliveries</th><th>At</th></tr>
+  <tr><th>ID</th><th>Monitor</th>{{if gt (len $.Networks) 1}}<th>Network</th>{{end}}<th>Rule</th><th>Event</th><th>Payload</th><th>Deliveries</th><th>At</th></tr>
   {{range .Alerts}}
   <tr>
     <td><a href="/alerts/{{.ID}}">{{.ID}}</a></td>
     <td>{{index $.MonitorNames .MonitorID}}</td>
+    {{if gt (len $.Networks) 1}}<td>{{if .Network}}{{.Network}}{{else}}<span class="muted">unassigned</span>{{end}}</td>{{end}}
     <td>#{{.RuleID}}</td>
     <td>{{template "copyID" .EventID}}</td>
     <td><details><summary>view</summary>{{decodedEvent .Payload}}<pre>{{prettyJSON .Payload}}</pre></details></td>
@@ -41,7 +49,7 @@
   {{end}}
 </table>
 {{if .OlderHref}}<p><a href="{{.OlderHref}}">Older →</a></p>{{end}}
-{{else if or .SelectedMonitor .SelectedRule .ContractID}}<p class="muted">No alerts match these filters.</p>
+{{else if or .SelectedMonitor .SelectedRule .ContractID .Network}}<p class="muted">No alerts match these filters.</p>
 {{else if eq .Empty "no_monitors"}}
 <section class="empty">
   <h2>Nothing is being watched yet</h2>

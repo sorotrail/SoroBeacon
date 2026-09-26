@@ -20,6 +20,13 @@
     <option value="true" {{if eq .Enabled "true"}}selected{{end}}>Enabled</option>
     <option value="false" {{if eq .Enabled "false"}}selected{{end}}>Disabled</option>
   </select>
+  {{if gt (len .Networks) 1}}
+  <label for="network">Network</label>
+  <select id="network" name="network">
+    <option value="" {{if eq .Network ""}}selected{{end}}>All</option>
+    {{range .Networks}}<option value="{{.}}" {{if eq . $.Network}}selected{{end}}>{{.}}</option>{{end}}
+  </select>
+  {{end}}
   <label for="sort">Sort</label>
   <select id="sort" name="sort">
     <option value="name" {{if eq .Sort "name"}}selected{{end}}>Name</option>
@@ -39,7 +46,7 @@
 <table>
   <tr>
     <th><input type="checkbox" aria-label="Select all" onclick="document.querySelectorAll('input[name=ids]').forEach(c => c.checked = this.checked)"></th>
-    <th>ID</th><th>Name</th><th>Contracts</th><th>Last matched</th><th>Status</th><th>Created</th><th></th>
+    <th>ID</th><th>Name</th><th>Contracts</th>{{if gt (len $.Networks) 1}}<th>Network</th>{{end}}<th>Last matched</th><th>Status</th><th>Created</th><th></th>
   </tr>
   {{range .Monitors}}
   <tr>
@@ -47,6 +54,7 @@
     <td>{{.ID}}</td>
     <td><a href="/monitors/{{.ID}}">{{.Name}}</a></td>
     <td>{{range .ContractIDs}}{{template "copyID" .}}<br>{{end}}</td>
+    {{if gt (len $.Networks) 1}}<td>{{if .Network}}{{.Network}}{{else}}<span class="muted">unassigned</span>{{end}}</td>{{end}}
     <td>{{if eq .Cue "never"}}<span class="pill never">never</span>{{else}}{{.MatchedHTML}}{{if eq .Cue "silent"}} <span class="pill silent">silent</span>{{end}}{{end}}</td>
     <td>{{if .Enabled}}<span class="pill on">enabled</span>{{else}}<span class="pill off">disabled</span>{{end}}</td>
     <td>{{formatTime .CreatedAt $.Timezone}}{{with relTime .CreatedAt}} <span class="muted">({{.}})</span>{{end}}</td>
@@ -59,7 +67,7 @@
   {{end}}
 </table>
 {{if .OlderHref}}<p><a href="{{.OlderHref}}">Older →</a></p>{{end}}
-{{else if or .Query (eq .Enabled "true") (eq .Enabled "false")}}<p class="muted">No monitors match these filters.</p>
+{{else if or .Query .Network (eq .Enabled "true") (eq .Enabled "false")}}<p class="muted">No monitors match these filters.</p>
 {{else}}<p class="muted">No monitors yet — create one below.</p>{{end}}
 
 <fieldset>
@@ -69,6 +77,13 @@
     <input type="text" id="name" name="name" required>
     <label for="contract_ids">Contract IDs (one per line)</label>
     <textarea id="contract_ids" name="contract_ids" rows="3" required placeholder="CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"></textarea>
+    {{if gt (len .Networks) 1}}
+    <label for="new_network">Network</label>
+    <select id="new_network" name="network">
+      {{range .Networks}}<option value="{{.}}" {{if eq . $.NewNetwork}}selected{{end}}>{{.}}</option>{{end}}
+    </select>
+    <p class="muted">Contract IDs are only valid on the chain they were deployed to, and a monitor cannot be moved later — delete and recreate it to switch.</p>
+    {{end}}
     <p><button>Create</button></p>
   </form>
 </fieldset>
@@ -80,6 +95,13 @@
     <input type="text" id="import_name" name="name" value="imported" required>
     <label for="import_file">File (CSV or JSON, one contract ID per line)</label>
     <input type="file" id="import_file" name="file" accept=".csv,.json,.txt" required>
+    {{if gt (len .Networks) 1}}
+    <label for="import_network">Network</label>
+    <select id="import_network" name="network">
+      {{range .Networks}}<option value="{{.}}" {{if eq . $.NewNetwork}}selected{{end}}>{{.}}</option>{{end}}
+    </select>
+    <p class="muted">Imported IDs are watched on this chain only. An ID is a different contract on another network.</p>
+    {{end}}
     <p><button>Import</button></p>
   </form>
 </fieldset>

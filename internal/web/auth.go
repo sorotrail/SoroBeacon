@@ -7,17 +7,21 @@ import (
 	"time"
 
 	"github.com/sorotrail/sorobeacon/internal/auth"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 // Dashboard sign-in.
 //
 // The dashboard has no user accounts and is not going to grow any: it accepts
-// the same static token as the API (API_TOKEN) and, on success, sets an
-// HttpOnly session cookie. A cookie rather than HTTP Basic because Basic
-// credentials are cached by the browser and replayed on requests the page did
-// not initiate — including cross-site ones — while a SameSite=Lax cookie is
-// withheld from exactly those, so the dashboard's state-changing forms cannot
-// be forged from another origin.
+// the same static token as the API (API_TOKEN, or one workspace's token from
+// WORKSPACE_TOKENS) and, on success, sets an HttpOnly session cookie. A cookie
+// rather than HTTP Basic because Basic credentials are cached by the browser
+// and replayed on requests the page did not initiate — including cross-site
+// ones — while a SameSite=Lax cookie is withheld from exactly those, so the
+// dashboard's state-changing forms cannot be forged from another origin.
+//
+// The token also decides which workspace the signed-in session sees, so a
+// dashboard opened with a team's token cannot list another team's monitors.
 //
 // Sessions live in memory (internal/auth): a restart signs everyone out.
 // There is no user database to invalidate against, and re-entering the token
@@ -28,14 +32,18 @@ const (
 )
 
 // authExempt reports whether a dashboard path is served without a session.
-// /login has to be reachable to sign in at all; /favicon.ico so an
-// unauthenticated page load does not answer the icon request with a login
-// redirect; /theme and /timezone because they set presentation cookies only —
-// no data is read or written — and the sign-in page renders the same header
-// (and therefore the same theme switch) as every other page.
+// /login has to be reachable to sign in at all; the two OIDC paths for the same
+// reason and in both directions — a visitor who is not signed in needs to start
+// the flow, and the provider's callback arrives with nothing but a state and a
+// code, so gating it would turn every callback into a redirect back to the
+// start and never complete a login. /favicon.ico so an unauthenticated page
+// load does not answer the icon request with a login redirect; /theme and
+// /timezone because they set presentation cookies only — no data is read or
+// written — and the sign-in page renders the same header (and therefore the
+// same theme switch) as every other page.
 func authExempt(path string) bool {
 	switch path {
-	case loginPath, logoutPath, "/favicon.ico", "/theme", "/timezone":
+	case loginPath, logoutPath, "/favicon.ico", "/theme", "/timezone", oidcStartPath, oidcCallbackPath:
 		return true
 	default:
 		return false
@@ -76,25 +84,34 @@ func (s *Server) authEnabled() bool {
 	return s.auth.Enabled()
 }
 
-// authMiddleware gates every dashboard route on a live session. Exempt paths
-// are the sign-in flow itself and the presentation-only cookie routes above.
+// authMiddleware gates every dashboard route on a live session and scopes the
+// request to the workspace that session was signed into. Exempt paths are the
+// sign-in flow itself and the presentation-only cookie routes above.
+//
+// The scope comes from the session, which inherited it from the token at
+// /login: the dashboard never asks the browser which workspace it wants.
 func (s *Server) authMiddleware() func(http.Handler) http.Handler {
 	if !s.authEnabled() {
 		return func(next http.Handler) http.Handler { return next }
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if authExempt(r.URL.Path) || s.auth.HasSession(auth.SessionID(r)) {
+			if authExempt(r.URL.Path) {
 				next.ServeHTTP(w, r)
 				return
 			}
-			// Every dashboard client is a browser, so answer with the sign-in
-			// page rather than a bodyless 401. 303 matters for the POSTs
-			// (create, toggle, delete, retry): it converts them into a GET of
-			// /login instead of a "resubmit form?" prompt, and deliberately
-			// drops the body — an unauthenticated POST must not be replayed
-			// once the operator signs in.
-			http.Redirect(w, r, loginPath+"?next="+url.QueryEscape(safeNext(r.URL.RequestURI())), http.StatusSeeOther)
+			ws, ok := s.auth.SessionWorkspace(auth.SessionID(r))
+			if !ok {
+				// Every dashboard client is a browser, so answer with the sign-in
+				// page rather than a bodyless 401. 303 matters for the POSTs
+				// (create, toggle, delete, retry): it converts them into a GET of
+				// /login instead of a "resubmit form?" prompt, and deliberately
+				// drops the body — an unauthenticated POST must not be replayed
+				// once the operator signs in.
+				http.Redirect(w, r, loginPath+"?next="+url.QueryEscape(safeNext(r.URL.RequestURI())), http.StatusSeeOther)
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(workspace.With(r.Context(), ws)))
 		})
 	}
 }
@@ -110,6 +127,28 @@ func safeNext(v string) string {
 	return v
 }
 
+// loginData is the sign-in page's scaffold, shared by the GET, the rejected
+// token and a failed SSO round-trip, so the three cannot drift into offering
+// different ways in. What the page offers depends on what the instance accepts:
+// a token form only when a static token exists, an SSO button only when a
+// provider does, and both when an operator is migrating from one to the other.
+func (s *Server) loginData(r *http.Request, next, errMsg string) map[string]any {
+	data := map[string]any{
+		"Title":      "Sign in",
+		"Next":       next,
+		"LocalLogin": s.auth.HasStaticTokens(),
+	}
+	if p := s.auth.OIDC(); p.Enabled() {
+		// The display name is the issuer's host, so the label on the button says
+		// who the browser is about to be sent to.
+		data["SSO"] = p.DisplayName()
+	}
+	if errMsg != "" {
+		data["Error"] = errMsg
+	}
+	return data
+}
+
 // loginPage renders the sign-in form. Already being signed in is not an
 // error, it is just nothing to do here, so it redirects to the overview.
 func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
@@ -117,10 +156,7 @@ func (s *Server) loginPage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	s.render(w, r, "login", map[string]any{
-		"Title": "Sign in",
-		"Next":  safeNext(r.URL.Query().Get("next")),
-	})
+	s.render(w, r, "login", s.loginData(r, safeNext(r.URL.Query().Get("next")), ""))
 }
 
 // login checks the submitted token and starts a session. The token never
@@ -140,11 +176,8 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.auth.Login(strings.TrimSpace(r.PostFormValue("token")))
 	if !ok {
 		s.log.Warn("dashboard sign-in rejected", "remote_addr", r.RemoteAddr)
-		s.renderStatus(w, r, http.StatusUnauthorized, "login", map[string]any{
-			"Title": "Sign in",
-			"Next":  next,
-			"Error": "That token was not accepted.",
-		})
+		s.renderStatus(w, r, http.StatusUnauthorized, "login",
+			s.loginData(r, next, "That token was not accepted."))
 		return
 	}
 

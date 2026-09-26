@@ -62,6 +62,12 @@
             "description": "Allowlisted order: name (default), id (newest first), created_at"
           },
           {
+            "name": "network",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Only monitors watching this Stellar chain. Omitted means every chain this instance polls."
+          },
+          {
             "name": "limit",
             "in": "query",
             "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
@@ -440,6 +446,12 @@
             "description": "Keyset order; anything else is 400"
           },
           {
+            "name": "network",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Only alerts whose event came from this Stellar chain. Omitted means every chain."
+          },
+          {
             "name": "since",
             "in": "query",
             "schema": { "type": "string", "format": "date-time" },
@@ -478,7 +490,7 @@
     "/alerts.csv": {
       "get": {
         "summary": "Export alerts as CSV",
-        "description": "Streams every alert matching the same filters as GET /alerts as text/csv. Columns are fixed: id, monitor_name, rule_id, contract_id, event_name, event_id, ledger, created_at, payload. Values beginning with =, +, - or @ are prefixed with an apostrophe to prevent spreadsheet formula injection. When no limit is given the export is capped at 10000 rows.",
+        "description": "Streams every alert matching the same filters as GET /alerts as text/csv. Columns are fixed: id, monitor_name, rule_id, contract_id, event_name, event_id, ledger, created_at, payload, network. Column position is part of the contract, so a new column is always appended, never inserted. Values beginning with =, +, - or @ are prefixed with an apostrophe to prevent spreadsheet formula injection. When no limit is given the export is capped at 10000 rows.",
         "parameters": [
           {
             "name": "monitor_id",
@@ -513,6 +525,12 @@
             "in": "query",
             "schema": { "type": "string", "enum": ["created_at_desc", "created_at_asc"], "default": "created_at_desc" },
             "description": "Keyset order; anything else is 400"
+          },
+          {
+            "name": "network",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Only alerts whose event came from this Stellar chain. Omitted means every chain."
           },
           {
             "name": "limit",
@@ -592,7 +610,7 @@
     "/health": {
       "get": {
         "summary": "Combined health report",
-        "description": "Legacy combined check; prefer /livez and /readyz. Exempt from authentication so probes and the docker-compose healthcheck keep working.",
+        "description": "Legacy combined check; prefer /livez and /readyz. Exempt from authentication so probes and the docker-compose healthcheck keep working. On an instance that polls several Stellar networks the body adds a `networks` array — per chain: source state, last processed ledger, chain tip, lag and last successful poll — and answers 503 `degraded` when any chain's source is failing. The top-level `rpc` field is only ever the primary chain's source, which is why the array exists.",
         "security": [],
         "responses": {
           "200": { "description": "Healthy" },
@@ -613,7 +631,7 @@
     "/readyz": {
       "get": {
         "summary": "Readiness probe",
-        "description": "Checks the database and the event source concurrently, bounded by a 3s timeout each, reporting per-dependency detail. Wire to readinessProbe. Exempt from authentication, so its per-dependency detail is readable without a token — do not expose it to the public internet.",
+        "description": "Checks the database and the event source concurrently, bounded by a 3s timeout each, reporting per-dependency detail. On an instance that polls several Stellar networks each chain gets its own check (`rpc_testnet`, `rpc_mainnet`, ...) alongside the primary chain's `rpc`, so a node that is down on one chain cannot read as ready. Wire to readinessProbe. Exempt from authentication, so its per-dependency detail is readable without a token — do not expose it to the public internet.",
         "security": [],
         "responses": {
           "200": { "description": "Ready" },
@@ -873,6 +891,70 @@
           "400": { "$ref": "#/components/responses/Error" }
         }
       }
+    },
+    "/tokens": {
+      "post": {
+        "summary": "Mint a scoped API token",
+        "description": "Creates a database-backed credential: `sb_` followed by 32 random bytes, base64url-encoded. The response's `token` field is the only place the secret ever appears — the row stores a SHA-256 digest of it, so it cannot be read back, listed, logged or recovered. A client that loses the secret mints a new token and revokes the old one.\n\n`scopes` is required and non-empty: a token with no scope authenticates and can then call nothing. Every scope must come from the enumeration below. A request carrying a scoped token may only grant scopes it already holds, so `tokens:write` is not a road back to full control. `expires_in` is a Go duration string (`72h`, `168h`); omit it for a token that never expires.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TokenInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Minted. The only response in the API that contains a token secret.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CreatedAPIToken" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/TokenManagementDisabled" }
+        }
+      },
+      "get": {
+        "summary": "List API tokens",
+        "description": "Lists the caller's workspace's tokens: name, display prefix, scopes and lifecycle timestamps. Never a secret and never the stored digest.",
+        "responses": {
+          "200": {
+            "description": "Tokens, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tokens": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/APIToken" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/TokenManagementDisabled" }
+        }
+      }
+    },
+    "/tokens/{id}/revoke": {
+      "post": {
+        "summary": "Revoke an API token",
+        "description": "Stops a token immediately: the next request with it authenticates as no credential at all. The row survives with its `revoked_at` set, so the audit trail (name, prefix, scopes, last use) outlives the credential. Revoking twice is idempotent and keeps the first `revoked_at`. A token can only be revoked by the workspace that owns it; another workspace's id and a nonexistent id get the same 404.",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "responses": {
+          "204": { "description": "Revoked" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/TokenManagementDisabled" }
+        }
+      }
     }
   },
   "components": {
@@ -880,7 +962,7 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "One of the static tokens from API_TOKEN (comma-separated to allow rotation). A dashboard session cookie from /login is accepted in the browser's own same-origin requests."
+        "description": "Any of three credentials. (1) A static token from API_TOKEN (comma-separated to allow rotation): full reach over the default workspace. (2) A scoped token minted by POST /tokens — it looks like `sb_…`, and carries a scope list, an optional expiry and a revocation. Each route names the scopes it requires; a route that has no mapping denies a scoped token with 403 rather than allowing it. (3) A dashboard session cookie from /login, accepted in the browser's own same-origin requests. A token from WORKSPACE_TOKENS (`workspace=token` pairs) is accepted the same way as (1) but additionally scopes the request: it sees and changes only that workspace's monitors, channels, rules, alerts, saved searches and templates. `API_TOKEN`'s tokens belong to the `default` workspace, as do rows created before workspaces existed. Scoped tokens are workspace-bound too: the workspace comes from the row that stores the token's digest, not from the request. There is deliberately no X-Workspace header or query parameter — the workspace is a property of the credential, so a client cannot ask for another tenant's data."
       }
     },
     "parameters": {
@@ -904,6 +986,14 @@
       }
     },
     "responses": {
+      "TokenManagementDisabled": {
+        "description": "Token management is not configured on this instance: it needs a database-backed store, so an unset deployment answers this way rather than pretending to mint.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      },
       "Error": {
         "description": "Error envelope",
         "content": {
@@ -962,6 +1052,10 @@
             "description": "Soroban contract strkeys (C...)"
           },
           "enabled": { "type": "boolean" },
+          "network": {
+            "type": "string",
+            "description": "Stellar chain this monitor watches. Empty on rows created before multi-network ingestion, which startup labels with the primary network."
+          },
           "channel_ids": {
             "type": "array",
             "items": { "type": "integer", "format": "int64" }
@@ -979,6 +1073,10 @@
             "items": { "type": "string", "pattern": "^C[A-Z2-7]{55}$" }
           },
           "enabled": { "type": "boolean", "default": true },
+          "network": {
+            "type": "string",
+            "description": "Stellar chain these contract ids live on, chosen at creation. Omitted means the instance's primary network (the first entry in NETWORKS, or NETWORK when unset). A name this instance does not poll is rejected: the monitor would match nothing forever. A monitor's network cannot be changed afterwards — a contract id resolves to a different contract on another chain, and the alerts already stored keep their old label — so moving one means deleting and recreating it."
+          },
           "channel_ids": {
             "type": "array",
             "items": { "type": "integer", "format": "int64" }
@@ -1116,6 +1214,10 @@
           "event_id": { "type": "string" },
           "event_name": { "type": "string" },
           "payload": { "type": "object" },
+          "network": {
+            "type": "string",
+            "description": "Stellar chain the matching event came from. Taken from the monitor, never from the caller: it is what a reorg on that chain may retract and no other chain's."
+          },
           "created_at": { "type": "string", "format": "date-time" }
         }
       },
@@ -1212,6 +1314,10 @@
           "parameters": {
             "type": "object",
             "additionalProperties": { "type": "string" }
+          },
+          "network": {
+            "type": "string",
+            "description": "Chain the instantiated monitor watches. A template is chain-agnostic text, so this defaults to the instance's primary network."
           }
         }
       },
@@ -1222,7 +1328,11 @@
           "name": { "type": "string", "description": "Monitor name prefix" },
           "contract_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 500 },
           "channel_ids": { "type": "array", "items": { "type": "integer", "format": "int64" } },
-          "enabled": { "type": "boolean", "default": true }
+          "enabled": { "type": "boolean", "default": true },
+          "network": {
+            "type": "string",
+            "description": "Chain every monitor in this batch watches. Omitted means the primary. The already-monitored check is per network: the same id on another chain is a different contract, and watching it there is normal."
+          }
         }
       },
       "ImportRowResult": {
@@ -1233,6 +1343,67 @@
           "monitor_id": { "type": "integer", "format": "int64" },
           "status": { "type": "string", "enum": ["created", "skipped", "error"] },
           "error": { "type": "string" }
+        }
+      },
+      "Scope": {
+        "type": "string",
+        "description": "A permission a token can carry, as `<resource>:<read|write>`. `write` implies `read` on the same resource, and `*` carries every scope. Routes not listed here are denied: an unmapped route answers 403 to a scoped token rather than guessing.",
+        "enum": [
+          "monitors:read", "monitors:write",
+          "channels:read", "channels:write",
+          "alerts:read", "alerts:write",
+          "templates:read", "templates:write",
+          "stats:read",
+          "tokens:read", "tokens:write",
+          "*"
+        ]
+      },
+      "TokenInput": {
+        "type": "object",
+        "required": ["scopes"],
+        "properties": {
+          "name": { "type": "string", "maxLength": 64, "description": "Label for the token list, e.g. 'ci-deploy'. Defaults to 'token'." },
+          "scopes": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Scope" },
+            "description": "At least one. Unknown or misspelled scopes are a 400 field error, never a silently dropped entry."
+          },
+          "expires_in": {
+            "type": "string",
+            "description": "Go duration string measured from now ('72h', '168h'). Omit or leave empty for a token that never expires. A non-positive or unparseable value is a 400."
+          }
+        }
+      },
+      "APIToken": {
+        "type": "object",
+        "description": "One token as stored and listed: enough to recognise and audit it, with nothing in it to steal. There is no field holding the secret, because only a digest is stored.",
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "name": { "type": "string" },
+          "prefix": {
+            "type": "string",
+            "description": "The leading characters of the secret (`sb_` plus eight), for matching a token you have pasted somewhere. Not a hash and not derivable into the secret."
+          },
+          "scopes": { "type": "array", "items": { "$ref": "#/components/schemas/Scope" } },
+          "created_at": { "type": "string", "format": "date-time" },
+          "expires_at": { "type": ["string", "null"], "format": "date-time", "description": "null when the token never expires" },
+          "last_used_at": {
+            "type": ["string", "null"],
+            "format": "date-time",
+            "description": "null until the token is first presented. Updated at most once a minute per token, so it is an indicator, not a precise audit timestamp."
+          },
+          "revoked_at": { "type": ["string", "null"], "format": "date-time", "description": "null while the token is live" }
+        }
+      },
+      "CreatedAPIToken": {
+        "type": "object",
+        "description": "An APIToken plus the secret, and the only schema in this document that has one.",
+        "allOf": [{ "$ref": "#/components/schemas/APIToken" }],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "The raw token: `sb_` followed by 43 base64url characters. Return it to the caller once and never again — it is not retrievable afterwards, so store it client-side or mint another."
+          }
         }
       }
     }

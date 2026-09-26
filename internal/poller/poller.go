@@ -5,7 +5,9 @@ package poller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -20,6 +22,11 @@ import (
 // to the chain. A zero LastSuccessfulPoll means no successful poll has
 // completed yet — callers must not treat the ledger fields as "in sync".
 type Position struct {
+	// Network is the chain this snapshot describes, "" for an instance that
+	// was never scoped to one. Lag is only comparable within one network:
+	// each chain produces ledgers on its own schedule, so a public-network
+	// lag of 5 and a futurenet lag of 40 are different amounts of lateness.
+	Network             string
 	LastProcessedLedger uint32
 	LatestChainLedger   uint32
 	LastSuccessfulPoll  time.Time
@@ -34,18 +41,23 @@ func (p Position) Lag() int64 {
 }
 
 // Store is the slice of the store the poller needs.
+//
+// The ingest and reorg-window methods take this poller's network. Each chain
+// keeps its own cursor and its own ledger-hash window, so two pollers running
+// concurrently cannot rewind each other, and a reorg on one chain cannot
+// retract the other chain's alerts.
 type Store interface {
 	ListMonitors(ctx context.Context, enabledOnly bool) ([]store.Monitor, error)
 	ListRules(ctx context.Context, monitorID int64, enabledOnly bool) ([]store.Rule, error)
 	CreateAlert(ctx context.Context, a *store.Alert) (store.AlertOutcome, error)
-	GetIngestState(ctx context.Context) (store.IngestState, error)
-	SetIngestState(ctx context.Context, s store.IngestState) error
+	GetIngestState(ctx context.Context, network string) (store.IngestState, error)
+	SetIngestState(ctx context.Context, network string, s store.IngestState) error
 	// The ledger-hash window backing reorg detection, and the retraction
 	// write that marks alerts orphaned by a reorg.
-	RecordLedgerHashes(ctx context.Context, hashes []store.LedgerHash) error
-	LedgerHashes(ctx context.Context, from, to uint32) ([]store.LedgerHash, error)
-	PruneLedgerHashes(ctx context.Context, before uint32) error
-	RetractAlertsFromLedger(ctx context.Context, ledger uint32, at time.Time) (int64, error)
+	RecordLedgerHashes(ctx context.Context, network string, hashes []store.LedgerHash) error
+	LedgerHashes(ctx context.Context, network string, from, to uint32) ([]store.LedgerHash, error)
+	PruneLedgerHashes(ctx context.Context, network string, before uint32) error
+	RetractAlertsFromLedger(ctx context.Context, network string, ledger uint32, at time.Time) (int64, error)
 }
 
 // Dispatcher receives every newly created alert. Implemented by
@@ -63,6 +75,12 @@ type Poller struct {
 	dispatch Dispatcher
 	interval time.Duration
 	log      *slog.Logger
+	// network is the Stellar network this poller ingests: the only monitors it
+	// watches, the only checkpoint it advances and the only reorg window it
+	// reads. Empty means "the pre-multi-network instance": every monitor, and
+	// the legacy single-row ingest state — which is what keeps every existing
+	// caller and test of New unchanged.
+	network string
 	// metrics is optional instrumentation; nil-safe, see internal/metrics.
 	metrics *metrics.Metrics
 	// scanned/matched accumulate per-cycle counts for metrics.
@@ -81,6 +99,12 @@ type Poller struct {
 	// confirmDepth is how many ledgers behind the tip an event must be before
 	// it may alert. Zero alerts immediately, which is the historical default.
 	confirmDepth uint32
+	// knownNetworks, set only on the supervisor's reporting unit, is every
+	// network this instance polls. Non-nil enables the one-shot warning about
+	// monitors on a chain no unit polls.
+	knownNetworks []string
+	// warnedOrphans latches that warning so it cannot repeat.
+	warnedOrphans bool
 }
 
 // Position returns the last successful poll snapshot. Safe to call from
@@ -95,6 +119,7 @@ func (p *Poller) Position() Position {
 
 func (p *Poller) recordPosition(processed, latest uint32, at time.Time) {
 	p.pos.Store(Position{
+		Network:             p.network,
 		LastProcessedLedger: processed,
 		LatestChainLedger:   latest,
 		LastSuccessfulPoll:  at.UTC(),
@@ -115,11 +140,44 @@ func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval 
 	}
 }
 
-// WithMetrics attaches Prometheus instrumentation to the poll loop.
+// WithMetrics attaches Prometheus instrumentation to the poll loop, labelled
+// with this poller's network when one was set first.
 func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
-	p.metrics = m
+	p.metrics = forNetwork(m, p.network)
 	return p
 }
+
+// WithNetwork restricts a Poller to one Stellar network: it watches only that
+// network's monitors, advances only that network's checkpoint, and retracts
+// only that network's alerts on a reorg. Not calling it leaves the poller in
+// the pre-multi-network mode — every monitor, the single legacy ingest row —
+// which is what an instance that configures one network through the legacy
+// fields still gets.
+func (p *Poller) WithNetwork(network string) *Poller {
+	p.network = network
+	// Every line this poller emits is about one chain, so an operator reading
+	// a two-network log can tell them apart. Metrics are labelled the same
+	// way, whichever of the two With-methods runs first.
+	if p.log != nil && network != "" {
+		p.log = p.log.With("network", network)
+	}
+	p.metrics = forNetwork(p.metrics, network)
+	return p
+}
+
+// forNetwork returns m labelled for network, or m unchanged when there is no
+// network to label with. metrics is nil-safe, so a nil m is expected here.
+func forNetwork(m *metrics.Metrics, network string) *metrics.Metrics {
+	if m == nil || network == "" {
+		return m
+	}
+	return m.WithNetwork(network)
+}
+
+// Network reports the network this poller ingests, "" for the legacy
+// all-networks mode. The supervisor and the health endpoint key their
+// per-network reporting on it.
+func (p *Poller) Network() string { return p.network }
 
 // WithReorg enables reorg detection over a window of `window` recent ledgers
 // and holds alerts until they are `depth` ledgers behind the tip. window 0
@@ -168,6 +226,49 @@ func (p *Poller) Poll(ctx context.Context) error {
 	monitors, err := p.store.ListMonitors(ctx, true)
 	if err != nil {
 		return err
+	}
+	// One poller per network, so every other network's monitors are not just
+	// uninteresting here, they are wrong: the same contract id on two chains
+	// names two different things. The filter happens after the read rather
+	// than in it because ListMonitors is the shared, unfiltered listing the
+	// rest of the ingest path uses; a monitor whose network is still empty
+	// belongs to no chain yet, so no named poller claims it — startup's
+	// AssignLegacyNetwork is what labels those rows.
+	if p.network != "" {
+		own := make([]store.Monitor, 0, len(monitors))
+		var orphans []string
+		polled := make(map[string]bool, len(p.knownNetworks))
+		for _, n := range p.knownNetworks {
+			polled[n] = true
+		}
+		for _, m := range monitors {
+			if m.Network == p.network {
+				own = append(own, m)
+				continue
+			}
+			// knownNetworks is non-nil only on the supervisor's reporting
+			// unit, so this neither runs per poller nor cries wolf about a
+			// chain a sibling unit does poll. A monitor outside that set is
+			// watched by nobody and will never alert.
+			if p.knownNetworks != nil && !polled[m.Network] {
+				label := m.Network
+				if label == "" {
+					// Rows startup's AssignLegacyNetwork missed: no chain at
+					// all, which is the more common half of this mistake.
+					label = "<none>"
+				}
+				orphans = append(orphans, fmt.Sprintf("%d=%s", m.ID, label))
+			}
+		}
+		if len(orphans) > 0 && !p.warnedOrphans {
+			// Warn once per process: the set rarely changes, and a line every
+			// cycle would bury everything else the poller reports.
+			p.warnedOrphans = true
+			p.log.Warn("monitors belong to no polled network",
+				"monitors", strings.Join(orphans, ","),
+				"polling", strings.Join(p.knownNetworks, ","))
+		}
+		monitors = own
 	}
 
 	// Map each contract to the monitors watching it; dedupe contracts. Along
@@ -242,7 +343,7 @@ func (p *Poller) Poll(ctx context.Context) error {
 		p.metrics.SetPriorityContracts(string(pr), tierCounts[pr])
 	}
 
-	state, err := p.store.GetIngestState(ctx)
+	state, err := p.store.GetIngestState(ctx, p.network)
 	if err != nil {
 		return err
 	}
@@ -268,7 +369,7 @@ func (p *Poller) Poll(ctx context.Context) error {
 	} else if divergence != 0 && divergence-1 < state.LastLedger {
 		state.LastLedger = divergence - 1
 		state.LastCursor = ""
-		if err := p.store.SetIngestState(ctx, state); err != nil {
+		if err := p.store.SetIngestState(ctx, p.network, state); err != nil {
 			return err
 		}
 		startLedger = state.LastLedger + 1
@@ -346,7 +447,7 @@ func (p *Poller) Poll(ctx context.Context) error {
 	if checkpoint > state.LastLedger {
 		state.LastLedger = checkpoint
 		state.LastCursor = ""
-		if err := p.store.SetIngestState(ctx, state); err != nil {
+		if err := p.store.SetIngestState(ctx, p.network, state); err != nil {
 			return err
 		}
 	}

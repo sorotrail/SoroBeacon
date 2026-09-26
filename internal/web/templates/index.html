@@ -30,6 +30,27 @@
 {{else}}
 <p class="muted">Poller lag: waiting for the first successful poll.</p>
 {{end}}
+{{if .NetworkStatuses}}
+{{/* The figures above are the worst network's on purpose, so this table is
+     the only place that says *which* chain is behind — and which one's node is
+     unreachable, which the aggregate cannot tell apart from being slow. */}}
+<section>
+  <h2>Networks</h2>
+  <table>
+    <tr><th>Network</th><th>Processed</th><th>Chain tip</th><th>Lag</th><th>Last poll</th><th>Source</th></tr>
+    {{range .NetworkStatuses}}
+    <tr>
+      <td>{{.Network}}</td>
+      <td>{{.LastProcessedLedger}}</td>
+      <td>{{.LatestChainLedger}}</td>
+      <td>{{.LedgerLag}}</td>
+      <td>{{if .LastPollAt}}{{.LastPollAt}}{{else}}<span class="pill never">never</span>{{end}}</td>
+      <td>{{if eq .Source "ok"}}<span class="pill on">ok</span>{{else}}<span class="pill off" title="{{.Source}}">down</span>{{end}}</td>
+    </tr>
+    {{end}}
+  </table>
+</section>
+{{end}}
 
 {{if eq .Empty "no_monitors"}}
 <section class="empty">

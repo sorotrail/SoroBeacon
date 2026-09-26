@@ -9,6 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/sorotrail/sorobeacon/internal/auth"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 // ErrNotFound is returned when a requested row does not exist.
@@ -85,6 +88,12 @@ type Monitor struct {
 	LastMatchedAt *time.Time `json:"last_matched_at"`
 	// ChannelIDs are the notification channels this monitor alerts to.
 	ChannelIDs []int64 `json:"channel_ids"`
+	// Network is the Stellar network this monitor watches: contract ids are
+	// only meaningful on one chain, so a monitor belongs to exactly one. The
+	// empty string is the pre-multi-network value and is assigned the
+	// instance's primary network at startup; a newly created monitor always
+	// carries the network it was created for.
+	Network string `json:"network"`
 }
 
 // Rule is one condition evaluated against every event of its monitor's
@@ -139,6 +148,11 @@ type Alert struct {
 	// already fired within the window. It is rule config, not alert data, so
 	// it is never persisted on the alert row.
 	Cooldown time.Duration `json:"-"`
+	// Network is the Stellar network the matching event came from, copied
+	// from the monitor by CreateAlert. It is stored rather than derived by
+	// joining monitors (which cascade-delete) so the dashboard's per-network
+	// filter and the reorg retraction both stay indexed comparisons.
+	Network string `json:"network,omitempty"`
 	// SuppressedSinceLast is set by CreateAlert when a row is created: the
 	// number of matches this rule dropped under its cooldown since the
 	// previous alert. CreateAlert also folds it into Payload so the stored
@@ -204,21 +218,28 @@ type LedgerHash struct {
 // and records the alerts a reorg orphaned. It is a separate interface so a
 // backend without the feature (or a test fake) can omit it without
 // pretending to implement it.
+//
+// Every method takes the network the window belongs to. Two chains number
+// their ledgers independently, so a shared window would report a divergence on
+// nearly every cycle — mainnet ledger 100 overwriting testnet ledger 100 is not
+// a reorganisation — and a false positive here retracts real alerts.
 type Ledgers interface {
 	// RecordLedgerHashes upserts the observed hashes. Re-observing the same
 	// ledger with the same hash is a no-op; re-observing it with a different
 	// hash is the reorg signature and is recorded as the new value.
-	RecordLedgerHashes(ctx context.Context, hashes []LedgerHash) error
-	// LedgerHashes returns the stored hashes for ledgers in [from, to],
-	// ascending. Ledgers outside the window are omitted.
-	LedgerHashes(ctx context.Context, from, to uint32) ([]LedgerHash, error)
-	// PruneLedgerHashes drops hashes for ledgers strictly before `before`,
-	// bounding how far back a reorg can be detected.
-	PruneLedgerHashes(ctx context.Context, before uint32) error
-	// RetractAlertsFromLedger marks every alert that came from a ledger at or
-	// after `ledger` as retracted (unless already retracted), returning how
-	// many rows changed. One statement keeps the correction atomic.
-	RetractAlertsFromLedger(ctx context.Context, ledger uint32, at time.Time) (int64, error)
+	RecordLedgerHashes(ctx context.Context, network string, hashes []LedgerHash) error
+	// LedgerHashes returns the stored hashes for one network's ledgers in
+	// [from, to].
+	LedgerHashes(ctx context.Context, network string, from, to uint32) ([]LedgerHash, error)
+	// PruneLedgerHashes drops one network's hashes for ledgers strictly before
+	// `before`, bounding how far back a reorg can be detected.
+	PruneLedgerHashes(ctx context.Context, network string, before uint32) error
+	// RetractAlertsFromLedger marks every alert that came from `network` at a
+	// ledger at or after `ledger` as retracted (unless already retracted),
+	// returning how many rows changed. One statement keeps the correction
+	// atomic. The network filter is what stops one chain's reorg orphaning
+	// another chain's alerts.
+	RetractAlertsFromLedger(ctx context.Context, network string, ledger uint32, at time.Time) (int64, error)
 }
 
 // AlertFilter narrows ListAlerts. Zero values mean "no constraint".
@@ -242,6 +263,9 @@ type AlertFilter struct {
 	// "created_at_asc". Unknown values are treated as the default in the
 	// store; the API rejects them with 400. Never interpolate this into SQL.
 	Sort string
+	// Network filters alerts by the Stellar network their event came from.
+	// Empty means every network.
+	Network string
 }
 
 // ListFilter pages monitors or channels. Zero values mean "no constraint"
@@ -267,17 +291,62 @@ type ListFilter struct {
 	Sort    string
 	Limit   int
 	AfterID int64
+	// Network filters monitors by the Stellar network they watch. Empty
+	// means every network. Only meaningful for monitors.
+	Network string
 }
 
 // Stats is the aggregate snapshot served by GET /stats.
+//
+// LastLedger and LastPollAt describe the instance's ingest position: with one
+// network they are that network's, and with several they come from whichever
+// checkpoint advanced most recently. Networks carries the per-network detail
+// so a dashboard can tell "testnet is current, mainnet is two hours behind"
+// instead of showing one blended number that hides it.
 type Stats struct {
-	Monitors     int64     `json:"monitors"`
-	Rules        int64     `json:"rules"`
-	Channels     int64     `json:"channels"`
-	Alerts       int64     `json:"alerts"`
-	AlertsLast24 int64     `json:"alerts_last_24h"`
-	LastLedger   uint32    `json:"last_ledger"`
-	LastPollAt   time.Time `json:"last_poll_at"`
+	Monitors     int64          `json:"monitors"`
+	Rules        int64          `json:"rules"`
+	Channels     int64          `json:"channels"`
+	Alerts       int64          `json:"alerts"`
+	AlertsLast24 int64          `json:"alerts_last_24h"`
+	LastLedger   uint32         `json:"last_ledger"`
+	LastPollAt   time.Time      `json:"last_poll_at"`
+	Networks     []NetworkStats `json:"networks,omitempty"`
+}
+
+// NetworkStats is one network's ingest checkpoint as stored, independent of
+// any other network's.
+type NetworkStats struct {
+	Network    string    `json:"network"`
+	LastLedger uint32    `json:"last_ledger"`
+	LastPollAt time.Time `json:"last_poll_at"`
+}
+
+// summarizeCheckpoints fills Stats' ingest fields from the checkpoints a
+// backend read, which must arrive newest-updated first.
+//
+// Shared by both backends so the dashboard cannot report one instance's
+// position differently depending on the DATABASE_URL scheme. Networks lists the
+// named networks; the pre-multi-network ” checkpoint is listed only while it is
+// the only one there is, so an instance that never configured a second network
+// keeps reporting exactly the figure it always did.
+func summarizeCheckpoints(st *Stats, cps []NetworkStats) {
+	var named, legacy []NetworkStats
+	for _, c := range cps {
+		if c.Network == "" {
+			legacy = append(legacy, c)
+		} else {
+			named = append(named, c)
+		}
+	}
+	st.Networks = named
+	if len(named) == 0 {
+		st.Networks = legacy
+	}
+	if len(cps) > 0 {
+		st.LastLedger = cps[0].LastLedger
+		st.LastPollAt = cps[0].LastPollAt
+	}
 }
 
 // AlertSeriesDays is the overview chart window: today (UTC) and the 29
@@ -398,10 +467,15 @@ type Alerts interface {
 	ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int) ([]Alert, error)
 }
 
-// Ingest persists the poller checkpoint.
+// Ingest persists the poller checkpoints. One per network: two chains advance
+// at their own pace and one poller can lag while another is current, so a single
+// shared cursor would either rewind or skip one of them every cycle.
+//
+// network == "" is the pre-multi-network checkpoint row, kept readable so an
+// instance that polls no named network behaves exactly as it did before.
 type Ingest interface {
-	GetIngestState(ctx context.Context) (IngestState, error)
-	SetIngestState(ctx context.Context, s IngestState) error
+	GetIngestState(ctx context.Context, network string) (IngestState, error)
+	SetIngestState(ctx context.Context, network string, s IngestState) error
 }
 
 // SavedSearch is a named, reusable alert filter combination.
@@ -469,7 +543,66 @@ type MonitorTemplates interface {
 	DeleteMonitorTemplate(ctx context.Context, id int64) error
 }
 
+// Workspaces is the tenancy boundary's own table: the named scopes every
+// monitor, channel, alert, saved search and template belongs to.
+//
+// Seeding is the only write here on purpose. A workspace is created by
+// configuration, not by an API call — WORKSPACE_TOKENS names the tenants an
+// instance serves, and startup records them so the table describes reality
+// rather than only the implicit default. Deleting one is a data-lifecycle
+// decision this issue deliberately leaves out of scope.
+type Workspaces interface {
+	// EnsureWorkspace inserts id when it is absent, as the id's own name.
+	// It is idempotent because it runs on every startup, and it never
+	// overwrites a name that was set some other way.
+	//
+	// It takes the id directly rather than reading it from ctx: it is called
+	// once per configured workspace by the process that owns the list.
+	EnsureWorkspace(ctx context.Context, id workspace.ID) error
+}
+
+// APITokens persists scoped, expiring, revocable bearer credentials. The rows
+// are credentials, so the shape that crosses this boundary is auth.Token and it
+// carries a digest rather than a secret: the plaintext exists only in the
+// response that mints it, which is what makes "shown once" a property of the
+// schema rather than a promise.
+//
+// TokenByHash is the one method here that ignores the context's workspace, and
+// it has to: it runs before the caller's tenant is known, and the row it returns
+// is where the tenant comes from. Every other method is tenant-scoped like the
+// rest of the package (see workspace_scope.go), so a workspace cannot list,
+// revoke or refresh another's tokens — nor learn that one exists, since each of
+// those answers ErrNotFound.
+type APITokens interface {
+	// CreateAPIToken inserts one token row and fills its ID, creation time and
+	// workspace from the context.
+	CreateAPIToken(ctx context.Context, t *auth.Token) error
+	// TokenByHash returns the row whose digest is hash, or found false. The
+	// digest is compared, never decoded, so this is an indexed read.
+	TokenByHash(ctx context.Context, hash string) (token *auth.Token, found bool, err error)
+	// ListAPITokens returns the caller workspace's tokens newest first,
+	// including revoked and expired ones: the dashboard has to show what is
+	// retired, not hide it.
+	ListAPITokens(ctx context.Context) ([]auth.Token, error)
+	// RevokeAPIToken retires one of the caller's tokens, keeping the first
+	// revocation timestamp so a repeated call is a no-op rather than an error.
+	RevokeAPIToken(ctx context.Context, id int64) error
+	// TouchAPIToken stamps when a token last authenticated. It is called at
+	// most once a minute per token, which is how often the stale-token report
+	// needs to be right.
+	TouchAPIToken(ctx context.Context, id int64, at time.Time) error
+}
+
 // Store is everything the application needs from persistence.
+//
+// Tenancy: every method below is scoped to the workspace carried by ctx
+// (internal/workspace), and rows a method writes land in that workspace. A
+// context with no workspace is treated as the default one rather than an
+// error, so an instance that never configured tenancy behaves exactly as it
+// did before workspaces existed. internal/workspace.WithSystem marks the
+// cross-tenant instance work (ingest, delivery, retention, reorg); the
+// methods that accept it say so in their own comments, and the rest are
+// documented in internal/store/workspace_scope.go.
 type Store interface {
 	Monitors
 	Rules
@@ -479,6 +612,16 @@ type Store interface {
 	Ledgers
 	SavedSearches
 	MonitorTemplates
+	Workspaces
+	APITokens
+	// AssignLegacyNetwork labels every monitor and alert whose network column
+	// is still empty — i.e. everything written before multi-network ingestion
+	// existed — with network, returning how many rows changed. Startup calls it
+	// once with the instance's primary network, before any poller runs, so an
+	// upgraded single-network instance neither loses its monitors from the
+	// listing nor strands its alert history outside every network filter.
+	// Idempotent: the second call finds nothing to label and reports 0.
+	AssignLegacyNetwork(ctx context.Context, network string) (int64, error)
 	GetStats(ctx context.Context) (Stats, error)
 	// AlertCountsByDay returns UTC calendar-day alert totals for `days`
 	// consecutive days ending today (UTC). Days with no alerts are present

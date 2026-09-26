@@ -38,17 +38,31 @@ type PositionReader interface {
 	Position() poller.Position
 }
 
+// NetworkStatusReader is the multi-network supervisor's per-chain view.
+// Optional, and supplied by the same object as PositionReader: an instance
+// that polls one network has nothing to break out.
+type NetworkStatusReader interface {
+	Statuses(ctx context.Context) []poller.NetworkStatus
+}
+
 // DefaultMaxBodyBytes is 1 MiB, matching config.DefaultHTTPMaxBodyBytes.
 // Used when New is not followed by WithMaxBodyBytes.
 const DefaultMaxBodyBytes int64 = 1 << 20
 
 type Server struct {
-	store              store.Store
-	registry           *rules.Registry
-	factory            *notify.Factory
-	rpc                HealthChecker
-	log                *slog.Logger
-	poller             PositionReader
+	store        store.Store
+	registry     *rules.Registry
+	factory      *notify.Factory
+	rpc          HealthChecker
+	log          *slog.Logger
+	poller       PositionReader
+	networkState NetworkStatusReader
+	// networkNames are the chains this instance polls, primary first, from
+	// NETWORKS/NETWORK. Empty (the New default, and every test that never
+	// calls WithNetworks) means no network may be named on a monitor, so
+	// monitors stay in the pre-multi-network '' state that single-poller
+	// deployments already use.
+	networkNames       []string
 	readyzLagThreshold uint32
 	rateLimit          RateLimitConfig
 	maxBodyBytes       int64
@@ -56,6 +70,10 @@ type Server struct {
 	// default until WithAuth is called, or when no API_TOKEN is set) means
 	// every request is allowed.
 	auth *auth.Authenticator
+	// tokens mints and retires scoped API tokens. Nil (until WithTokens)
+	// leaves /tokens answering 503 rather than half-working: a token endpoint
+	// with nowhere to store a digest is not a credential system.
+	tokens *auth.Manager
 }
 
 // New wires an API server. Rate limiting stays off until WithRateLimit.
@@ -74,9 +92,36 @@ func (s *Server) WithMaxBodyBytes(n int64) *Server {
 }
 
 // WithPoller attaches the ingest-position source used by /health and /readyz.
+// A poller that also reports per-network status — the multi-network
+// supervisor, which is the only thing that can — is wired for that in the
+// same call, so main does not have to know which shape it is holding.
 func (s *Server) WithPoller(p PositionReader) *Server {
 	s.poller = p
+	if ns, ok := p.(NetworkStatusReader); ok {
+		s.networkState = ns
+	}
 	return s
+}
+
+// WithNetworks declares the chains this instance polls, primary first, so
+// monitor writes can validate a requested network instead of accepting a name
+// nothing will ever ingest. Passing config.NetworkNames(cfg.Networks) is the
+// wire-up; an instance that polls one network still passes it, because "is
+// mainnet a legal network here?" is a question with a per-instance answer.
+func (s *Server) WithNetworks(names []string) *Server {
+	s.networkNames = names
+	return s
+}
+
+// defaultNetwork is the chain a monitor lands on when the request does not
+// name one: the primary, which is the only chain a single-network instance
+// polls. Empty when the server has no configured list, which leaves a monitor
+// unlabelled exactly as it was before networks existed.
+func (s *Server) defaultNetwork() string {
+	if len(s.networkNames) == 0 {
+		return ""
+	}
+	return s.networkNames[0]
 }
 
 // WithReadyzLagThreshold fails /readyz when ledger lag exceeds n.
@@ -99,8 +144,31 @@ func (s *Server) WithRateLimit(cfg RateLimitConfig) *Server {
 // open — the behaviour an unconfigured deployment had before authentication
 // existed. main builds one authenticator and shares it with the dashboard,
 // so a session minted at /login also satisfies this middleware.
+//
+// It also carries over a manager set earlier, because an authenticator that
+// does not know about the token table rejects every scoped token it is
+// offered: /tokens would mint credentials that cannot authenticate.
 func (s *Server) WithAuth(a *auth.Authenticator) *Server {
 	s.auth = a
+	if a != nil && s.tokens != nil {
+		a.WithTokens(s.tokens)
+	}
+	return s
+}
+
+// WithTokens enables scoped API tokens: the /tokens endpoints, and with them
+// the ability to hand out a credential that can create a monitor and nothing
+// else. The same *auth.Manager the dashboard is given, so both mint through
+// one set of rules about what a token may hold.
+//
+// The authenticator is told as well, in whichever order the two setters are
+// called: minting a token and then refusing to authenticate it is a broken
+// feature that looks like a wrong scope list.
+func (s *Server) WithTokens(m *auth.Manager) *Server {
+	s.tokens = m
+	if s.auth != nil {
+		s.auth.WithTokens(m)
+	}
 	return s
 }
 
@@ -113,7 +181,7 @@ func (s *Server) WithAuth(a *auth.Authenticator) *Server {
 func (s *Server) Routes() chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer, MaxBodyMiddleware(s.maxBodyBytes))
-	r.Use(AuthMiddleware(s.auth))
+	r.Use(AuthMiddleware(s.auth, s.log))
 	r.Use(RateLimitMiddleware(s.rateLimit))
 	// JSON clients hitting a typo'd path or the wrong method should get
 	// the same envelope as every other API error, not chi's plain-text
@@ -161,6 +229,12 @@ func (s *Server) Routes() chi.Router {
 
 	r.Post("/monitors/import", s.importContracts)
 
+	r.Route("/tokens", func(r chi.Router) {
+		r.Post("/", s.createToken)
+		r.Get("/", s.listTokens)
+		r.Post("/{id}/revoke", s.revokeToken)
+	})
+
 	r.Get("/alerts", s.listAlerts)
 	r.Get("/alerts.csv", s.exportAlertsCSV)
 	r.Get("/alerts/{id}/deliveries", s.listDeliveries)
@@ -193,6 +267,9 @@ func parseListFilter(w http.ResponseWriter, r *http.Request) (store.ListFilter, 
 	}
 	f.Query = strings.TrimSpace(q.Get("q"))
 	f.Type = strings.TrimSpace(q.Get("type"))
+	// Network narrows a list to one chain. Unset means every network an
+	// instance polls, which is what a caller that predates multi-network sees.
+	f.Network = strings.ToLower(strings.TrimSpace(q.Get("network")))
 	if v := q.Get("sort"); v != "" {
 		switch v {
 		case "name", "id", "created_at":
@@ -406,6 +483,20 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusServiceUnavailable
 	} else {
 		out["rpc_latest_ledger"] = h.LatestLedger
+	}
+	// Per-network detail. `rpc` above is the primary chain's source only, so
+	// without this an instance polling mainnet and testnet would report
+	// itself healthy while one of the two is unreachable and silently
+	// missing alerts. A single-network instance has no supervisor and adds
+	// nothing — the `rpc` field already answers the question.
+	if s.networkState != nil {
+		statuses := s.networkState.Statuses(ctx)
+		out["networks"] = statuses
+		for _, ns := range statuses {
+			if ns.Source != "ok" {
+				out["status"], status = "degraded", http.StatusServiceUnavailable
+			}
+		}
 	}
 	s.attachPoller(out)
 	writeJSON(w, status, out)
