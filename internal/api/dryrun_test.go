@@ -219,18 +219,18 @@ func TestDryRun_MissingType(t *testing.T) {
 // Test that decodeAlertToEvent reconstructs DecodedEvent correctly.
 func TestDryRun_DecodeAlertToEvent(t *testing.T) {
 	payload, _ := json.Marshal(map[string]any{
-		"contract_id": "CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA",
-		"event_name":  "transfer",
-		"ledger":      float64(100),
+		"contract_id":      "CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA",
+		"event_name":       "transfer",
+		"ledger":           float64(100),
 		"ledger_closed_at": time.Now().UTC().Format(time.RFC3339),
-		"tx_hash":     "txhash123",
-		"topics":      []any{"transfer"},
-		"value":       "100",
+		"tx_hash":          "txhash123",
+		"topics":           []any{"transfer"},
+		"value":            "100",
 	})
 	a := store.Alert{
-		ID:        1,
-		EventID:   "evt-001",
-		Payload:   payload,
+		ID:      1,
+		EventID: "evt-001",
+		Payload: payload,
 	}
 	ev, ok := decodeAlertToEvent(a)
 	if !ok {
@@ -294,22 +294,3 @@ func TestDryRun_InvalidMonitorID(t *testing.T) {
 		t.Fatalf("status = %d, want 400", res.StatusCode)
 	}
 }
-
-// mockDecodedEventStore is a store that returns DecodedEvent-based alerts
-// for testing the dry-run evaluation path.
-type mockDecodedEventStore struct {
-	store.Store
-	monitors map[int64]*store.Monitor
-}
-
-func (m *mockDecodedEventStore) GetMonitor(_ context.Context, id int64) (*store.Monitor, error) {
-	if mon, ok := m.monitors[id]; ok {
-		return mon, nil
-	}
-	return nil, store.ErrNotFound
-}
-func (m *mockDecodedEventStore) ListAlerts(_ context.Context, _ store.AlertFilter) ([]store.Alert, error) { return nil, nil }
-func (m *mockDecodedEventStore) CreateAlert(_ context.Context, _ *store.Alert) (store.AlertOutcome, error) { return store.AlertCreated, nil }
-func (m *mockDecodedEventStore) CreateMonitor(_ context.Context, _ *store.Monitor) error               { return nil }
-func (m *mockDecodedEventStore) Ping(_ context.Context) error                                             { return nil }
-func (m *mockDecodedEventStore) Close()                                                                     {}

@@ -59,7 +59,11 @@ func (s *Server) exportAlertsNDJSON(w http.ResponseWriter, r *http.Request) {
 			s.log.Error("NDJSON marshal failed", "request_id", reqid.From(r), "err", err)
 			return nil // skip, not fatal
 		}
-		w.Write(append(b, '\n'))
+		if _, err := w.Write(append(b, '\n')); err != nil {
+			// The client went away. Returning the error stops the store
+			// walk instead of paging on into a connection nobody reads.
+			return err
+		}
 		count++
 		if count%flushEvery == 0 {
 			flusher.Flush()
@@ -86,16 +90,16 @@ func exportAlertNDJSONRow(a store.Alert, monitorName string) map[string]any {
 	}
 	_ = json.Unmarshal(a.Payload, &p)
 	return map[string]any{
-		"id":          strconv.FormatInt(a.ID, 10),
-		"monitor_id":  strconv.FormatInt(a.MonitorID, 10),
+		"id":           strconv.FormatInt(a.ID, 10),
+		"monitor_id":   strconv.FormatInt(a.MonitorID, 10),
 		"monitor_name": monitorName,
-		"rule_id":     strconv.FormatInt(a.RuleID, 10),
-		"event_id":    a.EventID,
-		"event_name":  p.EventName,
-		"contract_id": p.ContractID,
-		"ledger":      p.Ledger,
-		"created_at":  a.CreatedAt.UTC().Format(time.RFC3339),
-		"payload":     string(a.Payload),
+		"rule_id":      strconv.FormatInt(a.RuleID, 10),
+		"event_id":     a.EventID,
+		"event_name":   p.EventName,
+		"contract_id":  p.ContractID,
+		"ledger":       p.Ledger,
+		"created_at":   a.CreatedAt.UTC().Format(time.RFC3339),
+		"payload":      string(a.Payload),
 	}
 }
 
