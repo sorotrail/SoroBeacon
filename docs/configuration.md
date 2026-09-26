@@ -233,6 +233,40 @@ Archive objects contain only alert rows (contract id, event, payload, ledger); c
 | --- | --- | --- | --- | --- |
 | `LOG_LEVEL` | enum | `info` | optional | Minimum `log/slog` level: `debug` \| `info` \| `warn` (or `warning`) \| `error`. Logs are structured JSON on stdout. |
 
+## Tracing (OpenTelemetry)
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `OTLP_ENDPOINT` | URL string | empty (tracing off) | optional | OTLP/HTTP base URL spans are shipped to (e.g. `http://localhost:4318` for a local Jaeger). Must be an absolute `http`/`https` URL when set; empty disables tracing entirely — no exporter, no goroutines, no measurable overhead. |
+| `OTLP_SERVICE_NAME` | string | `sorobeacon` | optional | `service.name` resource attribute reported with every trace. |
+| `OTLP_SAMPLE_RATE` | float | `1` | optional | Fraction of traces kept, in `[0, 1]`. Sampling is parent-based, so a whole poll-cycle trace is kept or dropped as a unit — never half a trace. Out-of-range or non-numeric values fail startup. |
+
+When enabled, one trace covers each poll cycle: `poller.poll` (root) →
+`poller.fetch_events` per page (RPC fetch + local decode) →
+`rules.evaluate` per rule → `poller.create_alert` → `store.create_alert`
+→ one `notify.deliver` per channel. Deliveries are children of their
+alert's span, never roots, so one alert's full path is one timeline —
+which is the point: metrics (issue #26) show aggregates, traces show the
+individual path. Every span also carries a `request_id` attribute (the
+ambient `X-Request-ID`) so a log line and its trace can be joined.
+
+Span attributes hold identifiers only (alert, monitor, rule, channel and
+event ids, channel type, outcome). **Channel config — webhook URLs, bot
+tokens, SMTP credentials — never enters a span**, the same rule that
+applies to logs and API responses.
+
+Shutdown flushes pending spans to the collector (bounded to 5 seconds) so
+the last moments of a deployment are exported rather than dropped.
+
+```sh
+# Local collector: Jaeger all-in-one (OTLP/HTTP on :4318, UI on :16686)
+docker run --rm -p 16686:16686 -p 4318:4318 jaegertracing/all-in-one:latest
+
+export OTLP_ENDPOINT=http://localhost:4318
+# OTLP_SERVICE_NAME=sorobeacon-staging   # optional
+# OTLP_SAMPLE_RATE=0.25                  # keep a quarter of traces
+```
+
 ## Not environment variables
 
 | Thing | Where it lives |
@@ -245,6 +279,6 @@ Archive objects contain only alert rows (contract id, event, payload, ledger); c
 ## Drift vs `.env.example`
 
 `.env.example` is the copy-paste template. This reference was written
-against `internal/config` on the same commit; `.env.example` already
-listed every runtime variable (including `CORS_ALLOWED_ORIGINS`) with
-matching defaults, so it was not changed in this PR.
+against `internal/config` on the same commit; `.env.example` lists every
+runtime variable with matching defaults, including the tracing trio
+(`OTLP_ENDPOINT`, `OTLP_SERVICE_NAME`, `OTLP_SAMPLE_RATE`).

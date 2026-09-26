@@ -154,6 +154,36 @@ per-dependency detail). `/api/v1/version` reports the version, commit and
 build date baked in at compile time. Every response carries an
 `X-Request-ID` correlation header, echoed in error bodies and log lines.
 
+**Distributed tracing** answers the per-alert question metrics cannot: when
+an alert was late, which stage was slow? With `OTLP_ENDPOINT` set, one
+OTLP/HTTP trace per poll cycle spans the whole path — `poller.poll` →
+`poller.fetch_events` (RPC fetch + decode) → `rules.evaluate` →
+`poller.create_alert` → `store.create_alert` → `notify.deliver` per
+channel — with each delivery a child of its alert's span, never a root.
+Every span carries the ambient `X-Request-ID` as a `request_id` attribute,
+so a log line and its trace can be joined. Tracing is **off by default**
+(no endpoint, no exporter, no overhead); `OTLP_SAMPLE_RATE` scales it down
+on busy deployments. Span attributes never contain channel config, tokens
+or webhook URLs — channels are identified by row id only.
+
+Try it locally with the collector of your choice; for example
+[Jaeger](https://www.jaegertracing.io/docs/latest/getting-started/) all-in-one
+exposes an OTLP/HTTP endpoint on port 4318:
+
+```sh
+# Run a local collector (Jaeger all-in-one; OTLP/HTTP on :4318,
+# UI on :16686)
+docker run --rm -p 16686:16686 -p 4318:4318 jaegertracing/all-in-one:latest
+
+# Point SoroBeacon at it
+cp .env.example .env   # edit DATABASE_URL as usual
+OTLP_ENDPOINT=http://localhost:4318 ./bin/sorobeacon
+
+# After a matching event lands, open http://localhost:16686 and search
+# for service "sorobeacon"; one poll cycle is one trace from the RPC
+# fetch to every channel delivery.
+```
+
 Channel secrets (webhook URLs, bot tokens, SMTP credentials) live in each
 channel's `config` JSON in the database. They are never logged and never
 returned by the API. Set `CONFIG_ENCRYPTION_KEY` to encrypt them at rest;
@@ -296,6 +326,28 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 }'
 ```
 
+**`topic_position`** — match when the decoded topic at a fixed position
+exactly equals a configured value. Custom (non-SEP-41) contracts put
+meaningful values in fixed topic positions — a pool ID, a market symbol, an
+account — and this is the direct "position N equals V" question that
+`event_emitted` (first topic only) and `token_event` (SEP-41 slots only)
+cannot ask. Comparison is exact string equality against the topic's decoded
+string form; a position beyond the event's topic count is a non-match, not
+an error:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "topic_position",
+  "params": {
+    "position": 2,
+    "equals": "POOL_USDC_XLM",
+    "event": "deposit"
+  }
+}'
+```
+
+See [docs/rules/topic-position.md](docs/rules/topic-position.md).
+
 Every rule type also accepts an optional `cooldown` (a Go duration string such
 as `"5m"`): the first match alerts, further matches in the window are counted
 and dropped, and the next alert reports `suppressed_since_last`. It survives a
@@ -310,13 +362,14 @@ curl -s -X DELETE localhost:8080/api/v1/monitors/1/rules/2
 
 ### Channels
 
-Eight channel types ship with the MVP. `config` is validated on create/update
+Nine channel types ship with the MVP. `config` is validated on create/update
 and never returned in responses. Each has a page under
 [docs/channels/](docs/channels/):
 [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md),
 [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md),
 [PagerDuty](docs/channels/pagerduty.md), [Email](docs/channels/email.md),
-[Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md) and the
+[Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md),
+[DingTalk](docs/channels/dingtalk.md) and the
 [generic webhook](docs/channels/webhook.md).
 
 ```sh
@@ -336,6 +389,7 @@ curl -s -X POST localhost:8080/api/v1/channels -d '{
 # PagerDuty:{"routing_key": "R0UT1NGK3Y", "severity": "warning"}
 # Webex:    {"bot_token": "Y2lzY29zcGFyazovL3VzL1JPT00v...", "room_id": "Y2lzY29zcGFyazovL3VzL1JPT00v..."}
 # Signal:   {"api_url": "http://signal-cli:8080", "number": "+15551234567", "recipients": ["+15559876543"]}
+# DingTalk: {"webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=...", "secret": "SEC..."}
 
 curl -s localhost:8080/api/v1/channels
 curl -s -X PATCH localhost:8080/api/v1/channels/1 -d '{"enabled": false}'
@@ -365,6 +419,33 @@ curl -s localhost:8080/api/v1/alerts/7/deliveries     # delivery attempts for on
 curl -s localhost:8080/api/v1/health
 curl -s localhost:8080/api/v1/stats
 ```
+
+#### Live alerts (Server-Sent Events)
+
+`GET /api/v1/alerts/stream` streams alerts as they are created, so the
+dashboard and any API consumer can react without polling `/api/v1/alerts` on
+a timer. SSE rather than WebSockets: the traffic is one-directional, and SSE
+survives proxies (and reconnects on its own) with far less configuration.
+
+```sh
+curl -N localhost:8080/api/v1/alerts/stream             # every alert
+curl -N 'localhost:8080/api/v1/alerts/stream?monitor_id=1'
+```
+
+Each alert arrives as an `alert` event whose `data` is one JSON object: the
+stored alert's fields plus the monitor's `name`.
+
+```
+event: alert
+data: {"id":7,"monitor_id":1,"monitor_name":"My token","rule_id":3,"event_id":"0000…","payload":{"contract_id":"C…","event_name":"transfer"},"created_at":"2026-09-24T12:00:00Z"}
+```
+
+`monitor_id` filters server-side. Comment lines (`: keep-alive`) are sent
+every 15s so an idle connection is not reaped by a proxy. A slow or dead
+client never blocks alert creation: each subscriber has a buffered queue and,
+when it fills, the oldest pending event is dropped — the loss is counted by
+`sorobeacon_alerts_stream_dropped_total` on `/metrics`. The alerts page in the
+dashboard subscribes to this endpoint and appends new alerts live.
 
 ## CLI
 
@@ -429,6 +510,7 @@ Layout:
 cmd/sorobeacon      wiring + graceful shutdown, CLI subcommands (cli*.go)
 cmd/sorobeacon      wiring + graceful shutdown
 internal/config     env config
+internal/telemetry  OpenTelemetry tracer setup (OTLP/HTTP; off by default)
 internal/stellar    RPC client (getEvents/getLatestLedger/getHealth) + ScVal decoder
 internal/store      Postgres (pgx) + embedded golang-migrate migrations
 internal/rules      RuleEvaluator interface + event_emitted, value_threshold,
@@ -491,4 +573,4 @@ Decoded events use a small value vocabulary (`nil`, `bool`, `string`,
 ## License
 ### Notification Channels
 
-Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md), and generic [Webhooks](docs/channels/webhook.md).
+Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md), [DingTalk](docs/channels/dingtalk.md), and generic [Webhooks](docs/channels/webhook.md).

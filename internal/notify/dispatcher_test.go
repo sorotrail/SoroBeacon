@@ -34,6 +34,15 @@ func (m *mockNotifier) Send(_ context.Context, a Alert) error {
 type fakeDispatchStore struct {
 	channels []store.Channel
 	attempts []store.DeliveryAttempt
+	// inhibitions feeds the inhibition check; firing answers RuleFiredWithin.
+	inhibitions []store.Inhibition
+	firing      map[int64]bool
+	inhibited   []inhibitedMark
+}
+
+type inhibitedMark struct {
+	alertID  int64
+	sourceID int64
 }
 
 func (f *fakeDispatchStore) ListChannelsForMonitor(_ context.Context, _ int64) ([]store.Channel, error) {
@@ -47,6 +56,25 @@ func (f *fakeDispatchStore) RecordDeliveryAttempt(_ context.Context, d *store.De
 
 func (f *fakeDispatchStore) ListChannels(_ context.Context, _ bool) ([]store.Channel, error) {
 	return f.channels, nil
+}
+
+func (f *fakeDispatchStore) ListInhibitionsForTarget(_ context.Context, target int64) ([]store.Inhibition, error) {
+	var out []store.Inhibition
+	for _, in := range f.inhibitions {
+		if in.TargetRuleID == target {
+			out = append(out, in)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeDispatchStore) RuleFiredWithin(_ context.Context, ruleID int64, _ time.Duration) (bool, error) {
+	return f.firing[ruleID], nil
+}
+
+func (f *fakeDispatchStore) MarkAlertInhibited(_ context.Context, alertID, sourceID int64) error {
+	f.inhibited = append(f.inhibited, inhibitedMark{alertID: alertID, sourceID: sourceID})
+	return nil
 }
 
 func newTestDispatcher(t *testing.T, st *fakeDispatchStore, n Notifier) *Dispatcher {
@@ -176,4 +204,41 @@ func TestDispatchBadConfigRecordsFailure(t *testing.T) {
 	require.Len(t, st.attempts, 1, "bad config is recorded once, not retried")
 	assert.Equal(t, "failed", st.attempts[0].Status)
 	assert.Contains(t, st.attempts[0].ResponseSnippet, "unknown channel type")
+}
+
+func TestDispatchInhibitedSkipsDeliveryAndMarks(t *testing.T) {
+	st := &fakeDispatchStore{
+		channels: []store.Channel{mockChannel(1)},
+		inhibitions: []store.Inhibition{
+			{SourceRuleID: 7, TargetRuleID: 9, FiringWindowSeconds: 300},
+		},
+		firing: map[int64]bool{7: true},
+	}
+	n := &mockNotifier{}
+	d := newTestDispatcher(t, st, n)
+
+	d.Dispatch(context.Background(), Alert{ID: 20, MonitorID: 2, RuleID: 9})
+
+	assert.Equal(t, 0, n.calls, "inhibited alert must not reach any notifier")
+	assert.Empty(t, st.attempts, "inhibited alert records no delivery attempts")
+	require.Len(t, st.inhibited, 1, "the suppression must be recorded on the alert")
+	assert.Equal(t, int64(20), st.inhibited[0].alertID)
+	assert.Equal(t, int64(7), st.inhibited[0].sourceID)
+}
+
+func TestDispatchQuietSourceDelivers(t *testing.T) {
+	st := &fakeDispatchStore{
+		channels: []store.Channel{mockChannel(1)},
+		inhibitions: []store.Inhibition{
+			{SourceRuleID: 7, TargetRuleID: 9, FiringWindowSeconds: 300},
+		},
+		firing: map[int64]bool{7: false},
+	}
+	n := &mockNotifier{}
+	d := newTestDispatcher(t, st, n)
+
+	d.Dispatch(context.Background(), Alert{ID: 21, MonitorID: 2, RuleID: 9})
+
+	assert.Equal(t, 1, n.calls, "a quiet source must not suppress delivery")
+	assert.Empty(t, st.inhibited)
 }

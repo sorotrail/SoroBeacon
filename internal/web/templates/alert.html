@@ -4,6 +4,7 @@
 <table class="decoded">
   <tr><th>Monitor</th><td>{{if .Monitor}}<a href="/monitors/{{.Monitor.ID}}">{{.Monitor.Name}}</a>{{else}}#{{.Alert.MonitorID}}{{end}}</td></tr>
   <tr><th>Rule</th><td>{{if .Rule}}{{.Rule.Type}} (#{{.Rule.ID}}){{else}}#{{.Alert.RuleID}}{{end}}</td></tr>
+  <tr><th>Severity</th><td>{{if .Alert.Severity}}<span class="pill {{severityClass .Alert.Severity}}">{{.Alert.Severity}}</span>{{else}}<span class="pill warning">warning</span>{{end}}</td></tr>
   <tr><th>Contract</th><td><code>{{.ContractID}}</code></td></tr>
   <tr><th>Event</th><td>{{.EventName}} <code>{{.Alert.EventID}}</code></td></tr>
   <tr><th>Ledger</th><td>{{.Ledger}}</td></tr>

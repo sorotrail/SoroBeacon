@@ -54,6 +54,11 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Equal(t, DefaultMonitorSilentAfter, cfg.MonitorSilentAfter)
 	assert.Nil(t, cfg.ConfigEncryptionKey)
 	assert.Empty(t, cfg.APITokens)
+	// Tracing defaults to entirely off.
+	assert.Empty(t, cfg.OTLP.Endpoint)
+	assert.Empty(t, cfg.OTLP.ServiceName)
+	assert.Equal(t, DefaultOTLPSampleRate, cfg.OTLP.SampleRate)
+	assert.False(t, cfg.OTLP.Enabled())
 }
 
 func TestLoadRequiresDatabaseURL(t *testing.T) {
@@ -69,6 +74,59 @@ func TestLoadRequiresSoroTrailURL(t *testing.T) {
 
 	_, err := Load()
 	assert.ErrorContains(t, err, "SOROTRAIL_URL")
+}
+
+func TestLoadOTLPOffByDefault(t *testing.T) {
+	// Clear optional vars so a leaked environment cannot turn tracing on.
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("OTLP_ENDPOINT", "")
+	t.Setenv("OTLP_SERVICE_NAME", "")
+	t.Setenv("OTLP_SAMPLE_RATE", "")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.OTLP.Endpoint, "tracing must be off unless OTLP_ENDPOINT is set")
+	assert.False(t, cfg.OTLP.Enabled())
+}
+
+func TestLoadOTLPConfig(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("OTLP_ENDPOINT", "http://localhost:4318")
+	t.Setenv("OTLP_SERVICE_NAME", "sorobeacon-staging")
+	t.Setenv("OTLP_SAMPLE_RATE", "0.25")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "http://localhost:4318", cfg.OTLP.Endpoint)
+	assert.True(t, cfg.OTLP.Enabled())
+	assert.Equal(t, "sorobeacon-staging", cfg.OTLP.ServiceName)
+	assert.Equal(t, 0.25, cfg.OTLP.SampleRate)
+}
+
+func TestLoadOTLPEndpointValidation(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	for _, bad := range []string{"localhost:4318", "ftp://collector", "http://"} {
+		t.Setenv("OTLP_ENDPOINT", bad)
+		_, err := Load()
+		assert.ErrorContains(t, err, "OTLP_ENDPOINT", "endpoint %q must be rejected", bad)
+	}
+}
+
+func TestLoadOTLPSampleRateValidation(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("OTLP_ENDPOINT", "http://localhost:4318")
+	for _, bad := range []string{"-0.1", "1.1", "abc", "NaN", "Inf"} {
+		t.Setenv("OTLP_SAMPLE_RATE", bad)
+		_, err := Load()
+		assert.ErrorContains(t, err, "OTLP_SAMPLE_RATE", "rate %q must be rejected", bad)
+	}
+
+	// The bounds themselves are valid.
+	for _, good := range []string{"0", "1"} {
+		t.Setenv("OTLP_SAMPLE_RATE", good)
+		_, err := Load()
+		assert.NoError(t, err, "rate %q must be accepted", good)
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -466,6 +524,9 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"reorg_tracking_window",
 		"reorg_confirmation_depth",
 		"api_token_count",
+		"otlp_tracing_enabled",
+		"otlp_service_name",
+		"otlp_sample_rate",
 	}, keys)
 }
 

@@ -38,6 +38,9 @@ type channelRequest struct {
 	// delivery. Omitted keeps immediate delivery (the pre-digest default).
 	DigestMode          *string `json:"digest_mode"`
 	DigestWindowSeconds *int64  `json:"digest_window_seconds"`
+	// MinSeverity is the minimum alert severity this channel will receive.
+	// Empty means no filter (receive all severities).
+	MinSeverity *string `json:"min_severity"`
 }
 
 // validateDigest checks a channel's digest settings. Empty mode means
@@ -58,6 +61,18 @@ func validateDigest(mode string, windowSeconds int64) []FieldError {
 	default:
 		return []FieldError{{Field: "digest_mode", Reason: `must be "" or "window"`}}
 	}
+}
+
+// validateMinSeverity checks a channel's min_severity setting. Empty means
+// no filter; otherwise it must be one of the valid severity values.
+func validateMinSeverity(minSeverity string) []FieldError {
+	if minSeverity == "" {
+		return nil
+	}
+	if _, ok := store.ParseSeverity(minSeverity); !ok {
+		return []FieldError{{Field: "min_severity", Reason: `must be "info", "warning", or "critical"`}}
+	}
+	return nil
 }
 
 func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
@@ -93,6 +108,11 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 		digestWindow = *req.DigestWindowSeconds
 	}
 	details = append(details, validateDigest(digestMode, digestWindow)...)
+	var minSeverity string
+	if req.MinSeverity != nil {
+		minSeverity = *req.MinSeverity
+	}
+	details = append(details, validateMinSeverity(minSeverity)...)
 	if len(details) > 0 {
 		writeValidation(w, r, details)
 		return
@@ -104,6 +124,7 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 		Enabled:             req.Enabled == nil || *req.Enabled,
 		DigestMode:          digestMode,
 		DigestWindowSeconds: digestWindow,
+		MinSeverity:         store.Severity(minSeverity),
 	}
 	if err := s.store.CreateChannel(r.Context(), &ch); err != nil {
 		s.fail(w, r, err)
@@ -197,10 +218,23 @@ func (s *Server) updateChannel(w http.ResponseWriter, r *http.Request) {
 	if req.DigestWindowSeconds != nil {
 		ch.DigestWindowSeconds = *req.DigestWindowSeconds
 	}
+	if req.MinSeverity != nil {
+		if *req.MinSeverity == "" {
+			ch.MinSeverity = ""
+		} else {
+			parsed, ok := store.ParseSeverity(*req.MinSeverity)
+			if !ok {
+				details = append(details, FieldError{Field: "min_severity", Reason: `must be "info", "warning", or "critical"`})
+			} else {
+				ch.MinSeverity = parsed
+			}
+		}
+	}
 	if _, err := s.factory.New(ch.Type, ch.Config); err != nil {
 		details = append(details, channelConfigDetails(err)...)
 	}
 	details = append(details, validateDigest(ch.DigestMode, ch.DigestWindowSeconds)...)
+	details = append(details, validateMinSeverity(string(ch.MinSeverity))...)
 	if len(details) > 0 {
 		writeValidation(w, r, details)
 		return

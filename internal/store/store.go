@@ -68,6 +68,58 @@ func (p Priority) Rank() int {
 	}
 }
 
+// Severity is the alert severity level. It is a small closed set with a
+// fixed order so the API, store, and dispatcher all agree on the vocabulary
+// and ordering.
+type Severity string
+
+const (
+	// SeverityInfo is informational: routine matches that do not require
+	// immediate attention.
+	SeverityInfo Severity = "info"
+	// SeverityWarning is the default: notable events that should be seen
+	// but do not warrant paging.
+	SeverityWarning Severity = "warning"
+	// SeverityCritical is for high-impact events that require immediate
+	// response (e.g., treasury movements, contract upgrades).
+	SeverityCritical Severity = "critical"
+)
+
+// ParseSeverity validates a severity string. The empty string maps to
+// SeverityWarning so a caller that never sets one gets today's behaviour,
+// and any other unknown value is rejected rather than silently downgraded.
+func ParseSeverity(s string) (Severity, bool) {
+	switch Severity(s) {
+	case "":
+		return SeverityWarning, true
+	case SeverityInfo, SeverityWarning, SeverityCritical:
+		return Severity(s), true
+	default:
+		return "", false
+	}
+}
+
+// Rank orders the severities for routing: higher ranks are more severe.
+func (s Severity) Rank() int {
+	switch s {
+	case SeverityCritical:
+		return 2
+	case SeverityInfo:
+		return 0
+	default:
+		return 1
+	}
+}
+
+// MeetsThreshold reports whether this severity meets or exceeds the given
+// minimum severity. An empty minimum means no filter (always true).
+func (s Severity) MeetsThreshold(min Severity) bool {
+	if min == "" {
+		return true
+	}
+	return s.Rank() >= min.Rank()
+}
+
 // Monitor watches one or more Soroban contracts.
 type Monitor struct {
 	ID          int64     `json:"id"`
@@ -95,6 +147,10 @@ type Rule struct {
 	Type      string          `json:"type"`
 	Params    json.RawMessage `json:"params"`
 	Enabled   bool            `json:"enabled"`
+	// Severity is the alert severity this rule produces. Empty means
+	// SeverityWarning, so rules created before the field existed keep
+	// today's behaviour. It is validated at the API boundary.
+	Severity Severity `json:"severity"`
 }
 
 // Channel is a configured notification destination. Config holds
@@ -117,6 +173,11 @@ type Channel struct {
 	// "window". Zero leaves digesting off even when a mode is set, so a
 	// half-filled form cannot silently batch forever.
 	DigestWindowSeconds int64     `json:"digest_window_seconds"`
+	// MinSeverity is the minimum alert severity this channel will receive.
+	// Empty means no filter (receive all severities), so channels created
+	// before the field existed keep today's behaviour. It is validated at
+	// the API boundary.
+	MinSeverity Severity `json:"min_severity"`
 	CreatedAt           time.Time `json:"created_at"`
 }
 
@@ -130,6 +191,14 @@ type Alert struct {
 	EventID   string          `json:"event_id"`
 	Payload   json.RawMessage `json:"payload"`
 	CreatedAt time.Time       `json:"created_at"`
+	// InhibitedByRuleID is set when an inhibition rule suppressed this
+	// alert's delivery. Nil means delivered (or never subjected to
+	// inhibition); the alert row itself is always stored.
+	InhibitedByRuleID *int64 `json:"inhibited_by_rule_id,omitempty"`
+	// Severity is the alert severity copied from the rule at creation time.
+	// It is stored so changing a rule's severity later does not rewrite
+	// history.
+	Severity Severity `json:"severity"`
 	// LedgerClosedAt is the matching event's ledger close time. CreateAlert
 	// uses it to stamp monitors.last_matched_at; it is not stored on the
 	// alert row. Zero skips the stamp so callers that only persist an
@@ -267,6 +336,8 @@ type AlertFilter struct {
 	// the cursor row; created_at_asc uses >. Comparing only on id would
 	// repeat or skip rows once sort is not newest-id.
 	AfterID int64
+	// Severity filters alerts by minimum severity. Empty means no filter.
+	Severity Severity
 	// Type filters channels by their notifier type ("slack", "discord",
 	// ...). Empty means no type filter. Only meaningful for channels.
 	Type string
@@ -606,6 +677,7 @@ type Store interface {
 	Rules
 	Channels
 	Alerts
+	Inhibitions
 	Ingest
 	Backfills
 	Ledgers
@@ -618,6 +690,15 @@ type Store interface {
 	// consecutive days ending today (UTC). Days with no alerts are present
 	// with count 0 so a chart has no gaps. Bucketing is done in SQL.
 	AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCount, error)
+	// GroupAlerts creates or increments the alert group for key
+	// with windowStart and returns whether the alert should be
+	// delivered immediately (first alert in the window) and the
+	// current group count. Grouping is off when window duration is
+	// zero, which callers enforce before invoking this method.
+	GroupAlerts(ctx context.Context, key string, windowStart time.Time) (shouldDeliver bool, currentCount int64, err error)
+	// CreateAlertGroup creates or increments the alert group row
+	// identified by key and windowStart. Returns the new count.
+	CreateAlertGroup(ctx context.Context, key string, windowStart time.Time) (int64, error)
 	Ping(ctx context.Context) error
 	Close()
 }
