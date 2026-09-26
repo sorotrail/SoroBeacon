@@ -185,6 +185,8 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 		pages:       map[string]*template.Template{},
 		silentAfter: 24 * time.Hour,
 	}
+	for _, page := range []string{"index", "monitors", "monitor", "channels", "alerts", "alert", "login", "error", "rulebuilder", "searches"} {
+		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/shortcuts.html", "templates/"+page+".html")
 	for _, page := range []string{"index", "monitors", "monitor", "channels", "channel-delete", "alerts", "alert", "login", "error", "rulebuilder", "searches"} {
 		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/"+page+".html")
 		if err != nil {

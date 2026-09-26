@@ -1,0 +1,18 @@
+{{define "shortcuts"}}
+<div id="shortcuts-dialog" class="shortcuts-dialog" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title" aria-hidden="true" hidden>
+  <section class="shortcuts-panel">
+    <h2 id="shortcuts-title">Keyboard shortcuts</h2>
+    <dl class="shortcuts-list">
+      <dt><kbd>g</kbd> then <kbd>o</kbd></dt><dd>Go to overview</dd>
+      <dt><kbd>g</kbd> then <kbd>m</kbd></dt><dd>Go to monitors</dd>
+      <dt><kbd>g</kbd> then <kbd>c</kbd></dt><dd>Go to channels</dd>
+      <dt><kbd>g</kbd> then <kbd>a</kbd></dt><dd>Go to alerts</dd>
+      <dt><kbd>/</kbd></dt><dd>Focus the page filter</dd>
+      <dt><kbd>?</kbd></dt><dd>Open this help</dd>
+      <dt><kbd>Escape</kbd></dt><dd>Close this help</dd>
+    </dl>
+    <p class="muted">Shortcuts are disabled while typing and do not replace browser or assistive-technology commands.</p>
+    <button type="button" data-shortcuts-close>Close</button>
+  </section>
+</div>
+{{end}}

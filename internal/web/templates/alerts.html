@@ -11,6 +11,7 @@
   <label for="rule_id">Rule</label>
   <input type="number" id="rule_id" name="rule_id" value="{{if .SelectedRule}}{{.SelectedRule}}{{end}}" min="1" placeholder="id">
   <label for="contract_id">Contract</label>
+  <input type="search" id="contract_id" name="contract_id" value="{{.ContractID}}" placeholder="contract id" data-shortcut-filter>
   <input type="search" id="contract_id" name="contract_id" value="{{.ContractID}}" placeholder="contract id">
   <label for="severity">Severity</label>
   <select id="severity" name="severity">

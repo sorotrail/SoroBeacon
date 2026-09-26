@@ -13,7 +13,7 @@
 {{end}}
 <form class="filters" method="get" action="/monitors">
   <label for="q">Name</label>
-  <input type="search" id="q" name="q" value="{{.Query}}" placeholder="Search by name">
+  <input type="search" id="q" name="q" value="{{.Query}}" placeholder="Search by name" data-shortcut-filter>
   <label for="enabled">Status</label>
   <select id="enabled" name="enabled">
     <option value="" {{if eq .Enabled ""}}selected{{end}}>All</option>

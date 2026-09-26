@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
@@ -340,15 +341,14 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 	notifier, err := d.factory.New(ch.Type, ch.Config)
 	if err != nil {
 		// Bad config: record one failed attempt, no point retrying.
-		d.record(ctx, a.ID, ch.ID, "failed", err.Error())
-		d.log.Error("build notifier", "channel_id", ch.ID, "channel_type", ch.Type, "err", err)
-		telemetry.RecordError(span, err)
+		d.record(ctx, a.ID, ch.ID, "failed", sanitizeDeliveryError(err).Error())
+		d.log.Error("build notifier", "channel_id", ch.ID, "channel_type", ch.Type, "err", sanitizeDeliveryError(err))
 		return
 	}
 
 	backoff := d.BaseBackoff
 	for attempt := 1; ; attempt++ {
-		err := notifier.Send(ctx, a)
+		err = d.sendWithRecovery(ctx, a, ch, notifier)
 		if err == nil {
 			if d.metrics != nil {
 				d.metrics.RecordDelivery(ch.Type, true)
@@ -357,20 +357,11 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 			d.log.Info("alert delivered", "alert_id", a.ID, "channel_id", ch.ID, "attempt", attempt)
 			return
 		}
-		if d.metrics != nil {
-			d.metrics.RecordDelivery(ch.Type, false)
-		}
-		d.record(ctx, a.ID, ch.ID, "failed", err.Error())
+		d.metrics.RecordDelivery(ch.Type, false)
+		safeErr := sanitizeDeliveryError(err)
+		d.record(ctx, a.ID, ch.ID, "failed", safeErr.Error())
 		d.log.Warn("alert delivery failed",
-			"alert_id", a.ID, "channel_id", ch.ID, "attempt", attempt, "err", err)
-		telemetry.RecordError(span, err)
-
-		// Honor Retry-After if present in error message or headers
-		if errStr := err.Error(); strings.Contains(errStr, "Retry-After") || strings.Contains(errStr, "429") {
-			if d.metrics != nil {
-				d.metrics.RecordThrottle(ch.Type)
-			}
-		}
+			"alert_id", a.ID, "channel_id", ch.ID, "attempt", attempt, "err", safeErr)
 
 		if attempt >= d.MaxAttempts || ctx.Err() != nil {
 			return
@@ -384,9 +375,43 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 	}
 }
 
+func (d *Dispatcher) sendWithRecovery(ctx context.Context, a Alert, ch store.Channel, notifier Notifier) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			d.log.Error("notifier panicked", "alert_id", a.ID, "channel_id", ch.ID)
+			err = errors.New("delivery failed")
+		}
+	}()
+	return notifier.Send(ctx, a)
+}
+
+func sanitizeDeliveryError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := strings.TrimSpace(err.Error())
+	if msg == "" {
+		return errors.New("delivery failed")
+	}
+	msg = redactSecretText(msg)
+	if msg == "" {
+		return errors.New("delivery failed")
+	}
+	return errors.New(msg)
+}
+
+func redactSecretText(s string) string {
+	secretPattern := regexp.MustCompile(`(?i)\b(?:token|secret|password|passwd|api[_-]?key|auth[_-]?token|access[_-]?token|bearer)\b(?:\s*[:=]\s*|\s+)[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+`)
+	return secretPattern.ReplaceAllString(s, "[redacted]")
+}
+
 func (d *Dispatcher) record(ctx context.Context, alertID, channelID int64, status, snippet string) *store.DeliveryAttempt {
 	if len(snippet) > 500 {
 		snippet = snippet[:500]
+	}
+	snippet = redactSecretText(snippet)
+	if snippet == "" {
+		snippet = "delivery failed"
 	}
 	da := &store.DeliveryAttempt{
 		AlertID:         alertID,
