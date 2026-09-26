@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -64,6 +65,10 @@ func (emptyStore) ListMonitorTemplates(context.Context) ([]store.MonitorTemplate
 }
 func (emptyStore) UpdateMonitorTemplate(context.Context, *store.MonitorTemplate) error { return nil }
 func (emptyStore) DeleteMonitorTemplate(context.Context, int64) error                  { return nil }
+func (emptyStore) CreateAuditEntry(context.Context, *store.AuditEntry) error           { return nil }
+func (emptyStore) ListAuditEntries(context.Context, store.AuditFilter) ([]store.AuditEntry, error) {
+	return nil, nil
+}
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
@@ -72,6 +77,104 @@ func newTestServer(t *testing.T) *Server {
 		t.Fatalf("New: %v", err)
 	}
 	return s
+}
+
+type channelDeleteStore struct {
+	emptyStore
+	channel  store.Channel
+	monitors []store.Monitor
+	deleted  bool
+}
+
+func (s *channelDeleteStore) GetChannel(context.Context, int64) (*store.Channel, error) {
+	return &s.channel, nil
+}
+
+func (s *channelDeleteStore) ListMonitorsForChannel(context.Context, int64) ([]store.Monitor, error) {
+	return s.monitors, nil
+}
+
+func (s *channelDeleteStore) DeleteChannel(context.Context, int64) error {
+	s.deleted = true
+	return nil
+}
+
+func newChannelDeleteServer(t *testing.T, st *channelDeleteStore) (*Server, *httptest.Server) {
+	t.Helper()
+	s, err := New(st, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return s, httptest.NewServer(s.Routes())
+}
+
+func TestDeleteChannelConfirmationAllowsZeroAttachments(t *testing.T) {
+	st := &channelDeleteStore{channel: store.Channel{ID: 7, Name: "unused"}}
+	_, srv := newChannelDeleteServer(t, st)
+	defer srv.Close()
+
+	res, err := http.PostForm(srv.URL+"/channels/7/delete", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusOK || !strings.Contains(string(body), "No monitors currently depend") {
+		t.Fatalf("initial confirmation = %d, %s", res.StatusCode, body)
+	}
+	if st.deleted {
+		t.Fatal("channel deleted before confirmation")
+	}
+
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	res, err = client.PostForm(srv.URL+"/channels/7/delete", url.Values{"confirm": {"1"}, "confirmed_signature": {""}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusSeeOther || !st.deleted {
+		t.Fatalf("confirmed delete = %d, deleted=%v", res.StatusCode, st.deleted)
+	}
+}
+
+func TestDeleteChannelConfirmationRejectsStaleAttachmentCount(t *testing.T) {
+	st := &channelDeleteStore{
+		channel:  store.Channel{ID: 7, Name: "shared"},
+		monitors: []store.Monitor{{ID: 1, Name: "old", ChannelIDs: []int64{7}}},
+	}
+	_, srv := newChannelDeleteServer(t, st)
+	defer srv.Close()
+
+	res, err := http.PostForm(srv.URL+"/channels/7/delete", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	st.monitors = []store.Monitor{
+		{ID: 1, Name: "old", ChannelIDs: []int64{7}},
+		{ID: 2, Name: "new", ChannelIDs: []int64{7}},
+	}
+
+	bodyForm := url.Values{"confirm": {"1"}, "confirmed_signature": {"1:7,;"}}
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	res, err = client.PostForm(srv.URL+"/channels/7/delete", bodyForm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusOK || !strings.Contains(string(body), "attachments changed") || !strings.Contains(string(body), "new") {
+		t.Fatalf("stale confirmation = %d, %s", res.StatusCode, body)
+	}
+	if st.deleted {
+		t.Fatal("channel deleted using stale attachment count")
+	}
 }
 
 type pagingStore struct {
@@ -289,13 +392,13 @@ func TestAlertsPageFilterControlsAndPreservedPaging(t *testing.T) {
 }
 
 func TestAlertFilterQueryOmitsDefaults(t *testing.T) {
-	if got := alertFilterQuery(0, 0, "", ""); got != "" {
+	if got := alertFilterQuery(0, 0, "", "", ""); got != "" {
 		t.Fatalf("defaults = %q, want empty so ?cursor= stays stable", got)
 	}
-	if got := alertFilterQuery(0, 0, "", "created_at_desc"); got != "" {
+	if got := alertFilterQuery(0, 0, "", "", "created_at_desc"); got != "" {
 		t.Fatalf("default sort = %q, want empty", got)
 	}
-	got := alertFilterQuery(7, 9, "CAAA", "created_at_asc")
+	got := alertFilterQuery(7, 9, "CAAA", "", "created_at_asc")
 	if !strings.Contains(got, "monitor_id=7") || !strings.Contains(got, "rule_id=9") ||
 		!strings.Contains(got, "contract_id=CAAA") || !strings.Contains(got, "sort=created_at_asc") ||
 		!strings.HasSuffix(got, "&") {
@@ -307,10 +410,10 @@ func TestAlertFilterQueryOmitsDefaults(t *testing.T) {
 // JSON API's export endpoint, drop the (meaningless) cursor, and preserve
 // the filters applied to the list on screen.
 func TestAlertExportHref(t *testing.T) {
-	if got := alertExportHref(0, 0, "", ""); got != "/api/v1/alerts.csv" {
+	if got := alertExportHref(0, 0, "", "", ""); got != "/api/v1/alerts.csv" {
 		t.Fatalf("defaults = %q, want the bare export URL", got)
 	}
-	got := string(alertExportHref(7, 9, "CAAA", "created_at_asc"))
+	got := string(alertExportHref(7, 9, "CAAA", "", "created_at_asc"))
 	for _, want := range []string{"/api/v1/alerts.csv?", "monitor_id=7", "rule_id=9", "contract_id=CAAA", "sort=created_at_asc"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("export href %q missing %q", got, want)

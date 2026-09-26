@@ -68,6 +68,7 @@ func sessionCookie(id string, secure bool, ttl time.Duration) *http.Cookie {
 // is what an unset API_TOKEN produces — leaves the dashboard open, exactly as
 // it was before authentication existed.
 func (s *Server) WithAuth(a *auth.Authenticator) *Server {
+	s.a = a
 	s.auth = a
 	return s
 }

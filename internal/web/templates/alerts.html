@@ -12,6 +12,13 @@
   <input type="number" id="rule_id" name="rule_id" value="{{if .SelectedRule}}{{.SelectedRule}}{{end}}" min="1" placeholder="id">
   <label for="contract_id">Contract</label>
   <input type="search" id="contract_id" name="contract_id" value="{{.ContractID}}" placeholder="contract id">
+  <label for="severity">Severity</label>
+  <select id="severity" name="severity">
+    <option value="">All severities</option>
+    <option value="info" {{if eq .Severity "info"}}selected{{end}}>Info</option>
+    <option value="warning" {{if eq .Severity "warning"}}selected{{end}}>Warning</option>
+    <option value="critical" {{if eq .Severity "critical"}}selected{{end}}>Critical</option>
+  </select>
   <label for="sort">Sort</label>
   <select id="sort" name="sort">
     <option value="created_at_desc" {{if eq .Sort "created_at_desc"}}selected{{end}}>Newest</option>
@@ -20,14 +27,16 @@
   <button>Filter</button>
 </form>
 <p class="export"><a href="{{.ExportHref}}">Export CSV</a> | <a href="/searches">Saved searches</a></p>
+<p class="muted" id="live-status" aria-live="polite"></p>
 {{if .Alerts}}
 <table>
-  <tr><th>ID</th><th>Monitor</th><th>Rule</th><th>Event</th><th>Payload</th><th>Deliveries</th><th>At</th></tr>
+  <tr><th>ID</th><th>Monitor</th><th>Rule</th><th>Severity</th><th>Event</th><th>Payload</th><th>Deliveries</th><th>At</th></tr>
   {{range .Alerts}}
   <tr>
     <td><a href="/alerts/{{.ID}}">{{.ID}}</a></td>
     <td>{{index $.MonitorNames .MonitorID}}</td>
     <td>#{{.RuleID}}</td>
+    <td>{{if .Severity}}<span class="pill {{severityClass .Severity}}">{{.Severity}}</span>{{else}}<span class="pill warning">warning</span>{{end}}</td>
     <td>{{template "copyID" .EventID}}</td>
     <td><details><summary>view</summary>{{decodedEvent .Payload}}<pre>{{prettyJSON .Payload}}</pre></details></td>
     <td>
@@ -39,9 +48,10 @@
     <td>{{if .RetractedAt}}<span class="pill off" title="orphaned by a chain reorg">retracted</span> {{end}}{{formatTime .CreatedAt $.Timezone}}{{with relTime .CreatedAt}} <span class="muted">({{.}})</span>{{end}}</td>
   </tr>
   {{end}}
+  </tbody>
 </table>
 {{if .OlderHref}}<p><a href="{{.OlderHref}}">Older →</a></p>{{end}}
-{{else if or .SelectedMonitor .SelectedRule .ContractID}}<p class="muted">No alerts match these filters.</p>
+{{else if or .SelectedMonitor .SelectedRule .ContractID .Severity}}<p class="muted">No alerts match these filters.</p>
 {{else if eq .Empty "no_monitors"}}
 <section class="empty">
   <h2>Nothing is being watched yet</h2>
@@ -67,4 +77,133 @@
   <p><a href="/monitors">Review monitors</a></p>
 </section>
 {{end}}
+
+<script>
+// Live alerts. The server streams newly created alerts over SSE
+// (/api/v1/alerts/stream); this appends each one to the table instead of
+// making the operator reload the page. Rows are built with DOM APIs, never
+// innerHTML, because the payload is attacker-controlled on-chain data.
+(function () {
+  if (!window.EventSource) return;
+
+  var order = "{{.Sort}}";
+  var monitorID = "{{.SelectedMonitor}}";
+  var ruleID = "{{.SelectedRule}}";
+  var contractID = "{{.ContractID}}";
+  var status = document.getElementById("live-status");
+  var columns = ["ID", "Monitor", "Rule", "Event", "Payload", "Deliveries", "At"];
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+
+  // ensureBody returns the tbody to append to. On a page that rendered an
+  // empty state there is no table yet, so the first live alert builds one
+  // (replacing the now-stale "no alerts" message).
+  function ensureBody() {
+    var body = document.getElementById("alerts-body");
+    if (body) return body;
+    var table = el("table");
+    table.id = "alerts-table";
+    var thead = el("thead"), headRow = el("tr");
+    columns.forEach(function (name) { headRow.appendChild(el("th", null, name)); });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    body = el("tbody");
+    body.id = "alerts-body";
+    table.appendChild(body);
+    var host = document.querySelector("main") || document.body;
+    var empty = host.querySelector("section.empty");
+    if (empty && empty.parentNode) {
+      empty.parentNode.insertBefore(table, empty);
+      empty.parentNode.removeChild(empty);
+    } else {
+      host.appendChild(table);
+    }
+    return body;
+  }
+
+  function buildRow(a) {
+    var row = el("tr");
+    row.className = "live";
+
+    var idCell = el("td");
+    var link = el("a", null, String(a.id));
+    link.setAttribute("href", "/alerts/" + encodeURIComponent(String(a.id)));
+    idCell.appendChild(link);
+    row.appendChild(idCell);
+
+    row.appendChild(el("td", null, a.monitor_name || ("#" + a.monitor_id)));
+    row.appendChild(el("td", null, "#" + a.rule_id));
+    row.appendChild(el("td", null, a.event_id || ""));
+
+    var payloadCell = el("td");
+    var details = el("details");
+    details.appendChild(el("summary", null, "view"));
+    var pre = el("pre");
+    try {
+      pre.textContent = JSON.stringify(a.payload, null, 2);
+    } catch (err) {
+      pre.textContent = "";
+    }
+    details.appendChild(pre);
+    payloadCell.appendChild(details);
+    row.appendChild(payloadCell);
+
+    var deliveryCell = el("td");
+    var deliveries = el("details");
+    deliveries.setAttribute("hx-get", "/alerts/" + a.id + "/deliveries");
+    deliveries.setAttribute("hx-trigger", "toggle once");
+    deliveries.setAttribute("hx-target", "find div");
+    deliveries.appendChild(el("summary", null, "view"));
+    deliveries.appendChild(el("div", "muted", "loading\u2026"));
+    deliveryCell.appendChild(deliveries);
+    row.appendChild(deliveryCell);
+
+    var atCell = el("td");
+    if (a.created_at) atCell.textContent = new Date(a.created_at).toLocaleString();
+    row.appendChild(atCell);
+
+    return row;
+  }
+
+  // monitor_id is filtered server-side; rule_id and contract_id are applied
+  // here so a live row never contradicts the filters on screen.
+  function matches(a) {
+    if (ruleID && String(a.rule_id) !== ruleID) return false;
+    if (contractID && (!a.payload || a.payload.contract_id !== contractID)) return false;
+    return true;
+  }
+
+  var url = "/api/v1/alerts/stream";
+  if (monitorID && monitorID !== "0") url += "?monitor_id=" + encodeURIComponent(monitorID);
+  var es = new EventSource(url);
+
+  es.addEventListener("alert", function (ev) {
+    var a;
+    try { a = JSON.parse(ev.data); } catch (err) { return; }
+    if (!matches(a)) return;
+    var body = ensureBody();
+    var row = buildRow(a);
+    // Newest first for the default (desc) order; oldest-first pages extend
+    // downwards so the reading order stays consistent.
+    if (order === "created_at_asc") {
+      body.appendChild(row);
+    } else {
+      body.insertBefore(row, body.firstChild);
+    }
+  });
+
+  es.onopen = function () {
+    if (status) status.textContent = "Live alerts connected.";
+  };
+  es.onerror = function () {
+    // EventSource reconnects by itself; say so instead of alarming.
+    if (status) status.textContent = "Live alerts reconnecting\u2026";
+  };
+})();
+</script>
 {{end}}

@@ -101,5 +101,6 @@ func (s *Server) createRuleFromBuilder(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionCreate, "rule", rule.ID, "type", "params")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
