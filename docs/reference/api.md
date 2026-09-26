@@ -33,6 +33,39 @@ An unauthenticated instance mutates monitors and channels for anyone who can
 reach the port. Set `API_TOKEN` on anything beyond a trusted network.
 {% endhint %}
 
+## Rate limiting
+
+API rate limiting uses a per-client token bucket, enabled by setting
+`RATE_LIMIT_RPS` (see the [configuration guide](../configuration.md)); with rate
+limiting off, no `429` is ever produced. When a client exceeds the configured
+budget, the API replies with `429 Too Many Requests` and the rejected response
+carries:
+
+* `Retry-After` — the wait in whole seconds until the bucket holds a token
+  again. It is derived from the bucket's actual refill time, not a fixed
+  constant, rounded up to the next whole second and never `0`, so a client
+  that honours it never retries into a second rejection. Retry-After in
+  seconds is the interoperable form; the alternative delay format is not used.
+* `RateLimit-Limit` — the bucket size (burst). `RateLimit-Remaining` — `0` on
+  a rejection. `RateLimit-Reset` — the same value as `Retry-After`.
+
+`RateLimit-*` are informational, conventional headers rather than
+standards-track ones: they are not required for interoperability, but clients
+that already read the same pattern from other HTTP APIs can use them. They are
+sent because the limiter computes the values anyway, and they make throttling
+observable without retries.
+
+Successful responses are intentionally left unchanged — adding the headers
+there is a separate feature with cache-interaction costs of its own. The header
+is set only on the rejected response itself.
+
+One other endpoint answers `429`: retrying an alert delivery while the channel
+is still in its retry cooldown (`POST /alerts/{id}/retry`). That gate is not
+the token bucket and does not send `Retry-After`; clients should treat
+`Retry-After` as present only on token-bucket rejections.
+
+Probes (`/health`, `/livez`, `/readyz`) are exempt from rate limiting.
+
 ## Monitors
 
 | Method & path | Description |

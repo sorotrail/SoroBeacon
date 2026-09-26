@@ -116,15 +116,24 @@ func isProbePath(path string) bool {
 	}
 }
 
-func retryAfterSeconds(rps float64) int {
-	if rps <= 0 {
+func retryAfterDelay(bucket *rate.Limiter, now time.Time) int {
+	if bucket == nil || bucket.Limit() <= 0 {
 		return 1
 	}
-	n := int(math.Ceil(1 / rps))
-	if n < 1 {
+	tokens := bucket.TokensAt(now)
+	if tokens >= 1 {
 		return 1
 	}
-	return n
+	missing := 1 - tokens
+	delay := time.Duration((missing / float64(bucket.Limit())) * float64(time.Second))
+	if delay <= 0 {
+		return 1
+	}
+	seconds := int(math.Ceil(delay.Seconds()))
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
 }
 
 func setRateLimitHeaders(w http.ResponseWriter, limit, remaining, reset int) {
@@ -154,7 +163,7 @@ func (l *RateLimiter) Middleware(next http.Handler) http.Handler {
 		}
 		bucket := l.get(clientKey(r, l.cfg.TrustForwarded))
 		if !bucket.Allow() {
-			retry := retryAfterSeconds(l.cfg.RPS)
+			retry := retryAfterDelay(bucket, l.now())
 			setRateLimitHeaders(w, l.cfg.Burst, 0, retry)
 			w.Header().Set("Retry-After", strconv.Itoa(retry))
 			writeErr(w, r, http.StatusTooManyRequests, "rate limit exceeded")

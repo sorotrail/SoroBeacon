@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 func okHandler() http.Handler {
@@ -80,6 +82,80 @@ func TestRateLimitAllowsThenDenies(t *testing.T) {
 	}
 	if body["code"] != http.StatusText(http.StatusTooManyRequests) {
 		t.Fatalf("code = %#v", body["code"])
+	}
+}
+
+func TestRateLimitRetryAfterUsesBucketRefillDelay(t *testing.T) {
+	bucket := rate.NewLimiter(rate.Limit(0.5), 3)
+	now := time.Unix(0, 0)
+	for i := 0; i < 3; i++ {
+		if !bucket.AllowN(now, 1) {
+			t.Fatal("draining the bucket should succeed")
+		}
+	}
+	if bucket.AllowN(now, 1) {
+		t.Fatal("bucket should be empty after drain")
+	}
+
+	later := now.Add(1500 * time.Millisecond)
+	if bucket.AllowN(later, 1) {
+		t.Fatal("request should be denied before the refill boundary")
+	}
+	if got := retryAfterDelay(bucket, later); got != 1 {
+		t.Fatalf("Retry-After = %d, want 1s for a 0.5s refill", got)
+	}
+
+	boundary := later.Add(500 * time.Millisecond)
+	if !bucket.AllowN(boundary, 1) {
+		t.Fatal("request at the refill boundary should be allowed")
+	}
+
+	// A refill that lands mid-second rounds up rather than truncating;
+	// truncation would tell the client to retry before a token exists.
+	halves := rate.NewLimiter(rate.Limit(0.4), 1)
+	if !halves.AllowN(now, 1) {
+		t.Fatal("fresh bucket should allow the first request")
+	}
+	if got := retryAfterDelay(halves, now); got != 3 {
+		t.Fatalf("Retry-After = %d, want 3 (ceil of the 2.5s refill at 0.4 rps)", got)
+	}
+}
+
+func TestRateLimit429CarriesComputedRetryAfter(t *testing.T) {
+	lim := newRateLimiter(RateLimitConfig{RPS: 0.5, Burst: 1})
+	now := time.Unix(0, 0)
+	lim.now = func() time.Time { return now }
+
+	h := lim.Middleware(okHandler())
+	remote := "192.0.2.70:1"
+
+	allowed := doReq(t, h, http.MethodGet, "/monitors", remote, nil)
+	if allowed.Code != http.StatusOK {
+		t.Fatalf("first request = %d, want 200", allowed.Code)
+	}
+	if got := allowed.Header().Get("Retry-After"); got != "" {
+		t.Fatalf("Retry-After = %q on a successful response; the header belongs on the 429 only", got)
+	}
+
+	// Half a second in, the single-token bucket holds 0.25 tokens, so the
+	// next token lands 1.5s later: Retry-After must report ceil(1.5) = 2,
+	// proving the value is computed from the bucket rather than a constant.
+	now = now.Add(500 * time.Millisecond)
+	denied := doReq(t, h, http.MethodGet, "/monitors", remote, nil)
+	if denied.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request = %d, want 429", denied.Code)
+	}
+	if got := denied.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want 2 (ceil of the 1.5s refill at 0.5 rps)", got)
+	}
+	if got := denied.Header().Get("RateLimit-Remaining"); got != "0" {
+		t.Fatalf("RateLimit-Remaining = %q, want 0", got)
+	}
+	if got := denied.Header().Get("RateLimit-Limit"); got != "1" {
+		t.Fatalf("RateLimit-Limit = %q, want 1", got)
+	}
+	if got := denied.Header().Get("RateLimit-Reset"); got == "" {
+		t.Fatal("missing RateLimit-Reset on 429")
 	}
 }
 
