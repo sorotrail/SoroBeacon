@@ -21,7 +21,7 @@ Reading it top to bottom shows the whole pipeline as a set of interfaces:
   wherever events come from.
 * the **decoder** — `stellar.NewSpecDecoder(stellar.DefaultDecoder{}, ...)`
   wraps the plain decoder with contract-spec-aware named fields.
-* the **rules registry** — `rules.NewRegistry()` with the four built-in rule
+* the **rules registry** — `rules.NewRegistry()` with the five built-in rule
   types registered.
 * the **dispatcher** — `notify.NewDispatcher(st, factory, log)`.
 * the **poller** — `poller.New(src, st, registry, dispatcher, ...)` then
@@ -100,6 +100,7 @@ The built-ins, one file each:
 | `value_threshold` | `internal/rules/value_threshold.go` |
 | `token_event` | `internal/rules/token_event.go` |
 | `frequency_threshold` | `internal/rules/frequency_threshold.go` |
+| `composite` | `internal/rules/composite.go` |
 
 `frequency_threshold` is the interesting one: it is stateful, keeps a rolling
 window keyed by `rules.RuleID(ctx)`, and chooses the event id its alert is

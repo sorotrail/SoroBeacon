@@ -85,6 +85,10 @@ func NewRegistry() *Registry {
 	r.Register(TypeValueThreshold, ValueThreshold{})
 	r.Register(TypeTokenEvent, TokenEvent{})
 	r.Register(TypeFrequencyThreshold, NewFrequencyThreshold())
+	// The composite is registered last because it resolves child types
+	// through this registry; passing r to itself lets it see every leaf above
+	// and any type registered on this registry later.
+	r.Register(TypeComposite, NewComposite(r))
 	return r
 }
 
