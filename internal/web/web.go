@@ -709,6 +709,7 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionCreate, "monitor", m.ID, "name", "contract_ids")
 	http.Redirect(w, r, "/monitors", http.StatusSeeOther)
 }
 
@@ -790,6 +791,7 @@ func (s *Server) toggleMonitor(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionUpdate, "monitor", id, "enabled")
 	http.Redirect(w, r, "/monitors", http.StatusSeeOther)
 }
 
@@ -808,6 +810,7 @@ func (s *Server) duplicateMonitor(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionCreate, "monitor", m.ID, "name", "contract_ids")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", m.ID), http.StatusSeeOther)
 }
 
@@ -821,6 +824,7 @@ func (s *Server) deleteMonitor(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionDelete, "monitor", id)
 	http.Redirect(w, r, "/monitors", http.StatusSeeOther)
 }
 
@@ -844,6 +848,7 @@ func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionDelete, "rule", ruleID, "monitor_id")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
 
@@ -868,6 +873,7 @@ func (s *Server) toggleRule(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionUpdate, "rule", ruleID, "enabled")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
 
@@ -894,6 +900,7 @@ func (s *Server) setMonitorChannels(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionUpdate, "monitor", id, "channel_ids")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
 
@@ -947,6 +954,7 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionCreate, "channel", ch.ID, "name", "type", "config")
 	http.Redirect(w, r, "/channels", http.StatusSeeOther)
 }
 
@@ -983,6 +991,7 @@ func (s *Server) deleteChannel(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionDelete, "channel", id)
 	http.Redirect(w, r, "/channels", http.StatusSeeOther)
 }
 

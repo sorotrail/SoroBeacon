@@ -2,6 +2,7 @@ package notify
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"time"
@@ -19,6 +20,11 @@ var (
 	ErrRetryCooldown    = errors.New("retried too recently")
 )
 
+// DefaultDigestFlushInterval is how often the dispatcher checks for digest
+// windows that have elapsed. A window is closed within one interval of its
+// expiry.
+const DefaultDigestFlushInterval = 30 * time.Second
+
 // DefaultRetryCooldown bounds how often an operator can re-send one
 // alert to one channel. Long enough to stop a jammed button, short
 // enough that a real "the webhook is fixed, try again" is not blocked.
@@ -28,6 +34,9 @@ const DefaultRetryCooldown = 30 * time.Second
 type DispatchStore interface {
 	ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]store.Channel, error)
 	RecordDeliveryAttempt(ctx context.Context, d *store.DeliveryAttempt) error
+	// ListChannels is how the digest flusher discovers channels with a
+	// window to close. Dispatch itself only needs ListChannelsForMonitor.
+	ListChannels(ctx context.Context, enabledOnly bool) ([]store.Channel, error)
 }
 
 // Dispatcher fans an alert out to its monitor's channels, retrying each
@@ -43,6 +52,11 @@ type Dispatcher struct {
 	// (default 1s, doubled each retry: 1s, 2s, 4s...).
 	MaxAttempts int
 	BaseBackoff time.Duration
+
+	// digest is optional. When attached, channels with digest mode
+	// "window" accumulate alerts here and a summary is flushed once the
+	// window elapses.
+	digest store.DigestQueue
 }
 
 // NewDispatcher wires a Dispatcher with default retry settings.
@@ -62,6 +76,18 @@ func (d *Dispatcher) WithMetrics(m *metrics.Metrics) *Dispatcher {
 	return d
 }
 
+// WithDigestQueue attaches the pending-digest store. Without it, digest mode
+// is inert and every channel delivers immediately as before.
+func (d *Dispatcher) WithDigestQueue(q store.DigestQueue) *Dispatcher {
+	d.digest = q
+	return d
+}
+
+// digestEnabled reports whether a channel batches its delivery.
+func digestEnabled(ch store.Channel) bool {
+	return ch.DigestMode == store.DigestModeWindow && ch.DigestWindowSeconds > 0
+}
+
 // Dispatch delivers one alert to every enabled channel attached to its
 // monitor. Channel failures are recorded and logged, never fatal: one bad
 // channel must not block the others or the poller.
@@ -72,7 +98,123 @@ func (d *Dispatcher) Dispatch(ctx context.Context, a Alert) {
 		return
 	}
 	for _, ch := range channels {
+		if d.digest != nil && digestEnabled(ch) {
+			d.enqueueDigest(ctx, a, ch)
+			continue
+		}
 		d.deliver(ctx, a, ch)
+	}
+}
+
+// enqueueDigest persists an alert for a channel's next digest flush. The
+// row outlives the process, so a restart does not drop a partial window.
+func (d *Dispatcher) enqueueDigest(ctx context.Context, a Alert, ch store.Channel) {
+	payload, err := json.Marshal(a)
+	if err != nil {
+		d.log.Error("marshal alert for digest", "alert_id", a.ID, "channel_id", ch.ID, "err", err)
+		return
+	}
+	if err := d.digest.PushDigestAlert(ctx, ch.ID, payload); err != nil {
+		d.log.Error("queue alert for digest", "alert_id", a.ID, "channel_id", ch.ID, "err", err)
+	}
+}
+
+// RunDigestFlusher flushes due digests on a ticker until ctx is cancelled.
+// interval bounds how promptly a window is closed; a window that elapses
+// between ticks is flushed on the next one.
+func (d *Dispatcher) RunDigestFlusher(ctx context.Context, interval time.Duration) {
+	if d.digest == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			d.FlushDigests(ctx, now)
+		}
+	}
+}
+
+// FlushDigests sends one summary per channel whose oldest pending alert is
+// at least its window old. Called on a ticker by RunDigestFlusher and
+// directly by tests. now is injectable so window tests need no sleep.
+func (d *Dispatcher) FlushDigests(ctx context.Context, now time.Time) {
+	if d.digest == nil {
+		return
+	}
+	channels, err := d.store.ListChannels(ctx, false)
+	if err != nil {
+		d.log.Error("list channels for digest flush", "err", err)
+		return
+	}
+	for _, ch := range channels {
+		if !digestEnabled(ch) {
+			continue
+		}
+		pending, err := d.digest.ListDigestAlerts(ctx, ch.ID)
+		if err != nil {
+			d.log.Error("list pending digest alerts", "channel_id", ch.ID, "err", err)
+			continue
+		}
+		if len(pending) == 0 {
+			continue
+		}
+		window := time.Duration(ch.DigestWindowSeconds) * time.Second
+		if now.Sub(pending[0].CreatedAt) < window {
+			continue
+		}
+		d.flushDigest(ctx, ch, pending)
+	}
+}
+
+// flushDigest renders and sends one channel's digest, then clears the rows it
+// covered. On a send failure the rows are kept so the next tick retries; a
+// partial window is never lost.
+func (d *Dispatcher) flushDigest(ctx context.Context, ch store.Channel, pending []store.DigestAlert) {
+	alerts := make([]Alert, 0, len(pending))
+	ids := make([]int64, 0, len(pending))
+	for _, p := range pending {
+		var a Alert
+		if err := json.Unmarshal(p.Payload, &a); err != nil {
+			d.log.Error("decode pending digest alert", "channel_id", ch.ID, "err", err)
+			ids = append(ids, p.ID)
+			continue
+		}
+		alerts = append(alerts, a)
+		ids = append(ids, p.ID)
+	}
+	if len(alerts) == 0 {
+		d.clearDigest(ctx, ch.ID, ids)
+		return
+	}
+
+	notifier, err := d.factory.New(ch.Type, ch.Config)
+	if err != nil {
+		d.log.Error("build notifier for digest", "channel_id", ch.ID, "channel_type", ch.Type, "err", err)
+		return
+	}
+	summary := RenderDigest(alerts, DefaultDigestMaxLen)
+	synthetic := Alert{MonitorID: alerts[0].MonitorID, MonitorName: alerts[0].MonitorName, Digest: summary}
+	if err := notifier.Send(ctx, synthetic); err != nil {
+		d.metrics.RecordDelivery(ch.Type, false)
+		d.log.Warn("digest delivery failed; keeping the window for the next flush",
+			"channel_id", ch.ID, "count", len(alerts), "err", err)
+		return
+	}
+	d.metrics.RecordDelivery(ch.Type, true)
+	d.log.Info("digest delivered", "channel_id", ch.ID, "count", len(alerts))
+	d.clearDigest(ctx, ch.ID, ids)
+}
+
+func (d *Dispatcher) clearDigest(ctx context.Context, channelID int64, ids []int64) {
+	if err := d.digest.DeleteDigestAlerts(ctx, channelID, ids); err != nil {
+		d.log.Error("clear flushed digest alerts", "channel_id", channelID, "err", err)
 	}
 }
 

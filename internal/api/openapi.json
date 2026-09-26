@@ -742,6 +742,51 @@
         }
       }
     },
+    "/audit": {
+      "get": {
+        "summary": "Audit log of configuration changes",
+        "description": "Append-only entries for monitor, rule and channel create, update and delete. diff records field names only, never values.",
+        "parameters": [
+          { "name": "target_type", "in": "query", "schema": { "type": "string", "enum": ["monitor", "rule", "channel"] } },
+          { "name": "target_id", "in": "query", "schema": { "type": "integer", "format": "int64" } },
+          { "name": "from", "in": "query", "schema": { "type": "string", "format": "date-time" } },
+          { "name": "to", "in": "query", "schema": { "type": "string", "format": "date-time" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit entries, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["entries"],
+                  "properties": {
+                    "entries": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": ["id", "actor", "action", "target_type", "target_id", "created_at"],
+                        "properties": {
+                          "id": { "type": "integer", "format": "int64" },
+                          "actor": { "type": "string" },
+                          "action": { "type": "string", "enum": ["create", "update", "delete"] },
+                          "target_type": { "type": "string", "enum": ["monitor", "rule", "channel"] },
+                          "target_id": { "type": "integer", "format": "int64" },
+                          "diff": { "type": "object" },
+                          "created_at": { "type": "string", "format": "date-time" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/templates": {
       "post": {
         "summary": "Create a monitor template",
@@ -1122,7 +1167,19 @@
             "type": "object",
             "description": "Type-specific; the channel reference documents each"
           },
-          "enabled": { "type": "boolean", "default": true }
+          "enabled": { "type": "boolean", "default": true },
+          "digest_mode": {
+            "type": "string",
+            "enum": ["", "window"],
+            "default": "",
+            "description": "Empty delivers immediately; window batches into one summary per digest_window_seconds"
+          },
+          "digest_window_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Accumulation window when digest_mode is window; must be > 0 then"
+          }
         }
       },
       "MonitorPage": {

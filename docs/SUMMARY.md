@@ -39,6 +39,8 @@
 * [PagerDuty](channels/pagerduty.md)
 * [Federation](channels/federation.md)
 * [Message templates](channels/templates.md)
+* [External secrets](channels/secrets.md)
+* [Digest mode](channels/digest.md)
 
 ## 📏 Operations
 

@@ -103,12 +103,21 @@ type Rule struct {
 // When a ConfigCipher is configured, Config is encrypted at rest and the
 // store returns it decrypted (see crypto.go).
 type Channel struct {
-	ID        int64           `json:"id"`
-	Name      string          `json:"name"`
-	Type      string          `json:"type"`
-	Config    json.RawMessage `json:"-"`
-	Enabled   bool            `json:"enabled"`
-	CreatedAt time.Time       `json:"created_at"`
+	ID     int64           `json:"id"`
+	Name   string          `json:"name"`
+	Type   string          `json:"type"`
+	Config json.RawMessage `json:"-"`
+	// Enabled controls whether the channel receives alerts at all.
+	Enabled bool `json:"enabled"`
+	// DigestMode selects batched delivery: "" (the default) sends every
+	// alert immediately, exactly as before digesting existed; "window"
+	// accumulates alerts and sends one summary per DigestWindowSeconds.
+	DigestMode string `json:"digest_mode"`
+	// DigestWindowSeconds is the accumulation window when DigestMode is
+	// "window". Zero leaves digesting off even when a mode is set, so a
+	// half-filled form cannot silently batch forever.
+	DigestWindowSeconds int64     `json:"digest_window_seconds"`
+	CreatedAt           time.Time `json:"created_at"`
 }
 
 // Alert records one rule match on one event. EventID is the source event's
@@ -466,6 +475,81 @@ type SavedSearches interface {
 	ClearDefaultSearch(ctx context.Context, id int64) error
 }
 
+// Audit actions persisted on audit_log.action. A small closed set so the
+// API can filter on it and clients can branch on a stable token.
+const (
+	AuditActionCreate = "create"
+	AuditActionUpdate = "update"
+	AuditActionDelete = "delete"
+)
+
+// AuditEntry is one append-only record of a mutating operation on a monitor,
+// rule or channel. Diff records which fields were sent — never their values:
+// channel config holds webhook URLs, bot tokens and SMTP credentials, so only
+// the fact that a field changed is stored, never what it changed to.
+// Actor is the request ID today and will carry the authenticated principal
+// once auth identifies one; the column is a plain string so that needs no
+// migration.
+type AuditEntry struct {
+	ID         int64           `json:"id"`
+	Actor      string          `json:"actor"`
+	Action     string          `json:"action"`
+	TargetType string          `json:"target_type"`
+	TargetID   int64           `json:"target_id"`
+	Diff       json.RawMessage `json:"diff,omitempty"`
+	CreatedAt  time.Time       `json:"created_at"`
+}
+
+// AuditFilter narrows ListAuditEntries. Zero values mean "no constraint".
+type AuditFilter struct {
+	TargetType string
+	TargetID   int64
+	From       time.Time
+	To         time.Time
+	Limit      int
+}
+
+// Digest modes persisted on channels.digest_mode. The empty string means
+// immediate delivery.
+const (
+	DigestModeOff    = ""
+	DigestModeWindow = "window"
+)
+
+// DigestAlert is one alert waiting to be summarised into a channel digest.
+// Payload is the serialised notify.Alert; the store keeps it opaque so the
+// store package does not depend on the notification layer.
+type DigestAlert struct {
+	ID        int64           `json:"id"`
+	ChannelID int64           `json:"channel_id"`
+	Payload   json.RawMessage `json:"payload"`
+	CreatedAt time.Time       `json:"created_at"`
+}
+
+// DigestQueue persists alerts awaiting a channel's digest flush so a restart
+// does not silently drop a partial window. Rows are owned by the channel and
+// cascade when it is deleted.
+type DigestQueue interface {
+	// PushDigestAlert appends one serialised alert to a channel's window.
+	PushDigestAlert(ctx context.Context, channelID int64, payload json.RawMessage) error
+	// ListDigestAlerts returns a channel's pending alerts oldest first.
+	ListDigestAlerts(ctx context.Context, channelID int64) ([]DigestAlert, error)
+	// DeleteDigestAlerts removes the flushed rows by id. Deleting by id
+	// rather than draining the channel keeps an alert that arrived during
+	// the flush from being dropped.
+	DeleteDigestAlerts(ctx context.Context, channelID int64, ids []int64) error
+}
+
+// Audits is append-only by design: there is deliberately no Update or Delete
+// method, so nothing can rewrite or erase the log through the store.
+type Audits interface {
+	// CreateAuditEntry appends one entry and fills in its ID and CreatedAt.
+	CreateAuditEntry(ctx context.Context, e *AuditEntry) error
+	// ListAuditEntries returns entries newest first, at most f.Limit of
+	// them (default and cap applied by the store).
+	ListAuditEntries(ctx context.Context, f AuditFilter) ([]AuditEntry, error)
+}
+
 // MonitorTemplate defines a reusable monitor shape. Monitors created from
 // a template are one-time copies: editing the template does not retroactively
 // change existing monitors, so operators can tweak instances without fear.
@@ -527,6 +611,8 @@ type Store interface {
 	Ledgers
 	SavedSearches
 	MonitorTemplates
+	Audits
+	DigestQueue
 	GetStats(ctx context.Context) (Stats, error)
 	// AlertCountsByDay returns UTC calendar-day alert totals for `days`
 	// consecutive days ending today (UTC). Days with no alerts are present

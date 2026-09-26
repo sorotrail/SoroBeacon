@@ -65,6 +65,10 @@ func (emptyStore) ListMonitorTemplates(context.Context) ([]store.MonitorTemplate
 }
 func (emptyStore) UpdateMonitorTemplate(context.Context, *store.MonitorTemplate) error { return nil }
 func (emptyStore) DeleteMonitorTemplate(context.Context, int64) error                  { return nil }
+func (emptyStore) CreateAuditEntry(context.Context, *store.AuditEntry) error           { return nil }
+func (emptyStore) ListAuditEntries(context.Context, store.AuditFilter) ([]store.AuditEntry, error) {
+	return nil, nil
+}
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
