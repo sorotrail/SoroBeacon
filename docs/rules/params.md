@@ -5,11 +5,9 @@ validators in `internal/rules` (the `Validate` and `parse*` functions there
 are the authority). Each rule also has a page of its own with matching
 semantics and more examples — [event\_emitted](event-emitted.md),
 [value\_threshold](value-threshold.md), [token\_event](token-event.md),
-[frequency\_threshold](frequency-threshold.md),
-[composite](composite.md), and the cross-cutting [cooldown](cooldown.md).
 [frequency\_threshold](frequency-threshold.md), [topic\_regex](topic-regex.md),
-[address\_watchlist](address-watchlist.md), and the cross-cutting
-[cooldown](cooldown.md).
+[address\_watchlist](address-watchlist.md), [composite](composite.md), and the
+cross-cutting [cooldown](cooldown.md).
 
 ## Conventions that apply to every rule type
 
@@ -247,11 +245,11 @@ An unknown rule type reports on `type` instead (one detail, and the top-level
 
 ```json
 {
-  "error": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold token_event frequency_threshold composite])",
+  "error": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold token_event frequency_threshold composite topic_regex address_watchlist])",
   "code": "Bad Request",
   "request_id": "…",
   "details": [
-    {"field": "type", "reason": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold token_event frequency_threshold composite])"}
+    {"field": "type", "reason": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold token_event frequency_threshold composite topic_regex address_watchlist])"}
   ]
 }
 ```

@@ -283,6 +283,7 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 ```
 
 See [docs/rules/composite.md](docs/rules/composite.md).
+
 **`topic_regex`** — match a regular expression against a decoded topic, at a
 given position or any topic when `position` is omitted. Real contracts emit
 families of events (`swap_exact_in`, `swap_exact_out`, `pool_deposit`, …) and
