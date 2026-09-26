@@ -1771,3 +1771,9 @@ func (s *SQLite) UpdateMonitorTemplate(ctx context.Context, t *MonitorTemplate) 
 func (s *SQLite) DeleteMonitorTemplate(ctx context.Context, id int64) error {
 	return s.deleteByID(ctx, "monitor_templates", id)
 }
+
+// ListAlertsStream implements Store by paging ListAlerts with the keyset
+// cursor, so peak memory is one page rather than the whole result set.
+func (s *SQLite) ListAlertsStream(ctx context.Context, f AlertFilter, fn func(Alert) error) error {
+	return streamAlerts(ctx, f, s.ListAlerts, fn)
+}

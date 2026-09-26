@@ -593,10 +593,5 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 		// notification reports it too.
 		Payload:   alert.Payload,
 		CreatedAt: alert.CreatedAt,
-		// GroupCount is 1 for the first alert in a window (the one
-		// we are delivering now) and 0 when grouping is disabled.
-		GroupCount: groupCount,
-		WindowStart: windowStart,
-		WindowEnd:   windowEnd,
 	})
 }

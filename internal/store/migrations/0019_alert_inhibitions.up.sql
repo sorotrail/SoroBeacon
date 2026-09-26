@@ -6,14 +6,14 @@
 -- incident quiet without hiding a genuinely new episode the next day.
 -- inhibited_by_rule_id on alerts records which source suppressed a delivery
 -- so the dashboard can show why nothing was sent.
-CREATE TABLE alert_inhibitions (
+CREATE TABLE IF NOT EXISTS alert_inhibitions (
     source_rule_id       BIGINT  NOT NULL REFERENCES rules (id) ON DELETE CASCADE,
     target_rule_id       BIGINT  NOT NULL REFERENCES rules (id) ON DELETE CASCADE,
     firing_window_seconds INTEGER NOT NULL DEFAULT 300,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (source_rule_id, target_rule_id)
 );
-CREATE INDEX alert_inhibitions_target_idx ON alert_inhibitions (target_rule_id);
+CREATE INDEX IF NOT EXISTS alert_inhibitions_target_idx ON alert_inhibitions (target_rule_id);
 
-ALTER TABLE alerts ADD COLUMN inhibited_by_rule_id BIGINT REFERENCES rules (id) ON DELETE SET NULL;
-CREATE INDEX alerts_inhibited_by_idx ON alerts (inhibited_by_rule_id) WHERE inhibited_by_rule_id IS NOT NULL;
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS inhibited_by_rule_id BIGINT REFERENCES rules (id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS alerts_inhibited_by_idx ON alerts (inhibited_by_rule_id) WHERE inhibited_by_rule_id IS NOT NULL;

@@ -1489,3 +1489,9 @@ func mapErr(err error) error {
 	}
 	return err
 }
+
+// ListAlertsStream implements Store by paging ListAlerts with the keyset
+// cursor, so peak memory is one page rather than the whole result set.
+func (p *Postgres) ListAlertsStream(ctx context.Context, f AlertFilter, fn func(Alert) error) error {
+	return streamAlerts(ctx, f, p.ListAlerts, fn)
+}
