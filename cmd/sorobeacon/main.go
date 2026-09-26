@@ -25,6 +25,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/backfill"
 	"github.com/sorotrail/sorobeacon/internal/config"
 	sorogrpc "github.com/sorotrail/sorobeacon/internal/grpc"
+	"github.com/sorotrail/sorobeacon/internal/horizon"
 	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
@@ -350,6 +351,15 @@ func buildSource(ctx context.Context, log *slog.Logger, cfg config.Config) (poll
 		stc := sorotrail.NewClient(cfg.SoroTrailURL, nil)
 		log.Info("upstream mode: reading events from SoroTrail", "url", cfg.SoroTrailURL)
 		return sorotrail.NewSource(stc), stc, nil
+	case "horizon":
+		hc := horizon.NewClient(cfg.HorizonURL, nil)
+		log.Info("horizon mode: reading events from Horizon", "url", cfg.HorizonURL)
+		// Horizon returns transaction result metadata as XDR, so events must be
+		// extracted and decoded through the existing stellar decoder.
+		// We use SpecDecoder with a nil spec source (Horizon doesn't provide
+		// a spec endpoint), so it falls back to DefaultDecoder for all contracts.
+		decoder := stellar.NewSpecDecoder(stellar.DefaultDecoder{}, nil, log)
+		return horizon.NewSource(hc, decoder), hc, nil
 	default: // "rpc"
 		// Several endpoints behind one Client: calls try them in the order
 		// RPC_URLS lists them and fail over when one rate-limits or goes

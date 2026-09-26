@@ -85,11 +85,15 @@ type Config struct {
 	// PollInterval is how often the poller asks the RPC for new events.
 	PollInterval time.Duration
 	// SourceMode selects where events come from: "rpc" (standalone,
-	// default) or "sorotrail" (upstream, reads a SoroTrail indexer).
+	// default), "sorotrail" (upstream, reads a SoroTrail indexer), or
+	// "horizon" (reads contract events from a Horizon server).
 	SourceMode string
 	// SoroTrailURL is the base URL of a SoroTrail indexer; required when
 	// SourceMode is "sorotrail", ignored otherwise.
 	SoroTrailURL string
+	// HorizonURL is the base URL of a Horizon server; required when
+	// SourceMode is "horizon", ignored otherwise.
+	HorizonURL string
 	// CORSAllowedOrigins is the allow-list of browser Origins permitted to
 	// call the API cross-origin (CORS_ALLOWED_ORIGINS, comma-separated).
 	// Empty disables CORS; the dashboard is same-origin and never needs it.
@@ -252,12 +256,16 @@ func Load() (Config, error) {
 	}
 
 	cfg.SourceMode = getenv("SOURCE_MODE", "rpc")
-	if cfg.SourceMode != "rpc" && cfg.SourceMode != "sorotrail" {
-		return cfg, fmt.Errorf("invalid SOURCE_MODE %q (want rpc|sorotrail)", cfg.SourceMode)
+	if cfg.SourceMode != "rpc" && cfg.SourceMode != "sorotrail" && cfg.SourceMode != "horizon" {
+		return cfg, fmt.Errorf("invalid SOURCE_MODE %q (want rpc|sorotrail|horizon)", cfg.SourceMode)
 	}
 	cfg.SoroTrailURL = os.Getenv("SOROTRAIL_URL")
 	if cfg.SourceMode == "sorotrail" && cfg.SoroTrailURL == "" {
 		return cfg, fmt.Errorf("SOROTRAIL_URL is required when SOURCE_MODE=sorotrail")
+	}
+	cfg.HorizonURL = os.Getenv("HORIZON_URL")
+	if cfg.SourceMode == "horizon" && cfg.HorizonURL == "" {
+		return cfg, fmt.Errorf("HORIZON_URL is required when SOURCE_MODE=horizon")
 	}
 
 	if v := os.Getenv("POLL_INTERVAL"); v != "" {
@@ -537,6 +545,7 @@ func (c Config) LogAttrs() []slog.Attr {
 		// already appear (first one above) in the poller's own lines.
 		slog.Int("rpc_endpoint_count", len(c.RPCURLs)),
 		slog.String("sorotrail_url", c.SoroTrailURL),
+		slog.String("horizon_url", c.HorizonURL),
 		slog.String("cors_allowed_origins", strings.Join(c.CORSAllowedOrigins, ",")),
 		slog.Bool("config_encryption_enabled", len(c.ConfigEncryptionKey) > 0),
 		// The provider name, never the token or any resolved value.
