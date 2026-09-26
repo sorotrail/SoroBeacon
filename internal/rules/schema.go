@@ -85,6 +85,17 @@ func (ValueThreshold) ParamSchema() []FieldSchema {
 	}
 }
 
+func (NumericRange) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "min", Type: "string", Description: "Inclusive lower bound (decimal integer string); at least one of min/max required"},
+		{Name: "max", Type: "string", Description: "Inclusive upper bound (decimal integer string); at least one of min/max required"},
+		{Name: "inclusive", Type: "select", Description: "Boundary values match (default true)", Options: []string{"true", "false"}, Default: "true"},
+		{Name: "outside", Type: "select", Description: "Invert the match: fire outside the range (default false)", Options: []string{"true", "false"}, Default: "false"},
+		{Name: "event_name", Type: "string", Description: "Only consider events with this name"},
+		{Name: "value_path", Type: "string", Description: "Dot path into the event value"},
+	}
+}
+
 func (TokenEvent) ParamSchema() []FieldSchema {
 	return []FieldSchema{
 		{Name: "event", Type: "select", Required: true, Description: "SEP-41 event type", Options: []string{"transfer", "mint", "burn", "clawback", "set_admin", "*"}},
