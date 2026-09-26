@@ -1,0 +1,3 @@
+-- SQLite doesn't support DROP COLUMN before version 3.35.0
+-- This is a no-op for older SQLite versions
+-- For newer versions: ALTER TABLE alerts DROP COLUMN severity;

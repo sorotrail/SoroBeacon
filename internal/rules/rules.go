@@ -11,7 +11,11 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/sorotrail/sorobeacon/internal/stellar"
+	"github.com/sorotrail/sorobeacon/internal/telemetry"
 )
 
 // Rule type names understood by the default registry.
@@ -19,6 +23,9 @@ const (
 	TypeEventEmitted       = "event_emitted"
 	TypeValueThreshold     = "value_threshold"
 	TypeFrequencyThreshold = "frequency_threshold"
+	TypeTopicRegex         = "topic_regex"
+	TypeAddressWatchlist   = "address_watchlist"
+	TypeTopicPosition      = "topic_position"
 )
 
 // RuleEvaluator decides whether one decoded event matches one rule.
@@ -76,6 +83,18 @@ type EventNamer interface {
 // Registry maps rule type names to evaluators.
 type Registry struct {
 	evaluators map[string]RuleEvaluator
+	// telemetry is optional tracing; a nil Registry.telemetry (tests construct
+	// registries directly) just means no spans.
+	telemetry *telemetry.Provider
+}
+
+// WithTelemetry attaches tracing to every evaluation this registry runs.
+// The span is a child of the poll cycle span, so a slow rule is visible on
+// the same timeline as the fetch that produced the event and the delivery
+// its alert caused.
+func (r *Registry) WithTelemetry(t *telemetry.Provider) *Registry {
+	r.telemetry = t
+	return r
 }
 
 // NewRegistry returns a Registry with the built-in rule types registered.
@@ -85,6 +104,9 @@ func NewRegistry() *Registry {
 	r.Register(TypeValueThreshold, ValueThreshold{})
 	r.Register(TypeTokenEvent, TokenEvent{})
 	r.Register(TypeFrequencyThreshold, NewFrequencyThreshold())
+	r.Register(TypeTopicRegex, &TopicRegex{})
+	r.Register(TypeAddressWatchlist, &AddressWatchlist{})
+	r.Register(TypeTopicPosition, TopicPosition{})
 	return r
 }
 
@@ -104,6 +126,40 @@ func (r *Registry) Types() []string {
 
 // Evaluate runs the evaluator registered for ruleType.
 func (r *Registry) Evaluate(ctx context.Context, ruleType string, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error) {
+	ctx, span := r.startEvalSpan(ctx, ruleType, ev)
+	matched, err := r.evaluate(ctx, ruleType, ev, params)
+	if err != nil {
+		telemetry.RecordError(span, err)
+	}
+	telemetry.SetAttrs(span, "matched", matched)
+	span.End()
+	return matched, err
+}
+
+// startEvalSpan opens the rules.evaluate span with the identifiers an
+// operator needs to connect one evaluation to its monitor, rule and event.
+// Only ids and public chain data: params and the decoded value can embed
+// operator-chosen strings, so they never go into attributes.
+func (r *Registry) startEvalSpan(ctx context.Context, ruleType string, ev *stellar.DecodedEvent) (context.Context, trace.Span) {
+	if r.telemetry == nil {
+		// Preserve the ctx even without tracing: WithRuleID and friends ride
+		// the same context values.
+		return ctx, telemetry.NoopSpan()
+	}
+	ctx, span := r.telemetry.WithRequestID(ctx, "rules.evaluate",
+		trace.WithAttributes(
+			attribute.String(telemetry.AttrRuleType, ruleType),
+			attribute.Int64(telemetry.AttrRuleID, RuleID(ctx)),
+			attribute.String(telemetry.AttrEventID, ev.ID),
+			attribute.String(telemetry.AttrContractID, ev.ContractID),
+		),
+	)
+	return ctx, span
+}
+
+// evaluate is Evaluate without its span, so the error handling above stays
+// readable.
+func (r *Registry) evaluate(ctx context.Context, ruleType string, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error) {
 	e, ok := r.evaluators[ruleType]
 	if !ok {
 		return false, fmt.Errorf("unknown rule type %q", ruleType)
@@ -154,4 +210,35 @@ func (r *Registry) Validate(ruleType string, params json.RawMessage) error {
 	// rather than duplicated in each evaluator's Validate.
 	_, err := ParseCooldown(params)
 	return err
+}
+
+// DryRunResult is the result of evaluating a rule against historical events.
+type DryRunResult struct {
+	Matches []*stellar.DecodedEvent
+	Count   int
+}
+
+// DryRun evaluates candidate rule params against a slice of historical
+// events using the production evaluation path. It returns the events
+// that matched the rule. Nothing is persisted and nothing is delivered.
+//
+// Design decision: the event corpus used here is stored alert payloads,
+// which are biased because only matched events are captured. The caller
+// documents this bias in the response note.
+func (r *Registry) DryRun(ctx context.Context, ruleType string, events []*stellar.DecodedEvent, params json.RawMessage) ([]*stellar.DecodedEvent, error) {
+	e, ok := r.evaluators[ruleType]
+	if !ok {
+		return nil, fmt.Errorf("unknown rule type %q", ruleType)
+	}
+	matches := make([]*stellar.DecodedEvent, 0, len(events))
+	for _, ev := range events {
+		matched, err := e.Evaluate(ctx, ev, params)
+		if err != nil {
+			return nil, err
+		}
+		if matched {
+			matches = append(matches, ev)
+		}
+	}
+	return matches, nil
 }

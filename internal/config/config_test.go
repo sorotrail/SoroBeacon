@@ -54,6 +54,11 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Equal(t, DefaultMonitorSilentAfter, cfg.MonitorSilentAfter)
 	assert.Nil(t, cfg.ConfigEncryptionKey)
 	assert.Empty(t, cfg.APITokens)
+	// Tracing defaults to entirely off.
+	assert.Empty(t, cfg.OTLP.Endpoint)
+	assert.Empty(t, cfg.OTLP.ServiceName)
+	assert.Equal(t, DefaultOTLPSampleRate, cfg.OTLP.SampleRate)
+	assert.False(t, cfg.OTLP.Enabled())
 }
 
 func TestLoadRequiresDatabaseURL(t *testing.T) {
@@ -69,6 +74,59 @@ func TestLoadRequiresSoroTrailURL(t *testing.T) {
 
 	_, err := Load()
 	assert.ErrorContains(t, err, "SOROTRAIL_URL")
+}
+
+func TestLoadOTLPOffByDefault(t *testing.T) {
+	// Clear optional vars so a leaked environment cannot turn tracing on.
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("OTLP_ENDPOINT", "")
+	t.Setenv("OTLP_SERVICE_NAME", "")
+	t.Setenv("OTLP_SAMPLE_RATE", "")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.OTLP.Endpoint, "tracing must be off unless OTLP_ENDPOINT is set")
+	assert.False(t, cfg.OTLP.Enabled())
+}
+
+func TestLoadOTLPConfig(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("OTLP_ENDPOINT", "http://localhost:4318")
+	t.Setenv("OTLP_SERVICE_NAME", "sorobeacon-staging")
+	t.Setenv("OTLP_SAMPLE_RATE", "0.25")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "http://localhost:4318", cfg.OTLP.Endpoint)
+	assert.True(t, cfg.OTLP.Enabled())
+	assert.Equal(t, "sorobeacon-staging", cfg.OTLP.ServiceName)
+	assert.Equal(t, 0.25, cfg.OTLP.SampleRate)
+}
+
+func TestLoadOTLPEndpointValidation(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	for _, bad := range []string{"localhost:4318", "ftp://collector", "http://"} {
+		t.Setenv("OTLP_ENDPOINT", bad)
+		_, err := Load()
+		assert.ErrorContains(t, err, "OTLP_ENDPOINT", "endpoint %q must be rejected", bad)
+	}
+}
+
+func TestLoadOTLPSampleRateValidation(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("OTLP_ENDPOINT", "http://localhost:4318")
+	for _, bad := range []string{"-0.1", "1.1", "abc", "NaN", "Inf"} {
+		t.Setenv("OTLP_SAMPLE_RATE", bad)
+		_, err := Load()
+		assert.ErrorContains(t, err, "OTLP_SAMPLE_RATE", "rate %q must be rejected", bad)
+	}
+
+	// The bounds themselves are valid.
+	for _, good := range []string{"0", "1"} {
+		t.Setenv("OTLP_SAMPLE_RATE", good)
+		_, err := Load()
+		assert.NoError(t, err, "rate %q must be accepted", good)
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -460,9 +518,15 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"sorotrail_url",
 		"cors_allowed_origins",
 		"config_encryption_enabled",
+		"secrets_provider",
+		"secrets_cache_ttl",
+		"vault_token_configured",
 		"reorg_tracking_window",
 		"reorg_confirmation_depth",
 		"api_token_count",
+		"otlp_tracing_enabled",
+		"otlp_service_name",
+		"otlp_sample_rate",
 	}, keys)
 }
 
@@ -783,5 +847,57 @@ func TestLoadRejectsInvalidDatabaseURL(t *testing.T) {
 				assert.ErrorContains(t, err, s)
 			}
 		})
+	}
+}
+
+func TestLoadSecretsProvider(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+
+	// Disabled by default: references stay literals.
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.SecretsProvider)
+
+	t.Setenv("SECRETS_PROVIDER", "env")
+	t.Setenv("SECRETS_CACHE_TTL", "90s")
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, "env", cfg.SecretsProvider)
+	assert.Equal(t, 90*time.Second, cfg.SecretsCacheTTL)
+
+	// A disabled cache is allowed.
+	t.Setenv("SECRETS_CACHE_TTL", "0s")
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Zero(t, cfg.SecretsCacheTTL)
+}
+
+func TestLoadRejectsBadSecretsConfig(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+
+	t.Setenv("SECRETS_PROVIDER", "aws")
+	_, err := Load()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "SECRETS_PROVIDER")
+
+	t.Setenv("SECRETS_PROVIDER", "")
+	t.Setenv("SECRETS_CACHE_TTL", "-1s")
+	_, err = Load()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "SECRETS_CACHE_TTL")
+
+	t.Setenv("SECRETS_CACHE_TTL", "")
+	t.Setenv("SECRETS_PROVIDER", "vault")
+	_, err = Load()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "VAULT_ADDR")
+
+	// The token is a credential and must never reach LogAttrs.
+	t.Setenv("VAULT_ADDR", "https://vault.example:8200")
+	t.Setenv("VAULT_TOKEN", "hvs.super-secret")
+	cfg, err := Load()
+	require.NoError(t, err)
+	for _, a := range cfg.LogAttrs() {
+		assert.NotEqual(t, "hvs.super-secret", a.Value.String())
 	}
 }

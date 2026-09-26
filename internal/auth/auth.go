@@ -43,16 +43,26 @@ const (
 // The zero value is not usable; build one with New. A nil *Authenticator is
 // treated as "no authentication configured" by the middlewares that accept
 // it, so a server built without WithAuth keeps its previous open behaviour.
+type tokenEntry struct {
+	digest [sha256.Size]byte
+	role   Role
+}
+
+type sessionInfo struct {
+	expires time.Time
+	role    Role
+}
+
 type Authenticator struct {
 	// digests are SHA-256 hashes of the configured tokens. Tokens are
 	// hashed once at construction so Verify compares fixed-width values:
 	// crypto/subtle.ConstantTimeCompare returns immediately on a length
 	// mismatch, which would otherwise leak each configured token's length.
-	digests [][sha256.Size]byte
+	tokens []tokenEntry
 
-	ttl      time.Duration
+	tt       time.Duration
 	mu       sync.Mutex
-	sessions map[string]time.Time
+	sessions map[string]sessionInfo
 	now      func() time.Time
 }
 
@@ -65,8 +75,8 @@ func New(tokens []string, ttl time.Duration) *Authenticator {
 		ttl = DefaultSessionTTL
 	}
 	a := &Authenticator{
-		ttl:      ttl,
-		sessions: make(map[string]time.Time),
+		tt:       ttl,
+		sessions: make(map[string]sessionInfo),
 		now:      time.Now,
 	}
 	for _, t := range tokens {
@@ -74,7 +84,18 @@ func New(tokens []string, ttl time.Duration) *Authenticator {
 		if t == "" {
 			continue
 		}
-		a.digests = append(a.digests, sha256.Sum256([]byte(t)))
+		// Support explicit role suffix if present e.g. token:admin, otherwise default to admin for backwards compatibility
+		role := RoleAdmin
+		if idx := strings.LastIndex(t, ":"); idx != -1 {
+			if r, ok := ParseRole(t[idx+1:]); ok {
+				role = r
+				t = t[:idx]
+			}
+		}
+		a.tokens = append(a.tokens, tokenEntry{
+			digest: sha256.Sum256([]byte(t)),
+			role:   role,
+		})
 	}
 	return a
 }
@@ -83,10 +104,10 @@ func New(tokens []string, ttl time.Duration) *Authenticator {
 // reads it so the cookie it sets and the server-side session expire
 // together instead of drifting apart.
 func (a *Authenticator) SessionTTL() time.Duration {
-	if a == nil || a.ttl <= 0 {
+	if a == nil || a.tt <= 0 {
 		return DefaultSessionTTL
 	}
-	return a.ttl
+	return a.tt
 }
 
 // Enabled reports whether a token is configured. When it is not, both the
@@ -94,7 +115,7 @@ func (a *Authenticator) SessionTTL() time.Duration {
 // the process logs one warning at startup instead of failing, so an upgrade
 // or a docker-compose quickstart never locks the operator out.
 func (a *Authenticator) Enabled() bool {
-	return a != nil && len(a.digests) > 0
+	return a != nil && len(a.tokens) > 0
 }
 
 // Verify reports whether candidate matches any configured token.
@@ -104,15 +125,28 @@ func (a *Authenticator) Enabled() bool {
 // tokens exist or which one matched. Accepting a list at all is what makes
 // rotation work: add the new token, roll clients over, remove the old one.
 func (a *Authenticator) Verify(candidate string) bool {
+	_, ok := a.verifyToken(candidate)
+	return ok
+}
+
+func (a *Authenticator) verifyToken(candidate string) (Role, bool) {
 	if !a.Enabled() {
-		return false
+		return RoleAdmin, false
 	}
 	got := sha256.Sum256([]byte(candidate))
+	matchedRole := RoleViewer
 	match := 0
-	for _, want := range a.digests {
-		match |= subtle.ConstantTimeCompare(got[:], want[:])
+	for _, entry := range a.tokens {
+		m := subtle.ConstantTimeCompare(got[:], entry.digest[:])
+		if m == 1 {
+			matchedRole = entry.role
+		}
+		match |= m
 	}
-	return match == 1
+	if match == 1 {
+		return matchedRole, true
+	}
+	return RoleUnknown, false
 }
 
 // Bearer extracts the token from an Authorization header value. The scheme
@@ -136,27 +170,34 @@ func Bearer(header string) (string, bool) {
 // id is returned only to the caller: the submitted token is never echoed
 // back, logged, or stored.
 func (a *Authenticator) Login(token string) (string, bool) {
-	if !a.Verify(token) {
+	role, ok := a.verifyToken(token)
+	if !ok {
 		return "", false
 	}
-	return a.NewSession(), true
+	return a.NewSessionWithRole(role), true
 }
 
-// NewSession mints a session id. It exists for the login handler; callers
-// that already hold a live session should use HasSession instead.
-func (a *Authenticator) NewSession() string {
+// NewSessionWithRole mints a session id associated with a specific role.
+func (a *Authenticator) NewSessionWithRole(role Role) string {
 	buf := make([]byte, sessionIDBytes)
 	if _, err := rand.Read(buf); err != nil {
-		// crypto/rand failing is unrecoverable for a credential: returning
-		// a predictable id would be worse than refusing to sign anyone in.
 		return ""
 	}
 	id := base64.RawURLEncoding.EncodeToString(buf)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.sweepLocked(a.now())
-	a.sessions[id] = a.now().Add(a.ttl)
+	a.sessions[id] = sessionInfo{
+		expires: a.now().Add(a.tt),
+		role:    role,
+	}
 	return id
+}
+
+// NewSession mints a session id. It exists for the login handler; callers
+// that already hold a live session should use HasSession instead.
+func (a *Authenticator) NewSession() string {
+	return a.NewSessionWithRole(RoleAdmin)
 }
 
 // HasSession reports whether id names a live, unexpired session. Sessions
@@ -164,20 +205,25 @@ func (a *Authenticator) NewSession() string {
 // behaviour for a single static credential — there is no user database to
 // invalidate against, and a session cookie is worth exactly one token.
 func (a *Authenticator) HasSession(id string) bool {
+	_, ok := a.getSessionRole(id)
+	return ok
+}
+
+func (a *Authenticator) getSessionRole(id string) (Role, bool) {
 	if a == nil || id == "" {
-		return false
+		return RoleUnknown, false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	expires, ok := a.sessions[id]
+	info, ok := a.sessions[id]
 	if !ok {
-		return false
+		return RoleUnknown, false
 	}
-	if !a.now().Before(expires) {
+	if !a.now().Before(info.expires) {
 		delete(a.sessions, id)
-		return false
+		return RoleUnknown, false
 	}
-	return true
+	return info.role, true
 }
 
 // DropSession ends a session (the dashboard's sign-out button). Unknown ids
@@ -192,8 +238,8 @@ func (a *Authenticator) DropSession(id string) {
 }
 
 func (a *Authenticator) sweepLocked(now time.Time) {
-	for id, expires := range a.sessions {
-		if !now.Before(expires) {
+	for id, info := range a.sessions {
+		if !now.Before(info.expires) {
 			delete(a.sessions, id)
 		}
 	}
@@ -218,16 +264,22 @@ func SessionID(r *http.Request) string {
 // dashboard's own same-origin calls such as the CSV export link, which
 // cannot attach a header).
 func (a *Authenticator) Authenticated(r *http.Request) bool {
+	role, ok := a.RoleForRequest(r)
+	return ok && role.HasPermission(RoleViewer)
+}
+
+// RoleForRequest determines the effective Role for an HTTP request.
+func (a *Authenticator) RoleForRequest(r *http.Request) (Role, bool) {
 	if !a.Enabled() {
-		// No credential is required, so every request is authenticated.
-		return true
+		return RoleAdmin, true
 	}
-	if token, ok := Bearer(r.Header.Get("Authorization")); ok && a.Verify(token) {
-		return true
+	if token, ok := Bearer(r.Header.Get("Authorization")); ok {
+		if role, ok := a.verifyToken(token); ok {
+			return role, true
+		}
 	}
-	// Session ids are 256 bits of crypto/rand and looked up by exact match,
-	// so a map lookup is not a timing oracle here (unlike the token compare
-	// above, where the attacker supplies guesses against a low-entropy
-	// secret).
-	return a.HasSession(SessionID(r))
+	if role, ok := a.getSessionRole(SessionID(r)); ok {
+		return role, true
+	}
+	return RoleUnknown, false
 }

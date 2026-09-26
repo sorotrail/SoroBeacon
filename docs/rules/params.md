@@ -5,8 +5,9 @@ validators in `internal/rules` (the `Validate` and `parse*` functions there
 are the authority). Each rule also has a page of its own with matching
 semantics and more examples — [event\_emitted](event-emitted.md),
 [value\_threshold](value-threshold.md), [token\_event](token-event.md),
-[frequency\_threshold](frequency-threshold.md), and the cross-cutting
-[cooldown](cooldown.md).
+[frequency\_threshold](frequency-threshold.md), [topic\_regex](topic-regex.md),
+[address\_watchlist](address-watchlist.md), [topic\_position](topic-position.md),
+and the cross-cutting [cooldown](cooldown.md).
 
 ## Conventions that apply to every rule type
 
@@ -118,6 +119,50 @@ Complete, valid params document:
 }
 ```
 
+## topic\_regex
+
+RE2 pattern match against a decoded topic — at a position, or any topic.
+See the [rule page](topic-regex.md) for matching semantics.
+
+| Param | JSON type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `pattern` | string | yes | — | Go/RE2 regular expression, matched unanchored within a topic's string value. At most 512 bytes. |
+| `position` | number | no | unset (any topic) | Topic index to match; `0` is the event name, user topics start at `1`. A position outside the event's topic list simply doesn't match. |
+
+Complete, valid params document:
+
+```json
+{
+  "pattern": "^swap_",
+  "position": 0
+}
+```
+
+## address\_watchlist
+
+SEP-41 events whose from or to address appears on a configured watchlist.
+See the [rule page](address-watchlist.md) for matching semantics.
+
+| Param | JSON type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `addresses` | array of string | yes | — | Non-empty list of Stellar addresses (account `G...` or contract `C...` strkeys). At most 1024 entries. |
+| `match` | string | no | `either` | Which slot(s) to watch: `from`, `to`, or `either`. |
+| `event` | string | no | unset (all SEP-41 events) | Restrict to one SEP-41 event: `transfer`, `mint`, `burn`, `clawback`, `set_admin`, or `*`. |
+
+Matching is exact and case-sensitive — no partial or prefix matching. The
+address set is built once and memoised, so a long watchlist does not scan
+linearly per event.
+
+Complete, valid params document:
+
+```json
+{
+  "addresses": ["GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"],
+  "match": "either",
+  "event": "transfer"
+}
+```
+
 ## frequency\_threshold
 
 Rolling-window aggregate: "more than N matching events within M minutes".
@@ -136,6 +181,36 @@ Complete, valid params document:
   "event_name": "transfer",
   "count": 50,
   "window": "5m"
+}
+```
+
+## topic\_position
+
+Matches when the decoded topic at a fixed position exactly equals a configured
+value — the question custom (non-SEP-41) contracts raise with their
+positioned topics (a pool ID, a market symbol, an account), which
+`event_emitted` (first topic only) and `token_event` (SEP-41 slots only)
+cannot ask.
+
+| Param | JSON type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `position` | number | yes | — | Topic index to compare; `0` is the event-name topic. |
+| `equals` | string | yes | — | Exact value the decoded topic must equal. |
+| `event` | string | no | — | Also require this event name (first topic). |
+
+The comparison is exact string equality against the topic's **decoded string
+form**: string topics compare as themselves, numeric topics by their decimal
+rendering (`{"i128": "1000000"}` and `42` both compare as `"1000000"`-style
+decimal strings), addresses by their strkey. Matching is case-sensitive; a
+position beyond the event's topic count is a non-match, never an error.
+
+Complete, valid params document:
+
+```json
+{
+  "position": 2,
+  "equals": "POOL_USDC_XLM",
+  "event": "deposit"
 }
 ```
 
@@ -173,11 +248,11 @@ An unknown rule type reports on `type` instead (one detail, and the top-level
 
 ```json
 {
-  "error": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold token_event frequency_threshold])",
+  "error": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold token_event frequency_threshold topic_regex address_watchlist topic_position])",
   "code": "Bad Request",
   "request_id": "…",
   "details": [
-    {"field": "type", "reason": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold token_event frequency_threshold])"}
+    {"field": "type", "reason": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold token_event frequency_threshold topic_regex address_watchlist topic_position])"}
   ]
 }
 ```

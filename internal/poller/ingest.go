@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/rules"
@@ -32,6 +33,10 @@ type Ingestor struct {
 	log      *slog.Logger
 	// metrics is optional instrumentation; nil-safe, see internal/metrics.
 	metrics *metrics.Metrics
+	// live is the optional SSE fan-out. When set, every alert this Ingestor
+	// creates for a live event is published to it; nil (the NewIngestor
+	// default) disables live alerts entirely.
+	live *broadcast.Broadcaster
 }
 
 // NewIngestor wires an Ingestor. d receives every alert unless the caller
@@ -43,6 +48,14 @@ func NewIngestor(st IngestStore, reg *rules.Registry, d Dispatcher, log *slog.Lo
 // WithMetrics attaches Prometheus instrumentation to alert evaluation.
 func (in *Ingestor) WithMetrics(m *metrics.Metrics) *Ingestor {
 	in.metrics = m
+	return in
+}
+
+// WithPublisher attaches the live fan-out that serves the SSE endpoint. The
+// poller sets it so an alert is visible on a connected dashboard the moment it
+// is created, with no database round-trip; a backfill leaves it nil.
+func (in *Ingestor) WithPublisher(b *broadcast.Broadcaster) *Ingestor {
+	in.live = b
 	return in
 }
 
@@ -143,6 +156,7 @@ func (in *Ingestor) fireAlert(ctx context.Context, m store.Monitor, rule store.R
 		LedgerClosedAt: ev.LedgerClosedAt,
 		Cooldown:       ruleCooldown(rule),
 		Backfilled:     opts.Backfilled,
+		Severity:       rule.Severity,
 	}
 	outcome, err := in.store.CreateAlert(ctx, alert)
 	if err != nil {
@@ -171,6 +185,23 @@ func (in *Ingestor) fireAlert(ctx context.Context, m store.Monitor, rule store.R
 		in.log.Info("alert created", logAttrs...)
 	}
 
+	// Publish before dispatching: a live dashboard should see the alert the
+	// moment it exists, not after the (possibly retried) channel fan-out.
+	// Only created alerts reach here — duplicates and cooldown-suppressed
+	// matches returned above — so the stream mirrors the alert table exactly.
+	// A backfilled alert is historical, so it never reaches the live stream.
+	if in.live != nil && !opts.Backfilled {
+		in.live.Publish(broadcast.Alert{
+			ID:          alert.ID,
+			MonitorID:   m.ID,
+			MonitorName: m.Name,
+			RuleID:      rule.ID,
+			EventID:     eventID,
+			Payload:     alert.Payload,
+			CreatedAt:   alert.CreatedAt,
+		})
+	}
+
 	if !opts.Deliver {
 		return true, false
 	}
@@ -185,10 +216,9 @@ func (in *Ingestor) fireAlert(ctx context.Context, m store.Monitor, rule store.R
 		EventName:   ev.EventName(),
 		Ledger:      ev.Ledger,
 		TxHash:      ev.TxHash,
-		// The store folds the suppressed count into the payload, so the
-		// notification reports it too.
-		Payload:   alert.Payload,
-		CreatedAt: alert.CreatedAt,
+		Payload:     alert.Payload,
+		CreatedAt:   alert.CreatedAt,
+		Severity:    string(alert.Severity),
 	})
 	return true, true
 }

@@ -38,6 +38,7 @@ type Metrics struct {
 	eventsMatched  prometheus.Counter
 	alertsFired    prometheus.Counter
 	deliveries     *prometheus.CounterVec
+	throttles      *prometheus.CounterVec
 	httpDuration   *prometheus.HistogramVec
 	lastPollAgoSec prometheus.Gauge
 }
@@ -104,6 +105,11 @@ func New() *Metrics {
 			Help: "Alert deliveries, by channel type and outcome (ok|error).",
 		}, []string{"channel", "outcome"}),
 
+		throttles: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_alert_throttles_total",
+			Help: "Throttled alert delivery attempts, by channel type.",
+		}, []string{"channel"}),
+
 		httpDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "sorobeacon_http_request_duration_seconds",
 			Help:    "HTTP request duration by route pattern, method and status.",
@@ -116,7 +122,7 @@ func New() *Metrics {
 		}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
-		m.eventsScanned, m.eventsMatched, m.alertsFired, m.deliveries,
+		m.eventsScanned, m.eventsMatched, m.alertsFired, m.deliveries, m.throttles,
 		m.httpDuration, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
 		m.reorgsTotal, m.lastReorgLedger)
 	return m
@@ -125,6 +131,22 @@ func New() *Metrics {
 // Handler serves the metrics registry in Prometheus text format.
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
+}
+
+// RegisterStreamDropped exposes the live-alerts broadcaster's dropped-event
+// counter on /metrics. The callback is read lazily on each scrape, so the
+// broadcaster keeps its own cheap atomic counter and this package does not
+// need to import it. A nil callback (or nil receiver) registers nothing.
+func (m *Metrics) RegisterStreamDropped(dropped func() uint64) {
+	if m == nil || dropped == nil {
+		return
+	}
+	m.registry.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "sorobeacon_alerts_stream_dropped_total",
+		Help: "Alert events dropped from the live SSE stream because a subscriber could not keep up.",
+	}, func() float64 {
+		return float64(dropped())
+	}))
 }
 
 // RecordPoll observes one completed poll cycle.
@@ -225,6 +247,14 @@ func (m *Metrics) RecordDelivery(channelType string, ok bool) {
 		outcome = "error"
 	}
 	m.deliveries.WithLabelValues(channelType, outcome).Inc()
+}
+
+// RecordThrottle counts one throttled delivery per channel type.
+func (m *Metrics) RecordThrottle(channelType string) {
+	if m == nil {
+		return
+	}
+	m.throttles.WithLabelValues(channelType).Inc()
 }
 
 // statusRecorder captures the status code a handler wrote, for the HTTP

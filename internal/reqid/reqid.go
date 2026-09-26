@@ -41,6 +41,25 @@ func From(r *http.Request) string {
 	return New()
 }
 
+// FromContext returns the request ID carried by ctx, or "" when the context
+// never went through the middleware. Unlike From it does not generate one:
+// background stages (the poller's loop) have no HTTP request behind them and
+// must not invent a new id per stage — telemetry uses this to stamp spans
+// with the correlation id, falling back to one id for the whole loop.
+func FromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(ctxKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// WithContext returns ctx carrying id, the writer side of FromContext.
+// The middleware uses it; tests and background stages that already hold a
+// correlation id use it to keep a whole trace under one id.
+func WithContext(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, ctxKey{}, id)
+}
+
 // Middleware assigns the request's ID, echoes it on the response, and
 // stores it in the context.
 func Middleware(next http.Handler) http.Handler {
