@@ -261,6 +261,29 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 See [docs/rules/frequency-threshold.md](docs/rules/frequency-threshold.md) for
 the re-arm semantics.
 
+**`composite`** — combine child rules with `and`, `or` or `not`, so "a large
+transfer **and** the recipient is on my watchlist" is one rule instead of two
+monitors and a human doing the correlation. Children are ordinary rules
+validated recursively through the registry: an unknown child type or a
+malformed grandchild is rejected at create time with the path to the problem
+(`rules[1].params`), nesting is capped at five levels, and evaluation
+short-circuits. `not` takes exactly one child:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "composite",
+  "params": {
+    "op": "and",
+    "rules": [
+      {"type": "token_event", "params": {"event": "transfer", "min_amount": "1000000"}},
+      {"type": "event_emitted", "params": {"topic_equals": {"1": "GDW6...SENDER"}}}
+    ]
+  }
+}'
+```
+
+See [docs/rules/composite.md](docs/rules/composite.md).
+
 **`topic_regex`** — match a regular expression against a decoded topic, at a
 given position or any topic when `position` is omitted. Real contracts emit
 families of events (`swap_exact_in`, `swap_exact_out`, `pool_deposit`, …) and
