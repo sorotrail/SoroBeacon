@@ -67,6 +67,108 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("ChannelConfigEncryptedAtRest", func(t *testing.T) { testChannelConfigEncrypted(t, newStore) })
 	t.Run("ChannelConfigLegacyPlaintextThenReencrypts", func(t *testing.T) { testChannelConfigLegacy(t, newStore) })
 	t.Run("ChannelConfigDecryptFailureNamesChannel", func(t *testing.T) { testChannelConfigDecryptFailure(t, newStore) })
+	t.Run("AuditLogAppendOnlyFiltersAndNoSecrets", func(t *testing.T) { testAuditLog(t, newStore) })
+	t.Run("ChannelDigestSettingsAndQueue", func(t *testing.T) { testChannelDigest(t, newStore) })
+}
+
+// testChannelDigest pins the digest settings round trip and the pending
+// queue, including that rows cascade when their channel is deleted.
+func testChannelDigest(t *testing.T, newStore conformanceFactory) {
+	ctx := context.Background()
+	st := newStore(t)
+
+	ch := &Channel{
+		Name: "digest", Type: "slack", Config: json.RawMessage(`{}`), Enabled: true,
+		DigestMode: DigestModeWindow, DigestWindowSeconds: 300,
+	}
+	require.NoError(t, st.CreateChannel(ctx, ch))
+
+	got, err := st.GetChannel(ctx, ch.ID)
+	require.NoError(t, err)
+	assert.Equal(t, DigestModeWindow, got.DigestMode)
+	assert.Equal(t, int64(300), got.DigestWindowSeconds)
+
+	got.DigestMode = DigestModeOff
+	got.DigestWindowSeconds = 0
+	require.NoError(t, st.UpdateChannel(ctx, got))
+	got, err = st.GetChannel(ctx, ch.ID)
+	require.NoError(t, err)
+	assert.Equal(t, DigestModeOff, got.DigestMode)
+	assert.Zero(t, got.DigestWindowSeconds)
+
+	require.NoError(t, st.PushDigestAlert(ctx, ch.ID, json.RawMessage(`{"id":1}`)))
+	require.NoError(t, st.PushDigestAlert(ctx, ch.ID, json.RawMessage(`{"id":2}`)))
+	rows, err := st.ListDigestAlerts(ctx, ch.ID)
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	assert.JSONEq(t, `{"id":1}`, string(rows[0].Payload))
+
+	require.NoError(t, st.DeleteDigestAlerts(ctx, ch.ID, []int64{rows[0].ID}))
+	rows, err = st.ListDigestAlerts(ctx, ch.ID)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+
+	// Deleting the channel cascades to its pending rows.
+	require.NoError(t, st.DeleteChannel(ctx, ch.ID))
+	rows, err = st.ListDigestAlerts(ctx, ch.ID)
+	require.NoError(t, err)
+	assert.Empty(t, rows)
+}
+
+// testAuditLog proves the audit table is append-only, filters correctly, and
+// never carries the secret values a channel config holds.
+func testAuditLog(t *testing.T, newStore conformanceFactory) {
+	ctx := context.Background()
+	st := newStore(t)
+
+	ch := &Channel{
+		Name:    "audit channel",
+		Type:    "slack",
+		Config:  json.RawMessage(`{"webhook_url":"https://hooks.example/SECRET-TOKEN"}`),
+		Enabled: true,
+	}
+	require.NoError(t, st.CreateChannel(ctx, ch))
+
+	// The middleware records field names, never values; this mirrors what it
+	// writes so the store contract (and the absence of the secret) is pinned.
+	entries := []*AuditEntry{
+		{Actor: "req-1", Action: AuditActionCreate, TargetType: "channel", TargetID: ch.ID, Diff: json.RawMessage(`{"fields":["config","name"]}`)},
+		{Actor: "req-2", Action: AuditActionUpdate, TargetType: "channel", TargetID: ch.ID, Diff: json.RawMessage(`{"fields":["config"]}`)},
+		{Actor: "req-3", Action: AuditActionDelete, TargetType: "monitor", TargetID: 42},
+	}
+	for _, e := range entries {
+		require.NoError(t, st.CreateAuditEntry(ctx, e))
+		assert.NotZero(t, e.ID)
+		assert.False(t, e.CreatedAt.IsZero())
+	}
+
+	// Append-only: all three survive, newest first.
+	list, err := st.ListAuditEntries(ctx, AuditFilter{})
+	require.NoError(t, err)
+	require.Len(t, list, 3)
+	assert.Equal(t, entries[2].ID, list[0].ID)
+	for _, e := range list {
+		assert.NotContains(t, string(e.Diff), "SECRET-TOKEN")
+	}
+	// An entry with no diff is stored as an empty JSON object, never NULL.
+	assert.JSONEq(t, `{}`, string(list[0].Diff))
+
+	byType, err := st.ListAuditEntries(ctx, AuditFilter{TargetType: "channel"})
+	require.NoError(t, err)
+	require.Len(t, byType, 2)
+
+	byTarget, err := st.ListAuditEntries(ctx, AuditFilter{TargetType: "channel", TargetID: ch.ID})
+	require.NoError(t, err)
+	require.Len(t, byTarget, 2)
+
+	limited, err := st.ListAuditEntries(ctx, AuditFilter{Limit: 1})
+	require.NoError(t, err)
+	require.Len(t, limited, 1)
+
+	// A time window that excludes everything returns nothing.
+	none, err := st.ListAuditEntries(ctx, AuditFilter{From: time.Now().Add(time.Hour)})
+	require.NoError(t, err)
+	assert.Empty(t, none)
 }
 
 // TestClampAlertSeriesDays pins the overview-chart window bounds. It is pure

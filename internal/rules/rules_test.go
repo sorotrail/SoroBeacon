@@ -259,7 +259,7 @@ func TestValueThresholdValidate(t *testing.T) {
 
 func TestRegistry(t *testing.T) {
 	r := NewRegistry()
-	assert.ElementsMatch(t, []string{TypeEventEmitted, TypeValueThreshold, TypeTokenEvent, TypeFrequencyThreshold}, r.Types())
+	assert.ElementsMatch(t, []string{TypeEventEmitted, TypeValueThreshold, TypeTokenEvent, TypeFrequencyThreshold, TypeTopicRegex, TypeAddressWatchlist, TypeTopicPosition}, r.Types())
 
 	_, err := r.Evaluate(context.Background(), "unknown", transferEvent(1), json.RawMessage(`{}`))
 	assert.Error(t, err)

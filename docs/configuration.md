@@ -25,6 +25,7 @@ and this page should be updated.
 | `CONFIG_ENCRYPTION_KEY` | **yes** | Base64 AES-GCM key that encrypts channel `config` at rest. Losing it makes encrypted configs unrecoverable — back it up with the database. |
 | `API_TOKEN` | **yes** | Bearer token(s) for `/api/v1` and the dashboard sign-in. Anyone holding one can read and mutate everything, so treat it like a password: mode `0600` on disk, a secret manager in production, and never in a log line, ticket or shell history. |
 | `NETWORK_PASSPHRASE` | no (public nets) | SDF passphrases are public. For `NETWORK=custom` it identifies a private network — treat it as operational config, not a credential. |
+| `VAULT_TOKEN` | **yes** | Credential for the Vault secret provider. Never logged; a resolved secret is never returned by the API. |
 | `RPC_URL` / `RPC_URLS` / `SOROTRAIL_URL` | maybe | A URL is not a password, but provider URLs sometimes embed tokens in the path or query. Do not commit those. |
 | `CORS_ALLOWED_ORIGINS` | no | An allow-list, not a credential. Think hard before allowing a third-party origin: whatever credential that origin's users hold can act through their browser. |
 | everything else | no | |
@@ -116,6 +117,23 @@ set stay plaintext, keep working, and are re-encrypted lazily on their next
 write. Losing the key makes encrypted rows undecryptable: reads fail with an
 error naming the channel and never echo ciphertext or key material. Back the
 key up alongside your database backups.
+
+## External secrets
+
+A channel config value can reference a secret held outside SoroBeacon — in
+Vault or the process environment — instead of storing the value in the
+database. The value is resolved when a notifier is constructed and is never
+written back, logged or returned by the API. See
+[External secrets in channel config](channels/secrets.md) for the reference
+syntax and providers.
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `SECRETS_PROVIDER` | string | empty (disabled) | optional | `env` or `vault`; selects the provider that resolves `${secret:...}` references. Unset treats references as literals, so an upgrade changes nothing. |
+| `SECRETS_CACHE_TTL` | duration | `5m` | optional | How long a resolved secret is reused so every alert does not hit the provider. `0s` disables caching. The cache is dropped whenever a channel is created, updated or deleted. |
+| `VAULT_ADDR` | URL string | _(none)_ | required when `SECRETS_PROVIDER=vault` | Vault base URL, e.g. `https://vault.example:8200`. |
+| `VAULT_TOKEN` | secret string | _(none)_ | optional | Vault token sent as `X-Vault-Token`. Never logged. |
+| `VAULT_NAMESPACE` | string | empty | optional | Vault Enterprise namespace sent as `X-Vault-Namespace`. |
 
 ## RPC / event source
 
@@ -218,6 +236,40 @@ Archive objects contain only alert rows (contract id, event, payload, ledger); c
 | --- | --- | --- | --- | --- |
 | `LOG_LEVEL` | enum | `info` | optional | Minimum `log/slog` level: `debug` \| `info` \| `warn` (or `warning`) \| `error`. Logs are structured JSON on stdout. |
 
+## Tracing (OpenTelemetry)
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `OTLP_ENDPOINT` | URL string | empty (tracing off) | optional | OTLP/HTTP base URL spans are shipped to (e.g. `http://localhost:4318` for a local Jaeger). Must be an absolute `http`/`https` URL when set; empty disables tracing entirely — no exporter, no goroutines, no measurable overhead. |
+| `OTLP_SERVICE_NAME` | string | `sorobeacon` | optional | `service.name` resource attribute reported with every trace. |
+| `OTLP_SAMPLE_RATE` | float | `1` | optional | Fraction of traces kept, in `[0, 1]`. Sampling is parent-based, so a whole poll-cycle trace is kept or dropped as a unit — never half a trace. Out-of-range or non-numeric values fail startup. |
+
+When enabled, one trace covers each poll cycle: `poller.poll` (root) →
+`poller.fetch_events` per page (RPC fetch + local decode) →
+`rules.evaluate` per rule → `poller.create_alert` → `store.create_alert`
+→ one `notify.deliver` per channel. Deliveries are children of their
+alert's span, never roots, so one alert's full path is one timeline —
+which is the point: metrics (issue #26) show aggregates, traces show the
+individual path. Every span also carries a `request_id` attribute (the
+ambient `X-Request-ID`) so a log line and its trace can be joined.
+
+Span attributes hold identifiers only (alert, monitor, rule, channel and
+event ids, channel type, outcome). **Channel config — webhook URLs, bot
+tokens, SMTP credentials — never enters a span**, the same rule that
+applies to logs and API responses.
+
+Shutdown flushes pending spans to the collector (bounded to 5 seconds) so
+the last moments of a deployment are exported rather than dropped.
+
+```sh
+# Local collector: Jaeger all-in-one (OTLP/HTTP on :4318, UI on :16686)
+docker run --rm -p 16686:16686 -p 4318:4318 jaegertracing/all-in-one:latest
+
+export OTLP_ENDPOINT=http://localhost:4318
+# OTLP_SERVICE_NAME=sorobeacon-staging   # optional
+# OTLP_SAMPLE_RATE=0.25                  # keep a quarter of traces
+```
+
 ## Not environment variables
 
 | Thing | Where it lives |
@@ -230,6 +282,6 @@ Archive objects contain only alert rows (contract id, event, payload, ledger); c
 ## Drift vs `.env.example`
 
 `.env.example` is the copy-paste template. This reference was written
-against `internal/config` on the same commit; `.env.example` already
-listed every runtime variable (including `CORS_ALLOWED_ORIGINS`) with
-matching defaults, so it was not changed in this PR.
+against `internal/config` on the same commit; `.env.example` lists every
+runtime variable with matching defaults, including the tracing trio
+(`OTLP_ENDPOINT`, `OTLP_SERVICE_NAME`, `OTLP_SAMPLE_RATE`).
