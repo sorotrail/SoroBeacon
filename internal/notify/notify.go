@@ -57,6 +57,7 @@ const (
 	TypeWebhook   = "webhook"
 	TypeMatrix    = "matrix"
 	TypePagerDuty = "pagerduty"
+	TypeTwilio    = "twilio"
 )
 
 // DefaultFactory returns a Factory with the built-in channel types.
@@ -69,6 +70,8 @@ func DefaultFactory() *Factory {
 	f.Register(TypeWebhook, NewWebhook)
 	f.Register(TypeMatrix, NewMatrix)
 	f.Register(TypePagerDuty, NewPagerDuty)
+	f.Register(TypeFederation, NewFederation)
+	f.Register(TypeTwilio, NewTwilio)
 	return f
 }
 

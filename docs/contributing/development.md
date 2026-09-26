@@ -28,7 +28,7 @@ make build && make test
 cmd/sorobeacon      wiring + graceful shutdown
 internal/config     env config
 internal/stellar    RPC client + ScVal decoder + value helpers
-internal/store      Postgres (pgx) + embedded migrations
+internal/store      Postgres (pgx) + SQLite backends, embedded migrations
 internal/rules      rule registry + built-in evaluators
 internal/notify     channel notifiers + retrying dispatcher
 internal/poller     the ingest loop
@@ -39,9 +39,9 @@ internal/web        html/template + htmx dashboard
 ## Conventions
 
 * Idiomatic Go: `gofmt`, `go vet`, and `golangci-lint run` must pass.
-* Plain SQL in the store — no ORM. Migrations are sequential pairs in `internal/store/migrations` (`NNNN_name.up.sql` / `.down.sql`); never edit an applied migration.
+* Plain SQL in the store — no ORM. Migrations are sequential pairs in `internal/store/migrations` (`NNNN_name.up.sql` / `.down.sql`); the SQLite DDL lives in a parallel set under `internal/store/migrations/sqlite/` at the same version numbers. Never edit an applied migration.
 * Structured logging via `log/slog`, lower\_snake\_case keys. **Never log channel config.**
-* Tests: table-driven where natural. Rule types and channels must ship with unit tests; store changes need integration tests (they read `TEST_DATABASE_URL` and skip when unset).
+* Tests: table-driven where natural. Rule types and channels must ship with unit tests. The store's shared conformance suite (`internal/store/conformance_test.go`) runs against both backends: SQLite as part of `go test ./...`, Postgres when `TEST_DATABASE_URL` is set (`make test-db`). A store change that is not reflected in both backends fails the suite.
 
 ## Pull requests
 

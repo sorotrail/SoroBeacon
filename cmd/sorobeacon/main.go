@@ -1,10 +1,13 @@
 // Command sorobeacon runs the SoroBeacon monitoring service: the event
-// poller, the JSON API and the dashboard, all in one process.
+// poller, the JSON API and the dashboard, all in one process. Given any
+// argument it acts as a CLI for a running instance instead — see cli.go.
 package main
 
 import (
 	"context"
 	"errors"
+	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -16,8 +19,11 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/sorotrail/sorobeacon/internal/api"
+	"github.com/sorotrail/sorobeacon/internal/archive"
 	"github.com/sorotrail/sorobeacon/internal/auth"
+	"github.com/sorotrail/sorobeacon/internal/backfill"
 	"github.com/sorotrail/sorobeacon/internal/config"
+	sorogrpc "github.com/sorotrail/sorobeacon/internal/grpc"
 	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
@@ -29,7 +35,45 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/web"
 )
 
+// main dispatches on the arguments. With none, the binary is the monitoring
+// service — how the container image and every existing deployment invoke it.
+// With any, it is a client for a running instance, so bootstrapping and
+// scripted changes stop needing a curl script. An unrecognised command is an
+// error rather than a silent server start, because a typo'd subcommand is
+// otherwise impossible to notice.
 func main() {
+	args := os.Args[1:]
+	// `sorobeacon backfill` is an opt-in one-shot that replays history for a
+	// single monitor; any other argument is a client command against a
+	// running instance.
+	if len(args) > 0 && args[0] == "backfill" {
+		if err := runBackfill(args[1:]); err != nil {
+			slog.Error("backfill failed", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(args) > 0 {
+		switch args[0] {
+		case "backup":
+			if err := runBackup(args[1:]); err != nil {
+				slog.Error("backup failed", "err", err)
+				os.Exit(1)
+			}
+			return
+		case "restore":
+			if err := runRestore(args[1:]); err != nil {
+				slog.Error("restore failed", "err", err)
+				os.Exit(1)
+			}
+			return
+		}
+		if err := runCLI(context.Background(), args, os.Stdout); err != nil {
+			reportCLIError(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
@@ -70,55 +114,41 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Storage.
+	// Storage. The DATABASE_URL scheme selects the backend: postgres /
+	// postgresql for the pgx pool, sqlite for a single-file database that
+	// removes the Postgres prerequisite on a small VPS or Raspberry Pi. Both
+	// implement store.Store and apply their own embedded migrations.
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		return err
 	}
-	st, err := store.NewPostgres(ctx, cfg.DatabaseURL, store.PoolSettings{
+	st, err := store.New(ctx, cfg.DatabaseURL, store.PoolSettings{
 		MaxConns:        cfg.DatabaseMaxConns,
 		MinConns:        cfg.DatabaseMinConns,
 		MaxConnLifetime: cfg.DatabaseMaxConnLifetime,
 		MaxConnIdleTime: cfg.DatabaseMaxConnIdleTime,
-	})
+	}, configCipher)
 	if err != nil {
 		return err
 	}
-	st.WithConfigCipher(configCipher)
 	defer st.Close()
-	log.Info("database ready")
+	log.Info("database ready", "backend", store.BackendName(cfg.DatabaseURL))
 
-	// Pipeline: event source -> rules -> alerts -> channels. The source is
-	// the single seam between the poller and wherever events come from.
-	var src poller.EventSource
-	var health api.HealthChecker
-	switch cfg.SourceMode {
-	case "sorotrail":
-		stc := sorotrail.NewClient(cfg.SoroTrailURL, nil)
-		src = sorotrail.NewSource(stc)
-		health = stc
-		log.Info("upstream mode: reading events from SoroTrail", "url", cfg.SoroTrailURL)
-	default: // "rpc"
-		rpc := stellar.NewHTTPClient(cfg.RPCURL, nil)
-
-		// Verify the RPC endpoint really is the configured network before
-		// any monitor starts evaluating events. A mainnet endpoint behind
-		// a testnet config (or the reverse) silently evaluates every rule
-		// against the wrong chain — this fails fast instead. There is no
-		// equivalent check in upstream mode: the indexer's own deployment
-		// owns its network.
-		if net, err := rpc.GetNetwork(ctx); err != nil {
-			log.Warn("could not verify network passphrase", "error", err)
-		} else if err := config.VerifyPassphrase(cfg.Network.Passphrase, net.Passphrase); err != nil {
+	// Postgres partitions alerts by month. Make sure the months just ahead
+	// exist before the poller can write into them, so a row never has to fall
+	// back to the default partition under normal operation. A no-op on SQLite.
+	if pe, ok := st.(store.PartitionEnsurer); ok {
+		if err := pe.EnsureAlertPartitions(ctx, time.Now().UTC(), 3); err != nil {
 			return err
 		}
-		log.Info("network verified", "network", cfg.Network.Name, "rpc_url", cfg.RPCURL)
+	}
 
-		// Contract specs are fetched lazily per contract and cached, so
-		// events from a contract with a spec arrive with named fields while
-		// every other contract decodes exactly as before.
-		decoder := stellar.NewSpecDecoder(stellar.DefaultDecoder{}, stellar.NewRPCSpecSource(rpc), log)
-		src = poller.NewRPCSource(rpc, decoder)
-		health = rpc
+	// Pipeline: event source -> rules -> alerts -> channels. The source is
+	// the single seam between the poller and wherever events come from. The
+	// backfill subcommand shares this wiring so a replay reads exactly what
+	// live monitoring reads.
+	src, health, err := buildSource(ctx, log, cfg)
+	if err != nil {
+		return err
 	}
 	logStartupHealth(ctx, log, health)
 
@@ -141,7 +171,9 @@ func run() error {
 		})))
 	factory := notify.DefaultFactory()
 	dispatcher := notify.NewDispatcher(st, factory, log).WithMetrics(m)
-	p := poller.New(src, st, registry, dispatcher, cfg.PollInterval, log).WithMetrics(m)
+	p := poller.New(src, st, registry, dispatcher, cfg.PollInterval, log).
+		WithMetrics(m).
+		WithReorg(cfg.ReorgTrackingWindow, cfg.ReorgConfirmationDepth)
 
 	// HTTP: JSON API under /api/v1, dashboard at /.
 	apiSrv := api.New(st, registry, factory, health, log).
@@ -192,8 +224,38 @@ func run() error {
 		}
 	}()
 	go p.Run(ctx)
+	if cfg.GRPCAddr != "" {
+		grpcSrv := sorogrpc.New(st, authn, log)
+		go func() {
+			if err := grpcSrv.Serve(ctx, cfg.GRPCAddr); err != nil {
+				log.Error("grpc server error", "err", err)
+			}
+		}()
+	}
+	// Retention can tier expired alerts to object storage before deleting
+	// them. Off by default: an empty ARCHIVE_URL leaves the pruner behaving
+	// exactly as it did before archiving existed.
+	var archiver store.AlertArchiver
+	if cfg.ArchiveURL != "" {
+		back, err := archive.FromURL(cfg.ArchiveURL)
+		if err != nil {
+			return err
+		}
+		pruner, err := archive.NewPruner(back)
+		if err != nil {
+			return err
+		}
+		archiver = pruner
+		// Never log the URL: an operator may embed an endpoint or token in a
+		// query string. The scheme is enough to confirm what was selected.
+		log.Info("alert archiving enabled")
+	}
 	if cfg.AlertRetention > 0 {
-		go store.RunAlertPruner(ctx, st, cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, log)
+		go store.RunAlertPruner(ctx, st, cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, archiver, log)
+	} else if archiver != nil {
+		// Archiving only happens before a delete, so it is inert without
+		// retention. Warn rather than silently doing nothing.
+		log.Warn("ARCHIVE_URL is set but ALERT_RETENTION is unset; nothing will be archived or deleted")
 	}
 
 	select {
@@ -206,6 +268,138 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return httpSrv.Shutdown(shutdownCtx)
+}
+
+// buildSource wires the configured event source and its health checker. It is
+// shared by the long-lived server and the backfill subcommand so both honour
+// SOURCE_MODE and talk to the same backend.
+func buildSource(ctx context.Context, log *slog.Logger, cfg config.Config) (poller.EventSource, api.HealthChecker, error) {
+	switch cfg.SourceMode {
+	case "sorotrail":
+		stc := sorotrail.NewClient(cfg.SoroTrailURL, nil)
+		log.Info("upstream mode: reading events from SoroTrail", "url", cfg.SoroTrailURL)
+		return sorotrail.NewSource(stc), stc, nil
+	default: // "rpc"
+		// Several endpoints behind one Client: calls try them in the order
+		// RPC_URLS lists them and fail over when one rate-limits or goes
+		// down. The poller, the spec source and the readiness probe all
+		// keep talking to a single stellar.Client, so nothing downstream
+		// knows the difference.
+		rpc := stellar.NewFailoverClient(cfg.RPCURLs, nil, log)
+
+		// Verify every RPC endpoint really is the configured network before
+		// any monitor starts evaluating events. A mainnet endpoint behind a
+		// testnet config (or the reverse) silently evaluates every rule
+		// against the wrong chain, and because failover picks a node per
+		// call, one mixed endpoint would corrupt the alert stream
+		// intermittently — the hardest kind of bug to notice. This fails
+		// fast instead. There is no equivalent check in upstream mode: the
+		// indexer's own deployment owns its network.
+		if err := verifyNetworkEndpoints(ctx, log, rpc, cfg.Network.Passphrase); err != nil {
+			return nil, nil, err
+		}
+		log.Info("network verified",
+			"network", cfg.Network.Name,
+			"rpc_url", cfg.RPCURL,
+			"rpc_endpoint_count", len(cfg.RPCURLs))
+
+		// Contract specs are fetched lazily per contract and cached, so
+		// events from a contract with a spec arrive with named fields while
+		// every other contract decodes exactly as before.
+		decoder := stellar.NewSpecDecoder(stellar.DefaultDecoder{}, stellar.NewRPCSpecSource(rpc), log)
+		return poller.NewRPCSource(rpc, decoder), rpc, nil
+	}
+}
+
+// runBackfill implements `sorobeacon backfill`: an opt-in historical replay of
+// one monitor's recent ledger history. It shares the server's config, store and
+// event source, so a replay reads exactly what live monitoring reads.
+func runBackfill(args []string) error {
+	fs := flag.NewFlagSet("backfill", flag.ContinueOnError)
+	monitorID := fs.Int64("monitor", 0, "monitor id to backfill (required)")
+	fromLedger := fs.Uint("from", 0, "inclusive first ledger to replay")
+	toLedger := fs.Uint("to", 0, "inclusive last ledger to replay (default: source tip)")
+	lookback := fs.Duration("lookback", 0, "replay this far back from the end of the range, e.g. 72h (estimate; ignored when -from is set)")
+	deliver := fs.Bool("deliver", false, "send backfilled alerts to the monitor's channels (default: store only)")
+	rate := fs.Duration("rate", 0, "minimum delay between page fetches (default 200ms)")
+	pageSize := fs.Int("page-size", 0, "getEvents page size (default: the source's)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil // -h/-help already printed usage
+		}
+		return err
+	}
+	if *monitorID == 0 {
+		return errors.New("backfill: -monitor is required")
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := store.Migrate(cfg.DatabaseURL); err != nil {
+		return err
+	}
+	st, err := store.NewPostgres(ctx, cfg.DatabaseURL, store.PoolSettings{
+		MaxConns:        cfg.DatabaseMaxConns,
+		MinConns:        cfg.DatabaseMinConns,
+		MaxConnLifetime: cfg.DatabaseMaxConnLifetime,
+		MaxConnIdleTime: cfg.DatabaseMaxConnIdleTime,
+	})
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	// Channel configs hold secrets and may be encrypted at rest; decrypt them
+	// so the dispatcher can use them when -deliver is set.
+	if len(cfg.ConfigEncryptionKey) > 0 {
+		cipher, err := store.NewAESGCMCipher(cfg.ConfigEncryptionKey)
+		if err != nil {
+			return err
+		}
+		st.WithConfigCipher(cipher)
+	}
+
+	src, _, err := buildSource(ctx, log, cfg)
+	if err != nil {
+		return err
+	}
+
+	registry := rules.NewRegistry()
+	dispatcher := notify.NewDispatcher(st, notify.DefaultFactory(), log)
+	ingestor := poller.NewIngestor(st, registry, dispatcher, log)
+	job := backfill.New(src, st, registry, ingestor, log)
+
+	res, err := job.Run(ctx, backfill.Options{
+		MonitorID:  *monitorID,
+		FromLedger: uint32(*fromLedger),
+		ToLedger:   uint32(*toLedger),
+		Lookback:   *lookback,
+		Deliver:    *deliver,
+		Rate:       *rate,
+		PageSize:   *pageSize,
+	})
+	if err != nil {
+		return err
+	}
+	log.Info("backfill finished",
+		"monitor_id", res.MonitorID,
+		"from_ledger", res.FromLedger,
+		"to_ledger", res.ToLedger,
+		"oldest_ledger", res.OldestLedger,
+		"clamped", res.Clamped,
+		"resumed", res.Resumed,
+		"events", res.Events,
+		"matched", res.Matched,
+		"alerts", res.Alerts,
+		"dispatched", res.Dispatched,
+	)
+	return nil
 }
 
 // warnIfChannelConfigUnencrypted logs one warning at startup when
@@ -230,6 +424,38 @@ func warnIfAPITokenUnset(log *slog.Logger, tokens []string) {
 	if len(tokens) == 0 {
 		log.Warn("API authentication is disabled; set API_TOKEN to require a bearer token on /api/v1 and a sign-in on the dashboard")
 	}
+}
+
+// startupNetworkTimeout bounds the startup passphrase sweep across every
+// configured endpoint, so a set of unreachable endpoints delays boot by at
+// most this long rather than once per endpoint's own HTTP timeout.
+const startupNetworkTimeout = 15 * time.Second
+
+// verifyNetworkEndpoints asks every configured RPC endpoint which network it
+// belongs to and refuses to start if any of them reports a passphrase other
+// than the configured one. Failover spreads requests over the whole list, so
+// a list that spans two networks would emit a mixture of events from both
+// chains — this is the check that stops it.
+//
+// An endpoint that cannot be reached is logged and skipped rather than fatal:
+// unreachability is precisely what failover exists for, and an endpoint that
+// is down at boot may well be the healthy one a minute later. Only a wrong
+// answer is fatal.
+func verifyNetworkEndpoints(ctx context.Context, log *slog.Logger, client *stellar.FailoverClient, configured string) error {
+	ctx, cancel := context.WithTimeout(ctx, startupNetworkTimeout)
+	defer cancel()
+
+	for _, ep := range client.Endpoints() {
+		net, err := ep.Client.GetNetwork(ctx)
+		if err != nil {
+			log.Warn("could not verify network passphrase", "rpc_url", ep.URL, "error", err)
+			continue
+		}
+		if err := config.VerifyPassphrase(configured, net.Passphrase); err != nil {
+			return fmt.Errorf("rpc endpoint %s: %w", ep.URL, err)
+		}
+	}
+	return nil
 }
 
 // startupHealthTimeout bounds the one-off health check logged at startup,

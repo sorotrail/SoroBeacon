@@ -31,6 +31,23 @@ type monitorRequest struct {
 	ContractIDs *[]string `json:"contract_ids"`
 	Enabled     *bool     `json:"enabled"`
 	ChannelIDs  *[]int64  `json:"channel_ids"`
+	// Priority is "low", "normal" or "high". Omitted means normal, so a
+	// client that predates priorities creates a middle-tier monitor.
+	Priority *string `json:"priority"`
+}
+
+// priorityDetail validates an optional priority, returning a FieldError for an
+// unknown tier and the parsed value otherwise. Rejecting unknown values keeps
+// the scheduler's tier set closed rather than silently defaulting a typo.
+func priorityDetail(raw *string) (store.Priority, *FieldError) {
+	if raw == nil {
+		return "", nil
+	}
+	p, ok := store.ParsePriority(*raw)
+	if !ok {
+		return "", &FieldError{Field: "priority", Reason: `must be one of "low", "normal", "high"`}
+	}
+	return p, nil
 }
 
 func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
@@ -47,6 +64,10 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 	} else {
 		details = append(details, contractIDDetails(*req.ContractIDs)...)
 	}
+	priority, perr := priorityDetail(req.Priority)
+	if perr != nil {
+		details = append(details, *perr)
+	}
 	if len(details) > 0 {
 		writeValidation(w, r, details)
 		return
@@ -55,6 +76,7 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 		Name:        *req.Name,
 		ContractIDs: *req.ContractIDs,
 		Enabled:     req.Enabled == nil || *req.Enabled,
+		Priority:    priority.Normalized(),
 	}
 	if err := s.store.CreateMonitor(r.Context(), &m); err != nil {
 		s.fail(w, r, err)
@@ -137,6 +159,11 @@ func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 				m.ContractIDs = *req.ContractIDs
 			}
 		}
+	}
+	if priority, perr := priorityDetail(req.Priority); perr != nil {
+		details = append(details, *perr)
+	} else if req.Priority != nil {
+		m.Priority = priority
 	}
 	if len(details) > 0 {
 		writeValidation(w, r, details)

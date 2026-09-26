@@ -23,6 +23,17 @@ type Metrics struct {
 	pollDuration  prometheus.Histogram
 	pollLagLedger prometheus.Gauge
 
+	// Priority tier gauges: how many contracts each tier carries, and how
+	// far behind the tip the freshest event seen for that tier is. The lag
+	// gauge is labelled by the closed tier set, so cardinality is bounded.
+	pollPriorityContracts *prometheus.GaugeVec
+	pollPriorityLag       *prometheus.GaugeVec
+
+	// Reorg detection: how many reorgs have been seen, and the ledger of the
+	// most recent one. Both are expected to sit at zero.
+	reorgsTotal     prometheus.Counter
+	lastReorgLedger prometheus.Gauge
+
 	eventsScanned  prometheus.Counter
 	eventsMatched  prometheus.Counter
 	alertsFired    prometheus.Counter
@@ -51,6 +62,26 @@ func New() *Metrics {
 		pollLagLedger: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "sorobeacon_poll_lag_ledgers",
 			Help: "How far the poller's resume point trails the chain tip, in ledgers.",
+		}),
+
+		pollPriorityContracts: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_poll_priority_contracts",
+			Help: "Watched contracts per poll-priority tier (low|normal|high).",
+		}, []string{"priority"}),
+
+		pollPriorityLag: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_poll_lag_ledgers_by_priority",
+			Help: "Ledger lag of the freshest event seen for each poll-priority tier this cycle.",
+		}, []string{"priority"}),
+
+		reorgsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_reorgs_total",
+			Help: "Chain reorganisations detected within the tracking window. Expected to stay at zero.",
+		}),
+
+		lastReorgLedger: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_last_reorg_ledger",
+			Help: "Ledger at which the most recent reorganisation diverged from the ingested chain.",
 		}),
 
 		eventsScanned: prometheus.NewCounter(prometheus.CounterOpts{
@@ -86,7 +117,8 @@ func New() *Metrics {
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
 		m.eventsScanned, m.eventsMatched, m.alertsFired, m.deliveries,
-		m.httpDuration, m.lastPollAgoSec)
+		m.httpDuration, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
+		m.reorgsTotal, m.lastReorgLedger)
 	return m
 }
 
@@ -116,6 +148,41 @@ func (m *Metrics) SetPollLag(ledgersBehind int64) {
 		return
 	}
 	m.pollLagLedger.Set(float64(ledgersBehind))
+}
+
+// SetPriorityContracts records how many contracts the cycle scheduled in each
+// priority tier. It is a gauge, not a counter: contracts are added and removed
+// constantly, so the useful question is "how big is this tier now".
+func (m *Metrics) SetPriorityContracts(priority string, contracts int) {
+	if m == nil {
+		return
+	}
+	m.pollPriorityContracts.WithLabelValues(priority).Set(float64(contracts))
+}
+
+// RecordReorg counts one detected chain reorganisation and records where it
+// diverged.
+func (m *Metrics) RecordReorg(ledger uint32) {
+	if m == nil {
+		return
+	}
+	m.reorgsTotal.Inc()
+	m.lastReorgLedger.Set(float64(ledger))
+}
+
+// SetPollLagByPriority records the ledger lag of the freshest event seen for
+// one priority tier in the cycle that just finished. A tier whose contracts
+// are scheduled later in a slow cycle shows a larger lag here even though the
+// cycle-wide lag is the same, which is what makes the scheduling effect
+// measurable.
+func (m *Metrics) SetPollLagByPriority(priority string, ledgersBehind int64) {
+	if m == nil {
+		return
+	}
+	if ledgersBehind < 0 {
+		ledgersBehind = 0
+	}
+	m.pollPriorityLag.WithLabelValues(priority).Set(float64(ledgersBehind))
 }
 
 // TickPollAge advances the seconds-since-last-poll gauge; called on a timer

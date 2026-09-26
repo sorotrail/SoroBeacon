@@ -20,6 +20,26 @@ func (s *Server) livez(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "alive"})
 }
 
+// pollerStatus reports the last successful ingest position without exposing
+// the RPC or any other configuration held by the process.
+func (s *Server) pollerStatus(w http.ResponseWriter, r *http.Request) {
+	out := map[string]any{"status": "waiting"}
+	if s.poller == nil {
+		writeJSON(w, http.StatusServiceUnavailable, out)
+		return
+	}
+	pos := s.poller.Position()
+	if pos.Ready() {
+		out["status"] = "ok"
+		out["last_processed_ledger"] = pos.LastProcessedLedger
+		out["latest_chain_ledger"] = pos.LatestChainLedger
+		out["ledger_lag"] = pos.Lag()
+		out["last_successful_poll"] = pos.LastSuccessfulPoll.UTC().Format(time.RFC3339)
+	}
+	out["backing_off"] = pos.BackingOff
+	writeJSON(w, http.StatusOK, out)
+}
+
 // readyz answers "can this instance do useful work right now". It checks
 // the two things every request path depends on — the database and the RPC
 // endpoint — concurrently and with per-dependency detail, so a failure

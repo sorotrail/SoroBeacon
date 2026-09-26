@@ -589,6 +589,47 @@
         }
       }
     },
+    "/ingest": {
+      "post": {
+        "summary": "Receive a federated alert from another SoroBeacon instance",
+        "description": "Stores an alert forwarded by another instance without re-evaluating rules. The alert is stamped with its origin and hop count for loop prevention. Requires authentication.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["alert", "origin"],
+                "properties": {
+                  "alert": { "$ref": "#/components/schemas/Alert" },
+                  "origin": { "type": "string", "description": "Instance identifier of the originating SoroBeacon" },
+                  "hop_count": { "type": "integer", "minimum": 0, "maximum": 8, "description": "Number of hops this alert has traversed" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Alert ingested",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "outcome": { "type": "string", "enum": ["created", "duplicate", "suppressed"] },
+                    "alert_id": { "type": "integer", "format": "int64" },
+                    "origin": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/health": {
       "get": {
         "summary": "Combined health report",
@@ -618,6 +659,23 @@
         "responses": {
           "200": { "description": "Ready" },
           "503": { "description": "At least one dependency unhealthy" }
+        }
+      }
+    },
+    "/poller": {
+      "get": {
+        "summary": "Poller position and lag",
+        "description": "Reports the last successful poll position, chain tip, ledger lag, and whether the poller is currently backing off. Before the first successful poll, position fields are omitted and status is waiting. No configuration values are returned.",
+        "responses": {
+          "200": {
+            "description": "Poller status",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PollerStatus" }
+              }
+            }
+          },
+          "503": { "description": "Poller is not configured" }
         }
       }
     },
@@ -681,6 +739,196 @@
               }
             }
           }
+        }
+      }
+    },
+    "/templates": {
+      "post": {
+        "summary": "Create a monitor template",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MonitorTemplateInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MonitorTemplate" } } }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "get": {
+        "summary": "List monitor templates",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "templates": { "type": "array", "items": { "$ref": "#/components/schemas/MonitorTemplate" } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/templates/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/ID" }],
+      "get": {
+        "summary": "Get a monitor template",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MonitorTemplate" } } }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "patch": {
+        "summary": "Update a monitor template",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MonitorTemplateInput" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MonitorTemplate" } } }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "summary": "Delete a monitor template",
+        "description": "Existing monitors created from this template are unaffected.",
+        "responses": {
+          "204": { "description": "Deleted" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/templates/{id}/instantiate": {
+      "parameters": [{ "$ref": "#/components/parameters/ID" }],
+      "post": {
+        "summary": "Create a monitor from a template",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/InstantiateInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Monitor" } } }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/templates/{id}/instantiate/bulk": {
+      "parameters": [{ "$ref": "#/components/parameters/ID" }],
+      "post": {
+        "summary": "Bulk create monitors from a template",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["instances"],
+                "properties": {
+                  "instances": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": { "$ref": "#/components/schemas/InstantiateInput" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "created": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": { "type": "string" },
+                          "id": { "type": "integer", "format": "int64" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/monitors/import": {
+      "post": {
+        "summary": "Bulk import contracts from a file",
+        "description": "Accepts JSON or CSV (text/csv). Each contract ID creates one monitor. Validates all IDs before writing. Existing contracts are skipped.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ImportInput" }
+            },
+            "text/csv": {
+              "schema": { "type": "string", "description": "One contract ID per line" }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Monitor name prefix (CSV mode only, defaults to 'imported')"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Import results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "total": { "type": "integer" },
+                    "results": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/ImportRowResult" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
         }
       }
     }
@@ -948,6 +1196,113 @@
           "version": { "type": "string" },
           "commit": { "type": "string" },
           "build_date": { "type": "string" }
+        }
+      },
+      "PollerStatus": {
+        "type": "object",
+        "required": ["status", "backing_off"],
+        "properties": {
+          "status": { "type": "string", "enum": ["waiting", "ok"] },
+          "last_processed_ledger": { "type": "integer", "format": "int64" },
+          "latest_chain_ledger": { "type": "integer", "format": "int64" },
+          "ledger_lag": { "type": "integer", "format": "int64" },
+          "last_successful_poll": { "type": "string", "format": "date-time" },
+          "backing_off": { "type": "boolean" }
+        }
+      },
+      "MonitorTemplate": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "rules": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": { "type": "string" },
+                "params": { "type": "object" }
+              }
+            }
+          },
+          "channel_ids": { "type": "array", "items": { "type": "integer", "format": "int64" } },
+          "parameters": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "description": { "type": "string" },
+                "required": { "type": "boolean" },
+                "default": { "type": "string" }
+              }
+            }
+          },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "MonitorTemplateInput": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "rules": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": { "type": "string" },
+                "params": { "type": "object" }
+              }
+            }
+          },
+          "channel_ids": { "type": "array", "items": { "type": "integer", "format": "int64" } },
+          "parameters": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "description": { "type": "string" },
+                "required": { "type": "boolean" },
+                "default": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "InstantiateInput": {
+        "type": "object",
+        "required": ["name", "contract_ids"],
+        "properties": {
+          "name": { "type": "string" },
+          "contract_ids": { "type": "array", "items": { "type": "string" } },
+          "parameters": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          }
+        }
+      },
+      "ImportInput": {
+        "type": "object",
+        "required": ["name", "contract_ids"],
+        "properties": {
+          "name": { "type": "string", "description": "Monitor name prefix" },
+          "contract_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 500 },
+          "channel_ids": { "type": "array", "items": { "type": "integer", "format": "int64" } },
+          "enabled": { "type": "boolean", "default": true }
+        }
+      },
+      "ImportRowResult": {
+        "type": "object",
+        "properties": {
+          "row": { "type": "integer" },
+          "contract_id": { "type": "string" },
+          "monitor_id": { "type": "integer", "format": "int64" },
+          "status": { "type": "string", "enum": ["created", "skipped", "error"] },
+          "error": { "type": "string" }
         }
       }
     }

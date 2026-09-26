@@ -22,7 +22,7 @@ and this page should be updated.
 | `CONFIG_ENCRYPTION_KEY` | **yes** | Base64 AES-GCM key that encrypts channel `config` at rest. Losing it makes encrypted configs unrecoverable — back it up with the database. |
 | `API_TOKEN` | **yes** | Bearer token(s) for `/api/v1` and the dashboard sign-in. Anyone holding one can read and mutate everything, so treat it like a password: mode `0600` on disk, a secret manager in production, and never in a log line, ticket or shell history. |
 | `NETWORK_PASSPHRASE` | no (public nets) | SDF passphrases are public. For `NETWORK=custom` it identifies a private network — treat it as operational config, not a credential. |
-| `RPC_URL` / `SOROTRAIL_URL` | maybe | A URL is not a password, but provider URLs sometimes embed tokens in the path or query. Do not commit those. |
+| `RPC_URL` / `RPC_URLS` / `SOROTRAIL_URL` | maybe | A URL is not a password, but provider URLs sometimes embed tokens in the path or query. Do not commit those. |
 | `CORS_ALLOWED_ORIGINS` | no | An allow-list, not a credential. Think hard before allowing a third-party origin: whatever credential that origin's users hold can act through their browser. |
 | everything else | no | |
 
@@ -35,7 +35,27 @@ column; see [Channel config encryption](#channel-config-encryption).
 
 | Variable | Type | Default | Required | What it does |
 | --- | --- | --- | --- | --- |
-| `DATABASE_URL` | URL string | _(none)_ | **required** | Postgres connection string in pgx form, e.g. `postgres://user:pass@host:5432/sorobeacon?sslmode=disable`. Load fails if it is empty. |
+| `DATABASE_URL` | URL string | _(none)_ | **required** | Connection string whose scheme selects the backend. `postgres` / `postgresql` → a Postgres server (pgx pool), e.g. `postgres://user:pass@host:5432/sorobeacon?sslmode=disable`. `sqlite` → a single database file, e.g. `sqlite:///var/lib/sorobeacon/sorobeacon.db`, with no server to run. Load fails if it is empty; a Postgres URL must carry a host and a SQLite URL a file path. Errors never echo a password. |
+
+### SQLite backend
+
+`sqlite://<path>` stores everything in one file and needs no Postgres. The
+parent directory is created if it is missing, and the database runs in WAL
+mode. It is aimed at a single instance — one contract on a small VPS or a
+Raspberry Pi.
+
+**Writes serialise.** SQLite allows one writer at a time, so the store holds
+the write lock for the duration of a write transaction (it uses `BEGIN
+IMMEDIATE` and a single connection). The alert cooldown, which Postgres
+enforces with `SELECT ... FOR UPDATE`, is enforced the same way and with the
+same result — one alert per window — but write throughput is bounded by that
+one writer. Reads run concurrently under WAL. Do not point several SoroBeacon
+instances at one SQLite file; use Postgres for that.
+
+The `DATABASE_MAX_CONNS`, `DATABASE_MIN_CONNS`,
+`DATABASE_MAX_CONN_LIFETIME` and `DATABASE_MAX_CONN_IDLE_TIME` variables tune
+the **Postgres** pool. Setting any of them with a `sqlite` URL is a startup
+error rather than a setting that silently does nothing.
 
 ## API authentication
 
@@ -106,10 +126,49 @@ which network it is on and **refuses to start on a mismatch**.
 | `SOROTRAIL_URL` | URL string | _(none)_ | **required when `SOURCE_MODE=sorotrail`**; ignored in `rpc` mode | Base URL of the SoroTrail indexer. Load fails if this is empty in sorotrail mode. |
 | `NETWORK` | enum | `testnet` | optional | `testnet` \| `mainnet` \| `futurenet` \| `custom`. Selects the preset RPC endpoint and passphrase. |
 | `RPC_URL` | URL string | per `NETWORK` (testnet: `https://soroban-testnet.stellar.org`) | required when `NETWORK=custom`; optional override otherwise | Stellar RPC endpoint (JSON-RPC 2.0 over HTTP/HTTPS). Must be an absolute `http` or `https` URL when set. |
+| `RPC_URLS` | comma-separated URL list | _(none — `RPC_URL` is used)_ | optional | Ordered RPC endpoints to fail over between, highest priority first. **Takes priority over `RPC_URL` when set**, so you never need both; entries are trimmed, so `a, b` and `a,b` are the same list. Every entry must be an absolute `http` or `https` URL, and one endpoint that names no URL at all (`RPC_URLS=,,`) is a startup error rather than a silent fallback. |
 | `NETWORK_PASSPHRASE` | string | per `NETWORK` | **required when `NETWORK=custom`**; optional override otherwise | Network passphrase. Always wins over the preset, so a named network with a local quickstart passphrase works. |
 
-`NETWORK=custom` is for private standalone networks: both `RPC_URL` and
-`NETWORK_PASSPHRASE` must be set.
+`NETWORK=custom` is for private standalone networks: both an RPC endpoint
+(`RPC_URL` or `RPC_URLS`) and `NETWORK_PASSPHRASE` must be set.
+
+### Failing over between endpoints
+
+A public Soroban RPC endpoint rate-limits and goes down, and a monitoring tool
+that stops seeing events is the one failure mode it cannot have. With
+`RPC_URLS` set, every call goes to the first endpoint in the list that is not
+quarantined.
+
+This is the only supported way to keep a paid endpoint with a public
+fallback — one list, in priority order:
+
+```sh
+RPC_URLS=https://my-paid-rpc.example,https://soroban-testnet.stellar.org
+```
+
+A transport error, a `429` or a `5xx` answer means that endpoint is at fault,
+so it is quarantined for an exponentially growing backoff (5s, 10s, 20s …
+capped at 5m) and the same call is immediately retried on the next endpoint.
+Once the backoff expires the endpoint rejoins the rotation, and a successful
+probe clears its failure count. A `4xx` answer or a JSON-RPC error object does
+**not** trigger failover: the node understood the request and rejected it, so
+the next endpoint would reject it identically, and counting it against an
+endpoint would quarantine a node that is fine. While at least one endpoint is
+in rotation the poller never notices any of this.
+
+Every endpoint is checked at startup and SoroBeacon **refuses to start** if one
+of them reports a different network passphrase than the configured one. That
+check exists because failover spreads calls across the whole list: a set that
+mixed mainnet and testnet would feed a mixture of two chains' events into the
+alert stream, intermittently, which is far harder to spot than a hard failure.
+An endpoint that is unreachable at startup is logged and skipped instead —
+that is what failover is for.
+
+Quarantine and recovery are logged (`rpc endpoint quarantined`,
+`rpc endpoint recovered`) with the endpoint URL, the failure count and the
+backoff, and the same per-endpoint failure counts are exposed by
+`stellar.FailoverClient.Stats()` for the metrics work tracked in
+[#26](https://github.com/sorotrail/SoroBeacon/issues/26).
 
 ## HTTP
 
@@ -127,6 +186,28 @@ which network it is on and **refuses to start on a mismatch**.
 Only applies to `SOURCE_MODE=rpc` in practice (the standalone poller).
 Upstream (`sorotrail`) reads the indexer; this interval is still loaded
 but the poller is not the source.
+
+### Reorg detection
+
+The poller records the hash of each recently ingested ledger and re-reads the
+window every cycle. A ledger whose hash changes is a chain reorganisation, and
+the alerts derived from the orphaned range are marked retracted — kept, never
+deleted, because a delivered notification cannot be unsent. Reorgs are logged
+at `warn` and counted in `sorobeacon_reorgs_total`.
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `REORG_TRACKING_WINDOW` | integer (ledgers) | `128` | optional | How many recent ledger hashes to keep and re-check. `0` disables detection (the behaviour before the feature). Roughly ten minutes of Stellar history at the default, and one `getLedgers` call per cycle. A source that cannot report ledger hashes (SoroTrail, or an RPC node too old for `getLedgers`) simply has no detection. |
+| `REORG_CONFIRMATION_DEPTH` | integer (ledgers) | `0` | optional | Hold an event until it is this many ledgers behind the tip before evaluating it. Trades alert latency for fewer retractions; `0` alerts immediately, the historical default. |
+
+## Retention and archiving
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `ALERT_RETENTION` | duration or `<n>d` | empty (keep forever) | optional | How long alerts (and their delivery attempts) are kept. Unset keeps history forever, so an upgrade never starts deleting. On Postgres, retention first drops whole expired monthly partitions (effectively free) and then deletes the ragged edge in batches of 1000. |
+| `ARCHIVE_URL` | URL or path | empty (archiving off) | optional | Where retention copies a batch of expired alerts before deleting them. A local directory path, `file://`, `dir://`, or `s3://bucket/prefix` (region from `?region=` or `AWS_REGION`; credentials from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`; `?endpoint=` for MinIO or a test server). A failed archive blocks that batch's delete, so nothing is dropped un-archived. Requires `ALERT_RETENTION` to have any effect. Archive objects are NDJSON, one alert per line, keyed by the batch's own id range so re-running is idempotent. |
+
+Archive objects contain only alert rows (contract id, event, payload, ledger); channel `config` — the webhook URLs, bot tokens and SMTP credentials — is never read by the archiver and can never appear in one.
 
 ## Logging
 

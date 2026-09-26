@@ -2,8 +2,8 @@
 
 **Monitoring and alerting for Soroban smart contracts.** Point SoroBeacon at
 one or more contracts on Stellar, define rules ("this event fired", "an
-emitted value crossed a threshold", "more than N in M minutes"), and get alerts
-on Discord, Slack, Telegram, Matrix, PagerDuty, email, or any webhook — with a
+edmitted value crossed a threshold", "more than N in M minutes"), and get alerts
+on Discord, Slack, Telegram, Matrix, PagerDuty, Twilio SMS, email, or any webhook — with a
 small dashboard to manage monitors
 and review alert history.
 
@@ -35,6 +35,17 @@ Stellar RPC ──getEvents──▶ poller ──▶ decoder ──▶ rules en
 - The **dispatcher** fans each alert out to the monitor's channels with
   retries and exponential backoff, recording every delivery attempt.
 
+Reliability around the edges: each monitor carries a **poll priority**
+(`low`/`normal`/`high`, default `normal`) and the poller schedules high-priority
+contracts first with a weighted round-robin that never starves the low tier. A
+chain **reorganisation** is detected by re-reading recently ingested ledger
+hashes — a changed hash retracts the alerts derived from the orphaned range
+(kept and flagged, never deleted), and an optional confirmation depth can hold
+alerts until an event is buried. On Postgres, `alerts` is **range-partitioned
+by month**, so retention drops whole expired partitions instead of deleting row
+by row, and it can **archive** each batch to a directory or S3 before deleting
+it so a failed archive blocks the delete.
+
 ## Quickstart
 
 ```sh
@@ -54,6 +65,12 @@ make build
 set -a; . ./.env; set +a; ./bin/sorobeacon
 ```
 
+No Postgres on the box? Point `DATABASE_URL` at a file instead —
+`DATABASE_URL=sqlite:///var/lib/sorobeacon/sorobeacon.db` starts a working
+instance with no external service. SQLite backs a single instance well;
+it serialises writes, so use Postgres for several writers or several instances.
+See [capacity and scaling](docs/operations/scaling.md).
+
 ## Configuration
 
 All configuration comes from environment variables. The complete
@@ -68,8 +85,9 @@ vs optional, secrets, and `SOURCE_MODE`-only notes — is
 | `SOROTRAIL_URL` | —                                      | SoroTrail indexer base URL (upstream mode)   |
 | `NETWORK`       | `testnet`                              | `testnet` \| `mainnet` \| `futurenet` \| `custom` |
 | `RPC_URL`       | per network                            | Stellar RPC endpoint; overrides the preset   |
+| `RPC_URLS`      | _(none — `RPC_URL` is used)_           | Ordered, comma-separated endpoints to fail over between; takes priority over `RPC_URL` |
 | `NETWORK_PASSPHRASE` | per network                       | Overrides the network passphrase             |
-| `DATABASE_URL`  | *(required)*                           | Postgres URL (`postgres` / `postgresql`); validated at load |
+| `DATABASE_URL`  | *(required)*                           | Backend URL by scheme: Postgres (`postgres` / `postgresql`) or a single-file SQLite database (`sqlite:///path/to/sorobeacon.db`); validated at load |
 | `DATABASE_MAX_CONNS` | pgx default                       | Pool max connections (`0` = driver default)  |
 | `DATABASE_MIN_CONNS` | pgx default                       | Pool min connections (`0` = driver default)  |
 | `DATABASE_MAX_CONN_LIFETIME` | pgx default                | Max connection lifetime (`0` = driver default) |
@@ -79,7 +97,10 @@ vs optional, secrets, and `SOURCE_MODE`-only notes — is
 | `HTTP_MAX_BODY_BYTES` | `1048576` (1 MiB)                 | Max API write-body size; GET is unaffected   |
 | `CORS_ALLOWED_ORIGINS` | _(empty, CORS off)_             | Comma-separated browser Origins; empty disables CORS |
 | `MONITOR_SILENT_AFTER` | `24h`                            | Mark monitors silent on the dashboard after this much time since last match |
-| `HTTP_ADDR`     | `:8080`                                | API + dashboard listen address               |
+| `ALERT_RETENTION` | _(unset, keep forever)_             | How long to keep alerts; `90d`, `24h`. Postgres drops whole expired partitions |
+| `ARCHIVE_URL`   | _(unset, off)_                         | Archive expired alerts before deletion (directory or `s3://bucket/prefix`) |
+| `REORG_TRACKING_WINDOW` | `128`                        | Recent ledger hashes tracked for reorg detection; `0` disables |
+| `REORG_CONFIRMATION_DEPTH` | `0`                       | Ledgers an event must be buried before it may alert |
 | `LOG_LEVEL`     | `info`                                 | `debug` \| `info` \| `warn` \| `error`       |
 | `READYZ_LAG_THRESHOLD` | `0` (disabled)                  | Fail `/readyz` when poller ledger lag exceeds this; 0 leaves probes unchanged |
 | `RATE_LIMIT_RPS` | `0` (off)                             | Per-client API requests per second           |
@@ -95,6 +116,17 @@ for private standalone networks. At startup SoroBeacon asks the RPC which
 network it belongs to and **refuses to start on a mismatch**, so a mainnet
 endpoint behind testnet configuration fails fast instead of silently
 evaluating every monitor against the wrong chain.
+
+Set `RPC_URLS` to a comma-separated, ordered list and SoroBeacon fails over
+between the endpoints instead of staking the alert stream on one of them.
+Transport errors, `429`s and `5xx`s quarantine an endpoint with an
+exponential backoff and retry the call on the next one; a `4xx` or a
+JSON-RPC error does not, because it would fail identically everywhere. A
+quarantined endpoint is probed again once its backoff expires, and a
+successful probe puts it back in rotation. Every endpoint in the list is
+checked at startup and **a mixed-network list is fatal** — failover would
+otherwise interleave two chains' events. `RPC_URL` keeps working unchanged
+as the single-endpoint case; never set both.
 
 ### Operating modes
 
@@ -156,7 +188,7 @@ curl -s -X DELETE localhost:8080/api/v1/monitors/1
 
 ### Rules
 
-Four rule types ship:
+Five rule types ship:
 
 **`event_emitted`** — match on event name (the first topic, by Soroban
 convention) and/or exact topic values:
@@ -229,6 +261,41 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 See [docs/rules/frequency-threshold.md](docs/rules/frequency-threshold.md) for
 the re-arm semantics.
 
+**`topic_regex`** — match a regular expression against a decoded topic, at a
+given position or any topic when `position` is omitted. Real contracts emit
+families of events (`swap_exact_in`, `swap_exact_out`, `pool_deposit`, …) and
+one pattern covers the family. Patterns are unanchored RE2 matched within a
+topic's string value and are capped at 512 bytes; a position beyond an event's
+topic list simply doesn't match:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "topic_regex",
+  "params": {
+    "pattern": "^swap_",
+    "position": 0
+  }
+}'
+```
+
+**`address_watchlist`** — match any SEP-41 token event whose from or to
+address is on a configured list. "Did these specific addresses move anything"
+becomes one rule instead of one `token_event` rule per address. `match` is
+`from`, `to` or `either` (the default); matching is exact and case-sensitive;
+the address set is built once, so a watchlist of hundreds of addresses costs
+no more per event than one of two:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "address_watchlist",
+  "params": {
+    "addresses": ["GDW6...ACCOUNT", "GBXG...EXCHANGE"],
+    "match": "either",
+    "event": "transfer"
+  }
+}'
+```
+
 Every rule type also accepts an optional `cooldown` (a Go duration string such
 as `"5m"`): the first match alerts, further matches in the window are counted
 and dropped, and the next alert reports `suppressed_since_last`. It survives a
@@ -296,6 +363,53 @@ curl -s localhost:8080/api/v1/health
 curl -s localhost:8080/api/v1/stats
 ```
 
+## CLI
+
+The same binary doubles as a CLI for a running instance, so bootstrapping a
+deployment or changing it from a CI pipeline does not need curl scripts. The
+server starts when `sorobeacon` is run with no arguments; any argument makes
+it a client:
+
+```sh
+sorobeacon monitor list
+sorobeacon monitor create --name "My token" \
+  --contract CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA --channel 1
+sorobeacon monitor get 1
+sorobeacon monitor disable 1
+sorobeacon monitor delete 1
+
+sorobeacon rule list 1
+sorobeacon rule add 1 --type frequency_threshold --param event_name=transfer \
+  --param count=50 --param window=5m
+sorobeacon rule delete 1 2
+
+sorobeacon channel list --type slack
+sorobeacon channel create --name ops-slack --type slack \
+  --config webhook_url=https://hooks.slack.com/services/...
+sorobeacon channel test 1
+sorobeacon channel delete 1
+```
+
+`--config` and `--param` take one `key=value` per flag, and a value is typed
+by its JSON spelling: `count=50` is a number, `window=5m` a string (quote a
+value that must stay a string) and `to=["ops@example.com"]` an array. For
+anything nested, `--config-json` and `--params` take a whole JSON object.
+
+The instance to talk to comes from `SOROBEACON_URL` (default
+`http://localhost:8080`) and can be overridden with `--url`; `SOROBEACON_TOKEN`
+or `--token` sends `Authorization: Bearer` for an instance with `API_TOKEN`
+set. Output is a readable table by default and JSON with `--json`, so a script
+can pipe it into `jq`. Failures print the API's error envelope message and
+exit non-zero, and a channel's `config` — webhook URLs, bot tokens, SMTP
+credentials — is never printed, since the API does not return it. Run
+`sorobeacon help` for the command list, or `sorobeacon monitor`, `sorobeacon
+rule` or `sorobeacon channel` for a group's own usage and flags.
+
+```sh
+sorobeacon monitor list --json
+sorobeacon monitor create --name "My token" --contract C... --json
+```
+
 ## Development
 
 ```sh
@@ -309,6 +423,7 @@ make up / down  # docker compose
 Layout:
 
 ```
+cmd/sorobeacon      wiring + graceful shutdown, CLI subcommands (cli*.go)
 cmd/sorobeacon      wiring + graceful shutdown
 internal/config     env config
 internal/stellar    RPC client (getEvents/getLatestLedger/getHealth) + ScVal decoder
@@ -319,6 +434,13 @@ internal/notify     Notifier interface + 7 channels + retrying dispatcher
 internal/poller     ingest loop: poll -> decode -> match -> alert -> dispatch
 internal/api        chi JSON API
 internal/web        html/template + htmx dashboard
+internal/apiclient  HTTP client for the API, shared by the CLI
+```
+
+`cmd/sorobeacon` also contains the CLI subcommands (`cli*.go`); they talk to a
+running instance only through `internal/apiclient`, so the CLI and the API
+cannot drift apart.
+
 ```
 
 ### Adding a notification channel
@@ -364,5 +486,6 @@ Decoded events use a small value vocabulary (`nil`, `bool`, `string`,
 - Contract-spec-aware event decoding (named fields instead of raw topics)
 
 ## License
+### Notification Channels
 
-Apache-2.0 — see [LICENSE](LICENSE).
+Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), and generic [Webhooks](docs/channels/webhook.md).

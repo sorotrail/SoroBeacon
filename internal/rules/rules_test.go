@@ -259,7 +259,7 @@ func TestValueThresholdValidate(t *testing.T) {
 
 func TestRegistry(t *testing.T) {
 	r := NewRegistry()
-	assert.ElementsMatch(t, []string{TypeEventEmitted, TypeValueThreshold, TypeTokenEvent, TypeFrequencyThreshold}, r.Types())
+	assert.ElementsMatch(t, []string{TypeEventEmitted, TypeValueThreshold, TypeTokenEvent, TypeFrequencyThreshold, TypeTopicRegex, TypeAddressWatchlist}, r.Types())
 
 	_, err := r.Evaluate(context.Background(), "unknown", transferEvent(1), json.RawMessage(`{}`))
 	assert.Error(t, err)
@@ -276,4 +276,66 @@ func mustBig(s string) *big.Int {
 		panic("bad big.Int literal " + s)
 	}
 	return v
+}
+
+// Benchmarks use the same decoded transfer events as the table tests so the
+// numbers reflect the real hot path (JSON params + a populated DecodedEvent),
+// not empty structs. Matching and non-matching cases are both measured: the
+// non-matching path is what the poller hits for most (rule, event) pairs.
+func BenchmarkEventEmitted(b *testing.B) {
+	ev := transferEvent(5)
+	e := EventEmitted{}
+	ctx := context.Background()
+	cases := []struct {
+		name  string
+		want  bool
+		param json.RawMessage
+	}{
+		{name: "match", want: true, param: json.RawMessage(`{"event_name":"transfer"}`)},
+		{name: "nomatch", want: false, param: json.RawMessage(`{"event_name":"mint"}`)},
+	}
+	for _, tt := range cases {
+		b.Run(tt.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				got, err := e.Evaluate(ctx, ev, tt.param)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if got != tt.want {
+					b.Fatalf("got %v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkValueThreshold(b *testing.B) {
+	matchEv := transferEvent(101)
+	missEv := transferEvent(100)
+	v := ValueThreshold{}
+	ctx := context.Background()
+	params := json.RawMessage(`{"comparison":"gt","threshold":100,"value_path":"amount"}`)
+	cases := []struct {
+		name string
+		ev   *stellar.DecodedEvent
+		want bool
+	}{
+		{name: "match", ev: matchEv, want: true},
+		{name: "nomatch", ev: missEv, want: false},
+	}
+	for _, tt := range cases {
+		b.Run(tt.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				got, err := v.Evaluate(ctx, tt.ev, params)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if got != tt.want {
+					b.Fatalf("got %v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
 }

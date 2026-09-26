@@ -46,6 +46,7 @@ var configRequired = []string{
 	"SOROTRAIL_URL",
 	"NETWORK",
 	"RPC_URL",
+	"RPC_URLS",
 	"NETWORK_PASSPHRASE",
 	"POLL_INTERVAL",
 	"HTTP_ADDR",

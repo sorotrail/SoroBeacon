@@ -50,6 +50,19 @@ type EventSource interface {
 	FetchEvents(ctx context.Context, startLedger uint32, watch []Watch, cursor string, limit int) (FetchPage, error)
 }
 
+// RetentionReporter is implemented by EventSources that can report how far
+// back their backing store still holds events. The live poller ignores it;
+// the backfill job (internal/backfill) uses it to clamp a requested range to
+// what the source can actually serve and to say so, instead of silently
+// returning less. A source that does not implement it is treated as having
+// unbounded history.
+type RetentionReporter interface {
+	// OldestLedger returns the oldest ledger the source can still serve, or 0
+	// when it does not know. The RPC retains only ~1-7 days of events;
+	// SoroTrail holds durable history.
+	OldestLedger(ctx context.Context) (uint32, error)
+}
+
 // FetchPage is one page of events from an EventSource.
 type FetchPage struct {
 	// Events are already decoded — sources handle their own decoding, so

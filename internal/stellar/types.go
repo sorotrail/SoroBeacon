@@ -16,6 +16,8 @@ const (
 	MaxContractIDsPerFilter = 5
 	// DefaultEventsLimit is the page size requested from getEvents.
 	DefaultEventsLimit = 100
+	// DefaultLedgersLimit is the page size requested from getLedgers.
+	DefaultLedgersLimit = 200
 )
 
 // EventFilter narrows getEvents results. Within a filter, contractIds are
@@ -73,6 +75,32 @@ type GetEventsResult struct {
 	LatestLedger uint32  `json:"latestLedger"`
 	OldestLedger uint32  `json:"oldestLedger,omitempty"`
 	Cursor       string  `json:"cursor,omitempty"`
+}
+
+// GetLedgersRequest are the params for the getLedgers RPC method. When
+// Pagination.Cursor is set, StartLedger must be omitted.
+type GetLedgersRequest struct {
+	StartLedger uint32      `json:"startLedger,omitempty"`
+	Pagination  *Pagination `json:"pagination,omitempty"`
+}
+
+// Ledger is one entry the getLedgers method returns. Only the identity
+// fields SoroBeacon needs are decoded; the header/metadata XDR blobs are
+// ignored because a reorg is detected by a ledger hash changing, not by
+// walking the parent chain.
+type Ledger struct {
+	Hash            string    `json:"hash"`
+	Sequence        uint32    `json:"sequence"`
+	LedgerCloseTime time.Time `json:"ledgerCloseTime"`
+}
+
+// GetLedgersResult is the getLedgers response. Newer RPC versions return a
+// top-level cursor for the next page; an empty cursor means the range is
+// drained.
+type GetLedgersResult struct {
+	Ledgers      []Ledger `json:"ledgers"`
+	LatestLedger uint32   `json:"latestLedger"`
+	Cursor       string   `json:"cursor,omitempty"`
 }
 
 // LatestLedger is the getLatestLedger response.

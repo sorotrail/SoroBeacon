@@ -123,13 +123,15 @@ func parseConfigEnvelope(raw []byte) (ciphertext []byte, encrypted bool, err err
 
 // configForWrite returns the bytes to persist in channels.config: the
 // plaintext JSON when no cipher is configured, otherwise an encrypted
-// envelope. id is zero on create, so name is preferred in errors.
-func (p *Postgres) configForWrite(id int64, name string, raw json.RawMessage) ([]byte, error) {
+// envelope. id is zero on create, so name is preferred in errors. It is a
+// free function taking the cipher rather than a method so the Postgres and
+// SQLite stores share one implementation of the encryption contract.
+func configForWrite(cipher ConfigCipher, id int64, name string, raw json.RawMessage) ([]byte, error) {
 	plaintext := jsonOrEmpty(raw)
-	if p.cipher == nil {
+	if cipher == nil {
 		return plaintext, nil
 	}
-	ciphertext, err := p.cipher.Encrypt(plaintext)
+	ciphertext, err := cipher.Encrypt(plaintext)
 	if err != nil {
 		return nil, fmt.Errorf("%s: encrypt config: %w", channelRef(id, name), err)
 	}
@@ -139,9 +141,10 @@ func (p *Postgres) configForWrite(id int64, name string, raw json.RawMessage) ([
 // configForRead decrypts an encrypted channels.config value, or returns
 // legacy plaintext unchanged so rows written before a key was configured keep
 // working (they are re-encrypted lazily on the next write). It never includes
-// the config contents in an error.
-func (p *Postgres) configForRead(id int64, name string, raw []byte) (json.RawMessage, error) {
-	if p.cipher == nil {
+// the config contents in an error. Sharing it across backends keeps the
+// stored envelope byte-identical between Postgres and SQLite.
+func configForRead(cipher ConfigCipher, id int64, name string, raw []byte) (json.RawMessage, error) {
+	if cipher == nil {
 		return json.RawMessage(raw), nil
 	}
 	ciphertext, encrypted, err := parseConfigEnvelope(raw)
@@ -151,7 +154,7 @@ func (p *Postgres) configForRead(id int64, name string, raw []byte) (json.RawMes
 	if !encrypted {
 		return json.RawMessage(raw), nil
 	}
-	plaintext, err := p.cipher.Decrypt(ciphertext)
+	plaintext, err := cipher.Decrypt(ciphertext)
 	if err != nil {
 		return nil, fmt.Errorf("%s: decrypt config: %w", channelRef(id, name), err)
 	}
@@ -160,13 +163,26 @@ func (p *Postgres) configForRead(id int64, name string, raw []byte) (json.RawMes
 
 // decryptChannel replaces c.Config with its plaintext form. It is a no-op
 // when no cipher is configured.
-func (p *Postgres) decryptChannel(c *Channel) error {
-	config, err := p.configForRead(c.ID, c.Name, c.Config)
+func decryptChannel(cipher ConfigCipher, c *Channel) error {
+	config, err := configForRead(cipher, c.ID, c.Name, c.Config)
 	if err != nil {
 		return err
 	}
 	c.Config = config
 	return nil
+}
+
+// EncryptForStorage encrypts plaintext config for writing to the database,
+// using the same envelope as regular channel writes. Nil cipher returns
+// plaintext unchanged. Exported for the backup/restore path, which receives
+// decrypted config from a backup file and must re-encrypt it for the target
+// instance's key.
+func EncryptForStorage(cipher ConfigCipher, plaintext json.RawMessage) (json.RawMessage, error) {
+	b, err := configForWrite(cipher, 0, "restore", plaintext)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(b), nil
 }
 
 // channelRef names a channel for an error without echoing its config.

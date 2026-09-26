@@ -9,7 +9,9 @@
   <tr><th>Ledger</th><td>{{.Ledger}}</td></tr>
   <tr><th>Ledger closed</th><td>{{formatTime .LedgerClosedAt .Timezone}}</td></tr>
   <tr><th>Created</th><td>{{formatTime .Alert.CreatedAt .Timezone}}</td></tr>
+  {{if .Alert.RetractedAt}}<tr><th>Retracted</th><td><span class="pill off">orphaned by a reorg</span> {{formatTime .Alert.RetractedAt .Timezone}}</td></tr>{{end}}
 </table>
+{{if .Alert.RetractedAt}}<p class="muted">A chain reorganisation removed ledger {{.Alert.Ledger}} from the canonical chain; this alert is kept for the record but no longer reflects chain history.</p>{{end}}
 
 <h2>Event</h2>
 {{decodedEvent .Alert.Payload}}

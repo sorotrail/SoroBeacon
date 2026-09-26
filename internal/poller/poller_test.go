@@ -77,15 +77,18 @@ type fakeStore struct {
 	now        func() time.Time
 	lastFired  map[int64]time.Time // rule id -> last alert time
 	suppressed map[int64]int64     // rule id -> matches dropped this window
+	// ledgerHashes backs the reorg-detection half of the Store interface.
+	ledgerHashes map[uint32]string
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		rules:      map[int64][]store.Rule{},
-		dedup:      map[string]bool{},
-		now:        time.Now,
-		lastFired:  map[int64]time.Time{},
-		suppressed: map[int64]int64{},
+		ledgerHashes: map[uint32]string{},
+		rules:        map[int64][]store.Rule{},
+		dedup:        map[string]bool{},
+		now:          time.Now,
+		lastFired:    map[int64]time.Time{},
+		suppressed:   map[int64]int64{},
 	}
 }
 

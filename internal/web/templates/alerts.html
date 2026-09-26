@@ -19,7 +19,7 @@
   </select>
   <button>Filter</button>
 </form>
-<p class="export"><a href="{{.ExportHref}}">Export CSV</a></p>
+<p class="export"><a href="{{.ExportHref}}">Export CSV</a> | <a href="/searches">Saved searches</a></p>
 {{if .Alerts}}
 <table>
   <tr><th>ID</th><th>Monitor</th><th>Rule</th><th>Event</th><th>Payload</th><th>Deliveries</th><th>At</th></tr>
@@ -36,7 +36,7 @@
         <div class="muted">loading…</div>
       </details>
     </td>
-    <td>{{formatTime .CreatedAt $.Timezone}}{{with relTime .CreatedAt}} <span class="muted">({{.}})</span>{{end}}</td>
+    <td>{{if .RetractedAt}}<span class="pill off" title="orphaned by a chain reorg">retracted</span> {{end}}{{formatTime .CreatedAt $.Timezone}}{{with relTime .CreatedAt}} <span class="muted">({{.}})</span>{{end}}</td>
   </tr>
   {{end}}
 </table>

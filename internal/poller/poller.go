@@ -4,7 +4,6 @@ package poller
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"sync/atomic"
 	"time"
@@ -23,6 +22,7 @@ type Position struct {
 	LastProcessedLedger uint32
 	LatestChainLedger   uint32
 	LastSuccessfulPoll  time.Time
+	BackingOff          bool
 }
 
 // Ready reports whether a successful poll has completed.
@@ -40,6 +40,12 @@ type Store interface {
 	CreateAlert(ctx context.Context, a *store.Alert) (store.AlertOutcome, error)
 	GetIngestState(ctx context.Context) (store.IngestState, error)
 	SetIngestState(ctx context.Context, s store.IngestState) error
+	// The ledger-hash window backing reorg detection, and the retraction
+	// write that marks alerts orphaned by a reorg.
+	RecordLedgerHashes(ctx context.Context, hashes []store.LedgerHash) error
+	LedgerHashes(ctx context.Context, from, to uint32) ([]store.LedgerHash, error)
+	PruneLedgerHashes(ctx context.Context, before uint32) error
+	RetractAlertsFromLedger(ctx context.Context, ledger uint32, at time.Time) (int64, error)
 }
 
 // Dispatcher receives every newly created alert. Implemented by
@@ -54,9 +60,11 @@ type Poller struct {
 	source   EventSource
 	store    Store
 	registry *rules.Registry
-	dispatch Dispatcher
 	interval time.Duration
 	log      *slog.Logger
+	// ing evaluates events and records alerts; shared with the backfill job
+	// so a historical replay and live ingestion match identically.
+	ing *Ingestor
 	// metrics is optional instrumentation; nil-safe, see internal/metrics.
 	metrics *metrics.Metrics
 	// scanned/matched accumulate per-cycle counts for metrics.
@@ -65,6 +73,16 @@ type Poller struct {
 	// pos is the last successful poll snapshot, stored as Position.
 	// atomic.Value so HTTP handlers can read it without a mutex.
 	pos atomic.Value
+	// sched orders each cycle's watch list by monitor priority. It carries
+	// rotation state between cycles, so a contract cannot be permanently
+	// last within its tier.
+	sched *Scheduler
+	// reorgWindow is how many recent ledgers' hashes are kept and re-checked
+	// each cycle. Zero disables reorg detection (the pre-feature behaviour).
+	reorgWindow uint32
+	// confirmDepth is how many ledgers behind the tip an event must be before
+	// it may alert. Zero alerts immediately, which is the historical default.
+	confirmDepth uint32
 }
 
 // Position returns the last successful poll snapshot. Safe to call from
@@ -85,6 +103,12 @@ func (p *Poller) recordPosition(processed, latest uint32, at time.Time) {
 	})
 }
 
+func (p *Poller) recordBackoff(backingOff bool) {
+	position := p.Position()
+	position.BackingOff = backingOff
+	p.pos.Store(position)
+}
+
 // New wires a Poller. src is where events come from: NewRPCSource for a
 // Stellar RPC node, or the SoroTrail source for upstream mode.
 func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval time.Duration, log *slog.Logger) *Poller {
@@ -92,15 +116,28 @@ func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval 
 		source:   src,
 		store:    st,
 		registry: reg,
-		dispatch: d,
 		interval: interval,
 		log:      log,
+		ing:      NewIngestor(st, reg, d, log),
+		sched:    NewScheduler(),
 	}
 }
 
 // WithMetrics attaches Prometheus instrumentation to the poll loop.
 func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
 	p.metrics = m
+	p.ing = p.ing.WithMetrics(m)
+	return p
+}
+
+// WithReorg enables reorg detection over a window of `window` recent ledgers
+// and holds alerts until they are `depth` ledgers behind the tip. window 0
+// disables detection and depth 0 alerts immediately: both defaults reproduce
+// the behaviour before reorg handling existed. Sources that cannot report
+// ledger hashes are tolerated — detection simply does not run.
+func (p *Poller) WithReorg(window, depth uint32) *Poller {
+	p.reorgWindow = window
+	p.confirmDepth = depth
 	return p
 }
 
@@ -127,10 +164,12 @@ func (p *Poller) Run(ctx context.Context) {
 				continue
 			}
 			delay = min(delay*2, 10*p.interval)
+			p.recordBackoff(true)
 			p.log.Error("poll failed", "err", err, "retry_in", delay)
 			continue
 		}
 		delay = p.interval
+		p.recordBackoff(false)
 	}
 }
 
@@ -151,6 +190,11 @@ func (p *Poller) Poll(ctx context.Context) error {
 	var contracts []string
 	namesByContract := map[string]map[string]bool{}
 	unfilterable := map[string]bool{}
+	// prioByContract is the highest priority among the monitors watching a
+	// contract: a contract qualifies for the earliest tier it is named in,
+	// so a high-priority monitor is never slowed by sharing a contract with
+	// a low-priority one.
+	prioByContract := map[string]store.Priority{}
 	for _, m := range monitors {
 		ruleList, err := p.store.ListRules(ctx, m.ID, true)
 		if err != nil {
@@ -166,6 +210,9 @@ func (p *Poller) Poll(ctx context.Context) error {
 			}
 			if _, seen := byContract[c]; !seen {
 				contracts = append(contracts, c)
+				prioByContract[c] = m.Priority.Normalized()
+			} else if rank := m.Priority.Rank(); rank > prioByContract[c].Rank() {
+				prioByContract[c] = m.Priority.Normalized()
 			}
 			byContract[c] = append(byContract[c], m)
 			if unfilterable[c] {
@@ -187,15 +234,23 @@ func (p *Poller) Poll(ctx context.Context) error {
 		return nil
 	}
 
-	// Compile the derived filters into the watch list the source sees. A nil
-	// Topics is the safe default: no server-side narrowing.
-	watch := make([]Watch, 0, len(contracts))
+	// Compile the derived filters into the watch list the source sees, ordered
+	// by priority so a high-priority contract is fetched in an earlier request
+	// instead of waiting behind a batch of low-traffic ones. A nil Topics is
+	// the safe default: no server-side narrowing.
+	scheduled := make([]scheduledContract, 0, len(contracts))
+	tierCounts := map[store.Priority]int{}
 	for _, c := range contracts {
-		w := Watch{ContractID: c}
+		sc := scheduledContract{ContractID: c, Priority: prioByContract[c].Normalized()}
 		if !unfilterable[c] {
-			w.Topics = topicFiltersFor(sortedKeys(namesByContract[c]))
+			sc.Topics = topicFiltersFor(sortedKeys(namesByContract[c]))
 		}
-		watch = append(watch, w)
+		scheduled = append(scheduled, sc)
+		tierCounts[sc.Priority]++
+	}
+	watch := p.sched.Order(scheduled)
+	for _, pr := range prioritiesInServiceOrder {
+		p.metrics.SetPriorityContracts(string(pr), tierCounts[pr])
 	}
 
 	state, err := p.store.GetIngestState(ctx)
@@ -215,11 +270,46 @@ func (p *Poller) Poll(ctx context.Context) error {
 		p.log.Info("cold start", "start_ledger", startLedger)
 	}
 
+	// Detect a reorganisation before ingesting, so alerts derived from the
+	// orphaned ledgers are retracted before the replacement chain's events are
+	// evaluated. A detected divergence also rewinds the checkpoint, so the
+	// new chain is re-read even though the old one had advanced past it.
+	if divergence, err := p.detectReorg(ctx); err != nil {
+		p.log.Warn("reorg check failed", "err", err)
+	} else if divergence != 0 && divergence-1 < state.LastLedger {
+		state.LastLedger = divergence - 1
+		state.LastCursor = ""
+		if err := p.store.SetIngestState(ctx, state); err != nil {
+			return err
+		}
+		startLedger = state.LastLedger + 1
+		p.log.Warn("rewinding checkpoint after reorg", "start_ledger", startLedger)
+	}
+
+	// Confirmation depth: hold events until they are `confirmDepth` ledgers
+	// behind the tip. Unconfirmed events are simply not evaluated now; the
+	// capped checkpoint means the same range is re-read once it is confirmed.
+	var confirmedThrough uint32
+	confirmActive := p.confirmDepth > 0
+	if confirmActive {
+		tipNow, err := p.source.LatestLedger(ctx)
+		if err != nil {
+			return err
+		}
+		if tipNow > p.confirmDepth {
+			confirmedThrough = tipNow - p.confirmDepth
+		}
+	}
+
 	// Page the source until it reports no more events for the cycle. The
 	// cursor is opaque; batching (the RPC caps filters per request) is the
 	// source's concern, encoded in its cursors.
 	checkpoint := uint32(0) // min latestLedger across pages
 	tip := uint32(0)        // max latestLedger across pages
+	// tierLedger records the highest ledger at which an event was seen for
+	// each tier, so per-tier lag reflects how stale the newest data that tier
+	// has produced is. A tier with no events falls back to the checkpoint.
+	tierLedger := map[store.Priority]uint32{}
 	cursor := ""
 	for {
 		page, err := p.source.FetchEvents(ctx, startLedger, watch, cursor, stellar.DefaultEventsLimit)
@@ -234,6 +324,12 @@ func (p *Poller) Poll(ctx context.Context) error {
 		}
 		p.scanned += len(page.Events)
 		for _, ev := range page.Events {
+			if confirmActive && ev.Ledger > confirmedThrough {
+				continue // not yet buried deep enough; re-read once it is
+			}
+			if pr, ok := prioByContract[ev.ContractID]; ok && ev.Ledger > tierLedger[pr] {
+				tierLedger[pr] = ev.Ledger
+			}
 			p.handleEvent(ctx, ev, byContract)
 		}
 		if page.NextCursor == "" {
@@ -244,7 +340,20 @@ func (p *Poller) Poll(ctx context.Context) error {
 
 	// Lag: how far the checkpoint we reached trails the node's own tip.
 	// Grows when a batch's page-through takes longer than ledger cadence.
+	if confirmActive && checkpoint > confirmedThrough {
+		checkpoint = confirmedThrough
+	}
 	p.metrics.SetPollLag(int64(tip) - int64(checkpoint))
+	for _, pr := range prioritiesInServiceOrder {
+		if tierCounts[pr] == 0 {
+			continue
+		}
+		observed, ok := tierLedger[pr]
+		if !ok {
+			observed = checkpoint
+		}
+		p.metrics.SetPollLagByPriority(string(pr), int64(tip)-int64(observed))
+	}
 	if checkpoint > state.LastLedger {
 		state.LastLedger = checkpoint
 		state.LastCursor = ""
@@ -260,126 +369,13 @@ func (p *Poller) Poll(ctx context.Context) error {
 	return nil
 }
 
-// pollBatch pages through getEvents for one set of filters, following the
-// cursor until the stream is drained. Returns the node's latestLedger.
-// handleEvent runs every enabled rule of every monitor watching the
-// event's contract. Events arrive already decoded from the source;
-// per-event failures are logged, not fatal: one bad event must not stall
-// ingestion.
+// handleEvent runs every enabled rule of every monitor watching the event's
+// contract. Events arrive already decoded from the source; the shared
+// Ingestor owns evaluation, alert persistence and dispatch.
 func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent, byContract map[string][]store.Monitor) {
 	monitors, watched := byContract[decoded.ContractID]
 	if !watched {
 		return
 	}
-
-	for _, m := range monitors {
-		ruleList, err := p.store.ListRules(ctx, m.ID, true)
-		if err != nil {
-			p.log.Error("list rules", "monitor_id", m.ID, "err", err)
-			continue
-		}
-		for _, rule := range ruleList {
-			// The rule id rides in the context so a stateful evaluator (the
-			// frequency rule) can key its per-rule state.
-			ruleCtx := rules.WithRuleID(ctx, rule.ID)
-			matched, err := p.registry.Evaluate(ruleCtx, rule.Type, decoded, rule.Params)
-			if err != nil {
-				p.log.Warn("rule evaluation failed", "rule_id", rule.ID, "event_id", decoded.ID, "err", err)
-				continue
-			}
-			if matched {
-				p.matched++
-				p.metrics.RecordAlert()
-				// An evaluator may override the dedup key (the frequency rule
-				// stores every crossing in one episode under the window start).
-				eventID := decoded.ID
-				if id := p.registry.AlertEventID(ruleCtx, rule.Type, decoded, rule.Params); id != "" {
-					eventID = id
-				}
-				p.fireAlert(ctx, m, rule, decoded, eventID)
-			}
-		}
-	}
-}
-
-// fireAlert persists a deduped, cooldown-gated alert and hands it to the
-// dispatcher. The store owns both gates so they hold across poller instances
-// and restarts; this function only reports the outcome.
-func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule, ev *stellar.DecodedEvent, eventID string) {
-	body := map[string]any{
-		"contract_id":      ev.ContractID,
-		"event_name":       ev.EventName(),
-		"ledger":           ev.Ledger,
-		"ledger_closed_at": ev.LedgerClosedAt,
-		"tx_hash":          ev.TxHash,
-		"topics":           ev.Topics,
-		"value":            ev.Value,
-	}
-	// Named fields are only present when the contract's spec was available;
-	// without one the payload is byte-for-byte what it has always been.
-	if ev.Fields != nil {
-		body["fields"] = ev.Fields
-	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		p.log.Error("marshal alert payload", "event_id", ev.ID, "err", err)
-		return
-	}
-
-	alert := &store.Alert{
-		MonitorID:      m.ID,
-		RuleID:         rule.ID,
-		EventID:        eventID,
-		Payload:        payload,
-		LedgerClosedAt: ev.LedgerClosedAt,
-		Cooldown:       ruleCooldown(rule),
-	}
-	outcome, err := p.store.CreateAlert(ctx, alert)
-	if err != nil {
-		p.log.Error("create alert", "rule_id", rule.ID, "event_id", ev.ID, "err", err)
-		return
-	}
-	switch outcome {
-	case store.AlertDuplicate:
-		return // dedup: this rule already fired for this event
-	case store.AlertSuppressed:
-		// Counted by the store; logged so an operator can see the rule is
-		// firing far more often than it is alerting.
-		p.log.Info("alert suppressed by cooldown",
-			"rule_id", rule.ID, "event_id", ev.ID, "cooldown", alert.Cooldown)
-		return
-	}
-	logAttrs := []any{"alert_id", alert.ID, "monitor", m.Name, "rule_id", rule.ID, "event_id", ev.ID}
-	if alert.SuppressedSinceLast > 0 {
-		logAttrs = append(logAttrs, "suppressed_since_last", alert.SuppressedSinceLast)
-	}
-	p.log.Info("alert created", logAttrs...)
-
-	p.dispatch.Dispatch(ctx, notify.Alert{
-		ID:          alert.ID,
-		MonitorID:   m.ID,
-		MonitorName: m.Name,
-		RuleID:      rule.ID,
-		RuleType:    rule.Type,
-		EventID:     eventID,
-		ContractID:  ev.ContractID,
-		EventName:   ev.EventName(),
-		Ledger:      ev.Ledger,
-		TxHash:      ev.TxHash,
-		// The store folds the suppressed count into the payload, so the
-		// notification reports it too.
-		Payload:   alert.Payload,
-		CreatedAt: alert.CreatedAt,
-	})
-}
-
-// ruleCooldown reads a rule's optional cooldown. It is validated when the rule
-// is created, so a value that no longer parses is treated as "no cooldown"
-// rather than dropping matches.
-func ruleCooldown(rule store.Rule) time.Duration {
-	d, err := rules.ParseCooldown(rule.Params)
-	if err != nil {
-		return 0
-	}
-	return d
+	p.matched += p.ing.Handle(ctx, decoded, monitors, HandleOptions{Deliver: true}).Matched
 }

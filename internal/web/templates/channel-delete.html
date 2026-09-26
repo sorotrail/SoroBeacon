@@ -1,0 +1,24 @@
+{{define "content"}}
+<h1>Delete channel {{.Channel.Name}}</h1>
+{{if .Stale}}
+<p><strong>The channel attachments changed while you were deciding.</strong> Review the current impact below.</p>
+{{end}}
+<p>This channel is attached to {{.AttachedCount}} monitor{{if ne .AttachedCount 1}}s{{end}}.</p>
+{{if .Monitors}}
+<ul>
+  {{range .Monitors}}
+  <li>{{.Name}}{{if eq (len .ChannelIDs) 1}} <strong>(will have no channels)</strong>{{end}}</li>
+  {{end}}
+</ul>
+{{if gt .More 0}}<p>And {{.More}} more monitor{{if ne .More 1}}s{{end}}.</p>{{end}}
+{{else}}
+<p>No monitors currently depend on this channel.</p>
+{{end}}
+<p>Deleting it removes this attachment. This cannot be undone.</p>
+<form method="post" action="/channels/{{.Channel.ID}}/delete">
+  <input type="hidden" name="confirm" value="1">
+  <input type="hidden" name="confirmed_signature" value="{{.Signature}}">
+  <button type="submit">Delete channel</button>
+  <a href="/channels">Cancel</a>
+</form>
+{{end}}

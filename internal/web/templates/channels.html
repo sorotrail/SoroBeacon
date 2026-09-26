@@ -24,7 +24,7 @@
       <button hx-post="/channels/{{.ID}}/test" hx-target="#test-result-{{.ID}}" hx-swap="innerHTML">Send test</button>
       <span id="test-result-{{.ID}}" class="muted"></span>
       <form class="inline" method="post" action="/channels/{{.ID}}/delete"
-            onsubmit="return confirm('Delete channel {{.Name}}?')"><button>Delete</button></form>
+        ><button>Delete</button></form>
     </td>
   </tr>
   {{end}}

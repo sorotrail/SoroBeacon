@@ -36,11 +36,29 @@
   <legend>Add rule</legend>
   <form method="post" action="/monitors/{{.Monitor.ID}}/rules">
     <label for="type">Type</label>
-    <select id="type" name="type">
+    <select id="type" name="type"
+      hx-get="" hx-trigger="change"
+      hx-target="#builder-fields" hx-swap="innerHTML">
       {{range .RuleTypes}}<option value="{{.}}">{{.}}</option>{{end}}
     </select>
-    <label for="params">Params (JSON)</label>
-    <textarea id="params" name="params" rows="4">{"event_name": "transfer"}</textarea>
+    <script>
+    (function(){
+      var sel = document.getElementById('type');
+      if (sel) sel.setAttribute('hx-get', '/rulebuilder/' + sel.value);
+      sel.addEventListener('change', function(){
+        sel.setAttribute('hx-get', '/rulebuilder/' + sel.value);
+        htmx.process(sel);
+      });
+    })();
+    </script>
+    <div id="builder-fields"></div>
+    <input type="hidden" name="use_builder" value="true">
+    <details>
+      <summary class="muted">Raw JSON (advanced)</summary>
+      <label for="params">Params (JSON)</label>
+      <textarea id="params" name="params" rows="4">{"event_name": "transfer"}</textarea>
+    </details>
+    <div id="params-preview" class="muted" style="margin:.5rem 0"></div>
     <p><button>Add rule</button></p>
   </form>
 </fieldset>
