@@ -392,13 +392,13 @@ func TestAlertsPageFilterControlsAndPreservedPaging(t *testing.T) {
 }
 
 func TestAlertFilterQueryOmitsDefaults(t *testing.T) {
-	if got := alertFilterQuery(0, 0, "", ""); got != "" {
+	if got := alertFilterQuery(0, 0, "", "", ""); got != "" {
 		t.Fatalf("defaults = %q, want empty so ?cursor= stays stable", got)
 	}
-	if got := alertFilterQuery(0, 0, "", "created_at_desc"); got != "" {
+	if got := alertFilterQuery(0, 0, "", "", "created_at_desc"); got != "" {
 		t.Fatalf("default sort = %q, want empty", got)
 	}
-	got := alertFilterQuery(7, 9, "CAAA", "created_at_asc")
+	got := alertFilterQuery(7, 9, "CAAA", "", "created_at_asc")
 	if !strings.Contains(got, "monitor_id=7") || !strings.Contains(got, "rule_id=9") ||
 		!strings.Contains(got, "contract_id=CAAA") || !strings.Contains(got, "sort=created_at_asc") ||
 		!strings.HasSuffix(got, "&") {
@@ -410,10 +410,10 @@ func TestAlertFilterQueryOmitsDefaults(t *testing.T) {
 // JSON API's export endpoint, drop the (meaningless) cursor, and preserve
 // the filters applied to the list on screen.
 func TestAlertExportHref(t *testing.T) {
-	if got := alertExportHref(0, 0, "", ""); got != "/api/v1/alerts.csv" {
+	if got := alertExportHref(0, 0, "", "", ""); got != "/api/v1/alerts.csv" {
 		t.Fatalf("defaults = %q, want the bare export URL", got)
 	}
-	got := string(alertExportHref(7, 9, "CAAA", "created_at_asc"))
+	got := string(alertExportHref(7, 9, "CAAA", "", "created_at_asc"))
 	for _, want := range []string{"/api/v1/alerts.csv?", "monitor_id=7", "rule_id=9", "contract_id=CAAA", "sort=created_at_asc"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("export href %q missing %q", got, want)

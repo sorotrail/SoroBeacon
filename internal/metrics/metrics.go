@@ -133,6 +133,22 @@ func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
 }
 
+// RegisterStreamDropped exposes the live-alerts broadcaster's dropped-event
+// counter on /metrics. The callback is read lazily on each scrape, so the
+// broadcaster keeps its own cheap atomic counter and this package does not
+// need to import it. A nil callback (or nil receiver) registers nothing.
+func (m *Metrics) RegisterStreamDropped(dropped func() uint64) {
+	if m == nil || dropped == nil {
+		return
+	}
+	m.registry.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "sorobeacon_alerts_stream_dropped_total",
+		Help: "Alert events dropped from the live SSE stream because a subscriber could not keep up.",
+	}, func() float64 {
+		return float64(dropped())
+	}))
+}
+
 // RecordPoll observes one completed poll cycle.
 func (m *Metrics) RecordPoll(ok bool, took time.Duration) {
 	if m == nil {

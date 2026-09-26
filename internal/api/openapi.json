@@ -19,6 +19,7 @@
   "paths": {
     "/monitors": {
       "post": {
+        "description": "Required role: editor",
         "summary": "Create a monitor",
         "requestBody": {
           "required": true,
@@ -41,6 +42,7 @@
         }
       },
       "get": {
+        "description": "Required role: viewer",
         "summary": "List monitors",
         "parameters": [
           {
@@ -87,6 +89,7 @@
     },
     "/monitors/bulk": {
       "post": {
+        "description": "Required role: editor",
         "summary": "Bulk enable or disable monitors",
         "description": "Sets enabled on an explicit list of monitor IDs in one statement. Unknown IDs are returned and do not prevent the known ones from applying. There is no all-monitors shorthand.",
         "requestBody": {
@@ -208,6 +211,61 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Monitor" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/monitors/{id}/rules/dry-run": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "post": {
+        "summary": "Dry-run a rule against historical events",
+        "description": "Evaluates a candidate rule against stored alert history. Nothing is persisted and nothing is delivered. Stored alerts are biased toward matched events, so results underrepresent the true event corpus.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["type"],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": ["event_emitted", "value_threshold", "token_event"],
+                    "description": "Rule type to evaluate"
+                  },
+                  "params": {
+                    "type": "object",
+                    "description": "Type-specific rule parameters; validated against the rule type"
+                  },
+                  "window_days": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 90,
+                    "description": "Lookback window in days (clamped to 90)"
+                  },
+                  "max_samples": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": "Maximum historical alerts to evaluate"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Dry-run results",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DryRunResult" }
               }
             }
           },
@@ -413,6 +471,77 @@
         }
       }
     },
+    "/inhibitions": {
+      "post": {
+        "summary": "Create an inhibition rule",
+        "description": "While the source rule is firing (an alert within the pair's firing window, default 300s), deliveries for the target rule are suppressed. Alert rows are still stored.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/InhibitionInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Inhibition" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "get": {
+        "summary": "List inhibition rules",
+        "responses": {
+          "200": {
+            "description": "Inhibitions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "inhibitions": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/Inhibition" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/inhibitions/{sourceID}/{targetID}": {
+      "delete": {
+        "summary": "Delete an inhibition rule",
+        "parameters": [
+          {
+            "name": "sourceID",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "targetID",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "format": "int64" }
+          }
+        ],
+        "responses": {
+          "204": { "description": "Deleted" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/alerts": {
       "get": {
         "summary": "List alerts",
@@ -475,6 +604,31 @@
         }
       }
     },
+    "/alerts/stream": {
+      "get": {
+        "summary": "Stream alerts as they are created (Server-Sent Events)",
+        "description": "Opens a text/event-stream response that emits an `alert` event for every alert created after the connection opened. SSE rather than WebSockets: the traffic is one-directional and SSE reconnects on its own. An optional monitor_id filters server-side. Comment lines (keep-alives) are sent periodically so idle connections are not reaped by a proxy, and the stream advertises a 3000ms retry hint. A subscriber that cannot keep up loses its oldest queued events rather than blocking alert creation.",
+        "parameters": [
+          {
+            "name": "monitor_id",
+            "in": "query",
+            "schema": { "type": "integer", "format": "int64" },
+            "description": "Only stream alerts created by this monitor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Server-Sent Events stream; each `alert` event's data is one alert object",
+            "content": {
+              "text/event-stream": {
+                "schema": { "$ref": "#/components/schemas/Alert" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/alerts.csv": {
       "get": {
         "summary": "Export alerts as CSV",
@@ -526,6 +680,65 @@
             "description": "Alerts as CSV",
             "content": {
               "text/csv": {
+                "schema": { "type": "string" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/alerts/export": {
+      "get": {
+        "summary": "Export alerts as NDJSON",
+        "description": "Streams every alert matching the same filters as GET /alerts as application/x-ndjson. Each line is a JSON object with id, monitor_id, monitor_name, rule_id, event_id, event_name, contract_id, ledger, created_at, and payload. A repeatable-read snapshot keeps the export consistent; cancellation stops the query. When no limit is given the export is capped at 10000 rows.",
+        "parameters": [
+          {
+            "name": "monitor_id",
+            "in": "query",
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "rule_id",
+            "in": "query",
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "contract_id",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Exact match on payload.contract_id"
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": { "type": "string", "format": "date-time" },
+            "description": "RFC 3339 lower bound on alert creation"
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": { "type": "string", "format": "date-time" },
+            "description": "RFC 3339 upper bound on alert creation"
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "schema": { "type": "string", "enum": ["created_at_desc", "created_at_asc"], "default": "created_at_desc" },
+            "description": "Keyset order; anything else is 400"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "default": 10000, "maximum": 10000 },
+            "description": "Maximum rows to export; the endpoint caps at 10000"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Alerts as NDJSON stream",
+            "content": {
+              "application/x-ndjson": {
                 "schema": { "type": "string" }
               }
             }
@@ -1126,6 +1339,31 @@
           "enabled": { "type": "boolean" }
         }
       },
+      "Inhibition": {
+        "type": "object",
+        "properties": {
+          "source_rule_id": { "type": "integer", "format": "int64" },
+          "target_rule_id": { "type": "integer", "format": "int64" },
+          "firing_window_seconds": {
+            "type": "integer",
+            "description": "Source counts as firing with an alert inside this window"
+          },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "InhibitionInput": {
+        "type": "object",
+        "required": ["source_rule_id", "target_rule_id"],
+        "properties": {
+          "source_rule_id": { "type": "integer", "format": "int64" },
+          "target_rule_id": { "type": "integer", "format": "int64" },
+          "firing_window_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional; defaults to 300 when absent or non-positive"
+          }
+        }
+      },
       "RuleInput": {
         "type": "object",
         "required": ["type", "params"],
@@ -1360,6 +1598,37 @@
           "monitor_id": { "type": "integer", "format": "int64" },
           "status": { "type": "string", "enum": ["created", "skipped", "error"] },
           "error": { "type": "string" }
+        }
+      },
+      "DryRunResult": {
+        "type": "object",
+        "required": ["count", "matches", "total_evaluated", "note"],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "description": "Number of historical events that matched the rule"
+          },
+          "matches": {
+            "type": "array",
+            "description": "Sample of matching events",
+            "items": {
+              "type": "object",
+              "properties": {
+                "event_id": { "type": "string" },
+                "contract_id": { "type": "string" },
+                "event_name": { "type": "string" },
+                "ledger": { "type": "integer", "format": "uint32" }
+              }
+            }
+          },
+          "total_evaluated": {
+            "type": "integer",
+            "description": "Total number of historical events evaluated"
+          },
+          "note": {
+            "type": "string",
+            "description": "Corpus bias and window documentation"
+          }
         }
       }
     }
