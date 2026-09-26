@@ -156,6 +156,19 @@ type Config struct {
 	// file://, dir:// or s3://bucket/prefix are accepted; the archive package
 	// validates it when the pruner is built.
 	ArchiveURL string
+
+	// NotifyRateLimitSlackRPS is the max requests per second for Slack channels
+	// (NOTIFY_RATE_LIMIT_SLACK_RPS, default 1.0, citing Slack API tier 2 / webhooks guidelines ~1 msg/sec).
+	NotifyRateLimitSlackRPS float64
+	// NotifyRateLimitTelegramRPS is the max requests per second for Telegram channels
+	// (NOTIFY_RATE_LIMIT_TELEGRAM_RPS, default 30.0, citing Telegram Bot API limit of 30 msg/sec).
+	NotifyRateLimitTelegramRPS float64
+	// NotifyRateLimitPagerDutyRPS is the max requests per second for PagerDuty channels
+	// (NOTIFY_RATE_LIMIT_PAGERDUTY_RPS, default 2.0, citing PagerDuty Events API v2 rate limit ~2 requests/sec).
+	NotifyRateLimitPagerDutyRPS float64
+	// NotifyRateLimitDefaultRPS is the default max requests per second for any other channel
+	// (NOTIFY_RATE_LIMIT_DEFAULT_RPS, default 5.0).
+	NotifyRateLimitDefaultRPS float64
 }
 
 // Load reads configuration from the environment. DATABASE_URL is the only
@@ -167,15 +180,19 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		Network:            net,
-		RPCURL:             net.RPCURL,
-		RPCURLs:            net.RPCURLs,
-		DatabaseURL:        os.Getenv("DATABASE_URL"),
-		PollInterval:       DefaultPollInterval,
-		HTTPAddr:           getenv("HTTP_ADDR", DefaultHTTPAddr),
-		HTTPMaxBodyBytes:   DefaultHTTPMaxBodyBytes,
-		LogLevel:           slog.LevelInfo,
-		MonitorSilentAfter: DefaultMonitorSilentAfter,
+		Network:                    net,
+		RPCURL:                     net.RPCURL,
+		RPCURLs:                    net.RPCURLs,
+		DatabaseURL:                os.Getenv("DATABASE_URL"),
+		PollInterval:               DefaultPollInterval,
+		HTTPAddr:                   getenv("HTTP_ADDR", DefaultHTTPAddr),
+		HTTPMaxBodyBytes:           DefaultHTTPMaxBodyBytes,
+		LogLevel:                   slog.LevelInfo,
+		MonitorSilentAfter:         DefaultMonitorSilentAfter,
+		NotifyRateLimitSlackRPS:    1.0,  // Slack webhooks / tier 2 rate limit ~1 rps
+		NotifyRateLimitTelegramRPS: 30.0, // Telegram Bot API limit ~30 rps
+		NotifyRateLimitPagerDutyRPS: 2.0, // PagerDuty Events API v2 rate limit ~2 rps
+		NotifyRateLimitDefaultRPS:  5.0,  // General default rps
 		// Detection is on by default; confirmation depth off, so a monitor
 		// alerts exactly as soon as it did before this feature.
 		ReorgTrackingWindow:    DefaultReorgTrackingWindow,
@@ -364,6 +381,35 @@ func Load() (Config, error) {
 		cfg.ReorgConfirmationDepth = uint32(n)
 	}
 	cfg.ArchiveURL = strings.TrimSpace(os.Getenv("ARCHIVE_URL"))
+
+	if v := os.Getenv("NOTIFY_RATE_LIMIT_SLACK_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_SLACK_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitSlackRPS = rps
+	}
+	if v := os.Getenv("NOTIFY_RATE_LIMIT_TELEGRAM_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_TELEGRAM_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitTelegramRPS = rps
+	}
+	if v := os.Getenv("NOTIFY_RATE_LIMIT_PAGERDUTY_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_PAGERDUTY_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitPagerDutyRPS = rps
+	}
+	if v := os.Getenv("NOTIFY_RATE_LIMIT_DEFAULT_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_DEFAULT_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitDefaultRPS = rps
+	}
 
 	if err := loadSecrets(&cfg); err != nil {
 		return cfg, err

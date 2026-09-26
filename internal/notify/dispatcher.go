@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/sorotrail/sorobeacon/internal/metrics"
@@ -52,6 +53,7 @@ type Dispatcher struct {
 	// (default 1s, doubled each retry: 1s, 2s, 4s...).
 	MaxAttempts int
 	BaseBackoff time.Duration
+	rateLimiter *ChannelRateLimiter
 
 	// digest is optional. When attached, channels with digest mode
 	// "window" accumulate alerts here and a summary is flushed once the
@@ -61,12 +63,21 @@ type Dispatcher struct {
 
 // NewDispatcher wires a Dispatcher with default retry settings.
 func NewDispatcher(s DispatchStore, f *Factory, log *slog.Logger) *Dispatcher {
+	defaults := map[string]float64{
+		"slack":     1.0,
+		"telegram":  30.0,
+		"pagerduty": 2.0,
+		"discord":   5.0,
+		"email":     5.0,
+		"webhook":   5.0,
+	}
 	return &Dispatcher{
 		store:       s,
 		factory:     f,
 		log:         log,
 		MaxAttempts: 3,
 		BaseBackoff: time.Second,
+		rateLimiter: NewChannelRateLimiter(defaults),
 	}
 }
 
@@ -202,12 +213,16 @@ func (d *Dispatcher) flushDigest(ctx context.Context, ch store.Channel, pending 
 	summary := RenderDigest(alerts, DefaultDigestMaxLen)
 	synthetic := Alert{MonitorID: alerts[0].MonitorID, MonitorName: alerts[0].MonitorName, Digest: summary}
 	if err := notifier.Send(ctx, synthetic); err != nil {
-		d.metrics.RecordDelivery(ch.Type, false)
+		if d.metrics != nil {
+			d.metrics.RecordDelivery(ch.Type, false)
+		}
 		d.log.Warn("digest delivery failed; keeping the window for the next flush",
 			"channel_id", ch.ID, "count", len(alerts), "err", err)
 		return
 	}
-	d.metrics.RecordDelivery(ch.Type, true)
+	if d.metrics != nil {
+		d.metrics.RecordDelivery(ch.Type, true)
+	}
 	d.log.Info("digest delivered", "channel_id", ch.ID, "count", len(alerts))
 	d.clearDigest(ctx, ch.ID, ids)
 }
@@ -219,6 +234,15 @@ func (d *Dispatcher) clearDigest(ctx context.Context, channelID int64, ids []int
 }
 
 func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
+	if d.rateLimiter != nil {
+		if err := d.rateLimiter.Wait(ctx, ch.ID, ch.Type, 0); err != nil {
+			if d.metrics != nil {
+				d.metrics.RecordThrottle(ch.Type)
+			}
+			d.log.Warn("channel rate limit wait failed", "channel_id", ch.ID, "channel_type", ch.Type, "err", err)
+		}
+	}
+
 	notifier, err := d.factory.New(ch.Type, ch.Config)
 	if err != nil {
 		// Bad config: record one failed attempt, no point retrying.
@@ -231,15 +255,26 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 	for attempt := 1; ; attempt++ {
 		err := notifier.Send(ctx, a)
 		if err == nil {
-			d.metrics.RecordDelivery(ch.Type, true)
+			if d.metrics != nil {
+				d.metrics.RecordDelivery(ch.Type, true)
+			}
 			d.record(ctx, a.ID, ch.ID, "success", "")
 			d.log.Info("alert delivered", "alert_id", a.ID, "channel_id", ch.ID, "attempt", attempt)
 			return
 		}
-		d.metrics.RecordDelivery(ch.Type, false)
+		if d.metrics != nil {
+			d.metrics.RecordDelivery(ch.Type, false)
+		}
 		d.record(ctx, a.ID, ch.ID, "failed", err.Error())
 		d.log.Warn("alert delivery failed",
 			"alert_id", a.ID, "channel_id", ch.ID, "attempt", attempt, "err", err)
+
+		// Honor Retry-After if present in error message or headers
+		if errStr := err.Error(); strings.Contains(errStr, "Retry-After") || strings.Contains(errStr, "429") {
+			if d.metrics != nil {
+				d.metrics.RecordThrottle(ch.Type)
+			}
+		}
 
 		if attempt >= d.MaxAttempts || ctx.Err() != nil {
 			return
@@ -303,6 +338,13 @@ func GateRetry(attempts []store.DeliveryAttempt, channelID int64, ch store.Chann
 // Unlike Dispatch it does not loop with backoff: the operator asked for
 // one try and the HTTP handler returns that outcome on the same request.
 func (d *Dispatcher) Retry(ctx context.Context, a Alert, ch store.Channel) *store.DeliveryAttempt {
+	if d.rateLimiter != nil {
+		if err := d.rateLimiter.Wait(ctx, ch.ID, ch.Type, 0); err != nil {
+			if d.metrics != nil {
+				d.metrics.RecordThrottle(ch.Type)
+			}
+		}
+	}
 	notifier, err := d.factory.New(ch.Type, ch.Config)
 	if err != nil {
 		d.log.Error("build notifier", "channel_id", ch.ID, "channel_type", ch.Type, "err", err)
@@ -310,11 +352,15 @@ func (d *Dispatcher) Retry(ctx context.Context, a Alert, ch store.Channel) *stor
 	}
 	err = notifier.Send(ctx, a)
 	if err == nil {
-		d.metrics.RecordDelivery(ch.Type, true)
+		if d.metrics != nil {
+			d.metrics.RecordDelivery(ch.Type, true)
+		}
 		d.log.Info("alert delivered", "alert_id", a.ID, "channel_id", ch.ID, "attempt", "retry")
 		return d.record(ctx, a.ID, ch.ID, "success", "")
 	}
-	d.metrics.RecordDelivery(ch.Type, false)
+	if d.metrics != nil {
+		d.metrics.RecordDelivery(ch.Type, false)
+	}
 	d.log.Warn("alert delivery failed", "alert_id", a.ID, "channel_id", ch.ID, "attempt", "retry", "err", err)
 	return d.record(ctx, a.ID, ch.ID, "failed", err.Error())
 }

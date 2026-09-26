@@ -70,6 +70,7 @@ const (
 	TypePagerDuty = "pagerduty"
 	TypeTwilio    = "twilio"
 	TypeSignal    = "signal"
+	TypeWebex     = "webex"
 )
 
 // DefaultFactory returns a Factory with the built-in channel types.
@@ -85,6 +86,7 @@ func DefaultFactory() *Factory {
 	f.Register(TypeFederation, NewFederation)
 	f.Register(TypeTwilio, NewTwilio)
 	f.Register(TypeSignal, NewSignal)
+	f.Register(TypeWebex, NewWebex)
 	return f
 }
 
