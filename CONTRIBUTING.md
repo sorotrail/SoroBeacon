@@ -22,7 +22,7 @@ Go 1.25+ is required (the Stellar SDK dependency sets the floor).
 |-------------------------|------------------------|------------------------------------------------|
 | a notification channel  | `notify.Notifier`      | `DefaultFactory` in `internal/notify/notify.go`|
 | a rule type             | `rules.RuleEvaluator`  | `NewRegistry` in `internal/rules/rules.go`     |
-| a different event source| `stellar.Client`       | wiring in `cmd/sorobeacon/main.go`             |
+| a different event source| `poller.EventSource`   | wiring in `cmd/sorobeacon/main.go`             |
 | a decoder (e.g. spec-aware) | `stellar.Decoder`  | wiring in `cmd/sorobeacon/main.go`             |
 | another database        | `store.Store` (or a sub-interface) | wiring in `cmd/sorobeacon/main.go` |
 
