@@ -1034,6 +1034,22 @@ func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
 	return out, rows.Err()
 }
 
+// ListAlertsStream streams alerts matching the filter, calling the callback
+// for each one. This is a simple implementation that loads all alerts and
+// iterates; a true streaming implementation would use a cursor.
+func (s *SQLite) ListAlertsStream(ctx context.Context, f AlertFilter, cb func(Alert) error) error {
+	alerts, err := s.ListAlerts(ctx, f)
+	if err != nil {
+		return err
+	}
+	for _, a := range alerts {
+		if err := cb(a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func scanSQLiteAlert(r rowScanner) (Alert, error) {
 	var a Alert
 	var payload string

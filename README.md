@@ -81,8 +81,9 @@ vs optional, secrets, and `SOURCE_MODE`-only notes — is
 
 | Variable        | Default                                | Description                                  |
 |-----------------|----------------------------------------|----------------------------------------------|
-| `SOURCE_MODE`   | `rpc`                                  | `rpc` (standalone) or `sorotrail` (upstream) |
+| `SOURCE_MODE`   | `rpc`                                  | `rpc` (standalone), `sorotrail` (upstream), or `horizon` (Horizon server) |
 | `SOROTRAIL_URL` | —                                      | SoroTrail indexer base URL (upstream mode)   |
+| `HORIZON_URL`   | —                                      | Horizon server base URL (horizon mode)       |
 | `NETWORK`       | `testnet`                              | `testnet` \| `mainnet` \| `futurenet` \| `custom` |
 | `RPC_URL`       | per network                            | Stellar RPC endpoint; overrides the preset   |
 | `RPC_URLS`      | _(none — `RPC_URL` is used)_           | Ordered, comma-separated endpoints to fail over between; takes priority over `RPC_URL` |
@@ -136,6 +137,24 @@ as the single-endpoint case; never set both.
   SoroTrail stores events durably past the RPC's ~1-7 day retention window,
   so upstream monitoring covers history the RPC has already dropped — and
   several SoroBeacon instances can share one indexer.
+- **`horizon`** — SoroBeacon reads contract events from a Horizon server's
+  REST API by fetching transactions for watched contracts and extracting
+  events from their `result_meta_xdr`. Horizon typically retains full history
+  (months to years depending on deployment), enabling deep historical backfill
+  without an intermediate indexer. This mode is useful when you operate your
+  own Horizon instance or have access to one with sufficient retention.
+
+**Differences between modes:**
+
+| Aspect | `rpc` | `sorotrail` | `horizon` |
+|--------|-------|-------------|-----------|
+| Latency | ~5s (poll interval) | ~1-5s (indexer poll) | ~10-30s (transaction scan) |
+| History retention | ~1-7 days | Unbounded (indexer stores all) | Unbounded (Horizon retention) |
+| Ordering guarantees | Ledger order per contract | Ledger order per contract | Ledger order per contract |
+| Server-side filtering | Yes (getEvents filters) | Yes (indexer filters) | No (client filters by contract) |
+| Spec-aware decoding | Yes (via RPC getLedgerEntries) | Yes (indexer provides decoded) | No (falls back to default decoding) |
+| Rate limiting | RPC 429 backoff | Indexer 429 backoff | Horizon 429 backoff |
+| Best for | Near-real-time, low latency | Multi-tenant, long history | Self-hosted Horizon, deep backfill |
 
 The ingest loop knows only an `EventSource` interface; adding a backend is
 implementing two methods. See

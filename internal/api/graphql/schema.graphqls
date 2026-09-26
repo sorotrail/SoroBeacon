@@ -1,0 +1,152 @@
+# GraphQL Schema for SoroBeacon
+# Read-only API for monitors, alerts, and stats
+
+type Query {
+  # Monitor queries
+  monitor(id: ID!): Monitor
+  monitors(
+    enabled: Boolean
+    limit: Int
+    cursor: String
+    query: String
+    sort: MonitorSort
+  ): MonitorConnection!
+
+  # Alert queries
+  alert(id: ID!): Alert
+  alerts(
+    monitorId: ID
+    ruleId: ID
+    contractId: String
+    from: DateTime
+    to: DateTime
+    severity: Severity
+    limit: Int
+    cursor: String
+    sort: AlertSort
+  ): AlertConnection!
+
+  # Stats queries
+  stats: Stats!
+  alertSeries(days: Int): [AlertDayCount!]!
+}
+
+# Monitor types
+type Monitor {
+  id: ID!
+  name: String!
+  contractIds: [String!]!
+  enabled: Boolean!
+  priority: Priority!
+  createdAt: DateTime!
+  lastMatchedAt: DateTime
+  rules: [Rule!]!
+  channels: [Channel!]!
+}
+
+type Rule {
+  id: ID!
+  monitorId: ID!
+  type: String!
+  params: JSON!
+  enabled: Boolean!
+  severity: Severity!
+}
+
+type Channel {
+  id: ID!
+  name: String!
+  type: String!
+  enabled: Boolean!
+  digestMode: String
+  digestWindowSeconds: Int
+  minSeverity: Severity
+  createdAt: DateTime!
+}
+
+# Alert types
+type Alert {
+  id: ID!
+  monitorId: ID!
+  ruleId: ID!
+  eventId: String!
+  payload: JSON!
+  createdAt: DateTime!
+  severity: Severity!
+  ledger: Int
+  retractedAt: DateTime
+  backfilled: Boolean!
+  inhibitedByRuleId: ID
+}
+
+# Stats types
+type Stats {
+  monitors: Int!
+  rules: Int!
+  channels: Int!
+  alerts: Int!
+  alertsLast24h: Int!
+  lastLedger: Int!
+  lastPollAt: DateTime
+}
+
+type AlertDayCount {
+  day: String!
+  count: Int!
+}
+
+# Connection types for pagination
+type MonitorConnection {
+  edges: [MonitorEdge!]!
+  pageInfo: PageInfo!
+}
+
+type MonitorEdge {
+  node: Monitor!
+  cursor: String!
+}
+
+type AlertConnection {
+  edges: [AlertEdge!]!
+  pageInfo: PageInfo!
+}
+
+type AlertEdge {
+  node: Alert!
+  cursor: String!
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+# Enums
+enum Priority {
+  LOW
+  NORMAL
+  HIGH
+}
+
+enum Severity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum MonitorSort {
+  NAME
+  ID
+  CREATED_AT
+}
+
+enum AlertSort {
+  CREATED_AT_DESC
+  CREATED_AT_ASC
+}
+
+# Scalars
+scalar DateTime
+scalar JSON

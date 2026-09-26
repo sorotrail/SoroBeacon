@@ -516,6 +516,7 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"rpc_url",
 		"rpc_endpoint_count",
 		"sorotrail_url",
+		"horizon_url",
 		"cors_allowed_origins",
 		"config_encryption_enabled",
 		"secrets_provider",
@@ -527,6 +528,9 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"otlp_tracing_enabled",
 		"otlp_service_name",
 		"otlp_sample_rate",
+		"graphql_playground_enabled",
+		"graphql_max_depth",
+		"graphql_max_complexity",
 	}, keys)
 }
 

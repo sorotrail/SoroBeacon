@@ -177,6 +177,8 @@ func (d *Dispatcher) inhibited(ctx context.Context, a Alert) bool {
 	}
 	d.log.Info("delivery inhibited", "alert_id", a.ID, "rule_id", a.RuleID, "source_rule_id", sourceID)
 	return true
+}
+
 // severityMeetsThreshold reports whether the alert severity meets or exceeds
 // the channel's minimum severity. Empty channel minimum means no filter.
 func severityMeetsThreshold(alertSeverity string, channelMinSeverity store.Severity) bool {
