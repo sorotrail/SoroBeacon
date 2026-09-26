@@ -85,6 +85,11 @@ type fakeStore struct {
 	suppressed map[int64]int64     // rule id -> matches dropped this window
 	// ledgerHashes backs the reorg-detection half of the Store interface.
 	ledgerHashes map[uint32]string
+
+	// groupStates backs alert grouping.
+	groupStates map[string]int64
+	// inhibitions backs the inhibition rules for the DispatchStore interface.
+	inhibitions []store.Inhibition
 }
 
 func newFakeStore() *fakeStore {
@@ -96,6 +101,8 @@ func newFakeStore() *fakeStore {
 		lastFired:    map[int64]time.Time{},
 		suppressed:   map[int64]int64{},
 		ledgerHashes: map[uint32]string{},
+		groupStates:  map[string]int64{},
+		inhibitions:  []store.Inhibition{},
 	}
 }
 
@@ -149,6 +156,30 @@ func (f *fakeStore) ListRules(_ context.Context, monitorID int64, enabledOnly bo
 		}
 	}
 	return out, nil
+}
+
+// ListInhibitionsForTarget returns inhibitions targeting the given rule.
+func (f *fakeStore) ListInhibitionsForTarget(_ context.Context, targetRuleID int64) ([]store.Inhibition, error) {
+	var out []store.Inhibition
+	for _, inh := range f.inhibitions {
+		if inh.TargetRuleID == targetRuleID {
+			out = append(out, inh)
+		}
+	}
+	return out, nil
+}
+
+// RuleFiredWithin reports whether the rule fired within the given window.
+func (f *fakeStore) RuleFiredWithin(_ context.Context, ruleID int64, window time.Duration) (bool, error) {
+	if last, ok := f.lastFired[ruleID]; ok {
+		return time.Since(last) < window, nil
+	}
+	return false, nil
+}
+
+// MarkAlertInhibited marks an alert as inhibited by a source rule.
+func (f *fakeStore) MarkAlertInhibited(_ context.Context, alertID, sourceRuleID int64) error {
+	return nil // no-op for tests
 }
 
 func (f *fakeStore) CreateAlert(_ context.Context, a *store.Alert) (store.AlertOutcome, error) {
