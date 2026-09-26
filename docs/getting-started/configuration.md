@@ -8,9 +8,10 @@ All configuration comes from environment variables. `.env.example` in the repo i
 | `SOROTRAIL_URL` | — | SoroTrail indexer base URL. Required when `SOURCE_MODE=sorotrail`. |
 | `NETWORK` | `testnet` | `testnet` \| `mainnet` \| `futurenet` \| `custom`. Selects the network preset (RPC endpoint + passphrase). |
 | `RPC_URL` | per `NETWORK` | Stellar RPC endpoint (JSON-RPC 2.0). Overrides the preset. |
+| `RPC_URLS` | — (uses `RPC_URL`) | Ordered, comma-separated RPC endpoints to fail over between. Takes priority over `RPC_URL` when set. Every endpoint must be on the configured network or startup fails. |
 | `NETWORK_PASSPHRASE` | per `NETWORK` | Overrides the preset passphrase. Required with `NETWORK=custom`. |
-| `DATABASE_URL` | _(required)_ | Postgres URL (`postgres` or `postgresql` scheme), e.g. `postgres://user:pass@host:5432/sorobeacon?sslmode=disable`. Validated at load; errors name the variable and never echo the password. |
-| `DATABASE_MAX_CONNS` | pgx default | Maximum connections in the pool. `0` or unset leaves the driver default. |
+| `DATABASE_URL` | _(required)_ | Backend URL selected by scheme. `postgres` / `postgresql` → a Postgres server, e.g. `postgres://user:pass@host:5432/sorobeacon?sslmode=disable`. `sqlite` → a single database file, e.g. `sqlite:///var/lib/sorobeacon/sorobeacon.db`, for a node with no Postgres. Validated at load; errors name the variable and never echo the password. |
+| `DATABASE_MAX_CONNS` | pgx default | Maximum connections in the **Postgres** pool. `0` or unset leaves the driver default. Setting it with a `sqlite` URL fails at startup. |
 | `DATABASE_MIN_CONNS` | pgx default | Minimum connections in the pool. `0` or unset leaves the driver default. Rejected when greater than `DATABASE_MAX_CONNS` if both are set. |
 | `DATABASE_MAX_CONN_LIFETIME` | pgx default | How long a connection may be reused. Go duration (`1h`, `30m`). `0` or unset leaves the driver default. |
 | `DATABASE_MAX_CONN_IDLE_TIME` | pgx default | How long an idle connection is kept. Go duration. `0` or unset leaves the driver default. |
@@ -26,7 +27,7 @@ All configuration comes from environment variables. `.env.example` in the repo i
 
 ## Where secrets live
 
-Channel secrets — webhook URLs, bot tokens, SMTP credentials — are stored in each channel's `config` JSON in Postgres, **not** in environment variables. SoroBeacon never logs them and never returns them from the API or renders them in the dashboard.
+Channel secrets — webhook URLs, bot tokens, SMTP credentials — are stored in each channel's `config` JSON in the database, **not** in environment variables. SoroBeacon never logs them and never returns them from the API or renders them in the dashboard.
 
 ### Encrypting channel config at rest
 

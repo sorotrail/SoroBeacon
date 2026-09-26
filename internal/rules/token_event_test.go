@@ -116,3 +116,31 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+func BenchmarkTokenEvent(b *testing.B) {
+	ev := sep41Event("transfer", alice, bob, map[string]any{"i128": "1000000"})
+	e := TokenEvent{}
+	ctx := context.Background()
+	cases := []struct {
+		name  string
+		want  bool
+		param json.RawMessage
+	}{
+		{name: "match", want: true, param: json.RawMessage(`{"event":"transfer","from":"` + alice + `","to":"` + bob + `","min_amount":"1"}`)},
+		{name: "nomatch", want: false, param: json.RawMessage(`{"event":"mint"}`)},
+	}
+	for _, tt := range cases {
+		b.Run(tt.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				got, err := e.Evaluate(ctx, ev, tt.param)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if got != tt.want {
+					b.Fatalf("got %v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
+}

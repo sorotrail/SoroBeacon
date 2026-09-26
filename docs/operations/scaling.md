@@ -79,6 +79,33 @@ The poller tracks two metrics that surface via `/api/v1/stats` and `/metrics`:
 The metric `poll_lag` (exposed on `/metrics`) reports the current lag in ledger
 units. If it's steadily increasing, one of the above adjustments is needed.
 
+## SQLite: the single-node backend
+
+`DATABASE_URL=sqlite:///path/to/sorobeacon.db` removes the Postgres server from
+the deployment entirely: one file holds the monitors, alerts and checkpoints.
+It is meant for exactly the case it sounds like — one instance watching a few
+contracts on a small VPS or a Raspberry Pi.
+
+What to expect:
+
+- **Writes serialise.** SQLite permits one writer at a time. The store takes
+  the write lock for the whole write transaction (`BEGIN IMMEDIATE` on a single
+  connection), so concurrent writers queue instead of failing. Throughput is
+  bounded by that one writer; it is not a fit for a high alert volume.
+- **Reads stay concurrent.** WAL journalling is enabled, so dashboard and API
+  reads are not blocked by an in-flight write.
+- **One instance.** Do not point several SoroBeacon processes at the same file,
+  and do not put it on a network filesystem — SQLite's locking assumes a local
+  disk. Use Postgres for multi-instance deployments.
+- **Cooldown semantics are unchanged.** Postgres uses `SELECT ... FOR UPDATE`;
+  SQLite enforces the same one-alert-per-window rule with its single writer.
+  The shared conformance suite runs both.
+- The Postgres pool variables (`DATABASE_MAX_CONNS`, …) are rejected at startup
+  with a SQLite URL rather than being silently ignored.
+
+Use Postgres when you need multiple instances, more writers than one, or
+managed backups and replication.
+
 ## Multi-instance deployment
 
 Running more than one SoroBeacon instance today is **not formally supported**.
@@ -105,7 +132,7 @@ intended for future multi-instance support.
 
 ## Database growth: alerts and delivery attempts
 
-The Postgres database stores several tables that grow over time:
+The database (Postgres or SQLite) stores several tables that grow over time:
 
 | Table | What it stores | Growth rate |
 |---|---|---|

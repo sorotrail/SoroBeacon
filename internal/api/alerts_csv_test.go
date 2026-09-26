@@ -128,6 +128,7 @@ func TestExportAlertsCSV_EscapesAndGuardsInjection(t *testing.T) {
 		"7",
 		`'-ops, "prod"`,
 		"3",
+		"warning",
 		"'=SUM(A1)",
 		"'+cmd",
 		"'@evt",

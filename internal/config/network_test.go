@@ -13,6 +13,7 @@ func TestParseNetwork(t *testing.T) {
 		wantName   string
 		wantRPC    string
 		wantPhrase string
+		wantRPCs   []string // nil means "the single wantRPC entry"
 		wantErr    string
 	}{
 		{
@@ -62,6 +63,29 @@ func TestParseNetwork(t *testing.T) {
 			wantPhrase: "Standalone Network ; February 7th 1974 at 8:37:19 PM",
 		},
 		{
+			name:     "rpc urls list",
+			env:      map[string]string{"NETWORK": "testnet", "RPC_URLS": "https://a.example, https://b.example"},
+			wantName: "testnet", wantRPC: "https://a.example", wantPhrase: stellar.PassphraseTestnet,
+			wantRPCs: []string{"https://a.example", "https://b.example"},
+		},
+		{
+			name:     "rpc urls wins over rpc url",
+			env:      map[string]string{"NETWORK": "testnet", "RPC_URL": "https://single.example", "RPC_URLS": "https://a.example,https://b.example"},
+			wantName: "testnet", wantRPC: "https://a.example", wantPhrase: stellar.PassphraseTestnet,
+			wantRPCs: []string{"https://a.example", "https://b.example"},
+		},
+		{
+			name:     "rpc urls satisfies a custom network without rpc url",
+			env:      map[string]string{"NETWORK": "custom", "NETWORK_PASSPHRASE": "p", "RPC_URLS": "https://a.example"},
+			wantName: "custom", wantRPC: "https://a.example", wantPhrase: "p",
+			wantRPCs: []string{"https://a.example"},
+		},
+		{
+			name:    "rpc urls entry with no scheme",
+			env:     map[string]string{"NETWORK": "testnet", "RPC_URLS": "https://a.example,b.example"},
+			wantErr: "RPC_URLS",
+		},
+		{
 			name:    "custom without rpc url",
 			env:     map[string]string{"NETWORK": "custom", "NETWORK_PASSPHRASE": "p"},
 			wantErr: "RPC_URL is required",
@@ -95,8 +119,81 @@ func TestParseNetwork(t *testing.T) {
 			if got.Name != tt.wantName || got.RPCURL != tt.wantRPC || got.Passphrase != tt.wantPhrase {
 				t.Fatalf("got %+v, want name=%s rpc=%s phrase=%s", got, tt.wantName, tt.wantRPC, tt.wantPhrase)
 			}
+			// RPC_URL on its own must keep producing exactly one endpoint.
+			wantRPCs := tt.wantRPCs
+			if wantRPCs == nil {
+				wantRPCs = []string{tt.wantRPC}
+			}
+			if !slicesEqual(got.RPCURLs, wantRPCs) {
+				t.Fatalf("got endpoints %v, want %v", got.RPCURLs, wantRPCs)
+			}
 		})
 	}
+}
+
+func TestParseRPCURLs(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    []string
+		wantErr string
+	}{
+		{name: "unset yields no endpoints", raw: ""},
+		{name: "single endpoint", raw: "https://rpc.example", want: []string{"https://rpc.example"}},
+		{
+			name: "ordered list",
+			raw:  "https://primary.example,https://fallback.example",
+			want: []string{"https://primary.example", "https://fallback.example"},
+		},
+		{
+			name: "whitespace around entries is trimmed",
+			raw:  "  https://primary.example ,  https://fallback.example  ",
+			want: []string{"https://primary.example", "https://fallback.example"},
+		},
+		{
+			name: "blank entries are skipped",
+			raw:  "https://primary.example,,",
+			want: []string{"https://primary.example"},
+		},
+		{name: "only separators is an error", raw: ",,", wantErr: "no endpoints"},
+		{name: "relative url is an error", raw: "rpc.example", wantErr: "https"},
+		{name: "unsupported scheme is an error", raw: "ftp://rpc.example", wantErr: "https"},
+		{name: "a later entry is still validated", raw: "https://ok.example,not-a-url", wantErr: "not-a-url"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseRPCURLs(tt.raw)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("want error containing %q, got nil", tt.wantErr)
+				}
+				if !contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error %q does not contain %q", err.Error(), tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !slicesEqual(got, tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// slicesEqual compares two string slices, treating nil and empty as equal so a
+// test can say "no endpoints" either way.
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestVerifyPassphrase(t *testing.T) {

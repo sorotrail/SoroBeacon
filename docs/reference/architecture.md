@@ -1,12 +1,21 @@
 # Architecture
 
-One Go process, three pipeline stages, Postgres for state:
+One Go process, three pipeline stages, one database for state. The database is
+selected by the `DATABASE_URL` scheme: Postgres (pgx) for a team deployment, or
+a single SQLite file for a node that should not run a database server.
 
 ```
 EventSource ──page──▶ poller ─▶ rules engine ─▶ alerts ─▶ dispatcher ─▶ channels
  (RPC or SoroTrail)        │                              │                   │
-                           └── ingest_state ── Postgres ──┴── delivery_attempts ─┘
+                           └── ingest_state ────── Postgres or SQLite ───────┴── delivery_attempts ─┘
 ```
+
+The two backends share one `store.Store` interface, one behavioural
+conformance suite (`internal/store/conformance_test.go`), and one
+channel-config encryption envelope. They differ in DDL (parallel migration
+sets) and in how the alert cooldown serialises: Postgres locks the rule row
+with `SELECT ... FOR UPDATE`, SQLite holds its single write lock through a
+`BEGIN IMMEDIATE` transaction. Both yield one alert per window.
 
 ## Event sources (`internal/poller`, `internal/sorotrail`)
 
@@ -74,7 +83,11 @@ The dispatcher fans each new alert out to the monitor's enabled channels. Per ch
 | `delivery_attempts` | Every delivery try with status and response snippet |
 | `ingest_state` | Single-row poller checkpoint (last ledger, cursor) |
 
-Migrations are embedded in the binary and applied automatically at startup (golang-migrate).
+Migrations are embedded in the binary and applied automatically at startup
+(golang-migrate). Postgres and SQLite each have their own embedded set —
+`internal/store/migrations/` and `internal/store/migrations/sqlite/` — because
+Postgres DDL (JSONB, TIMESTAMPTZ, `generate_series`) does not run unmodified on
+SQLite.
 
 ## Trust boundaries
 

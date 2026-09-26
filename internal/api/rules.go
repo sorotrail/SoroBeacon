@@ -23,9 +23,10 @@ func ruleParamDetails(err error) []FieldError {
 }
 
 type ruleRequest struct {
-	Type    *string          `json:"type"`
-	Params  *json.RawMessage `json:"params"`
-	Enabled *bool            `json:"enabled"`
+	Type     *string          `json:"type"`
+	Params   *json.RawMessage `json:"params"`
+	Enabled  *bool            `json:"enabled"`
+	Severity *string          `json:"severity"`
 }
 
 func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
@@ -128,6 +129,15 @@ func (s *Server) ruleFromRequest(monitorID int64, req ruleRequest) (store.Rule, 
 			details = append(details, ruleParamDetails(err)...)
 		}
 	}
+	severity := store.SeverityWarning
+	if req.Severity != nil && *req.Severity != "" {
+		parsed, ok := store.ParseSeverity(*req.Severity)
+		if !ok {
+			details = append(details, FieldError{Field: "severity", Reason: `must be "info", "warning", or "critical"`})
+		} else {
+			severity = parsed
+		}
+	}
 	if len(details) > 0 {
 		return store.Rule{}, details
 	}
@@ -136,6 +146,7 @@ func (s *Server) ruleFromRequest(monitorID int64, req ruleRequest) (store.Rule, 
 		Type:      *req.Type,
 		Params:    params,
 		Enabled:   req.Enabled == nil || *req.Enabled,
+		Severity:  severity,
 	}, nil
 }
 
@@ -177,6 +188,18 @@ func (s *Server) updateRule(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Enabled != nil {
 		rule.Enabled = *req.Enabled
+	}
+	if req.Severity != nil {
+		if *req.Severity == "" {
+			writeValidation(w, r, []FieldError{{Field: "severity", Reason: `must be "info", "warning", or "critical"`}})
+			return
+		}
+		parsed, ok := store.ParseSeverity(*req.Severity)
+		if !ok {
+			writeValidation(w, r, []FieldError{{Field: "severity", Reason: `must be "info", "warning", or "critical"`}})
+			return
+		}
+		rule.Severity = parsed
 	}
 	if err := s.registry.Validate(rule.Type, rule.Params); err != nil {
 		writeValidation(w, r, ruleParamDetails(err))

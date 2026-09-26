@@ -76,6 +76,14 @@ func parseAlertFilter(w http.ResponseWriter, r *http.Request) (store.AlertFilter
 		}
 		f.AfterID = id
 	}
+	if v := q.Get("severity"); v != "" {
+		if parsed, ok := store.ParseSeverity(v); ok {
+			f.Severity = parsed
+		} else {
+			writeErr(w, r, http.StatusBadRequest, `invalid severity (must be "info", "warning", or "critical")`)
+			return f, false
+		}
+	}
 	return f, true
 }
 
@@ -131,7 +139,7 @@ const alertExportPageSize = 500
 // part of the endpoint's contract: spreadsheet templates and importers key
 // off column position, so new columns are appended, never inserted.
 var alertCSVHeader = []string{
-	"id", "monitor_name", "rule_id", "contract_id",
+	"id", "monitor_name", "rule_id", "severity", "contract_id",
 	"event_name", "event_id", "ledger", "created_at", "payload",
 }
 
@@ -220,10 +228,15 @@ func alertCSVRow(a store.Alert, monitorName string) []string {
 		Ledger     uint32 `json:"ledger"`
 	}
 	_ = json.Unmarshal(a.Payload, &p)
+	sev := string(a.Severity)
+	if sev == "" {
+		sev = "warning"
+	}
 	return []string{
 		strconv.FormatInt(a.ID, 10),
 		csvSafe(monitorName),
 		strconv.FormatInt(a.RuleID, 10),
+		csvSafe(sev),
 		csvSafe(p.ContractID),
 		csvSafe(p.EventName),
 		csvSafe(a.EventID),
@@ -353,6 +366,7 @@ func notifyAlertFromStore(ctx context.Context, st store.Store, a store.Alert) no
 		EventID:   a.EventID,
 		Payload:   a.Payload,
 		CreatedAt: a.CreatedAt,
+		Severity:  string(a.Severity),
 	}
 	var p struct {
 		ContractID string `json:"contract_id"`

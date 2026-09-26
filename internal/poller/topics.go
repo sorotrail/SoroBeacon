@@ -8,6 +8,28 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
+// WatchesFor derives the source watch list for one monitor: its valid
+// contracts plus, when every enabled rule names a concrete event, the shared
+// topic filter. It mirrors what the live poller sends each cycle, factored out
+// so a backfill queries exactly the events the poller would have for the same
+// monitor. Invalid contract IDs are dropped (the RPC rejects the whole request
+// for one bad ID); Topics stays nil when any rule may match unnamed events,
+// which means "do not narrow" — always correct, if less efficient.
+func WatchesFor(reg *rules.Registry, ruleList []store.Rule, contracts []string) []Watch {
+	var topics [][]string
+	if names, ok := ruleEventNames(reg, ruleList); ok {
+		topics = topicFiltersFor(names)
+	}
+	watch := make([]Watch, 0, len(contracts))
+	for _, c := range contracts {
+		if !stellar.IsValidContractID(c) {
+			continue
+		}
+		watch = append(watch, Watch{ContractID: c, Topics: topics})
+	}
+	return watch
+}
+
 // maxTopicFilters is the RPC's cap on topic filters within one getEvents
 // filter. A contract whose rules name more distinct events than this cannot be
 // expressed, so it falls back to an unfiltered request rather than silently

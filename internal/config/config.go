@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/sorotrail/sorobeacon/internal/secrets"
 )
 
 // Defaults used when the corresponding environment variable is unset.
@@ -19,6 +21,10 @@ const (
 	DefaultRPCURL       = "https://soroban-testnet.stellar.org"
 	DefaultPollInterval = 5 * time.Second
 	DefaultHTTPAddr     = ":8080"
+	// DefaultOTLPSampleRate keeps every trace when tracing is enabled.
+	// Sampling is an operator lever for busy deployments, not a way to hide
+	// spans by default: the whole feature is off unless OTLP_ENDPOINT is set.
+	DefaultOTLPSampleRate = 1.0
 	// DefaultHTTPMaxBodyBytes is 1 MiB. Rule params are nested JSON and
 	// channel configs are small; 1 MiB is well above any legitimate write
 	// payload while bounding unauthenticated POSTs on a small instance.
@@ -26,6 +32,11 @@ const (
 	// DefaultMonitorSilentAfter is how long since last_matched_at before
 	// the monitors list treats a monitor as silent.
 	DefaultMonitorSilentAfter = 24 * time.Hour
+	// DefaultReorgTrackingWindow is how many recent ledger hashes the poller
+	// keeps for reorg detection. 128 ledgers is roughly ten minutes on
+	// Stellar and a few getLedgers pages per cycle — cheap, and deep enough
+	// to cover the practical reorg depth.
+	DefaultReorgTrackingWindow uint32 = 128
 )
 
 // Config holds all runtime configuration. Every field maps to one
@@ -35,10 +46,15 @@ type Config struct {
 	// and RPC endpoint, resolved from NETWORK / RPC_URL /
 	// NETWORK_PASSPHRASE by ParseNetwork.
 	Network Network
-	// RPCURL is the Stellar RPC endpoint (JSON-RPC 2.0 over HTTP). This is
-	// Network.RPCURL; kept as a direct field since most call sites only
-	// need the URL.
+	// RPCURL is the first Stellar RPC endpoint (JSON-RPC 2.0 over HTTP).
+	// This is Network.RPCURL; kept as a direct field since most call sites
+	// only need the URL.
 	RPCURL string
+	// RPCURLs is the ordered list of Stellar RPC endpoints to poll, with
+	// failover in that order (RPC_URLS). It is always non-empty: RPC_URLS
+	// takes priority when set, and RPC_URL alone is the single-entry case,
+	// so a deployment that never sets RPC_URLS behaves exactly as before.
+	RPCURLs []string
 	// DatabaseURL is a Postgres connection string (pgx format).
 	DatabaseURL string
 	// DatabaseMaxConns is the pgx pool MaxConns. Zero means use the
@@ -107,7 +123,81 @@ type Config struct {
 	// MonitorSilentAfter is how long since last_matched_at before the
 	// dashboard marks a monitor silent. Default 24h.
 	MonitorSilentAfter time.Duration
+	// OTLP is the OpenTelemetry tracing configuration. Endpoint empty (the
+	// default, OTLP_ENDPOINT unset) disables tracing entirely: no exporter,
+	// no exporter goroutines, no measurable overhead — spans collapse to
+	// no-ops. When set it is the OTLP/HTTP base URL spans are shipped to.
+	OTLP OTLPConfig
+	// GRPCAddr is the listen address for the optional gRPC server
+	// (GRPC_ADDR). Empty (the default) disables gRPC entirely so existing
+	// deployments do not open a new port without opting in.
+	GRPCAddr string
+	// ReorgTrackingWindow is how many recent ledgers' hashes the poller keeps
+	// and re-checks each cycle for reorg detection
+	// (REORG_TRACKING_WINDOW, default 128). Zero disables detection, which is
+	// the behaviour before the feature existed.
+	ReorgTrackingWindow uint32
+	// ReorgConfirmationDepth is how many ledgers behind the tip an event must
+	// be before it may alert (REORG_CONFIRMATION_DEPTH, default 0). Zero
+	// alerts immediately, the historical default.
+	ReorgConfirmationDepth uint32
+	// SecretsProvider selects the external secret provider used to resolve
+	// ${secret:...} references in channel configs (SECRETS_PROVIDER).
+	// Empty (the default) disables external secrets: references are then
+	// treated as literals, so an upgrade changes nothing.
+	SecretsProvider string
+	// SecretsCacheTTL is how long a resolved secret is reused
+	// (SECRETS_CACHE_TTL, default secrets.DefaultTTL). Zero disables
+	// caching so every construction re-fetches.
+	SecretsCacheTTL time.Duration
+	// VaultAddr is the HashiCorp Vault address (VAULT_ADDR); required when
+	// SecretsProvider is "vault".
+	VaultAddr string
+	// VaultToken is the Vault token (VAULT_TOKEN). It is a credential and
+	// is never logged.
+	VaultToken string
+	// VaultNamespace is the optional Vault Enterprise namespace
+	// (VAULT_NAMESPACE).
+	VaultNamespace string
+	// ArchiveURL is where retention copies alerts before deleting them
+	// (ARCHIVE_URL). Empty (the default) leaves archiving off, so retention
+	// behaves exactly as it did before the feature. A local directory path,
+	// file://, dir:// or s3://bucket/prefix are accepted; the archive package
+	// validates it when the pruner is built.
+	ArchiveURL string
+
+	// NotifyRateLimitSlackRPS is the max requests per second for Slack channels
+	// (NOTIFY_RATE_LIMIT_SLACK_RPS, default 1.0, citing Slack API tier 2 / webhooks guidelines ~1 msg/sec).
+	NotifyRateLimitSlackRPS float64
+	// NotifyRateLimitTelegramRPS is the max requests per second for Telegram channels
+	// (NOTIFY_RATE_LIMIT_TELEGRAM_RPS, default 30.0, citing Telegram Bot API limit of 30 msg/sec).
+	NotifyRateLimitTelegramRPS float64
+	// NotifyRateLimitPagerDutyRPS is the max requests per second for PagerDuty channels
+	// (NOTIFY_RATE_LIMIT_PAGERDUTY_RPS, default 2.0, citing PagerDuty Events API v2 rate limit ~2 requests/sec).
+	NotifyRateLimitPagerDutyRPS float64
+	// NotifyRateLimitDefaultRPS is the default max requests per second for any other channel
+	// (NOTIFY_RATE_LIMIT_DEFAULT_RPS, default 5.0).
+	NotifyRateLimitDefaultRPS float64
 }
+
+// OTLPConfig is the tracing slice of the configuration. It is a struct so a
+// stage that needs the endpoint does not pull the whole Config in.
+type OTLPConfig struct {
+	// Endpoint is the OTLP/HTTP base URL (OTLP_ENDPOINT, e.g.
+	// http://localhost:4318). Empty disables tracing.
+	Endpoint string
+	// ServiceName is the service.name resource attribute
+	// (OTLP_SERVICE_NAME). Empty falls back to "sorobeacon".
+	ServiceName string
+	// SampleRate is the fraction of traces kept, in [0,1]
+	// (OTLP_SAMPLE_RATE). Defaults to 1 (keep everything).
+	SampleRate float64
+}
+
+// Enabled reports whether tracing is switched on. The single place the
+// "off unless OTLP_ENDPOINT is set" rule lives, so the wiring in main and
+// the tests cannot drift apart.
+func (o OTLPConfig) Enabled() bool { return o.Endpoint != "" }
 
 // Load reads configuration from the environment. DATABASE_URL is the only
 // required variable; everything else has a sensible default.
@@ -118,19 +208,32 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		Network:            net,
-		RPCURL:             net.RPCURL,
-		DatabaseURL:        os.Getenv("DATABASE_URL"),
-		PollInterval:       DefaultPollInterval,
-		HTTPAddr:           getenv("HTTP_ADDR", DefaultHTTPAddr),
-		HTTPMaxBodyBytes:   DefaultHTTPMaxBodyBytes,
-		LogLevel:           slog.LevelInfo,
-		MonitorSilentAfter: DefaultMonitorSilentAfter,
+		Network:                     net,
+		RPCURL:                      net.RPCURL,
+		RPCURLs:                     net.RPCURLs,
+		DatabaseURL:                 os.Getenv("DATABASE_URL"),
+		PollInterval:                DefaultPollInterval,
+		HTTPAddr:                    getenv("HTTP_ADDR", DefaultHTTPAddr),
+		HTTPMaxBodyBytes:            DefaultHTTPMaxBodyBytes,
+		LogLevel:                    slog.LevelInfo,
+		MonitorSilentAfter:          DefaultMonitorSilentAfter,
+		NotifyRateLimitSlackRPS:     1.0,  // Slack webhooks / tier 2 rate limit ~1 rps
+		NotifyRateLimitTelegramRPS:  30.0, // Telegram Bot API limit ~30 rps
+		NotifyRateLimitPagerDutyRPS: 2.0,  // PagerDuty Events API v2 rate limit ~2 rps
+		NotifyRateLimitDefaultRPS:   5.0,  // General default rps
+		// Detection is on by default; confirmation depth off, so a monitor
+		// alerts exactly as soon as it did before this feature.
+		ReorgTrackingWindow:    DefaultReorgTrackingWindow,
+		ReorgConfirmationDepth: 0,
 	}
 
 	if err := validateDatabaseURL(cfg.DatabaseURL); err != nil {
 		return cfg, err
 	}
+	// The pool knobs below are Postgres-only. Knowing the backend here lets
+	// Load fail loudly when a SQLite deployment carries them instead of
+	// silently ignoring a setting the operator expects to matter.
+	sqliteBackend := isSQLiteURL(cfg.DatabaseURL)
 
 	if err := validateHTTPAddr(cfg.HTTPAddr); err != nil {
 		return cfg, err
@@ -138,10 +241,10 @@ func Load() (Config, error) {
 
 	// An absolute http(s) RPC URL is required whenever one is in play —
 	// always in rpc mode, and in sorotrail mode whenever RPC_URL is set
-	// alongside the indexer URL.
-	rpcURL, err := url.Parse(cfg.RPCURL)
-	if cfg.RPCURL != "" && (err != nil || !rpcURL.IsAbs() || rpcURL.Host == "" ||
-		(rpcURL.Scheme != "http" && rpcURL.Scheme != "https")) {
+	// alongside the indexer URL. cfg.RPCURL is RPC_URLS[0] when the list is
+	// set, so this covers both spellings; ParseRPCURLs validates the rest of
+	// the list (and each entry's own message names it).
+	if cfg.RPCURL != "" && !validRPCURL(cfg.RPCURL) {
 		return cfg, fmt.Errorf(
 			"invalid RPC_URL %q: must be an absolute http or https URL",
 			cfg.RPCURL,
@@ -265,6 +368,9 @@ func Load() (Config, error) {
 	if maxConns > 0 && minConns > 0 && maxConns < minConns {
 		return cfg, fmt.Errorf("DATABASE_MAX_CONNS %d is below DATABASE_MIN_CONNS %d", maxConns, minConns)
 	}
+	if sqliteBackend && (maxConns > 0 || minConns > 0 || maxLifetime > 0 || maxIdle > 0) {
+		return cfg, fmt.Errorf("DATABASE_MAX_CONNS, DATABASE_MIN_CONNS, DATABASE_MAX_CONN_LIFETIME and DATABASE_MAX_CONN_IDLE_TIME tune the Postgres pool and have no effect on a sqlite DATABASE_URL; unset them or use Postgres")
+	}
 	cfg.DatabaseMaxConns = maxConns
 	cfg.DatabaseMinConns = minConns
 	cfg.DatabaseMaxConnLifetime = maxLifetime
@@ -274,6 +380,13 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.ConfigEncryptionKey = key
+	cfg.GRPCAddr = os.Getenv("GRPC_ADDR")
+	if cfg.GRPCAddr != "" {
+		if err := validateHTTPAddr(cfg.GRPCAddr); err != nil {
+			return cfg, fmt.Errorf("invalid GRPC_ADDR: %w", err)
+		}
+	}
+
 	if v := os.Getenv("ALERT_RETENTION"); v != "" {
 		d, err := ParseRetention(v)
 		if err != nil {
@@ -281,8 +394,109 @@ func Load() (Config, error) {
 		}
 		cfg.AlertRetention = d
 	}
+	if v := os.Getenv("REORG_TRACKING_WINDOW"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 32)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid REORG_TRACKING_WINDOW %q: must be a non-negative integer", v)
+		}
+		cfg.ReorgTrackingWindow = uint32(n)
+	}
+	if v := os.Getenv("REORG_CONFIRMATION_DEPTH"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 32)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid REORG_CONFIRMATION_DEPTH %q: must be a non-negative integer", v)
+		}
+		cfg.ReorgConfirmationDepth = uint32(n)
+	}
+	cfg.ArchiveURL = strings.TrimSpace(os.Getenv("ARCHIVE_URL"))
+
+	// Tracing is off unless OTLP_ENDPOINT is set; see telemetry.Config.
+	cfg.OTLP.Endpoint = os.Getenv("OTLP_ENDPOINT")
+	if cfg.OTLP.Endpoint != "" {
+		u, err := url.Parse(cfg.OTLP.Endpoint)
+		if err != nil || !u.IsAbs() || u.Host == "" ||
+			(u.Scheme != "http" && u.Scheme != "https") {
+			return cfg, fmt.Errorf(
+				"invalid OTLP_ENDPOINT %q: must be an absolute http or https URL",
+				cfg.OTLP.Endpoint,
+			)
+		}
+	}
+	cfg.OTLP.ServiceName = os.Getenv("OTLP_SERVICE_NAME")
+	cfg.OTLP.SampleRate = DefaultOTLPSampleRate
+	if v := os.Getenv("OTLP_SAMPLE_RATE"); v != "" {
+		r, err := strconv.ParseFloat(v, 64)
+		if err != nil || r < 0 || r > 1 || math.IsNaN(r) || math.IsInf(r, 0) {
+			return cfg, fmt.Errorf("invalid OTLP_SAMPLE_RATE %q (want a number in [0, 1])", v)
+		}
+		cfg.OTLP.SampleRate = r
+	}
+	if v := os.Getenv("NOTIFY_RATE_LIMIT_SLACK_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_SLACK_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitSlackRPS = rps
+	}
+	if v := os.Getenv("NOTIFY_RATE_LIMIT_TELEGRAM_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_TELEGRAM_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitTelegramRPS = rps
+	}
+	if v := os.Getenv("NOTIFY_RATE_LIMIT_PAGERDUTY_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_PAGERDUTY_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitPagerDutyRPS = rps
+	}
+	if v := os.Getenv("NOTIFY_RATE_LIMIT_DEFAULT_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_DEFAULT_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitDefaultRPS = rps
+	}
+
+	if err := loadSecrets(&cfg); err != nil {
+		return cfg, err
+	}
 
 	return cfg, nil
+}
+
+// loadSecrets reads the external-secret provider configuration. The active
+// provider is validated here so a typo or a missing Vault address fails
+// startup rather than the first alert that references a secret.
+func loadSecrets(cfg *Config) error {
+	cfg.SecretsProvider = strings.ToLower(strings.TrimSpace(os.Getenv("SECRETS_PROVIDER")))
+	switch cfg.SecretsProvider {
+	case "", "env", "vault":
+	default:
+		return fmt.Errorf("invalid SECRETS_PROVIDER %q (want env|vault, or unset to disable external secrets)", cfg.SecretsProvider)
+	}
+
+	cfg.SecretsCacheTTL = secrets.DefaultTTL
+	if v := os.Getenv("SECRETS_CACHE_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SECRETS_CACHE_TTL %q: %w", v, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("SECRETS_CACHE_TTL %q is negative", v)
+		}
+		cfg.SecretsCacheTTL = d
+	}
+
+	cfg.VaultAddr = strings.TrimRight(strings.TrimSpace(os.Getenv("VAULT_ADDR")), "/")
+	cfg.VaultToken = os.Getenv("VAULT_TOKEN")
+	cfg.VaultNamespace = strings.TrimSpace(os.Getenv("VAULT_NAMESPACE"))
+	if cfg.SecretsProvider == "vault" && cfg.VaultAddr == "" {
+		return fmt.Errorf("VAULT_ADDR is required when SECRETS_PROVIDER=vault")
+	}
+	return nil
 }
 
 // validateHTTPAddr checks HTTP_ADDR is a host:port pair with a numeric
@@ -318,23 +532,44 @@ func (c Config) LogAttrs() []slog.Attr {
 		slog.String("log_level", strings.ToLower(c.LogLevel.String())),
 		slog.String("network", c.Network.Name),
 		slog.String("rpc_url", c.RPCURL),
+		// The count, not the list: it is how an operator confirms at a
+		// glance that the failover set was read, and the URLs themselves
+		// already appear (first one above) in the poller's own lines.
+		slog.Int("rpc_endpoint_count", len(c.RPCURLs)),
 		slog.String("sorotrail_url", c.SoroTrailURL),
 		slog.String("cors_allowed_origins", strings.Join(c.CORSAllowedOrigins, ",")),
 		slog.Bool("config_encryption_enabled", len(c.ConfigEncryptionKey) > 0),
+		// The provider name, never the token or any resolved value.
+		slog.String("secrets_provider", c.SecretsProvider),
+		slog.String("secrets_cache_ttl", c.SecretsCacheTTL.String()),
+		slog.Bool("vault_token_configured", c.VaultToken != ""),
+		slog.Uint64("reorg_tracking_window", uint64(c.ReorgTrackingWindow)),
+		slog.Uint64("reorg_confirmation_depth", uint64(c.ReorgConfirmationDepth)),
 		// The count, never the tokens themselves: LogAttrs is the one place
 		// configuration is printed, and an API token is a credential.
 		slog.Int("api_token_count", len(c.APITokens)),
+		slog.Bool("otlp_tracing_enabled", c.OTLP.Endpoint != ""),
+		slog.String("otlp_service_name", c.OTLP.ServiceName),
+		slog.Float64("otlp_sample_rate", c.OTLP.SampleRate),
 	}
 }
 
 // redactDatabaseURL keeps scheme, host (with port) and database name and
 // drops userinfo, query and fragment so a password never appears in logs.
+// A SQLite URL carries no credentials, so its file path — the whole database
+// — is kept; it is the one field an operator needs in the startup line.
 func redactDatabaseURL(raw string) string {
 	if raw == "" {
 		return ""
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" || u.Host == "" {
+	if err != nil || u.Scheme == "" {
+		return redacted
+	}
+	if strings.EqualFold(u.Scheme, "sqlite") {
+		return u.Scheme + "://" + u.Host + u.Path
+	}
+	if u.Host == "" {
 		return redacted
 	}
 	return u.Scheme + "://" + u.Host + u.Path
@@ -401,21 +636,42 @@ const databaseURLExample = "postgres://user:pass@localhost:5432/dbname?sslmode=d
 // error that looks like the database is down. Errors name the variable and
 // never echo the raw value (it holds a password); scheme and host are safe
 // to show once the URL has parsed.
+//
+// Three schemes are supported: postgres and postgresql select the pgx pool,
+// sqlite selects a single-file database (no server, for single-node
+// deployments). The scheme decides the backend in internal/store, so a typo
+// here must not silently pick one.
 func validateDatabaseURL(raw string) error {
-	const supported = "supported schemes: postgres, postgresql"
+	const supported = "supported schemes: postgres, postgresql, sqlite"
 	if strings.TrimSpace(raw) == "" {
-		return fmt.Errorf("DATABASE_URL is required (e.g. %s)", databaseURLExample)
+		return fmt.Errorf("DATABASE_URL is required (e.g. %s, or sqlite:///var/lib/sorobeacon/sorobeacon.db)", databaseURLExample)
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" || u.Host == "" {
+	if err != nil || u.Scheme == "" {
 		return fmt.Errorf("DATABASE_URL is not a parseable URL (%s)", supported)
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "postgres", "postgresql":
+		if u.Host == "" {
+			return fmt.Errorf("DATABASE_URL is not a parseable URL (%s)", supported)
+		}
+		return nil
+	case "sqlite":
+		if u.Opaque == "" && u.Host == "" && u.Path == "" {
+			return fmt.Errorf("DATABASE_URL sqlite URL is missing a database file path (e.g. sqlite:///var/lib/sorobeacon/sorobeacon.db)")
+		}
 		return nil
 	default:
 		return fmt.Errorf("DATABASE_URL scheme %q (host %s) is not supported (%s)", u.Scheme, u.Host, supported)
 	}
+}
+
+// isSQLiteURL reports whether raw selects the SQLite backend. It is a
+// best-effort parse: an unparseable value has already been rejected by
+// validateDatabaseURL, so a false here simply means "not sqlite".
+func isSQLiteURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && strings.EqualFold(u.Scheme, "sqlite")
 }
 
 // parseAPITokens splits API_TOKEN on commas into the accepted bearer

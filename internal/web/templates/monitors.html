@@ -72,4 +72,15 @@
     <p><button>Create</button></p>
   </form>
 </fieldset>
+
+<fieldset>
+  <legend>Import contracts</legend>
+  <form method="post" action="/monitors/import" enctype="multipart/form-data">
+    <label for="import_name">Name prefix</label>
+    <input type="text" id="import_name" name="name" value="imported" required>
+    <label for="import_file">File (CSV or JSON, one contract ID per line)</label>
+    <input type="file" id="import_file" name="file" accept=".csv,.json,.txt" required>
+    <p><button>Import</button></p>
+  </form>
+</fieldset>
 {{end}}

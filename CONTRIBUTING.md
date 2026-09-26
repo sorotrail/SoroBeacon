@@ -40,7 +40,11 @@ The README has worked examples for channels and rules.
   tokens and SMTP credentials. Keep them out of log lines, error messages,
   API responses and delivery `response_snippet`s.
 - **Migrations** are sequential files in `internal/store/migrations`
-  (`NNNN_name.up.sql` / `.down.sql`); never edit an applied migration.
+  (`NNNN_name.up.sql` / `.down.sql`); never edit an applied migration. The
+  SQLite backend has a parallel set at the same version numbers under
+  `internal/store/migrations/sqlite/`, because Postgres DDL does not run
+  unmodified on SQLite. `make migrate-new name=...` scaffolds both; a
+  migration with no SQLite change keeps a comment-only pair there.
 - **Structured logging** via `log/slog` with lower_snake_case keys.
 
 ## Good first issues
