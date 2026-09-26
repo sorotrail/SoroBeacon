@@ -1,4 +1,5 @@
-// Package config loads SoroBeacon configuration from environment variables.
+// Package config loads SoroBeacon configuration from the environment and an
+// optional config file.
 package config
 
 import (
@@ -8,7 +9,6 @@ import (
 	"math"
 	"net"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -138,10 +138,19 @@ type Config struct {
 	ArchiveURL string
 }
 
-// Load reads configuration from the environment. DATABASE_URL is the only
-// required variable; everything else has a sensible default.
+// Load reads configuration from the environment and, optionally, a YAML file
+// pointed to by CONFIG_FILE. Environment values win over the file, and the file
+// wins over defaults so a checked-in config stays sane while emergency
+// overrides still work.
 func Load() (Config, error) {
-	net, err := ParseNetwork(os.Getenv)
+	fileValues, err := loadFileValues()
+	if err != nil {
+		return Config{}, err
+	}
+
+	net, err := ParseNetwork(func(key string) string {
+		return lookupConfigValue(key, fileValues)
+	})
 	if err != nil {
 		return Config{}, err
 	}
@@ -150,9 +159,9 @@ func Load() (Config, error) {
 		Network:            net,
 		RPCURL:             net.RPCURL,
 		RPCURLs:            net.RPCURLs,
-		DatabaseURL:        os.Getenv("DATABASE_URL"),
+		DatabaseURL:        lookupConfigValue("DATABASE_URL", fileValues),
 		PollInterval:       DefaultPollInterval,
-		HTTPAddr:           getenv("HTTP_ADDR", DefaultHTTPAddr),
+		HTTPAddr:           valueOrFallback("HTTP_ADDR", fileValues, DefaultHTTPAddr),
 		HTTPMaxBodyBytes:   DefaultHTTPMaxBodyBytes,
 		LogLevel:           slog.LevelInfo,
 		MonitorSilentAfter: DefaultMonitorSilentAfter,
@@ -186,16 +195,16 @@ func Load() (Config, error) {
 		)
 	}
 
-	cfg.SourceMode = getenv("SOURCE_MODE", "rpc")
+	cfg.SourceMode = valueOrFallback("SOURCE_MODE", fileValues, "rpc")
 	if cfg.SourceMode != "rpc" && cfg.SourceMode != "sorotrail" {
 		return cfg, fmt.Errorf("invalid SOURCE_MODE %q (want rpc|sorotrail)", cfg.SourceMode)
 	}
-	cfg.SoroTrailURL = os.Getenv("SOROTRAIL_URL")
+	cfg.SoroTrailURL = lookupConfigValue("SOROTRAIL_URL", fileValues)
 	if cfg.SourceMode == "sorotrail" && cfg.SoroTrailURL == "" {
 		return cfg, fmt.Errorf("SOROTRAIL_URL is required when SOURCE_MODE=sorotrail")
 	}
 
-	if v := os.Getenv("POLL_INTERVAL"); v != "" {
+	if v := lookupConfigValue("POLL_INTERVAL", fileValues); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			return cfg, fmt.Errorf("invalid POLL_INTERVAL %q: %w", v, err)
@@ -206,7 +215,7 @@ func Load() (Config, error) {
 		cfg.PollInterval = d
 	}
 
-	if v := os.Getenv("CORS_ALLOWED_ORIGINS"); v != "" {
+	if v := lookupConfigValue("CORS_ALLOWED_ORIGINS", fileValues); v != "" {
 		for _, o := range strings.Split(v, ",") {
 			if o = strings.TrimSpace(o); o != "" {
 				cfg.CORSAllowedOrigins = append(cfg.CORSAllowedOrigins, o)
@@ -214,13 +223,13 @@ func Load() (Config, error) {
 		}
 	}
 
-	tokens, err := parseAPITokens(os.Getenv("API_TOKEN"))
+	tokens, err := parseAPITokens(lookupConfigValue("API_TOKEN", fileValues))
 	if err != nil {
 		return cfg, err
 	}
 	cfg.APITokens = tokens
 
-	if v := os.Getenv("HTTP_MAX_BODY_BYTES"); v != "" {
+	if v := lookupConfigValue("HTTP_MAX_BODY_BYTES", fileValues); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || n <= 0 {
 			return cfg, fmt.Errorf("invalid HTTP_MAX_BODY_BYTES %q: must be a positive integer (bytes)", v)
@@ -228,7 +237,7 @@ func Load() (Config, error) {
 		cfg.HTTPMaxBodyBytes = n
 	}
 
-	if v := os.Getenv("LOG_LEVEL"); v != "" {
+	if v := lookupConfigValue("LOG_LEVEL", fileValues); v != "" {
 		lvl, err := parseLevel(v)
 		if err != nil {
 			return cfg, err
@@ -236,21 +245,21 @@ func Load() (Config, error) {
 		cfg.LogLevel = lvl
 	}
 
-	if v := os.Getenv("READYZ_LAG_THRESHOLD"); v != "" {
+	if v := lookupConfigValue("READYZ_LAG_THRESHOLD", fileValues); v != "" {
 		n, err := strconv.ParseUint(v, 10, 32)
 		if err != nil {
 			return cfg, fmt.Errorf("invalid READYZ_LAG_THRESHOLD %q: %w", v, err)
 		}
 		cfg.ReadyzLagThreshold = uint32(n)
 	}
-	if v := os.Getenv("RATE_LIMIT_RPS"); v != "" {
+	if v := lookupConfigValue("RATE_LIMIT_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
 			return cfg, fmt.Errorf("invalid RATE_LIMIT_RPS %q (want a non-negative number)", v)
 		}
 		cfg.RateLimitRPS = rps
 	}
-	if v := os.Getenv("RATE_LIMIT_BURST"); v != "" {
+	if v := lookupConfigValue("RATE_LIMIT_BURST", fileValues); v != "" {
 		burst, err := strconv.Atoi(v)
 		if err != nil || burst < 0 {
 			return cfg, fmt.Errorf("invalid RATE_LIMIT_BURST %q (want a non-negative integer)", v)
@@ -263,7 +272,7 @@ func Load() (Config, error) {
 			cfg.RateLimitBurst = 1
 		}
 	}
-	if v := os.Getenv("MONITOR_SILENT_AFTER"); v != "" {
+	if v := lookupConfigValue("MONITOR_SILENT_AFTER", fileValues); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			return cfg, fmt.Errorf("invalid MONITOR_SILENT_AFTER %q: %w", v, err)
@@ -274,7 +283,7 @@ func Load() (Config, error) {
 		cfg.MonitorSilentAfter = d
 	}
 
-	if v := os.Getenv("RATE_LIMIT_TRUST_FORWARDED"); v != "" {
+	if v := lookupConfigValue("RATE_LIMIT_TRUST_FORWARDED", fileValues); v != "" {
 		switch strings.ToLower(strings.TrimSpace(v)) {
 		case "1", "true", "yes", "on":
 			cfg.RateLimitTrustForwarded = true
@@ -284,19 +293,19 @@ func Load() (Config, error) {
 			return cfg, fmt.Errorf("invalid RATE_LIMIT_TRUST_FORWARDED %q (want true|false)", v)
 		}
 	}
-	maxConns, err := parseInt32Env("DATABASE_MAX_CONNS")
+	maxConns, err := parseInt32EnvWithFile("DATABASE_MAX_CONNS", fileValues)
 	if err != nil {
 		return cfg, err
 	}
-	minConns, err := parseInt32Env("DATABASE_MIN_CONNS")
+	minConns, err := parseInt32EnvWithFile("DATABASE_MIN_CONNS", fileValues)
 	if err != nil {
 		return cfg, err
 	}
-	maxLifetime, err := parseDurationEnv("DATABASE_MAX_CONN_LIFETIME")
+	maxLifetime, err := parseDurationEnvWithFile("DATABASE_MAX_CONN_LIFETIME", fileValues)
 	if err != nil {
 		return cfg, err
 	}
-	maxIdle, err := parseDurationEnv("DATABASE_MAX_CONN_IDLE_TIME")
+	maxIdle, err := parseDurationEnvWithFile("DATABASE_MAX_CONN_IDLE_TIME", fileValues)
 	if err != nil {
 		return cfg, err
 	}
@@ -310,42 +319,79 @@ func Load() (Config, error) {
 	cfg.DatabaseMinConns = minConns
 	cfg.DatabaseMaxConnLifetime = maxLifetime
 	cfg.DatabaseMaxConnIdleTime = maxIdle
-	key, err := parseEncryptionKey(os.Getenv("CONFIG_ENCRYPTION_KEY"))
+	key, err := parseEncryptionKey(lookupConfigValue("CONFIG_ENCRYPTION_KEY", fileValues))
 	if err != nil {
 		return cfg, err
 	}
 	cfg.ConfigEncryptionKey = key
-	cfg.GRPCAddr = os.Getenv("GRPC_ADDR")
+	cfg.GRPCAddr = lookupConfigValue("GRPC_ADDR", fileValues)
 	if cfg.GRPCAddr != "" {
 		if err := validateHTTPAddr(cfg.GRPCAddr); err != nil {
 			return cfg, fmt.Errorf("invalid GRPC_ADDR: %w", err)
 		}
 	}
 
-	if v := os.Getenv("ALERT_RETENTION"); v != "" {
+	if v := lookupConfigValue("ALERT_RETENTION", fileValues); v != "" {
 		d, err := ParseRetention(v)
 		if err != nil {
 			return cfg, fmt.Errorf("invalid ALERT_RETENTION %q: %w", v, err)
 		}
 		cfg.AlertRetention = d
 	}
-	if v := os.Getenv("REORG_TRACKING_WINDOW"); v != "" {
+	if v := lookupConfigValue("REORG_TRACKING_WINDOW", fileValues); v != "" {
 		n, err := strconv.ParseUint(v, 10, 32)
 		if err != nil {
 			return cfg, fmt.Errorf("invalid REORG_TRACKING_WINDOW %q: must be a non-negative integer", v)
 		}
 		cfg.ReorgTrackingWindow = uint32(n)
 	}
-	if v := os.Getenv("REORG_CONFIRMATION_DEPTH"); v != "" {
+	if v := lookupConfigValue("REORG_CONFIRMATION_DEPTH", fileValues); v != "" {
 		n, err := strconv.ParseUint(v, 10, 32)
 		if err != nil {
 			return cfg, fmt.Errorf("invalid REORG_CONFIRMATION_DEPTH %q: must be a non-negative integer", v)
 		}
 		cfg.ReorgConfirmationDepth = uint32(n)
 	}
-	cfg.ArchiveURL = strings.TrimSpace(os.Getenv("ARCHIVE_URL"))
+	cfg.ArchiveURL = strings.TrimSpace(lookupConfigValue("ARCHIVE_URL", fileValues))
 
 	return cfg, nil
+}
+
+func valueOrFallback(key string, fileValues map[string]string, fallback string) string {
+	if v := lookupConfigValue(key, fileValues); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func parseInt32EnvWithFile(key string, fileValues map[string]string) (int32, error) {
+	v := lookupConfigValue(key, fileValues)
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("%s %d is negative", key, n)
+	}
+	return int32(n), nil
+}
+
+func parseDurationEnvWithFile(key string, fileValues map[string]string) (time.Duration, error) {
+	v := lookupConfigValue(key, fileValues)
+	if v == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s %q is negative", key, v)
+	}
+	return d, nil
 }
 
 // validateHTTPAddr checks HTTP_ADDR is a host:port pair with a numeric
@@ -537,48 +583,6 @@ func parseAPITokens(raw string) ([]string, error) {
 		return nil, fmt.Errorf("invalid API_TOKEN: set but contains no tokens (use comma-separated values, or unset it to leave authentication off)")
 	}
 	return tokens, nil
-}
-
-func getenv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-// parseInt32Env reads an optional int32. Unset or empty is 0 (driver
-// default). Negative values are rejected so a typo cannot shrink the
-// pool below pgx's floor.
-func parseInt32Env(key string) (int32, error) {
-	v := os.Getenv(key)
-	if v == "" {
-		return 0, nil
-	}
-	n, err := strconv.ParseInt(v, 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
-	}
-	if n < 0 {
-		return 0, fmt.Errorf("%s %d is negative", key, n)
-	}
-	return int32(n), nil
-}
-
-// parseDurationEnv reads an optional duration. Unset or empty is 0
-// (driver default). Negative durations are rejected.
-func parseDurationEnv(key string) (time.Duration, error) {
-	v := os.Getenv(key)
-	if v == "" {
-		return 0, nil
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
-	}
-	if d < 0 {
-		return 0, fmt.Errorf("%s %q is negative", key, v)
-	}
-	return d, nil
 }
 
 func parseLevel(s string) (slog.Level, error) {
