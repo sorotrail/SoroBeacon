@@ -35,13 +35,13 @@ func (f *fakeStore) Ping(ctx context.Context) error { return f.pingErr }
 func (f *fakeStore) ListSavedSearches(context.Context) ([]store.SavedSearch, error) {
 	return nil, nil
 }
-func (f *fakeStore) CreateSavedSearch(context.Context, *store.SavedSearch) error   { return nil }
+func (f *fakeStore) CreateSavedSearch(context.Context, *store.SavedSearch) error { return nil }
 func (f *fakeStore) GetSavedSearch(context.Context, int64) (*store.SavedSearch, error) {
 	return nil, store.ErrNotFound
 }
-func (f *fakeStore) DeleteSavedSearch(context.Context, int64) error        { return nil }
-func (f *fakeStore) SetDefaultSearch(context.Context, int64) error         { return nil }
-func (f *fakeStore) ClearDefaultSearch(context.Context, int64) error       { return nil }
+func (f *fakeStore) DeleteSavedSearch(context.Context, int64) error                      { return nil }
+func (f *fakeStore) SetDefaultSearch(context.Context, int64) error                       { return nil }
+func (f *fakeStore) ClearDefaultSearch(context.Context, int64) error                     { return nil }
 func (f *fakeStore) CreateMonitorTemplate(context.Context, *store.MonitorTemplate) error { return nil }
 func (f *fakeStore) GetMonitorTemplate(context.Context, int64) (*store.MonitorTemplate, error) {
 	return nil, store.ErrNotFound
@@ -252,6 +252,51 @@ func TestHealthIncludesPollerFieldsWhenReady(t *testing.T) {
 	}
 	if body["last_successful_poll"] != "2026-09-22T00:00:00Z" {
 		t.Fatalf("last_successful_poll = %v", body["last_successful_poll"])
+	}
+}
+
+func TestPollerStatusReportsPositionWithoutConfiguration(t *testing.T) {
+	at := time.Date(2026, 9, 22, 0, 0, 0, 0, time.UTC)
+	s := New(&fakeStore{}, rules.NewRegistry(), notify.DefaultFactory(), &fakeRPC{}, discardLogger()).
+		WithPoller(stubPosition{pos: poller.Position{
+			LastProcessedLedger: 100,
+			LatestChainLedger:   110,
+			LastSuccessfulPoll:  at,
+			BackingOff:          true,
+		}})
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	code, body := decodeHealth(t, srv.URL+"/poller")
+	if code != http.StatusOK {
+		t.Fatalf("poller status = %d, want 200", code)
+	}
+	if body["status"] != "ok" || body["last_processed_ledger"] != float64(100) ||
+		body["latest_chain_ledger"] != float64(110) || body["ledger_lag"] != float64(10) ||
+		body["last_successful_poll"] != "2026-09-22T00:00:00Z" || body["backing_off"] != true {
+		t.Fatalf("poller status = %+v", body)
+	}
+	for _, key := range []string{"rpc_url", "database_url", "config"} {
+		if _, ok := body[key]; ok {
+			t.Fatalf("poller status must not expose %q: %+v", key, body)
+		}
+	}
+}
+
+func TestPollerStatusWaitsBeforeFirstPoll(t *testing.T) {
+	s := New(&fakeStore{}, rules.NewRegistry(), notify.DefaultFactory(), &fakeRPC{}, discardLogger()).
+		WithPoller(stubPosition{})
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	code, body := decodeHealth(t, srv.URL+"/poller")
+	if code != http.StatusOK || body["status"] != "waiting" || body["backing_off"] != false {
+		t.Fatalf("pre-poll status = %d, %+v", code, body)
+	}
+	for _, key := range []string{"last_processed_ledger", "latest_chain_ledger", "ledger_lag", "last_successful_poll"} {
+		if _, ok := body[key]; ok {
+			t.Fatalf("pre-poll status must omit %q: %+v", key, body)
+		}
 	}
 }
 

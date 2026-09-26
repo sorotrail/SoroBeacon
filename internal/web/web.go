@@ -170,7 +170,7 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 		pages:       map[string]*template.Template{},
 		silentAfter: 24 * time.Hour,
 	}
-	for _, page := range []string{"index", "monitors", "monitor", "channels", "alerts", "alert", "login", "error", "rulebuilder", "searches"} {
+	for _, page := range []string{"index", "monitors", "monitor", "channels", "channel-delete", "alerts", "alert", "login", "error", "rulebuilder", "searches"} {
 		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, fmt.Errorf("parse template %s: %w", page, err)
@@ -709,6 +709,7 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionCreate, "monitor", m.ID, "name", "contract_ids")
 	http.Redirect(w, r, "/monitors", http.StatusSeeOther)
 }
 
@@ -790,6 +791,7 @@ func (s *Server) toggleMonitor(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionUpdate, "monitor", id, "enabled")
 	http.Redirect(w, r, "/monitors", http.StatusSeeOther)
 }
 
@@ -808,6 +810,7 @@ func (s *Server) duplicateMonitor(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionCreate, "monitor", m.ID, "name", "contract_ids")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", m.ID), http.StatusSeeOther)
 }
 
@@ -821,6 +824,7 @@ func (s *Server) deleteMonitor(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionDelete, "monitor", id)
 	http.Redirect(w, r, "/monitors", http.StatusSeeOther)
 }
 
@@ -844,6 +848,7 @@ func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionDelete, "rule", ruleID, "monitor_id")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
 
@@ -868,6 +873,7 @@ func (s *Server) toggleRule(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionUpdate, "rule", ruleID, "enabled")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
 
@@ -894,6 +900,7 @@ func (s *Server) setMonitorChannels(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionUpdate, "monitor", id, "channel_ids")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
 
@@ -947,6 +954,7 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionCreate, "channel", ch.ID, "name", "type", "config")
 	http.Redirect(w, r, "/channels", http.StatusSeeOther)
 }
 
@@ -956,11 +964,49 @@ func (s *Server) deleteChannel(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	ch, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	monitors, err := s.store.ListMonitorsForChannel(r.Context(), id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	signature := channelDeleteSignature(monitors)
+	if r.FormValue("confirm") != "1" || r.FormValue("confirmed_signature") != signature {
+		shown := monitors
+		if len(shown) > 5 {
+			shown = shown[:5]
+		}
+		s.render(w, r, "channel-delete", map[string]any{
+			"Channel": ch, "Monitors": shown, "AttachedCount": len(monitors),
+			"More":      len(monitors) - len(shown),
+			"Signature": signature, "Stale": r.FormValue("confirm") == "1",
+		})
+		return
+	}
 	if err := s.store.DeleteChannel(r.Context(), id); err != nil {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionDelete, "channel", id)
 	http.Redirect(w, r, "/channels", http.StatusSeeOther)
+}
+
+func channelDeleteSignature(monitors []store.Monitor) string {
+	var b strings.Builder
+	for _, monitor := range monitors {
+		b.WriteString(strconv.FormatInt(monitor.ID, 10))
+		b.WriteByte(':')
+		for _, channelID := range monitor.ChannelIDs {
+			b.WriteString(strconv.FormatInt(channelID, 10))
+			b.WriteByte(',')
+		}
+		b.WriteByte(';')
+	}
+	return b.String()
 }
 
 // testChannel is the htmx target for the "Send test" button; it returns a

@@ -172,6 +172,19 @@ func decryptChannel(cipher ConfigCipher, c *Channel) error {
 	return nil
 }
 
+// EncryptForStorage encrypts plaintext config for writing to the database,
+// using the same envelope as regular channel writes. Nil cipher returns
+// plaintext unchanged. Exported for the backup/restore path, which receives
+// decrypted config from a backup file and must re-encrypt it for the target
+// instance's key.
+func EncryptForStorage(cipher ConfigCipher, plaintext json.RawMessage) (json.RawMessage, error) {
+	b, err := configForWrite(cipher, 0, "restore", plaintext)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(b), nil
+}
+
 // channelRef names a channel for an error without echoing its config.
 func channelRef(id int64, name string) string {
 	if name != "" {

@@ -13,9 +13,9 @@ import (
 
 type importStore struct {
 	fakeStore
-	monitors  []store.Monitor
-	nextID    int64
-	channels  map[int64][]int64
+	monitors []store.Monitor
+	nextID   int64
+	channels map[int64][]int64
 }
 
 func (s *importStore) CreateMonitor(_ context.Context, m *store.Monitor) error {

@@ -7,6 +7,9 @@ semantics and more examples — [event\_emitted](event-emitted.md),
 [value\_threshold](value-threshold.md), [token\_event](token-event.md),
 [frequency\_threshold](frequency-threshold.md),
 [composite](composite.md), and the cross-cutting [cooldown](cooldown.md).
+[frequency\_threshold](frequency-threshold.md), [topic\_regex](topic-regex.md),
+[address\_watchlist](address-watchlist.md), and the cross-cutting
+[cooldown](cooldown.md).
 
 ## Conventions that apply to every rule type
 
@@ -115,6 +118,50 @@ Complete, valid params document:
   "event": "transfer",
   "from": "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR",
   "min_amount": "1000000000"
+}
+```
+
+## topic\_regex
+
+RE2 pattern match against a decoded topic — at a position, or any topic.
+See the [rule page](topic-regex.md) for matching semantics.
+
+| Param | JSON type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `pattern` | string | yes | — | Go/RE2 regular expression, matched unanchored within a topic's string value. At most 512 bytes. |
+| `position` | number | no | unset (any topic) | Topic index to match; `0` is the event name, user topics start at `1`. A position outside the event's topic list simply doesn't match. |
+
+Complete, valid params document:
+
+```json
+{
+  "pattern": "^swap_",
+  "position": 0
+}
+```
+
+## address\_watchlist
+
+SEP-41 events whose from or to address appears on a configured watchlist.
+See the [rule page](address-watchlist.md) for matching semantics.
+
+| Param | JSON type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `addresses` | array of string | yes | — | Non-empty list of Stellar addresses (account `G...` or contract `C...` strkeys). At most 1024 entries. |
+| `match` | string | no | `either` | Which slot(s) to watch: `from`, `to`, or `either`. |
+| `event` | string | no | unset (all SEP-41 events) | Restrict to one SEP-41 event: `transfer`, `mint`, `burn`, `clawback`, `set_admin`, or `*`. |
+
+Matching is exact and case-sensitive — no partial or prefix matching. The
+address set is built once and memoised, so a long watchlist does not scan
+linearly per event.
+
+Complete, valid params document:
+
+```json
+{
+  "addresses": ["GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"],
+  "match": "either",
+  "event": "transfer"
 }
 ```
 

@@ -39,7 +39,7 @@ func TestTwilio_Send(t *testing.T) {
 		})
 
 		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"sid":"SM123"}`)) 
+		_, _ = w.Write([]byte(`{"sid":"SM123"}`))
 	}))
 	defer srv.Close()
 

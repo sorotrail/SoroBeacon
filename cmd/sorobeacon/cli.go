@@ -80,7 +80,8 @@ Usage:
                                 [--params JSON] [--disabled]
   sorobeacon rule delete MONITOR_ID RULE_ID
 
-Rule types: event_emitted, value_threshold, token_event, frequency_threshold.
+Rule types: event_emitted, value_threshold, token_event, frequency_threshold,
+address_watchlist.
 --param values are typed by their JSON spelling, so count=50 is a number and
 window=5m is a string; quote a value that must stay a string. --params takes
 a whole JSON object and is the way to express nested params, for example:

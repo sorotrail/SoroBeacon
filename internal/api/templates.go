@@ -16,17 +16,17 @@ import (
 // a template leaves its instances untouched.
 
 type templateInput struct {
-	Name        string                    `json:"name"`
-	Description string                    `json:"description"`
+	Name        string                      `json:"name"`
+	Description string                      `json:"description"`
 	Rules       []store.MonitorTemplateRule `json:"rules"`
-	ChannelIDs  []int64                   `json:"channel_ids"`
-	Parameters  []store.TemplateParameter  `json:"parameters"`
+	ChannelIDs  []int64                     `json:"channel_ids"`
+	Parameters  []store.TemplateParameter   `json:"parameters"`
 }
 
 type instantiateInput struct {
-	Name         string            `json:"name"`
-	ContractIDs  []string          `json:"contract_ids"`
-	Parameters   map[string]string `json:"parameters"`
+	Name        string            `json:"name"`
+	ContractIDs []string          `json:"contract_ids"`
+	Parameters  map[string]string `json:"parameters"`
 }
 
 type bulkInstantiateInput struct {

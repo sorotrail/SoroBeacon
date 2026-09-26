@@ -19,6 +19,8 @@ const (
 	TypeEventEmitted       = "event_emitted"
 	TypeValueThreshold     = "value_threshold"
 	TypeFrequencyThreshold = "frequency_threshold"
+	TypeTopicRegex         = "topic_regex"
+	TypeAddressWatchlist   = "address_watchlist"
 )
 
 // RuleEvaluator decides whether one decoded event matches one rule.
@@ -89,6 +91,8 @@ func NewRegistry() *Registry {
 	// through this registry; passing r to itself lets it see every leaf above
 	// and any type registered on this registry later.
 	r.Register(TypeComposite, NewComposite(r))
+	r.Register(TypeTopicRegex, &TopicRegex{})
+	r.Register(TypeAddressWatchlist, &AddressWatchlist{})
 	return r
 }
 

@@ -23,6 +23,8 @@
 * [value\_threshold](rules/value-threshold.md)
 * [token\_event](rules/token-event.md)
 * [frequency\_threshold](rules/frequency-threshold.md)
+* [topic\_regex](rules/topic-regex.md)
+* [address\_watchlist](rules/address-watchlist.md)
 * [Rule cooldown](rules/cooldown.md)
 
 ## 📣 Channel reference
@@ -35,7 +37,10 @@
 * [Generic webhook](channels/webhook.md)
 * [Matrix](channels/matrix.md)
 * [PagerDuty](channels/pagerduty.md)
+* [Federation](channels/federation.md)
 * [Message templates](channels/templates.md)
+* [External secrets](channels/secrets.md)
+* [Digest mode](channels/digest.md)
 
 ## 📏 Operations
 
@@ -50,7 +55,9 @@
 
 * [Architecture](reference/architecture.md)
 * [HTTP API](reference/api.md)
+* [gRPC API](reference/grpc.md)
 * [CLI flags (environment variables)](reference/cli.md)
+* [Terraform provider](reference/terraform.md)
 
 ## 🔌 Contributing
 

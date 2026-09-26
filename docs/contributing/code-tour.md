@@ -101,6 +101,7 @@ The built-ins, one file each:
 | `token_event` | `internal/rules/token_event.go` |
 | `frequency_threshold` | `internal/rules/frequency_threshold.go` |
 | `composite` | `internal/rules/composite.go` |
+| `address_watchlist` | `internal/rules/address_watchlist.go` |
 
 `frequency_threshold` is the interesting one: it is stateful, keeps a rolling
 window keyed by `rules.RuleID(ctx)`, and chooses the event id its alert is

@@ -198,4 +198,3 @@ func truncateForName(contractID string) string {
 	}
 	return contractID[:6] + contractID[len(contractID)-6:]
 }
-

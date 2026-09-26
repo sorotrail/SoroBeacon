@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/sorotrail/sorobeacon/internal/secrets"
 )
 
 // Defaults used when the corresponding environment variable is unset.
@@ -117,6 +119,10 @@ type Config struct {
 	// MonitorSilentAfter is how long since last_matched_at before the
 	// dashboard marks a monitor silent. Default 24h.
 	MonitorSilentAfter time.Duration
+	// GRPCAddr is the listen address for the optional gRPC server
+	// (GRPC_ADDR). Empty (the default) disables gRPC entirely so existing
+	// deployments do not open a new port without opting in.
+	GRPCAddr string
 	// ReorgTrackingWindow is how many recent ledgers' hashes the poller keeps
 	// and re-checks each cycle for reorg detection
 	// (REORG_TRACKING_WINDOW, default 128). Zero disables detection, which is
@@ -126,12 +132,43 @@ type Config struct {
 	// be before it may alert (REORG_CONFIRMATION_DEPTH, default 0). Zero
 	// alerts immediately, the historical default.
 	ReorgConfirmationDepth uint32
+	// SecretsProvider selects the external secret provider used to resolve
+	// ${secret:...} references in channel configs (SECRETS_PROVIDER).
+	// Empty (the default) disables external secrets: references are then
+	// treated as literals, so an upgrade changes nothing.
+	SecretsProvider string
+	// SecretsCacheTTL is how long a resolved secret is reused
+	// (SECRETS_CACHE_TTL, default secrets.DefaultTTL). Zero disables
+	// caching so every construction re-fetches.
+	SecretsCacheTTL time.Duration
+	// VaultAddr is the HashiCorp Vault address (VAULT_ADDR); required when
+	// SecretsProvider is "vault".
+	VaultAddr string
+	// VaultToken is the Vault token (VAULT_TOKEN). It is a credential and
+	// is never logged.
+	VaultToken string
+	// VaultNamespace is the optional Vault Enterprise namespace
+	// (VAULT_NAMESPACE).
+	VaultNamespace string
 	// ArchiveURL is where retention copies alerts before deleting them
 	// (ARCHIVE_URL). Empty (the default) leaves archiving off, so retention
 	// behaves exactly as it did before the feature. A local directory path,
 	// file://, dir:// or s3://bucket/prefix are accepted; the archive package
 	// validates it when the pruner is built.
 	ArchiveURL string
+
+	// NotifyRateLimitSlackRPS is the max requests per second for Slack channels
+	// (NOTIFY_RATE_LIMIT_SLACK_RPS, default 1.0, citing Slack API tier 2 / webhooks guidelines ~1 msg/sec).
+	NotifyRateLimitSlackRPS float64
+	// NotifyRateLimitTelegramRPS is the max requests per second for Telegram channels
+	// (NOTIFY_RATE_LIMIT_TELEGRAM_RPS, default 30.0, citing Telegram Bot API limit of 30 msg/sec).
+	NotifyRateLimitTelegramRPS float64
+	// NotifyRateLimitPagerDutyRPS is the max requests per second for PagerDuty channels
+	// (NOTIFY_RATE_LIMIT_PAGERDUTY_RPS, default 2.0, citing PagerDuty Events API v2 rate limit ~2 requests/sec).
+	NotifyRateLimitPagerDutyRPS float64
+	// NotifyRateLimitDefaultRPS is the default max requests per second for any other channel
+	// (NOTIFY_RATE_LIMIT_DEFAULT_RPS, default 5.0).
+	NotifyRateLimitDefaultRPS float64
 }
 
 // Load reads configuration from the environment. DATABASE_URL is the only
@@ -143,15 +180,19 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		Network:            net,
-		RPCURL:             net.RPCURL,
-		RPCURLs:            net.RPCURLs,
-		DatabaseURL:        os.Getenv("DATABASE_URL"),
-		PollInterval:       DefaultPollInterval,
-		HTTPAddr:           getenv("HTTP_ADDR", DefaultHTTPAddr),
-		HTTPMaxBodyBytes:   DefaultHTTPMaxBodyBytes,
-		LogLevel:           slog.LevelInfo,
-		MonitorSilentAfter: DefaultMonitorSilentAfter,
+		Network:                    net,
+		RPCURL:                     net.RPCURL,
+		RPCURLs:                    net.RPCURLs,
+		DatabaseURL:                os.Getenv("DATABASE_URL"),
+		PollInterval:               DefaultPollInterval,
+		HTTPAddr:                   getenv("HTTP_ADDR", DefaultHTTPAddr),
+		HTTPMaxBodyBytes:           DefaultHTTPMaxBodyBytes,
+		LogLevel:                   slog.LevelInfo,
+		MonitorSilentAfter:         DefaultMonitorSilentAfter,
+		NotifyRateLimitSlackRPS:    1.0,  // Slack webhooks / tier 2 rate limit ~1 rps
+		NotifyRateLimitTelegramRPS: 30.0, // Telegram Bot API limit ~30 rps
+		NotifyRateLimitPagerDutyRPS: 2.0, // PagerDuty Events API v2 rate limit ~2 rps
+		NotifyRateLimitDefaultRPS:  5.0,  // General default rps
 		// Detection is on by default; confirmation depth off, so a monitor
 		// alerts exactly as soon as it did before this feature.
 		ReorgTrackingWindow:    DefaultReorgTrackingWindow,
@@ -311,6 +352,13 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.ConfigEncryptionKey = key
+	cfg.GRPCAddr = os.Getenv("GRPC_ADDR")
+	if cfg.GRPCAddr != "" {
+		if err := validateHTTPAddr(cfg.GRPCAddr); err != nil {
+			return cfg, fmt.Errorf("invalid GRPC_ADDR: %w", err)
+		}
+	}
+
 	if v := os.Getenv("ALERT_RETENTION"); v != "" {
 		d, err := ParseRetention(v)
 		if err != nil {
@@ -334,7 +382,72 @@ func Load() (Config, error) {
 	}
 	cfg.ArchiveURL = strings.TrimSpace(os.Getenv("ARCHIVE_URL"))
 
+	if v := os.Getenv("NOTIFY_RATE_LIMIT_SLACK_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_SLACK_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitSlackRPS = rps
+	}
+	if v := os.Getenv("NOTIFY_RATE_LIMIT_TELEGRAM_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_TELEGRAM_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitTelegramRPS = rps
+	}
+	if v := os.Getenv("NOTIFY_RATE_LIMIT_PAGERDUTY_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_PAGERDUTY_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitPagerDutyRPS = rps
+	}
+	if v := os.Getenv("NOTIFY_RATE_LIMIT_DEFAULT_RPS"); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_DEFAULT_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitDefaultRPS = rps
+	}
+
+	if err := loadSecrets(&cfg); err != nil {
+		return cfg, err
+	}
+
 	return cfg, nil
+}
+
+// loadSecrets reads the external-secret provider configuration. The active
+// provider is validated here so a typo or a missing Vault address fails
+// startup rather than the first alert that references a secret.
+func loadSecrets(cfg *Config) error {
+	cfg.SecretsProvider = strings.ToLower(strings.TrimSpace(os.Getenv("SECRETS_PROVIDER")))
+	switch cfg.SecretsProvider {
+	case "", "env", "vault":
+	default:
+		return fmt.Errorf("invalid SECRETS_PROVIDER %q (want env|vault, or unset to disable external secrets)", cfg.SecretsProvider)
+	}
+
+	cfg.SecretsCacheTTL = secrets.DefaultTTL
+	if v := os.Getenv("SECRETS_CACHE_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SECRETS_CACHE_TTL %q: %w", v, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("SECRETS_CACHE_TTL %q is negative", v)
+		}
+		cfg.SecretsCacheTTL = d
+	}
+
+	cfg.VaultAddr = strings.TrimRight(strings.TrimSpace(os.Getenv("VAULT_ADDR")), "/")
+	cfg.VaultToken = os.Getenv("VAULT_TOKEN")
+	cfg.VaultNamespace = strings.TrimSpace(os.Getenv("VAULT_NAMESPACE"))
+	if cfg.SecretsProvider == "vault" && cfg.VaultAddr == "" {
+		return fmt.Errorf("VAULT_ADDR is required when SECRETS_PROVIDER=vault")
+	}
+	return nil
 }
 
 // validateHTTPAddr checks HTTP_ADDR is a host:port pair with a numeric
@@ -377,6 +490,10 @@ func (c Config) LogAttrs() []slog.Attr {
 		slog.String("sorotrail_url", c.SoroTrailURL),
 		slog.String("cors_allowed_origins", strings.Join(c.CORSAllowedOrigins, ",")),
 		slog.Bool("config_encryption_enabled", len(c.ConfigEncryptionKey) > 0),
+		// The provider name, never the token or any resolved value.
+		slog.String("secrets_provider", c.SecretsProvider),
+		slog.String("secrets_cache_ttl", c.SecretsCacheTTL.String()),
+		slog.Bool("vault_token_configured", c.VaultToken != ""),
 		slog.Uint64("reorg_tracking_window", uint64(c.ReorgTrackingWindow)),
 		slog.Uint64("reorg_confirmation_depth", uint64(c.ReorgConfirmationDepth)),
 		// The count, never the tokens themselves: LogAttrs is the one place

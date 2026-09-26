@@ -38,6 +38,7 @@ type Metrics struct {
 	eventsMatched  prometheus.Counter
 	alertsFired    prometheus.Counter
 	deliveries     *prometheus.CounterVec
+	throttles      *prometheus.CounterVec
 	httpDuration   *prometheus.HistogramVec
 	lastPollAgoSec prometheus.Gauge
 }
@@ -104,6 +105,11 @@ func New() *Metrics {
 			Help: "Alert deliveries, by channel type and outcome (ok|error).",
 		}, []string{"channel", "outcome"}),
 
+		throttles: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_alert_throttles_total",
+			Help: "Throttled alert delivery attempts, by channel type.",
+		}, []string{"channel"}),
+
 		httpDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "sorobeacon_http_request_duration_seconds",
 			Help:    "HTTP request duration by route pattern, method and status.",
@@ -116,7 +122,7 @@ func New() *Metrics {
 		}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
-		m.eventsScanned, m.eventsMatched, m.alertsFired, m.deliveries,
+		m.eventsScanned, m.eventsMatched, m.alertsFired, m.deliveries, m.throttles,
 		m.httpDuration, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
 		m.reorgsTotal, m.lastReorgLedger)
 	return m
@@ -225,6 +231,14 @@ func (m *Metrics) RecordDelivery(channelType string, ok bool) {
 		outcome = "error"
 	}
 	m.deliveries.WithLabelValues(channelType, outcome).Inc()
+}
+
+// RecordThrottle counts one throttled delivery per channel type.
+func (m *Metrics) RecordThrottle(channelType string) {
+	if m == nil {
+		return
+	}
+	m.throttles.WithLabelValues(channelType).Inc()
 }
 
 // statusRecorder captures the status code a handler wrote, for the HTTP

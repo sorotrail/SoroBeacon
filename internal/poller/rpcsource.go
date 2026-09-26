@@ -34,6 +34,18 @@ func (s *RPCSource) LatestLedger(ctx context.Context) (uint32, error) {
 	return latest.Sequence, nil
 }
 
+// OldestLedger reports the oldest ledger the RPC still retains events for, so
+// a backfill can clamp a range that predates it. getHealth carries the value
+// directly; a node that does not report it yields 0, which the backfill
+// treats as "unknown".
+func (s *RPCSource) OldestLedger(ctx context.Context) (uint32, error) {
+	health, err := s.rpc.GetHealth(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return health.OldestLedger, nil
+}
+
 // encodeCursor packs batch index and the RPC's own cursor into one opaque
 // token. Base64 keeps it URL- and header-safe for any future transport.
 func encodeCursor(batch int, rpcCursor string) string {
@@ -257,4 +269,5 @@ func (s *RPCSource) LedgerHashes(ctx context.Context, from, to uint32) ([]store.
 }
 
 var _ EventSource = (*RPCSource)(nil)
+var _ RetentionReporter = (*RPCSource)(nil)
 var _ LedgerHashSource = (*RPCSource)(nil)

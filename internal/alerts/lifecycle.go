@@ -2,13 +2,13 @@ package alerts
 
 // AlertLifecycle manages acknowledgement and resolution lifecycle.
 type AlertLifecycle struct {
-    State string
+	State string
 }
 
 func (a *AlertLifecycle) Acknowledge() {
-    a.State = "acknowledged"
+	a.State = "acknowledged"
 }
 
 func (a *AlertLifecycle) Resolve() {
-    a.State = "resolved"
+	a.State = "resolved"
 }

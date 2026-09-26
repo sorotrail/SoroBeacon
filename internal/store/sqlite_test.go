@@ -38,6 +38,8 @@ func newTestSQLite(t *testing.T) conformanceStore {
 func (s *SQLite) resetConformance(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx,
 		`DELETE FROM delivery_attempts;
+		 DELETE FROM audit_log;
+		 DELETE FROM pending_digests;
 		 DELETE FROM alerts;
 		 DELETE FROM monitor_channels;
 		 DELETE FROM rules;

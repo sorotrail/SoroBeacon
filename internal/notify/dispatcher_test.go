@@ -45,6 +45,10 @@ func (f *fakeDispatchStore) RecordDeliveryAttempt(_ context.Context, d *store.De
 	return nil
 }
 
+func (f *fakeDispatchStore) ListChannels(_ context.Context, _ bool) ([]store.Channel, error) {
+	return f.channels, nil
+}
+
 func newTestDispatcher(t *testing.T, st *fakeDispatchStore, n Notifier) *Dispatcher {
 	t.Helper()
 	f := &Factory{constructors: map[string]Constructor{}}

@@ -4,7 +4,6 @@ package poller
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"sync/atomic"
 	"time"
@@ -23,6 +22,7 @@ type Position struct {
 	LastProcessedLedger uint32
 	LatestChainLedger   uint32
 	LastSuccessfulPoll  time.Time
+	BackingOff          bool
 }
 
 // Ready reports whether a successful poll has completed.
@@ -60,9 +60,11 @@ type Poller struct {
 	source   EventSource
 	store    Store
 	registry *rules.Registry
-	dispatch Dispatcher
 	interval time.Duration
 	log      *slog.Logger
+	// ing evaluates events and records alerts; shared with the backfill job
+	// so a historical replay and live ingestion match identically.
+	ing *Ingestor
 	// metrics is optional instrumentation; nil-safe, see internal/metrics.
 	metrics *metrics.Metrics
 	// scanned/matched accumulate per-cycle counts for metrics.
@@ -101,6 +103,12 @@ func (p *Poller) recordPosition(processed, latest uint32, at time.Time) {
 	})
 }
 
+func (p *Poller) recordBackoff(backingOff bool) {
+	position := p.Position()
+	position.BackingOff = backingOff
+	p.pos.Store(position)
+}
+
 // New wires a Poller. src is where events come from: NewRPCSource for a
 // Stellar RPC node, or the SoroTrail source for upstream mode.
 func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval time.Duration, log *slog.Logger) *Poller {
@@ -108,9 +116,9 @@ func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval 
 		source:   src,
 		store:    st,
 		registry: reg,
-		dispatch: d,
 		interval: interval,
 		log:      log,
+		ing:      NewIngestor(st, reg, d, log),
 		sched:    NewScheduler(),
 	}
 }
@@ -118,6 +126,7 @@ func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval 
 // WithMetrics attaches Prometheus instrumentation to the poll loop.
 func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
 	p.metrics = m
+	p.ing = p.ing.WithMetrics(m)
 	return p
 }
 
@@ -155,10 +164,12 @@ func (p *Poller) Run(ctx context.Context) {
 				continue
 			}
 			delay = min(delay*2, 10*p.interval)
+			p.recordBackoff(true)
 			p.log.Error("poll failed", "err", err, "retry_in", delay)
 			continue
 		}
 		delay = p.interval
+		p.recordBackoff(false)
 	}
 }
 
@@ -358,127 +369,13 @@ func (p *Poller) Poll(ctx context.Context) error {
 	return nil
 }
 
-// pollBatch pages through getEvents for one set of filters, following the
-// cursor until the stream is drained. Returns the node's latestLedger.
-// handleEvent runs every enabled rule of every monitor watching the
-// event's contract. Events arrive already decoded from the source;
-// per-event failures are logged, not fatal: one bad event must not stall
-// ingestion.
+// handleEvent runs every enabled rule of every monitor watching the event's
+// contract. Events arrive already decoded from the source; the shared
+// Ingestor owns evaluation, alert persistence and dispatch.
 func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent, byContract map[string][]store.Monitor) {
 	monitors, watched := byContract[decoded.ContractID]
 	if !watched {
 		return
 	}
-
-	for _, m := range monitors {
-		ruleList, err := p.store.ListRules(ctx, m.ID, true)
-		if err != nil {
-			p.log.Error("list rules", "monitor_id", m.ID, "err", err)
-			continue
-		}
-		for _, rule := range ruleList {
-			// The rule id rides in the context so a stateful evaluator (the
-			// frequency rule) can key its per-rule state.
-			ruleCtx := rules.WithRuleID(ctx, rule.ID)
-			matched, err := p.registry.Evaluate(ruleCtx, rule.Type, decoded, rule.Params)
-			if err != nil {
-				p.log.Warn("rule evaluation failed", "rule_id", rule.ID, "event_id", decoded.ID, "err", err)
-				continue
-			}
-			if matched {
-				p.matched++
-				p.metrics.RecordAlert()
-				// An evaluator may override the dedup key (the frequency rule
-				// stores every crossing in one episode under the window start).
-				eventID := decoded.ID
-				if id := p.registry.AlertEventID(ruleCtx, rule.Type, decoded, rule.Params); id != "" {
-					eventID = id
-				}
-				p.fireAlert(ctx, m, rule, decoded, eventID)
-			}
-		}
-	}
-}
-
-// fireAlert persists a deduped, cooldown-gated alert and hands it to the
-// dispatcher. The store owns both gates so they hold across poller instances
-// and restarts; this function only reports the outcome.
-func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule, ev *stellar.DecodedEvent, eventID string) {
-	body := map[string]any{
-		"contract_id":      ev.ContractID,
-		"event_name":       ev.EventName(),
-		"ledger":           ev.Ledger,
-		"ledger_closed_at": ev.LedgerClosedAt,
-		"tx_hash":          ev.TxHash,
-		"topics":           ev.Topics,
-		"value":            ev.Value,
-	}
-	// Named fields are only present when the contract's spec was available;
-	// without one the payload is byte-for-byte what it has always been.
-	if ev.Fields != nil {
-		body["fields"] = ev.Fields
-	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		p.log.Error("marshal alert payload", "event_id", ev.ID, "err", err)
-		return
-	}
-
-	alert := &store.Alert{
-		MonitorID:      m.ID,
-		RuleID:         rule.ID,
-		EventID:        eventID,
-		Payload:        payload,
-		Ledger:         ev.Ledger,
-		LedgerClosedAt: ev.LedgerClosedAt,
-		Cooldown:       ruleCooldown(rule),
-	}
-	outcome, err := p.store.CreateAlert(ctx, alert)
-	if err != nil {
-		p.log.Error("create alert", "rule_id", rule.ID, "event_id", ev.ID, "err", err)
-		return
-	}
-	switch outcome {
-	case store.AlertDuplicate:
-		return // dedup: this rule already fired for this event
-	case store.AlertSuppressed:
-		// Counted by the store; logged so an operator can see the rule is
-		// firing far more often than it is alerting.
-		p.log.Info("alert suppressed by cooldown",
-			"rule_id", rule.ID, "event_id", ev.ID, "cooldown", alert.Cooldown)
-		return
-	}
-	logAttrs := []any{"alert_id", alert.ID, "monitor", m.Name, "rule_id", rule.ID, "event_id", ev.ID}
-	if alert.SuppressedSinceLast > 0 {
-		logAttrs = append(logAttrs, "suppressed_since_last", alert.SuppressedSinceLast)
-	}
-	p.log.Info("alert created", logAttrs...)
-
-	p.dispatch.Dispatch(ctx, notify.Alert{
-		ID:          alert.ID,
-		MonitorID:   m.ID,
-		MonitorName: m.Name,
-		RuleID:      rule.ID,
-		RuleType:    rule.Type,
-		EventID:     eventID,
-		ContractID:  ev.ContractID,
-		EventName:   ev.EventName(),
-		Ledger:      ev.Ledger,
-		TxHash:      ev.TxHash,
-		// The store folds the suppressed count into the payload, so the
-		// notification reports it too.
-		Payload:   alert.Payload,
-		CreatedAt: alert.CreatedAt,
-	})
-}
-
-// ruleCooldown reads a rule's optional cooldown. It is validated when the rule
-// is created, so a value that no longer parses is treated as "no cooldown"
-// rather than dropping matches.
-func ruleCooldown(rule store.Rule) time.Duration {
-	d, err := rules.ParseCooldown(rule.Params)
-	if err != nil {
-		return 0
-	}
-	return d
+	p.matched += p.ing.Handle(ctx, decoded, monitors, HandleOptions{Deliver: true}).Matched
 }

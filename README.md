@@ -283,6 +283,40 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 ```
 
 See [docs/rules/composite.md](docs/rules/composite.md).
+**`topic_regex`** — match a regular expression against a decoded topic, at a
+given position or any topic when `position` is omitted. Real contracts emit
+families of events (`swap_exact_in`, `swap_exact_out`, `pool_deposit`, …) and
+one pattern covers the family. Patterns are unanchored RE2 matched within a
+topic's string value and are capped at 512 bytes; a position beyond an event's
+topic list simply doesn't match:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "topic_regex",
+  "params": {
+    "pattern": "^swap_",
+    "position": 0
+  }
+}'
+```
+
+**`address_watchlist`** — match any SEP-41 token event whose from or to
+address is on a configured list. "Did these specific addresses move anything"
+becomes one rule instead of one `token_event` rule per address. `match` is
+`from`, `to` or `either` (the default); matching is exact and case-sensitive;
+the address set is built once, so a watchlist of hundreds of addresses costs
+no more per event than one of two:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "address_watchlist",
+  "params": {
+    "addresses": ["GDW6...ACCOUNT", "GBXG...EXCHANGE"],
+    "match": "either",
+    "event": "transfer"
+  }
+}'
+```
 
 Every rule type also accepts an optional `cooldown` (a Go duration string such
 as `"5m"`): the first match alerts, further matches in the window are counted
@@ -298,13 +332,14 @@ curl -s -X DELETE localhost:8080/api/v1/monitors/1/rules/2
 
 ### Channels
 
-Seven channel types ship with the MVP. `config` is validated on create/update
+Eight channel types ship with the MVP. `config` is validated on create/update
 and never returned in responses. Each has a page under
 [docs/channels/](docs/channels/):
 [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md),
 [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md),
-[PagerDuty](docs/channels/pagerduty.md), [Email](docs/channels/email.md) and
-the [generic webhook](docs/channels/webhook.md).
+[PagerDuty](docs/channels/pagerduty.md), [Email](docs/channels/email.md),
+[Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md) and the
+[generic webhook](docs/channels/webhook.md).
 
 ```sh
 # Discord
@@ -321,6 +356,8 @@ curl -s -X POST localhost:8080/api/v1/channels -d '{
 # Matrix:   {"homeserver_url": "https://matrix.example.org", "access_token": "syt_...",
 #            "room_id": "!abcdef:example.org"}
 # PagerDuty:{"routing_key": "R0UT1NGK3Y", "severity": "warning"}
+# Webex:    {"bot_token": "Y2lzY29zcGFyazovL3VzL1JPT00v...", "room_id": "Y2lzY29zcGFyazovL3VzL1JPT00v..."}
+# Signal:   {"api_url": "http://signal-cli:8080", "number": "+15551234567", "recipients": ["+15559876543"]}
 
 curl -s localhost:8080/api/v1/channels
 curl -s -X PATCH localhost:8080/api/v1/channels/1 -d '{"enabled": false}'
@@ -476,4 +513,4 @@ Decoded events use a small value vocabulary (`nil`, `bool`, `string`,
 ## License
 ### Notification Channels
 
-Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), and generic [Webhooks](docs/channels/webhook.md).
+Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md), and generic [Webhooks](docs/channels/webhook.md).

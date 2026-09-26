@@ -22,6 +22,7 @@ and this page should be updated.
 | `CONFIG_ENCRYPTION_KEY` | **yes** | Base64 AES-GCM key that encrypts channel `config` at rest. Losing it makes encrypted configs unrecoverable — back it up with the database. |
 | `API_TOKEN` | **yes** | Bearer token(s) for `/api/v1` and the dashboard sign-in. Anyone holding one can read and mutate everything, so treat it like a password: mode `0600` on disk, a secret manager in production, and never in a log line, ticket or shell history. |
 | `NETWORK_PASSPHRASE` | no (public nets) | SDF passphrases are public. For `NETWORK=custom` it identifies a private network — treat it as operational config, not a credential. |
+| `VAULT_TOKEN` | **yes** | Credential for the Vault secret provider. Never logged; a resolved secret is never returned by the API. |
 | `RPC_URL` / `RPC_URLS` / `SOROTRAIL_URL` | maybe | A URL is not a password, but provider URLs sometimes embed tokens in the path or query. Do not commit those. |
 | `CORS_ALLOWED_ORIGINS` | no | An allow-list, not a credential. Think hard before allowing a third-party origin: whatever credential that origin's users hold can act through their browser. |
 | everything else | no | |
@@ -113,6 +114,23 @@ set stay plaintext, keep working, and are re-encrypted lazily on their next
 write. Losing the key makes encrypted rows undecryptable: reads fail with an
 error naming the channel and never echo ciphertext or key material. Back the
 key up alongside your database backups.
+
+## External secrets
+
+A channel config value can reference a secret held outside SoroBeacon — in
+Vault or the process environment — instead of storing the value in the
+database. The value is resolved when a notifier is constructed and is never
+written back, logged or returned by the API. See
+[External secrets in channel config](channels/secrets.md) for the reference
+syntax and providers.
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `SECRETS_PROVIDER` | string | empty (disabled) | optional | `env` or `vault`; selects the provider that resolves `${secret:...}` references. Unset treats references as literals, so an upgrade changes nothing. |
+| `SECRETS_CACHE_TTL` | duration | `5m` | optional | How long a resolved secret is reused so every alert does not hit the provider. `0s` disables caching. The cache is dropped whenever a channel is created, updated or deleted. |
+| `VAULT_ADDR` | URL string | _(none)_ | required when `SECRETS_PROVIDER=vault` | Vault base URL, e.g. `https://vault.example:8200`. |
+| `VAULT_TOKEN` | secret string | _(none)_ | optional | Vault token sent as `X-Vault-Token`. Never logged. |
+| `VAULT_NAMESPACE` | string | empty | optional | Vault Enterprise namespace sent as `X-Vault-Namespace`. |
 
 ## RPC / event source
 
