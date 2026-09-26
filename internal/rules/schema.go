@@ -76,6 +76,13 @@ func (EventEmitted) ParamSchema() []FieldSchema {
 	}
 }
 
+func (TokenSupplyChange) ParamSchema() []FieldSchema {
+	return []FieldSchema{
+		{Name: "direction", Type: "select", Description: "Supply direction to match (default any)", Options: []string{"mint", "burn", "any"}, Default: "any"},
+		{Name: "min_amount", Type: "string", Description: "Minimum amount (decimal integer string)"},
+	}
+}
+
 func (ValueThreshold) ParamSchema() []FieldSchema {
 	return []FieldSchema{
 		{Name: "event_name", Type: "string", Description: "Only consider events with this name"},
