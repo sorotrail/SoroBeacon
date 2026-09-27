@@ -34,7 +34,13 @@ func readTemplate(t *testing.T, name string) (front, body string) {
 	if err != nil {
 		t.Fatalf("read %s: %v", name, err)
 	}
-	text := string(raw)
+	// Normalise line endings before parsing. These files are read from the
+	// checkout, so their endings depend on the developer's core.autocrlf
+	// rather than on anything in the repository: with it enabled the file is
+	// CRLF on disk, "---\r\n" does not match "---\n", and every assertion
+	// below fails on Windows while Linux CI stays green. The subject here is
+	// the YAML content, not how the checkout stores newlines.
+	text := strings.ReplaceAll(string(raw), "\r\n", "\n")
 	if !strings.HasPrefix(text, "---\n") {
 		t.Fatalf("%s: missing YAML front matter", name)
 	}
