@@ -99,6 +99,13 @@ func FromURL(raw string) (Archiver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("archive: invalid ARCHIVE_URL: %w", err)
 	}
+	// A Windows path carries its drive letter as what looks like a URL
+	// scheme: "C:\srv\archive" parses with Scheme "c". No real scheme is a
+	// single letter, so treat that as a local path rather than rejecting it
+	// as an unsupported backend.
+	if len(u.Scheme) == 1 {
+		return NewDir(raw)
+	}
 	switch strings.ToLower(u.Scheme) {
 	case "", "file", "dir":
 		return NewDir(localPath(raw, u))

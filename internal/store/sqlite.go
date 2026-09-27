@@ -119,6 +119,9 @@ func ensureSQLiteDir(databaseURL string) error {
 // sqlite:///abs/path.db, sqlite://relative/path.db and sqlite:path.db are all
 // accepted; sqlite://:memory: is honoured for tests.
 func sqliteFilePath(databaseURL string) (string, error) {
+	if path, ok := sqliteWindowsPath(databaseURL); ok {
+		return path, nil
+	}
 	u, err := url.Parse(databaseURL)
 	if err != nil {
 		return "", fmt.Errorf("parse sqlite DATABASE_URL: %w", err)
@@ -139,6 +142,37 @@ func sqliteFilePath(databaseURL string) (string, error) {
 		return "", errors.New("sqlite DATABASE_URL is missing a database file path (e.g. sqlite:///var/lib/sorobeacon/sorobeacon.db)")
 	}
 	return path, nil
+}
+
+// sqliteWindowsPath recognises a sqlite URL whose file path is a Windows
+// drive path — "sqlite://C:\srv\beacon.db" or "sqlite:C:/srv/beacon.db".
+// url.Parse cannot cope with those: it reads "C:" as a host with an invalid
+// port and fails before any path is extracted. What follows the scheme is
+// already a filesystem path, so it is returned unchanged.
+//
+// The drive letter has to be checked precisely, or this would swallow the
+// forms that url.Parse does handle: "sqlite:///abs/path.db",
+// "sqlite://relative/path.db" and "sqlite:./data/beacon.db".
+func sqliteWindowsPath(databaseURL string) (string, bool) {
+	rest := strings.TrimSpace(databaseURL)
+	switch lower := strings.ToLower(rest); {
+	case strings.HasPrefix(lower, "sqlite://"):
+		rest = rest[len("sqlite://"):]
+	case strings.HasPrefix(lower, "sqlite:"):
+		rest = rest[len("sqlite:"):]
+	default:
+		return "", false
+	}
+	if len(rest) < 3 || rest[1] != ':' {
+		return "", false
+	}
+	if c := rest[0] | 0x20; c < 'a' || c > 'z' {
+		return "", false
+	}
+	if rest[2] != '\\' && rest[2] != '/' {
+		return "", false
+	}
+	return rest, true
 }
 
 // sqliteDSN builds the modernc.org/sqlite DSN: WAL journalling, foreign-key
