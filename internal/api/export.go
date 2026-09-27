@@ -2,7 +2,6 @@ package api
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -14,8 +13,9 @@ import (
 // exportAlertsNDJSON serves GET /alerts/export as NDJSON streaming.
 // It shares parseAlertFilter with GET /alerts, streams each alert as a
 // newline-delimited JSON object, flushes periodically, and caps the
-// total at maxAlertExportRows. A repeatable-read snapshot keeps the
-// export consistent; request cancellation stops the underlying query.
+// total at maxAlertExportRows. Rows are paged rather than read from a
+// snapshot, so an alert inserted mid-export may or may not appear;
+// request cancellation stops the walk at the next page.
 func (s *Server) exportAlertsNDJSON(w http.ResponseWriter, r *http.Request) {
 	f, ok := parseAlertFilter(w, r)
 	if !ok {
@@ -101,20 +101,4 @@ func exportAlertNDJSONRow(a store.Alert, monitorName string) map[string]any {
 		"created_at":   a.CreatedAt.UTC().Format(time.RFC3339),
 		"payload":      string(a.Payload),
 	}
-}
-
-// ndjsonRowMap is used by tests to verify NDJSON output structure.
-func ndjsonRowMap(a store.Alert, monitorName string) map[string]any {
-	return exportAlertNDJSONRow(a, monitorName)
-}
-
-// writeNDJSON writes a single NDJSON line to the response writer.
-// Exported so tests can verify the format without a live server.
-func writeNDJSON(w io.Writer, v map[string]any) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(append(b, '\n'))
-	return err
 }
