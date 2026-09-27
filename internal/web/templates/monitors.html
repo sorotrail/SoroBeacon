@@ -1,14 +1,55 @@
 {{define "content"}}
 <h1>Monitors</h1>
+{{if eq .Empty "no_monitors"}}
+<section class="empty">
+  <h2>Create your first monitor</h2>
+  <p>A monitor watches one or more Soroban contracts. Use the form below to add one — alerts only match events that happen after it is created.</p>
+</section>
+{{else if eq .Empty "monitors_disabled"}}
+<section class="empty">
+  <h2>All monitors are disabled</h2>
+  <p>Enable a monitor to start matching events. Disabled monitors keep their rules but do not fire.</p>
+</section>
+{{end}}
+<form class="filters" method="get" action="/monitors">
+  <label for="q">Name</label>
+  <input type="search" id="q" name="q" value="{{.Query}}" placeholder="Search by name">
+  <label for="enabled">Status</label>
+  <select id="enabled" name="enabled">
+    <option value="" {{if eq .Enabled ""}}selected{{end}}>All</option>
+    <option value="true" {{if eq .Enabled "true"}}selected{{end}}>Enabled</option>
+    <option value="false" {{if eq .Enabled "false"}}selected{{end}}>Disabled</option>
+  </select>
+  <label for="sort">Sort</label>
+  <select id="sort" name="sort">
+    <option value="name" {{if eq .Sort "name"}}selected{{end}}>Name</option>
+    <option value="id" {{if eq .Sort "id"}}selected{{end}}>Newest</option>
+    <option value="created_at" {{if eq .Sort "created_at"}}selected{{end}}>Created</option>
+  </select>
+  <button>Filter</button>
+</form>
 {{if .Monitors}}
+<form id="bulk-monitors" method="post" action="/monitors/bulk">
+<p>
+  <button type="submit" name="enabled" value="true">Enable selected</button>
+  <button type="submit" name="enabled" value="false">Disable selected</button>
+  <span class="muted">Select monitors, then enable or disable them in one step. There is no “all monitors” action.</span>
+</p>
+</form>
 <table>
-  <tr><th>ID</th><th>Name</th><th>Contracts</th><th>Status</th><th></th></tr>
+  <tr>
+    <th><input type="checkbox" aria-label="Select all" onclick="document.querySelectorAll('input[name=ids]').forEach(c => c.checked = this.checked)"></th>
+    <th>ID</th><th>Name</th><th>Contracts</th><th>Last matched</th><th>Status</th><th>Created</th><th></th>
+  </tr>
   {{range .Monitors}}
   <tr>
+    <td><input type="checkbox" form="bulk-monitors" name="ids" value="{{.ID}}" aria-label="Select monitor {{.Name}}"></td>
     <td>{{.ID}}</td>
     <td><a href="/monitors/{{.ID}}">{{.Name}}</a></td>
-    <td>{{range .ContractIDs}}<code>{{.}}</code><br>{{end}}</td>
+    <td>{{range .ContractIDs}}{{template "copyID" .}}<br>{{end}}</td>
+    <td>{{if eq .Cue "never"}}<span class="pill never">never</span>{{else}}{{.MatchedHTML}}{{if eq .Cue "silent"}} <span class="pill silent">silent</span>{{end}}{{end}}</td>
     <td>{{if .Enabled}}<span class="pill on">enabled</span>{{else}}<span class="pill off">disabled</span>{{end}}</td>
+    <td>{{formatTime .CreatedAt $.Timezone}}{{with relTime .CreatedAt}} <span class="muted">({{.}})</span>{{end}}</td>
     <td>
       <form class="inline" method="post" action="/monitors/{{.ID}}/toggle"><button>{{if .Enabled}}Disable{{else}}Enable{{end}}</button></form>
       <form class="inline" method="post" action="/monitors/{{.ID}}/delete"
@@ -17,6 +58,8 @@
   </tr>
   {{end}}
 </table>
+{{if .OlderHref}}<p><a href="{{.OlderHref}}">Older →</a></p>{{end}}
+{{else if or .Query (eq .Enabled "true") (eq .Enabled "false")}}<p class="muted">No monitors match these filters.</p>
 {{else}}<p class="muted">No monitors yet — create one below.</p>{{end}}
 
 <fieldset>
@@ -27,6 +70,17 @@
     <label for="contract_ids">Contract IDs (one per line)</label>
     <textarea id="contract_ids" name="contract_ids" rows="3" required placeholder="CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"></textarea>
     <p><button>Create</button></p>
+  </form>
+</fieldset>
+
+<fieldset>
+  <legend>Import contracts</legend>
+  <form method="post" action="/monitors/import" enctype="multipart/form-data">
+    <label for="import_name">Name prefix</label>
+    <input type="text" id="import_name" name="name" value="imported" required>
+    <label for="import_file">File (CSV or JSON, one contract ID per line)</label>
+    <input type="file" id="import_file" name="file" accept=".csv,.json,.txt" required>
+    <p><button>Import</button></p>
   </form>
 </fieldset>
 {{end}}

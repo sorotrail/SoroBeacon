@@ -44,11 +44,21 @@ func (ValueThreshold) Validate(params json.RawMessage) error {
 	if err != nil {
 		return err
 	}
+	var details FieldErrors
 	if _, ok := comparisons[p.Comparison]; !ok {
-		return fmt.Errorf("value_threshold: invalid comparison %q (want gt|gte|lt|lte|eq|neq)", p.Comparison)
+		details = append(details, FieldError{
+			Field:  "comparison",
+			Reason: fmt.Sprintf("value_threshold: invalid comparison %q (want gt|gte|lt|lte|eq|neq)", p.Comparison),
+		})
 	}
 	if threshold == nil {
-		return fmt.Errorf("value_threshold: threshold must be a number (or a numeric string)")
+		details = append(details, FieldError{
+			Field:  "threshold",
+			Reason: "value_threshold: threshold must be a number (or a numeric string)",
+		})
+	}
+	if len(details) > 0 {
+		return details
 	}
 	return nil
 }
@@ -66,7 +76,20 @@ func (ValueThreshold) Evaluate(_ context.Context, ev *stellar.DecodedEvent, para
 	if p.EventName != "" && ev.EventName() != p.EventName {
 		return false, nil
 	}
-	raw, found := stellar.Lookup(ev.Value, p.ValuePath)
+	// When the contract's spec was available, the event carries named fields
+	// and value_path addresses those first; otherwise it keeps addressing the
+	// raw positional value, exactly as before. An empty value_path, or a path
+	// the spec does not name, falls back to the raw value so a rule that
+	// omits value_path (documented as valid when the value itself is the
+	// number) keeps matching events from a contract that now has a spec.
+	var raw any
+	var found bool
+	if ev.Fields != nil && p.ValuePath != "" {
+		raw, found = stellar.Lookup(ev.Fields, p.ValuePath)
+	}
+	if !found {
+		raw, found = stellar.Lookup(ev.Value, p.ValuePath)
+	}
 	if !found {
 		return false, nil
 	}
@@ -75,6 +98,17 @@ func (ValueThreshold) Evaluate(_ context.Context, ev *stellar.DecodedEvent, para
 		return false, nil
 	}
 	return match(value.Cmp(threshold)), nil
+}
+
+// EventNames reports the event name this rule is scoped to. value_threshold
+// may omit event_name, in which case it judges every event's value and cannot
+// be narrowed server-side.
+func (ValueThreshold) EventNames(params json.RawMessage) ([]string, bool) {
+	p, _, err := parseValueThreshold(params)
+	if err != nil || p.EventName == "" {
+		return nil, false
+	}
+	return []string{p.EventName}, true
 }
 
 func parseValueThreshold(params json.RawMessage) (valueThresholdParams, *big.Float, error) {

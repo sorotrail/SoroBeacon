@@ -1,5 +1,5 @@
 {{define "layout"}}<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="{{.Theme}}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -7,37 +7,114 @@
   <link rel="icon" type="image/svg+xml" href="/favicon.ico">
   <script src="https://unpkg.com/htmx.org@1.9.12" crossorigin="anonymous"></script>
   <style>
-    :root { color-scheme: light dark; }
+    :root {
+      color-scheme: light dark;
+      --bg: Canvas;
+      --fg: CanvasText;
+      --line: color-mix(in srgb, currentColor 20%, transparent);
+      --pre-bg: color-mix(in srgb, currentColor 6%, transparent);
+      --focus-ring: #005fcc;
+    }
+    /* Only applies while the theme is "system"; the explicit themes below
+       set --focus-ring themselves and win on specificity. */
+    @media (prefers-color-scheme: dark) {
+      :root { --focus-ring: #7eb6ff; }
+    }
+    html[data-theme="light"] {
+      color-scheme: light;
+      --bg: #fff;
+      --fg: #111;
+      --line: #d4d4d4;
+      --pre-bg: #f4f4f5;
+      --focus-ring: #005fcc;
+    }
+    html[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #111;
+      --fg: #eee;
+      --line: #3f3f46;
+      --pre-bg: #1c1c1c;
+      --focus-ring: #7eb6ff;
+    }
+    body { font-family: system-ui, sans-serif; margin: 0; line-height: 1.5;
+           background: var(--bg); color: var(--fg); }
+    header { display: flex; gap: 1.5rem; align-items: baseline; flex-wrap: wrap;
+             padding: .75rem 1.5rem; border-bottom: 1px solid var(--line); }
+    /* Keyboard-only ring: 3:1 against light (#fff) and dark (#000) canvases. */
+    a:focus-visible,
+    button:focus-visible,
+    input:focus-visible,
+    textarea:focus-visible,
+    select:focus-visible,
+    summary:focus-visible {
+      outline: 3px solid var(--focus-ring);
+      outline-offset: 2px;
+    }
     body { font-family: system-ui, sans-serif; margin: 0; line-height: 1.5; }
-    header { display: flex; gap: 1.5rem; align-items: baseline; padding: .75rem 1.5rem;
+    header { display: flex; gap: 1.5rem; align-items: baseline; flex-wrap: wrap;
+             padding: .75rem 1.5rem;
              border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent); }
     header .brand { font-weight: 700; font-size: 1.1rem; }
     header a { text-decoration: none; color: inherit; opacity: .8; }
     header a:hover { opacity: 1; }
     header a.active { opacity: 1; font-weight: 600; border-bottom: 2px solid currentColor; }
+    header .theme { margin-left: auto; display: flex; align-items: baseline; gap: .4rem; }
+    header .theme label { margin: 0; font-size: .85rem; }
+    header .theme select { width: auto; }
+    header .tz { margin-left: auto; display: flex; align-items: baseline; gap: .4rem; }
+    header .tz label { margin: 0; font-size: .85rem; }
+    header .tz select { width: auto; }
+    header .signout { display: flex; align-items: baseline; }
     main { padding: 1.5rem; max-width: 70rem; margin: 0 auto; }
     table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
-    th, td { text-align: left; padding: .4rem .6rem;
-             border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+    th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid var(--line); }
     th { font-size: .85rem; text-transform: uppercase; opacity: .7; }
     form.inline { display: inline; }
-    fieldset { border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
-               border-radius: .5rem; margin: 1rem 0; padding: 1rem; max-width: 40rem; }
+    form.filters { display: flex; flex-wrap: wrap; gap: .75rem 1rem; align-items: end;
+                   margin: 1rem 0; }
+    form.filters label { margin: 0; }
+    form.filters input, form.filters select { width: auto; min-width: 10rem; }
+    fieldset { border: 1px solid var(--line); border-radius: .5rem; margin: 1rem 0;
+               padding: 1rem; max-width: 40rem; }
     label { display: block; margin: .5rem 0 .15rem; font-size: .9rem; }
-    input[type=text], textarea, select { width: 100%; box-sizing: border-box; padding: .35rem; }
+    input[type=text], textarea, select { width: 100%; box-sizing: border-box; padding: .35rem;
+                                         background: var(--bg); color: var(--fg);
+                                         border: 1px solid var(--line); }
     textarea { font-family: monospace; }
-    button { cursor: pointer; padding: .3rem .8rem; }
+    button { cursor: pointer; padding: .3rem .8rem; background: var(--bg); color: var(--fg);
+             border: 1px solid var(--line); }
     .muted { opacity: .65; font-size: .9rem; }
+    .empty { border: 1px dashed color-mix(in srgb, currentColor 30%, transparent);
+             border-radius: .5rem; padding: 1.25rem 1.5rem; margin: 1rem 0; max-width: 40rem; }
+    .empty h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+    .empty p { margin: .4rem 0; }
+    .empty a { font-weight: 600; }
+    footer.site-footer { padding: .5rem 1.5rem 1.25rem; max-width: 70rem; margin: 0 auto;
+                         font-size: .8rem; }
+    footer.site-footer a { color: inherit; }
     .pill { padding: .1rem .5rem; border-radius: 1rem; font-size: .8rem; }
+    /* Explicit on/off colours stay readable on both page themes. */
     .on  { background: #14532d; color: #dcfce7; }
     .off { background: #7f1d1d; color: #fee2e2; }
+    .never { background: #7c2d12; color: #ffedd5; }
+    .silent { background: #854d0e; color: #fef9c3; }
     .stats { display: flex; gap: 1rem; flex-wrap: wrap; }
-    .stat { border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
-            border-radius: .5rem; padding: .75rem 1.25rem; min-width: 8rem; }
+    .stat { border: 1px solid var(--line); border-radius: .5rem; padding: .75rem 1.25rem;
+            min-width: 8rem; }
     .stat b { display: block; font-size: 1.5rem; }
+    .alert-chart { margin: 1.25rem 0 1.5rem; max-width: 40rem; }
+    .alert-chart h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
+    .alert-chart-svg { width: 100%; height: auto; display: block; }
+    .alert-chart-svg rect { fill: currentColor; opacity: .75; }
     code { font-size: .85em; word-break: break-all; }
     pre { font-size: .85em; overflow-x: auto; margin: .3rem 0 0; padding: .5rem;
+          background: var(--pre-bg); border-radius: .3rem; }
           background: color-mix(in srgb, currentColor 6%, transparent); border-radius: .3rem; }
+    table.decoded { width: auto; min-width: 16rem; margin: .3rem 0 .5rem; }
+    table.decoded th { text-transform: none; font-weight: 600; white-space: nowrap;
+                       width: 1%; padding-right: 1rem; }
+    .copy-id { display: inline; }
+    .copy-btn { font-size: .75rem; padding: .1rem .45rem; margin-left: .25rem; vertical-align: baseline; }
   </style>
 </head>
 <body>
@@ -47,9 +124,72 @@
   <a href="/monitors" {{if eq .Active "monitors"}}class="active"{{end}}>Monitors</a>
   <a href="/channels" {{if eq .Active "channels"}}class="active"{{end}}>Channels</a>
   <a href="/alerts" {{if eq .Active "alerts"}}class="active"{{end}}>Alerts</a>
+  <form class="theme" method="post" action="/theme">
+    <label>Theme
+      <select name="theme" aria-label="Theme" onchange="this.form.submit()">
+        <option value="system" {{if eq .Theme "system"}}selected{{end}}>System</option>
+        <option value="light" {{if eq .Theme "light"}}selected{{end}}>Light</option>
+        <option value="dark" {{if eq .Theme "dark"}}selected{{end}}>Dark</option>
+      </select>
+    </label>
+    <noscript><button type="submit">Apply</button></noscript>
+  <form class="tz" method="post" action="/timezone">
+    <label for="tz">Timezone
+      <select id="tz" name="tz" onchange="this.form.submit()">
+        <option value="utc" {{if eq .Timezone "utc"}}selected{{end}}>UTC</option>
+        <option value="local" {{if eq .Timezone "local"}}selected{{end}}>Local</option>
+      </select>
+    </label>
+  </form>
+  {{if .AuthEnabled}}
+  <form class="signout" method="post" action="/logout">
+    <button type="submit">Sign out</button>
+  </form>
+  {{end}}
 </header>
 <main>
 {{template "content" .}}
 </main>
+<script>
+(function () {
+  function labelLocal(el) {
+    var raw = el.getAttribute("datetime");
+    if (!raw) return;
+    var d = new Date(raw);
+    if (isNaN(d.getTime())) return;
+    el.textContent = new Intl.DateTimeFormat(undefined, {
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+      hour12: false, timeZoneName: "short"
+    }).format(d);
+  }
+  function apply() {
+    document.querySelectorAll('time[data-tz="local"]').forEach(labelLocal);
+  }
+  apply();
+  document.body.addEventListener("htmx:afterSwap", apply);
+})();
+</script>
+
+<footer class="site-footer muted">
+  <span>{{.Version}}</span>
+  {{if .CommitURL}} · <a href="{{.CommitURL}}">{{.Commit}}</a>
+  {{else}} · <span>{{.Commit}}</span>{{end}}
+</footer>
+
+  document.addEventListener('click', function (ev) {
+    var btn = ev.target.closest ? ev.target.closest('button.copy-btn') : null;
+    if (!btn) return;
+    var value = btn.getAttribute('data-copy') || '';
+    var clip = navigator.clipboard;
+    if (!clip || typeof clip.writeText !== 'function') return;
+    clip.writeText(value).then(function () {
+      var prev = btn.textContent;
+      btn.textContent = 'Copied';
+      setTimeout(function () { btn.textContent = prev; }, 1200);
+    }).catch(function () {});
+  });
+</script>
 </body>
 </html>{{end}}
+{{define "copyID"}}<span class="copy-id"><code title="{{.}}">{{truncateID . 8}}</code><button type="button" class="copy-btn" data-copy="{{.}}" aria-label="Copy identifier">Copy</button></span>{{end}}

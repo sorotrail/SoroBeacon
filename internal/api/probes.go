@@ -20,6 +20,26 @@ func (s *Server) livez(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "alive"})
 }
 
+// pollerStatus reports the last successful ingest position without exposing
+// the RPC or any other configuration held by the process.
+func (s *Server) pollerStatus(w http.ResponseWriter, r *http.Request) {
+	out := map[string]any{"status": "waiting"}
+	if s.poller == nil {
+		writeJSON(w, http.StatusServiceUnavailable, out)
+		return
+	}
+	pos := s.poller.Position()
+	if pos.Ready() {
+		out["status"] = "ok"
+		out["last_processed_ledger"] = pos.LastProcessedLedger
+		out["latest_chain_ledger"] = pos.LatestChainLedger
+		out["ledger_lag"] = pos.Lag()
+		out["last_successful_poll"] = pos.LastSuccessfulPoll.UTC().Format(time.RFC3339)
+	}
+	out["backing_off"] = pos.BackingOff
+	writeJSON(w, http.StatusOK, out)
+}
+
 // readyz answers "can this instance do useful work right now". It checks
 // the two things every request path depends on — the database and the RPC
 // endpoint — concurrently and with per-dependency detail, so a failure
@@ -62,6 +82,23 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 		c.detail = "latest ledger " + strconv.FormatInt(int64(h.LatestLedger), 10)
 	}()
 	wg.Wait()
+
+	if s.readyzLagThreshold > 0 && s.poller != nil {
+		pos := s.poller.Position()
+		c := check{name: "poller"}
+		if !pos.Ready() {
+			// No successful poll yet: do not fail the probe on missing lag.
+			c.healthy = true
+			c.detail = "waiting for first poll"
+		} else if lag := pos.Lag(); lag > int64(s.readyzLagThreshold) {
+			c.detail = "ledger lag " + strconv.FormatInt(lag, 10) +
+				" exceeds threshold " + strconv.FormatUint(uint64(s.readyzLagThreshold), 10)
+		} else {
+			c.healthy = true
+			c.detail = "ledger lag " + strconv.FormatInt(lag, 10)
+		}
+		checks = append(checks, c)
+	}
 
 	status := http.StatusOK
 	byName := map[string]any{}

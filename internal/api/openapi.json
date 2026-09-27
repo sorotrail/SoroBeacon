@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "SoroBeacon API",
-    "description": "Monitoring and alerting for Stellar/Soroban contract events. All endpoints are mounted under /api/v1. The API is read-write for monitors, rules and channels; alerts are read-only.",
+    "description": "Monitoring and alerting for Stellar/Soroban contract events. All endpoints are mounted under /api/v1. The API is read-write for monitors, rules and channels; alerts are read-only.\n\nAuthentication: when API_TOKEN is configured, every endpoint below requires `Authorization: Bearer <token>` and answers 401 through the standard error envelope without one. The only exceptions are the probes /livez, /readyz and /health, which stay reachable so an orchestrator does not need the token. With API_TOKEN unset the API is open and none of this applies.",
     "version": "1.0.0",
     "license": {
       "name": "Apache-2.0"
@@ -13,9 +13,13 @@
       "url": "/api/v1"
     }
   ],
+  "security": [
+    { "bearerAuth": [] }
+  ],
   "paths": {
     "/monitors": {
       "post": {
+        "description": "Required role: editor",
         "summary": "Create a monitor",
         "requestBody": {
           "required": true,
@@ -38,19 +42,74 @@
         }
       },
       "get": {
+        "description": "Required role: viewer",
         "summary": "List monitors",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Case-insensitive substring match against the monitor name"
+          },
+          {
+            "name": "enabled",
+            "in": "query",
+            "schema": { "type": "boolean" },
+            "description": "Tri-state: omitted = all, true = enabled only, false = disabled only"
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "schema": { "type": "string", "enum": ["name", "id", "created_at"], "default": "name" },
+            "description": "Allowlisted order: name (default), id (newest first), created_at"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Opaque continuation cursor from a previous page"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Monitors",
             "content": {
               "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": { "$ref": "#/components/schemas/Monitor" }
-                }
+                "schema": { "$ref": "#/components/schemas/MonitorPage" }
               }
             }
           }
+        }
+      }
+    },
+    "/monitors/bulk": {
+      "post": {
+        "description": "Required role: editor",
+        "summary": "Bulk enable or disable monitors",
+        "description": "Sets enabled on an explicit list of monitor IDs in one statement. Unknown IDs are returned and do not prevent the known ones from applying. There is no all-monitors shorthand.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/BulkMonitorInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Applied",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BulkMonitorResult" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
         }
       }
     },
@@ -98,6 +157,119 @@
         "summary": "Delete a monitor",
         "responses": {
           "204": { "description": "Deleted" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/monitors/{id}/rules/bulk": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "post": {
+        "summary": "Create several rules in one request",
+        "description": "Validates every rule first, then inserts the batch in a single transaction. An empty array is 400. At most 50 rules per request.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 50,
+                "items": { "$ref": "#/components/schemas/RuleInput" }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created, in request order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/Rule" }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/monitors/{id}/duplicate": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "post": {
+        "summary": "Duplicate a monitor",
+        "description": "Copies the monitor with its rules and channel attachments under a unique name. The copy is created disabled so it cannot start alerting before review. Alerts are not copied.",
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Monitor" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/monitors/{id}/rules/dry-run": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "post": {
+        "summary": "Dry-run a rule against historical events",
+        "description": "Evaluates a candidate rule against stored alert history. Nothing is persisted and nothing is delivered. Stored alerts are biased toward matched events, so results underrepresent the true event corpus.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["type"],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": ["event_emitted", "value_threshold", "token_event"],
+                    "description": "Rule type to evaluate"
+                  },
+                  "params": {
+                    "type": "object",
+                    "description": "Type-specific rule parameters; validated against the rule type"
+                  },
+                  "window_days": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 90,
+                    "description": "Lookback window in days (clamped to 90)"
+                  },
+                  "max_samples": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": "Maximum historical alerts to evaluate"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Dry-run results",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DryRunResult" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
           "404": { "$ref": "#/components/responses/Error" }
         }
       }
@@ -207,15 +379,31 @@
       },
       "get": {
         "summary": "List channels",
+        "parameters": [
+          {
+            "name": "enabled",
+            "in": "query",
+            "schema": { "type": "boolean" },
+            "description": "When true, only enabled channels are returned"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Opaque continuation cursor from a previous page"
+          }
+        ],
         "responses": {
           "200": {
             "description": "Channels",
             "content": {
               "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": { "$ref": "#/components/schemas/Channel" }
-                }
+                "schema": { "$ref": "#/components/schemas/ChannelPage" }
               }
             }
           }
@@ -283,6 +471,77 @@
         }
       }
     },
+    "/inhibitions": {
+      "post": {
+        "summary": "Create an inhibition rule",
+        "description": "While the source rule is firing (an alert within the pair's firing window, default 300s), deliveries for the target rule are suppressed. Alert rows are still stored.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/InhibitionInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Inhibition" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "get": {
+        "summary": "List inhibition rules",
+        "responses": {
+          "200": {
+            "description": "Inhibitions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "inhibitions": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/Inhibition" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/inhibitions/{sourceID}/{targetID}": {
+      "delete": {
+        "summary": "Delete an inhibition rule",
+        "parameters": [
+          {
+            "name": "sourceID",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "targetID",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "format": "int64" }
+          }
+        ],
+        "responses": {
+          "204": { "description": "Deleted" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/alerts": {
       "get": {
         "summary": "List alerts",
@@ -291,6 +550,23 @@
             "name": "monitor_id",
             "in": "query",
             "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "rule_id",
+            "in": "query",
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "contract_id",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Exact match on payload.contract_id"
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "schema": { "type": "string", "enum": ["created_at_desc", "created_at_asc"], "default": "created_at_desc" },
+            "description": "Keyset order; anything else is 400"
           },
           {
             "name": "since",
@@ -328,12 +604,163 @@
         }
       }
     },
+    "/alerts/stream": {
+      "get": {
+        "summary": "Stream alerts as they are created (Server-Sent Events)",
+        "description": "Opens a text/event-stream response that emits an `alert` event for every alert created after the connection opened. SSE rather than WebSockets: the traffic is one-directional and SSE reconnects on its own. An optional monitor_id filters server-side. Comment lines (keep-alives) are sent periodically so idle connections are not reaped by a proxy, and the stream advertises a 3000ms retry hint. A subscriber that cannot keep up loses its oldest queued events rather than blocking alert creation.",
+        "parameters": [
+          {
+            "name": "monitor_id",
+            "in": "query",
+            "schema": { "type": "integer", "format": "int64" },
+            "description": "Only stream alerts created by this monitor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Server-Sent Events stream; each `alert` event's data is one alert object",
+            "content": {
+              "text/event-stream": {
+                "schema": { "$ref": "#/components/schemas/Alert" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/alerts.csv": {
+      "get": {
+        "summary": "Export alerts as CSV",
+        "description": "Streams every alert matching the same filters as GET /alerts as text/csv. Columns are fixed: id, monitor_name, rule_id, contract_id, event_name, event_id, ledger, created_at, payload. Values beginning with =, +, - or @ are prefixed with an apostrophe to prevent spreadsheet formula injection. When no limit is given the export is capped at 10000 rows.",
+        "parameters": [
+          {
+            "name": "monitor_id",
+            "in": "query",
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "rule_id",
+            "in": "query",
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "contract_id",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Exact match on payload.contract_id"
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": { "type": "string", "format": "date-time" },
+            "description": "RFC 3339 lower bound on alert creation"
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": { "type": "string", "format": "date-time" },
+            "description": "RFC 3339 upper bound on alert creation"
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "schema": { "type": "string", "enum": ["created_at_desc", "created_at_asc"], "default": "created_at_desc" },
+            "description": "Keyset order; anything else is 400"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "default": 10000, "maximum": 10000 },
+            "description": "Maximum rows to export; the endpoint caps at 10000"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Alerts as CSV",
+            "content": {
+              "text/csv": {
+                "schema": { "type": "string" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/alerts/export": {
+      "get": {
+        "summary": "Export alerts as NDJSON",
+        "description": "Streams every alert matching the same filters as GET /alerts as application/x-ndjson. Each line is a JSON object with id, monitor_id, monitor_name, rule_id, event_id, event_name, contract_id, ledger, created_at, and payload. A repeatable-read snapshot keeps the export consistent; cancellation stops the query. When no limit is given the export is capped at 10000 rows.",
+        "parameters": [
+          {
+            "name": "monitor_id",
+            "in": "query",
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "rule_id",
+            "in": "query",
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "contract_id",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Exact match on payload.contract_id"
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": { "type": "string", "format": "date-time" },
+            "description": "RFC 3339 lower bound on alert creation"
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": { "type": "string", "format": "date-time" },
+            "description": "RFC 3339 upper bound on alert creation"
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "schema": { "type": "string", "enum": ["created_at_desc", "created_at_asc"], "default": "created_at_desc" },
+            "description": "Keyset order; anything else is 400"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "default": 10000, "maximum": 10000 },
+            "description": "Maximum rows to export; the endpoint caps at 10000"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Alerts as NDJSON stream",
+            "content": {
+              "application/x-ndjson": {
+                "schema": { "type": "string" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/alerts/{id}/deliveries": {
       "parameters": [
         { "$ref": "#/components/parameters/ID" }
       ],
       "get": {
         "summary": "List one alert's delivery attempts",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Restrict to persisted statuses: success or failed. Omit for all. Unknown values are 400.",
+            "schema": { "type": "string", "enum": ["success", "failed"] }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Delivery attempts",
@@ -346,14 +773,81 @@
               }
             }
           },
+          "400": { "$ref": "#/components/responses/Error" },
           "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/alerts/{id}/deliveries/{channelID}/retry": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" },
+        { "$ref": "#/components/parameters/ChannelID" }
+      ],
+      "post": {
+        "summary": "Retry a failed delivery",
+        "description": "Records a new delivery attempt for one alert and channel. Rejects a channel that already succeeded (409), a disabled channel (400), a missing prior attempt (404), and repeats inside a 30s cooldown (429). Synchronous: the response is the new attempt.",
+        "responses": {
+          "200": {
+            "description": "New delivery attempt (success or failed)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DeliveryAttempt" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/ingest": {
+      "post": {
+        "summary": "Receive a federated alert from another SoroBeacon instance",
+        "description": "Stores an alert forwarded by another instance without re-evaluating rules. The alert is stamped with its origin and hop count for loop prevention. Requires authentication.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["alert", "origin"],
+                "properties": {
+                  "alert": { "$ref": "#/components/schemas/Alert" },
+                  "origin": { "type": "string", "description": "Instance identifier of the originating SoroBeacon" },
+                  "hop_count": { "type": "integer", "minimum": 0, "maximum": 8, "description": "Number of hops this alert has traversed" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Alert ingested",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "outcome": { "type": "string", "enum": ["created", "duplicate", "suppressed"] },
+                    "alert_id": { "type": "integer", "format": "int64" },
+                    "origin": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" }
         }
       }
     },
     "/health": {
       "get": {
         "summary": "Combined health report",
-        "description": "Legacy combined check; prefer /livez and /readyz.",
+        "description": "Legacy combined check; prefer /livez and /readyz. Exempt from authentication so probes and the docker-compose healthcheck keep working.",
+        "security": [],
         "responses": {
           "200": { "description": "Healthy" },
           "503": { "description": "Degraded" }
@@ -363,7 +857,8 @@
     "/livez": {
       "get": {
         "summary": "Liveness probe",
-        "description": "Answers 200 whenever the process can respond; checks no dependencies. Wire to livenessProbe.",
+        "description": "Answers 200 whenever the process can respond; checks no dependencies. Wire to livenessProbe. Exempt from authentication.",
+        "security": [],
         "responses": {
           "200": { "description": "Alive" }
         }
@@ -372,10 +867,28 @@
     "/readyz": {
       "get": {
         "summary": "Readiness probe",
-        "description": "Checks the database and the event source concurrently, bounded by a 3s timeout each, reporting per-dependency detail. Wire to readinessProbe.",
+        "description": "Checks the database and the event source concurrently, bounded by a 3s timeout each, reporting per-dependency detail. Wire to readinessProbe. Exempt from authentication, so its per-dependency detail is readable without a token — do not expose it to the public internet.",
+        "security": [],
         "responses": {
           "200": { "description": "Ready" },
           "503": { "description": "At least one dependency unhealthy" }
+        }
+      }
+    },
+    "/poller": {
+      "get": {
+        "summary": "Poller position and lag",
+        "description": "Reports the last successful poll position, chain tip, ledger lag, and whether the poller is currently backing off. Before the first successful poll, position fields are omitted and status is waiting. No configuration values are returned.",
+        "responses": {
+          "200": {
+            "description": "Poller status",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PollerStatus" }
+              }
+            }
+          },
+          "503": { "description": "Poller is not configured" }
         }
       }
     },
@@ -408,9 +921,284 @@
           }
         }
       }
+    },
+    "/stats/alerts-daily": {
+      "get": {
+        "summary": "Daily alert counts for the last 30 UTC days",
+        "description": "UTC calendar-day buckets, including explicit zeroes for quiet days. Days with no alerts are present so a chart has no gaps.",
+        "responses": {
+          "200": {
+            "description": "30-day UTC series",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["timezone", "days"],
+                  "properties": {
+                    "timezone": { "type": "string", "example": "UTC" },
+                    "days": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": ["day", "count"],
+                        "properties": {
+                          "day": { "type": "string", "format": "date", "description": "UTC calendar day (YYYY-MM-DD)" },
+                          "count": { "type": "integer", "format": "int64" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/audit": {
+      "get": {
+        "summary": "Audit log of configuration changes",
+        "description": "Append-only entries for monitor, rule and channel create, update and delete. diff records field names only, never values.",
+        "parameters": [
+          { "name": "target_type", "in": "query", "schema": { "type": "string", "enum": ["monitor", "rule", "channel"] } },
+          { "name": "target_id", "in": "query", "schema": { "type": "integer", "format": "int64" } },
+          { "name": "from", "in": "query", "schema": { "type": "string", "format": "date-time" } },
+          { "name": "to", "in": "query", "schema": { "type": "string", "format": "date-time" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit entries, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["entries"],
+                  "properties": {
+                    "entries": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": ["id", "actor", "action", "target_type", "target_id", "created_at"],
+                        "properties": {
+                          "id": { "type": "integer", "format": "int64" },
+                          "actor": { "type": "string" },
+                          "action": { "type": "string", "enum": ["create", "update", "delete"] },
+                          "target_type": { "type": "string", "enum": ["monitor", "rule", "channel"] },
+                          "target_id": { "type": "integer", "format": "int64" },
+                          "diff": { "type": "object" },
+                          "created_at": { "type": "string", "format": "date-time" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/templates": {
+      "post": {
+        "summary": "Create a monitor template",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MonitorTemplateInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MonitorTemplate" } } }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "get": {
+        "summary": "List monitor templates",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "templates": { "type": "array", "items": { "$ref": "#/components/schemas/MonitorTemplate" } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/templates/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/ID" }],
+      "get": {
+        "summary": "Get a monitor template",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MonitorTemplate" } } }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "patch": {
+        "summary": "Update a monitor template",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MonitorTemplateInput" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MonitorTemplate" } } }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "summary": "Delete a monitor template",
+        "description": "Existing monitors created from this template are unaffected.",
+        "responses": {
+          "204": { "description": "Deleted" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/templates/{id}/instantiate": {
+      "parameters": [{ "$ref": "#/components/parameters/ID" }],
+      "post": {
+        "summary": "Create a monitor from a template",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/InstantiateInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Monitor" } } }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/templates/{id}/instantiate/bulk": {
+      "parameters": [{ "$ref": "#/components/parameters/ID" }],
+      "post": {
+        "summary": "Bulk create monitors from a template",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["instances"],
+                "properties": {
+                  "instances": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": { "$ref": "#/components/schemas/InstantiateInput" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "created": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": { "type": "string" },
+                          "id": { "type": "integer", "format": "int64" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/monitors/import": {
+      "post": {
+        "summary": "Bulk import contracts from a file",
+        "description": "Accepts JSON or CSV (text/csv). Each contract ID creates one monitor. Validates all IDs before writing. Existing contracts are skipped.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ImportInput" }
+            },
+            "text/csv": {
+              "schema": { "type": "string", "description": "One contract ID per line" }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Monitor name prefix (CSV mode only, defaults to 'imported')"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Import results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "total": { "type": "integer" },
+                    "results": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/ImportRowResult" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
     }
   },
   "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "One of the static tokens from API_TOKEN (comma-separated to allow rotation). A dashboard session cookie from /login is accepted in the browser's own same-origin requests."
+      }
+    },
     "parameters": {
       "ID": {
         "name": "id",
@@ -420,6 +1208,12 @@
       },
       "RuleID": {
         "name": "ruleID",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "integer", "format": "int64" }
+      },
+      "ChannelID": {
+        "name": "channelID",
         "in": "path",
         "required": true,
         "schema": { "type": "integer", "format": "int64" }
@@ -451,6 +1245,25 @@
           "request_id": {
             "type": "string",
             "description": "Correlation ID, also on the X-Request-ID response header"
+          },
+          "details": {
+            "type": "array",
+            "description": "Field-level validation problems. Omitted when there are none so existing clients keep working. Each entry names a JSON path and why it failed; all problems in one request are listed together.",
+            "items": { "$ref": "#/components/schemas/ErrorDetail" }
+          }
+        }
+      },
+      "ErrorDetail": {
+        "type": "object",
+        "required": ["field", "reason"],
+        "properties": {
+          "field": {
+            "type": "string",
+            "description": "Dotted JSON path of the offending field, e.g. rules[0].params.min_amount"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Human-readable failure for that field"
           }
         }
       },
@@ -488,6 +1301,31 @@
           }
         }
       },
+      "BulkMonitorInput": {
+        "type": "object",
+        "required": ["ids", "enabled"],
+        "properties": {
+          "ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "items": { "type": "integer", "format": "int64" }
+          },
+          "enabled": { "type": "boolean" }
+        }
+      },
+      "BulkMonitorResult": {
+        "type": "object",
+        "required": ["updated", "unknown_ids", "enabled"],
+        "properties": {
+          "updated": { "type": "integer", "description": "How many existing monitors changed state" },
+          "unknown_ids": {
+            "type": "array",
+            "items": { "type": "integer", "format": "int64" }
+          },
+          "enabled": { "type": "boolean" }
+        }
+      },
       "Rule": {
         "type": "object",
         "properties": {
@@ -499,6 +1337,31 @@
           },
           "params": { "type": "object" },
           "enabled": { "type": "boolean" }
+        }
+      },
+      "Inhibition": {
+        "type": "object",
+        "properties": {
+          "source_rule_id": { "type": "integer", "format": "int64" },
+          "target_rule_id": { "type": "integer", "format": "int64" },
+          "firing_window_seconds": {
+            "type": "integer",
+            "description": "Source counts as firing with an alert inside this window"
+          },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "InhibitionInput": {
+        "type": "object",
+        "required": ["source_rule_id", "target_rule_id"],
+        "properties": {
+          "source_rule_id": { "type": "integer", "format": "int64" },
+          "target_rule_id": { "type": "integer", "format": "int64" },
+          "firing_window_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional; defaults to 300 when absent or non-positive"
+          }
         }
       },
       "RuleInput": {
@@ -542,7 +1405,45 @@
             "type": "object",
             "description": "Type-specific; the channel reference documents each"
           },
-          "enabled": { "type": "boolean", "default": true }
+          "enabled": { "type": "boolean", "default": true },
+          "digest_mode": {
+            "type": "string",
+            "enum": ["", "window"],
+            "default": "",
+            "description": "Empty delivers immediately; window batches into one summary per digest_window_seconds"
+          },
+          "digest_window_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Accumulation window when digest_mode is window; must be > 0 then"
+          }
+        }
+      },
+      "MonitorPage": {
+        "type": "object",
+        "properties": {
+          "monitors": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Monitor" }
+          },
+          "next_cursor": {
+            "type": "string",
+            "description": "Absent on the last page"
+          }
+        }
+      },
+      "ChannelPage": {
+        "type": "object",
+        "properties": {
+          "channels": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Channel" }
+          },
+          "next_cursor": {
+            "type": "string",
+            "description": "Absent on the last page"
+          }
         }
       },
       "AlertPage": {
@@ -590,6 +1491,144 @@
           "version": { "type": "string" },
           "commit": { "type": "string" },
           "build_date": { "type": "string" }
+        }
+      },
+      "PollerStatus": {
+        "type": "object",
+        "required": ["status", "backing_off"],
+        "properties": {
+          "status": { "type": "string", "enum": ["waiting", "ok"] },
+          "last_processed_ledger": { "type": "integer", "format": "int64" },
+          "latest_chain_ledger": { "type": "integer", "format": "int64" },
+          "ledger_lag": { "type": "integer", "format": "int64" },
+          "last_successful_poll": { "type": "string", "format": "date-time" },
+          "backing_off": { "type": "boolean" }
+        }
+      },
+      "MonitorTemplate": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "rules": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": { "type": "string" },
+                "params": { "type": "object" }
+              }
+            }
+          },
+          "channel_ids": { "type": "array", "items": { "type": "integer", "format": "int64" } },
+          "parameters": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "description": { "type": "string" },
+                "required": { "type": "boolean" },
+                "default": { "type": "string" }
+              }
+            }
+          },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "MonitorTemplateInput": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "rules": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": { "type": "string" },
+                "params": { "type": "object" }
+              }
+            }
+          },
+          "channel_ids": { "type": "array", "items": { "type": "integer", "format": "int64" } },
+          "parameters": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "description": { "type": "string" },
+                "required": { "type": "boolean" },
+                "default": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "InstantiateInput": {
+        "type": "object",
+        "required": ["name", "contract_ids"],
+        "properties": {
+          "name": { "type": "string" },
+          "contract_ids": { "type": "array", "items": { "type": "string" } },
+          "parameters": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          }
+        }
+      },
+      "ImportInput": {
+        "type": "object",
+        "required": ["name", "contract_ids"],
+        "properties": {
+          "name": { "type": "string", "description": "Monitor name prefix" },
+          "contract_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 500 },
+          "channel_ids": { "type": "array", "items": { "type": "integer", "format": "int64" } },
+          "enabled": { "type": "boolean", "default": true }
+        }
+      },
+      "ImportRowResult": {
+        "type": "object",
+        "properties": {
+          "row": { "type": "integer" },
+          "contract_id": { "type": "string" },
+          "monitor_id": { "type": "integer", "format": "int64" },
+          "status": { "type": "string", "enum": ["created", "skipped", "error"] },
+          "error": { "type": "string" }
+        }
+      },
+      "DryRunResult": {
+        "type": "object",
+        "required": ["count", "matches", "total_evaluated", "note"],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "description": "Number of historical events that matched the rule"
+          },
+          "matches": {
+            "type": "array",
+            "description": "Sample of matching events",
+            "items": {
+              "type": "object",
+              "properties": {
+                "event_id": { "type": "string" },
+                "contract_id": { "type": "string" },
+                "event_name": { "type": "string" },
+                "ledger": { "type": "integer", "format": "uint32" }
+              }
+            }
+          },
+          "total_evaluated": {
+            "type": "integer",
+            "description": "Total number of historical events evaluated"
+          },
+          "note": {
+            "type": "string",
+            "description": "Corpus bias and window documentation"
+          }
         }
       }
     }

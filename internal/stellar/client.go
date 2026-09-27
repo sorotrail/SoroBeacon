@@ -35,6 +35,25 @@ func (e *RPCError) Error() string {
 	return fmt.Sprintf("rpc error %d: %s", e.Code, e.Message)
 }
 
+// HTTPStatusError is a non-200 HTTP answer from an RPC endpoint. It is typed
+// rather than a plain string error so the failover client can tell the
+// endpoint's own failures (429, 5xx — worth trying elsewhere) from a
+// legitimate 4xx result, which every endpoint would answer the same way and
+// which therefore must not mark any of them unhealthy.
+//
+// Body is the truncated response body; RPC endpoints do not echo credentials,
+// and the client already limits it to keep a proxy's HTML error page from
+// filling the log line.
+type HTTPStatusError struct {
+	Method     string
+	StatusCode int
+	Body       string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("%s: unexpected status %d: %s", e.Method, e.StatusCode, e.Body)
+}
+
 // HTTPClient implements Client against a JSON-RPC 2.0 endpoint such as
 // https://soroban-testnet.stellar.org.
 type HTTPClient struct {
@@ -93,6 +112,28 @@ func (c *HTTPClient) GetEvents(ctx context.Context, req GetEventsRequest) (*GetE
 	return &res, nil
 }
 
+// GetLedgers calls the getLedgers method, which returns ledger identity
+// (hash, sequence) for a range. The poller uses it to track the hash of every
+// recently ingested ledger so a reorg that rewrites one shows up as a changed
+// hash rather than being silently ingested.
+func (c *HTTPClient) GetLedgers(ctx context.Context, req GetLedgersRequest) (*GetLedgersResult, error) {
+	if req.Pagination == nil || req.Pagination.Limit == 0 {
+		cursor := ""
+		if req.Pagination != nil {
+			cursor = req.Pagination.Cursor
+		}
+		req.Pagination = &Pagination{Cursor: cursor, Limit: DefaultLedgersLimit}
+	}
+	if req.Pagination.Cursor != "" {
+		req.StartLedger = 0
+	}
+	var res GetLedgersResult
+	if err := c.call(ctx, "getLedgers", req, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 func (c *HTTPClient) GetLatestLedger(ctx context.Context) (*LatestLedger, error) {
 	var res LatestLedger
 	if err := c.call(ctx, "getLatestLedger", struct{}{}, &res); err != nil {
@@ -115,6 +156,23 @@ func (c *HTTPClient) GetNetwork(ctx context.Context) (*Network, error) {
 		return nil, err
 	}
 	return &res, nil
+}
+
+// GetLedgerEntries calls getLedgerEntries with base64-encoded XDR LedgerKeys.
+// It backs the spec fetcher, which reads a contract's instance and Wasm code.
+// The RPC does not support xdrFormat here in the versions SoroBeacon targets,
+// so entries always come back as base64 XDR.
+func (c *HTTPClient) GetLedgerEntries(ctx context.Context, keys []string) ([]LedgerEntryResult, error) {
+	var res struct {
+		Entries      []LedgerEntryResult `json:"entries"`
+		LatestLedger uint32              `json:"latestLedger"`
+	}
+	if err := c.call(ctx, "getLedgerEntries", struct {
+		Keys []string `json:"keys"`
+	}{Keys: keys}, &res); err != nil {
+		return nil, err
+	}
+	return res.Entries, nil
 }
 
 func (c *HTTPClient) call(ctx context.Context, method string, params, result any) error {
@@ -145,7 +203,7 @@ func (c *HTTPClient) call(ctx context.Context, method string, params, result any
 		return fmt.Errorf("%s: read response: %w", method, err)
 	}
 	if httpRes.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s: unexpected status %d: %s", method, httpRes.StatusCode, truncate(string(raw), 200))
+		return &HTTPStatusError{Method: method, StatusCode: httpRes.StatusCode, Body: truncate(string(raw), 200)}
 	}
 
 	var envelope struct {
