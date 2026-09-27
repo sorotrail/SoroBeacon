@@ -1,9 +1,10 @@
 # Security policy
 
 SoroBeacon monitors Soroban contracts and delivers alerts. Its security
-posture is unusual and worth stating plainly: the API and dashboard are
-**unauthenticated by design** in the MVP, and the database holds channel
-secrets (webhook URLs, bot tokens, SMTP credentials) in plaintext.
+posture is unusual and worth stating plainly: with `API_TOKEN` unset the API
+and dashboard are **open to anyone who can reach the port**, and the database
+holds channel secrets (webhook URLs, bot tokens, SMTP credentials) in
+plaintext. Authentication is a single static token, not user accounts.
 
 ## Reporting a vulnerability
 
@@ -35,10 +36,20 @@ Out of scope:
 
 These are accepted risks with contributor issues, not surprises:
 
-- **No API authentication.** Run on a trusted network or behind a
-  reverse proxy with auth.
-- **Channel secrets stored unencrypted.** A database compromise yields
-  every channel credential. Encrypting at rest is an open issue.
+- **One static credential, all-or-nothing.** `API_TOKEN` gates `/api/v1`
+  and the dashboard sign-in; there are no accounts, no roles and no per-user
+  audit trail, and anyone holding a token can read and mutate everything.
+  Unset, the deployment is open. Set it, and keep the token out of tickets,
+  logs and shell history.
+- **Probes and metrics are unauthenticated.** `/health`, `/livez` and
+  `/readyz` are exempt so orchestrators keep working, and `/metrics` is served
+  outside the authenticated routers. Keep both off the public internet.
+- **Channel secrets are plaintext unless `CONFIG_ENCRYPTION_KEY` is set.**
+  With it set, `channels.config` is encrypted at rest and a database or
+  backup compromise yields ciphertext. Left unset — the default so existing
+  deployments upgrade safely — secrets are readable in the database and
+  backups. The key itself is a credential: losing it makes encrypted rows
+  unrecoverable, so back it up with the database.
 - **Channel secrets in `config` JSON** are never logged and never
   returned by the API, but they exist in the database and in the
   request body that created them.

@@ -77,23 +77,41 @@ func (TokenEvent) Validate(params json.RawMessage) error {
 	if err != nil {
 		return err
 	}
+	var details FieldErrors
 	if p.Event == "" {
-		return fmt.Errorf("token_event: event is required (transfer|mint|burn|clawback|set_admin|*)")
-	}
-	if p.Event != "*" {
+		details = append(details, FieldError{
+			Field:  "event",
+			Reason: "token_event: event is required (transfer|mint|burn|clawback|set_admin|*)",
+		})
+	} else if p.Event != "*" {
 		if _, ok := sep41Events[p.Event]; !ok {
-			return fmt.Errorf("token_event: unknown event %q (want transfer|mint|burn|clawback|set_admin|*)", p.Event)
+			details = append(details, FieldError{
+				Field:  "event",
+				Reason: fmt.Sprintf("token_event: unknown event %q (want transfer|mint|burn|clawback|set_admin|*)", p.Event),
+			})
 		}
 	}
 	if _, ok := new(big.Int).SetString(p.MinAmount, 10); p.MinAmount != "" && !ok {
-		return fmt.Errorf("token_event: min_amount %q is not a decimal integer", p.MinAmount)
+		details = append(details, FieldError{
+			Field:  "min_amount",
+			Reason: fmt.Sprintf("token_event: min_amount %q is not a decimal integer", p.MinAmount),
+		})
 	}
 	if _, ok := new(big.Int).SetString(p.MaxAmount, 10); p.MaxAmount != "" && !ok {
-		return fmt.Errorf("token_event: max_amount %q is not a decimal integer", p.MaxAmount)
+		details = append(details, FieldError{
+			Field:  "max_amount",
+			Reason: fmt.Sprintf("token_event: max_amount %q is not a decimal integer", p.MaxAmount),
+		})
 	}
 	// set_admin carries no value; amount filters on it can never match.
 	if p.Event == "set_admin" && (p.MinAmount != "" || p.MaxAmount != "") {
-		return fmt.Errorf("token_event: set_admin carries no amount; remove min_amount/max_amount")
+		details = append(details, FieldError{
+			Field:  "min_amount",
+			Reason: "token_event: set_admin carries no amount; remove min_amount/max_amount",
+		})
+	}
+	if len(details) > 0 {
+		return details
 	}
 	return nil
 }
@@ -185,6 +203,24 @@ func amount(value any) (*big.Int, bool) {
 func parseBig(s string) *big.Int {
 	n, _ := new(big.Int).SetString(s, 10)
 	return n
+}
+
+// EventNames reports the SEP-41 event this rule is scoped to. A wildcard
+// ("*") rule matches several events and reports them all; a rule with no
+// event at all matches none, which is invalid and cannot be narrowed.
+func (TokenEvent) EventNames(params json.RawMessage) ([]string, bool) {
+	p, err := parseTokenEvent(params)
+	if err != nil || p.Event == "" {
+		return nil, false
+	}
+	if p.Event == "*" {
+		names := make([]string, 0, len(sep41Events))
+		for name := range sep41Events {
+			names = append(names, name)
+		}
+		return names, true
+	}
+	return []string{p.Event}, true
 }
 
 func parseTokenEvent(params json.RawMessage) (tokenEventParams, error) {

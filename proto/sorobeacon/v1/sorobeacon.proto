@@ -1,0 +1,82 @@
+// SoroBeacon gRPC API — a focused subset of the REST API for machine-to-
+// machine communication and native streaming.
+//
+// Scope decision: this service covers read monitors, read alerts and stream
+// alerts. The write surface (create/update/delete) stays REST-only so there
+// is one source of truth for mutations. Streaming alerts is the part that
+// justifies gRPC: SSE covers browsers, this covers every other language.
+//
+// Generate Go stubs: make proto
+syntax = "proto3";
+
+package sorobeacon.v1;
+
+option go_package = "github.com/sorotrail/sorobeacon/internal/grpc/pb";
+
+import "google/protobuf/timestamp.proto";
+
+// MonitorService exposes read-only monitor and alert operations plus
+// a server-streaming subscription for live alerts.
+service MonitorService {
+  // GetMonitor returns a single monitor by ID.
+  rpc GetMonitor(GetMonitorRequest) returns (Monitor);
+
+  // ListMonitors returns the list of monitors.
+  rpc ListMonitors(ListMonitorsRequest) returns (ListMonitorsResponse);
+
+  // ListAlerts returns a page of alerts.
+  rpc ListAlerts(ListAlertsRequest) returns (ListAlertsResponse);
+
+  // StreamAlerts is a server-streaming RPC that pushes new alerts as they
+  // are created. The client supplies an optional monitor filter; the stream
+  // terminates cleanly on client disconnect.
+  rpc StreamAlerts(StreamAlertsRequest) returns (stream Alert);
+}
+
+message GetMonitorRequest {
+  int64 id = 1;
+}
+
+message ListMonitorsRequest {
+  bool enabled_only = 1;
+  int32 limit = 2;
+  int64 cursor = 3;
+}
+
+message ListMonitorsResponse {
+  repeated Monitor monitors = 1;
+}
+
+message Monitor {
+  int64 id = 1;
+  string name = 2;
+  repeated string contract_ids = 3;
+  bool enabled = 4;
+  google.protobuf.Timestamp created_at = 5;
+  repeated int64 channel_ids = 6;
+}
+
+message ListAlertsRequest {
+  int64 monitor_id = 1;
+  int64 rule_id = 2;
+  int32 limit = 3;
+  int64 cursor = 4;
+}
+
+message ListAlertsResponse {
+  repeated Alert alerts = 1;
+}
+
+message Alert {
+  int64 id = 1;
+  int64 monitor_id = 2;
+  int64 rule_id = 3;
+  string event_id = 4;
+  bytes payload = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+message StreamAlertsRequest {
+  // When set, only alerts for this monitor are streamed.
+  int64 monitor_id = 1;
+}

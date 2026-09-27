@@ -10,6 +10,17 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/poller"
 )
 
+// watch builds the poller's watch list from bare contract IDs. These tests
+// exercise the source's contract selection, not the topic filters, so no
+// Topics are set.
+func watch(ids ...string) []poller.Watch {
+	out := make([]poller.Watch, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, poller.Watch{ContractID: id})
+	}
+	return out
+}
+
 // stubSoroTrail serves scripted /events and /stats responses.
 type stubSoroTrail struct {
 	eventsJSON string
@@ -54,7 +65,7 @@ func TestSourceFetchEvents(t *testing.T) {
 	src := NewSource(NewClient(ts.URL, nil))
 
 	// First page: from_ledger applies, contract union passed through.
-	page, err := src.FetchEvents(context.Background(), 100, []string{"CA7QYNF7", "CB..."}, "", 50)
+	page, err := src.FetchEvents(context.Background(), 100, watch("CA7QYNF7", "CB..."), "", 50)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +99,7 @@ func TestSourceFetchEvents(t *testing.T) {
 
 	// Continuation: cursor passes through, from_ledger is not sent.
 	srv.eventsJSON = `{"events": []}`
-	if _, err := src.FetchEvents(context.Background(), 100, []string{"CA7QYNF7"}, "c2", 50); err != nil {
+	if _, err := src.FetchEvents(context.Background(), 100, watch("CA7QYNF7"), "c2", 50); err != nil {
 		t.Fatal(err)
 	}
 	if got, want := srv.lastQuery, "contract_id=CA7QYNF7&cursor=c2&limit=50"; got != want {
@@ -150,7 +161,7 @@ func TestSourceSkipsMalformedEvent(t *testing.T) {
 	defer ts.Close()
 
 	src := NewSource(NewClient(ts.URL, nil))
-	page, err := src.FetchEvents(context.Background(), 1, []string{"C"}, "", 50)
+	page, err := src.FetchEvents(context.Background(), 1, watch("C"), "", 50)
 	if err != nil {
 		t.Fatal(err)
 	}

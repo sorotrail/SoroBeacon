@@ -9,11 +9,15 @@ import (
 // discordConfig: {"webhook_url": "https://discord.com/api/webhooks/..."}
 type discordConfig struct {
 	WebhookURL string `json:"webhook_url"`
+	// Template optionally overrides the plain-text message; empty uses the
+	// shared default (see RenderText and docs/channels/templates.md).
+	Template string `json:"template,omitempty"`
 }
 
 // Discord posts alerts to a Discord webhook.
 type Discord struct {
 	cfg discordConfig
+	tpl channelTemplate
 }
 
 // NewDiscord builds a Discord notifier from channel config.
@@ -25,11 +29,15 @@ func NewDiscord(config json.RawMessage) (Notifier, error) {
 	if cfg.WebhookURL == "" {
 		return nil, fmt.Errorf("discord: webhook_url is required")
 	}
-	return &Discord{cfg: cfg}, nil
+	tpl, err := parseChannelTemplate(cfg.Template)
+	if err != nil {
+		return nil, fmt.Errorf("discord: %w", err)
+	}
+	return &Discord{cfg: cfg, tpl: tpl}, nil
 }
 
 func (d *Discord) Send(ctx context.Context, a Alert) error {
-	msg, err := RenderText(a)
+	msg, err := d.tpl.render(a)
 	if err != nil {
 		return err
 	}

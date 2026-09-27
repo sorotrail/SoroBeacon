@@ -32,8 +32,9 @@ curl -s -X POST localhost:8080/api/v1/channels/4/test
 | `from` | yes | Sender address. |
 | `to` | yes | List of recipient addresses. |
 | `subject_prefix` | no | Prepended to the subject verbatim when set (e.g. `"[PROD] "` — include the trailing space if you want one). Empty by default. |
+| `template` | no | Go `text/template` overriding the message **body**. See [Message templates](templates.md). |
 
-The subject line is `<subject_prefix>SoroBeacon alert: <monitor name>`; the body is the standard alert summary.
+The subject line is `<subject_prefix>SoroBeacon alert: <monitor name>`; without a `template` the body is the standard alert summary.
 
 {% hint style="info" %}
 For Gmail/Google Workspace use an **app password**, not the account password.

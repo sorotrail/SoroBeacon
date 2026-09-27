@@ -1,6 +1,7 @@
 package stellar
 
 import (
+	"context"
 	"encoding/json"
 	"math/big"
 	"testing"
@@ -40,7 +41,7 @@ func TestDecodeEventFromXDR(t *testing.T) {
 		Value: mustB64(t, i128Val(1, 5)), // 2^64 + 5
 	}
 
-	decoded, err := DefaultDecoder{}.DecodeEvent(ev)
+	decoded, err := DefaultDecoder{}.DecodeEvent(context.Background(), ev)
 	require.NoError(t, err)
 	assert.Equal(t, "transfer", decoded.EventName())
 	require.Len(t, decoded.Topics, 2)
@@ -61,7 +62,7 @@ func TestDecodeEventPrefersJSON(t *testing.T) {
 		// Base64 fields present too; JSON must win.
 		Topic: []string{"ignored"},
 	}
-	decoded, err := DefaultDecoder{}.DecodeEvent(ev)
+	decoded, err := DefaultDecoder{}.DecodeEvent(context.Background(), ev)
 	require.NoError(t, err)
 	assert.Equal(t, "transfer", decoded.EventName())
 

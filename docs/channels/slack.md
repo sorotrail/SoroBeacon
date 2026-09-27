@@ -26,5 +26,6 @@ curl -s -X POST localhost:8080/api/v1/channels/2/test
 | Key | Required | Description |
 | --- | --- | --- |
 | `webhook_url` | yes | Slack incoming webhook URL. Treated as a secret. |
+| `template` | no | Go `text/template` overriding the message — e.g. to add an `@here` mention. See [Message templates](templates.md). |
 
-Messages use the same plain-text alert summary as every chat channel (see [Discord](discord.md) for a sample).
+Without a `template`, messages use the same plain-text alert summary as every chat channel (see [Discord](discord.md) for a sample).

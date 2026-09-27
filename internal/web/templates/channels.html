@@ -1,23 +1,36 @@
 {{define "content"}}
 <h1>Channels</h1>
+{{if eq .Empty "no_channels"}}
+<section class="empty">
+  <h2>No notification channels yet</h2>
+  <p>When a rule matches, SoroBeacon delivers the alert through a channel. Add Discord, Slack, Telegram, email, or a webhook using the form below.</p>
+  {{if .HasMonitors}}
+  <p>A monitor is already in place — attach the new channel on the monitor page so alerts have somewhere to go.</p>
+  <p><a href="/monitors">Open monitors</a></p>
+  {{end}}
+</section>
+{{end}}
 {{if .Channels}}
 <table>
-  <tr><th>ID</th><th>Name</th><th>Type</th><th>Status</th><th></th></tr>
+  <tr><th>ID</th><th>Name</th><th>Type</th><th>Min Severity</th><th>Status</th><th>Created</th><th></th></tr>
   {{range .Channels}}
   <tr>
     <td>{{.ID}}</td>
     <td>{{.Name}}</td>
     <td>{{.Type}}</td>
+    <td>{{if .MinSeverity}}<span class="pill {{severityClass .MinSeverity}}">{{.MinSeverity}}</span>{{else}}all{{end}}</td>
     <td>{{if .Enabled}}<span class="pill on">enabled</span>{{else}}<span class="pill off">disabled</span>{{end}}</td>
+    <td>{{formatTime .CreatedAt $.Timezone}}{{with relTime .CreatedAt}} <span class="muted">({{.}})</span>{{end}}</td>
     <td>
       <button hx-post="/channels/{{.ID}}/test" hx-target="#test-result-{{.ID}}" hx-swap="innerHTML">Send test</button>
       <span id="test-result-{{.ID}}" class="muted" aria-live="polite"></span>
       <form class="inline" method="post" action="/channels/{{.ID}}/delete"
-            onsubmit="return confirm('Delete channel {{.Name}}?')"><button>Delete</button></form>
+        ><button>Delete</button></form>
     </td>
   </tr>
   {{end}}
 </table>
+{{if .NextCursor}}<p><a href="/channels?cursor={{.NextCursor}}">Older →</a></p>{{end}}
 {{else}}<p class="muted">No channels yet — create one below.</p>{{end}}
 
 <fieldset>
@@ -31,6 +44,13 @@
     </select>
     <label for="config">Config (JSON — secrets are stored, never displayed)</label>
     <textarea id="config" name="config" rows="4">{"webhook_url": "https://..."}</textarea>
+    <label for="min_severity">Min severity</label>
+    <select id="min_severity" name="min_severity">
+      <option value="">All severities</option>
+      <option value="info">Info</option>
+      <option value="warning">Warning</option>
+      <option value="critical">Critical</option>
+    </select>
     <p><button>Create</button></p>
   </form>
 </fieldset>
