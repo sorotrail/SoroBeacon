@@ -12,11 +12,15 @@ type telegramConfig struct {
 	ChatID   string `json:"chat_id"`
 	// APIBase overrides https://api.telegram.org, mainly for tests.
 	APIBase string `json:"api_base,omitempty"`
+	// Template optionally overrides the plain-text message; empty uses the
+	// shared default (see RenderText and docs/channels/templates.md).
+	Template string `json:"template,omitempty"`
 }
 
 // Telegram sends alerts via the Telegram Bot API (sendMessage).
 type Telegram struct {
 	cfg telegramConfig
+	tpl channelTemplate
 }
 
 // NewTelegram builds a Telegram notifier from channel config.
@@ -31,11 +35,15 @@ func NewTelegram(config json.RawMessage) (Notifier, error) {
 	if cfg.APIBase == "" {
 		cfg.APIBase = "https://api.telegram.org"
 	}
-	return &Telegram{cfg: cfg}, nil
+	tpl, err := parseChannelTemplate(cfg.Template)
+	if err != nil {
+		return nil, fmt.Errorf("telegram: %w", err)
+	}
+	return &Telegram{cfg: cfg, tpl: tpl}, nil
 }
 
 func (t *Telegram) Send(ctx context.Context, a Alert) error {
-	msg, err := RenderText(a)
+	msg, err := t.tpl.render(a)
 	if err != nil {
 		return err
 	}

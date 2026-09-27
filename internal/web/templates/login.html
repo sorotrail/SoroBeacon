@@ -1,0 +1,11 @@
+{{define "content"}}
+<h1>Sign in</h1>
+{{if .Error}}<p><span class="pill off">{{.Error}}</span></p>{{end}}
+<form method="post" action="/login">
+  <input type="hidden" name="next" value="{{.Next}}">
+  <label for="token">API token</label>
+  <input type="password" id="token" name="token" autocomplete="current-password" required autofocus>
+  <p><button type="submit">Sign in</button></p>
+</form>
+<p class="muted">Sign in with one of the tokens configured in <code>API_TOKEN</code>. There are no separate dashboard accounts: the session lasts {{.SessionHours}} hours and ends when SoroBeacon restarts.</p>
+{{end}}

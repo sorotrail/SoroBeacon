@@ -26,10 +26,12 @@ curl -s -X POST localhost:8080/api/v1/channels/1/test
 | Key | Required | Description |
 | --- | --- | --- |
 | `webhook_url` | yes | Discord incoming webhook URL. Treated as a secret. |
+| `template` | no | Go `text/template` overriding the message. See [Message templates](templates.md). |
 
 ## Message format
 
-Plain-text summary rendered from the shared alert template:
+Plain-text summary rendered from the shared alert template (override it with
+[`template`](templates.md)):
 
 ```
 🔔 SoroBeacon alert: Token treasury

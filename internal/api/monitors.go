@@ -1,23 +1,29 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
-// validContractIDs rejects malformed contract addresses up front: the RPC
+// contractIDDetails rejects malformed contract addresses up front: the RPC
 // refuses the entire getEvents request if any filter contains one, which
-// would stall ingestion for every monitor.
-func validContractIDs(w http.ResponseWriter, r *http.Request, ids []string) bool {
-	for _, id := range ids {
+// would stall ingestion for every monitor. Each bad ID is a separate
+// detail so a monitor with several typos is not a round-trip per typo.
+func contractIDDetails(ids []string) []FieldError {
+	var details []FieldError
+	for i, id := range ids {
 		if !stellar.IsValidContractID(id) {
-			writeErr(w, r, http.StatusBadRequest, "invalid contract id: "+id)
-			return false
+			details = append(details, FieldError{
+				Field:  fmt.Sprintf("contract_ids[%d]", i),
+				Reason: "invalid contract id: " + id,
+			})
 		}
 	}
-	return true
+	return details
 }
 
 type monitorRequest struct {
@@ -25,6 +31,23 @@ type monitorRequest struct {
 	ContractIDs *[]string `json:"contract_ids"`
 	Enabled     *bool     `json:"enabled"`
 	ChannelIDs  *[]int64  `json:"channel_ids"`
+	// Priority is "low", "normal" or "high". Omitted means normal, so a
+	// client that predates priorities creates a middle-tier monitor.
+	Priority *string `json:"priority"`
+}
+
+// priorityDetail validates an optional priority, returning a FieldError for an
+// unknown tier and the parsed value otherwise. Rejecting unknown values keeps
+// the scheduler's tier set closed rather than silently defaulting a typo.
+func priorityDetail(raw *string) (store.Priority, *FieldError) {
+	if raw == nil {
+		return "", nil
+	}
+	p, ok := store.ParsePriority(*raw)
+	if !ok {
+		return "", &FieldError{Field: "priority", Reason: `must be one of "low", "normal", "high"`}
+	}
+	return p, nil
 }
 
 func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
@@ -32,21 +55,28 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
+	var details []FieldError
 	if req.Name == nil || *req.Name == "" {
-		writeErr(w, r, http.StatusBadRequest, "name is required")
-		return
+		details = append(details, FieldError{Field: "name", Reason: "name is required"})
 	}
 	if req.ContractIDs == nil || len(*req.ContractIDs) == 0 {
-		writeErr(w, r, http.StatusBadRequest, "contract_ids is required")
-		return
+		details = append(details, FieldError{Field: "contract_ids", Reason: "contract_ids is required"})
+	} else {
+		details = append(details, contractIDDetails(*req.ContractIDs)...)
 	}
-	if !validContractIDs(w, r, *req.ContractIDs) {
+	priority, perr := priorityDetail(req.Priority)
+	if perr != nil {
+		details = append(details, *perr)
+	}
+	if len(details) > 0 {
+		writeValidation(w, r, details)
 		return
 	}
 	m := store.Monitor{
 		Name:        *req.Name,
 		ContractIDs: *req.ContractIDs,
 		Enabled:     req.Enabled == nil || *req.Enabled,
+		Priority:    priority.Normalized(),
 	}
 	if err := s.store.CreateMonitor(r.Context(), &m); err != nil {
 		s.fail(w, r, err)
@@ -63,7 +93,11 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listMonitors(w http.ResponseWriter, r *http.Request) {
-	monitors, err := s.store.ListMonitors(r.Context(), r.URL.Query().Get("enabled") == "true")
+	f, ok := parseListFilter(w, r)
+	if !ok {
+		return
+	}
+	monitors, err := s.store.ListMonitorsPage(r.Context(), f)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -71,7 +105,11 @@ func (s *Server) listMonitors(w http.ResponseWriter, r *http.Request) {
 	if monitors == nil {
 		monitors = []store.Monitor{}
 	}
-	writeJSON(w, http.StatusOK, monitors)
+	next := ""
+	if len(monitors) == effectivePageLimit(f.Limit) {
+		next = strconv.FormatInt(monitors[len(monitors)-1].ID, 10)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"monitors": monitors, "next_cursor": next})
 }
 
 func (s *Server) getMonitor(w http.ResponseWriter, r *http.Request) {
@@ -103,14 +141,33 @@ func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
+	var details []FieldError
 	if req.Name != nil {
-		m.Name = *req.Name
+		if *req.Name == "" {
+			details = append(details, FieldError{Field: "name", Reason: "name is required"})
+		} else {
+			m.Name = *req.Name
+		}
 	}
 	if req.ContractIDs != nil {
-		if !validContractIDs(w, r, *req.ContractIDs) {
-			return
+		if len(*req.ContractIDs) == 0 {
+			details = append(details, FieldError{Field: "contract_ids", Reason: "contract_ids is required"})
+		} else {
+			ids := contractIDDetails(*req.ContractIDs)
+			details = append(details, ids...)
+			if len(ids) == 0 {
+				m.ContractIDs = *req.ContractIDs
+			}
 		}
-		m.ContractIDs = *req.ContractIDs
+	}
+	if priority, perr := priorityDetail(req.Priority); perr != nil {
+		details = append(details, *perr)
+	} else if req.Priority != nil {
+		m.Priority = priority
+	}
+	if len(details) > 0 {
+		writeValidation(w, r, details)
+		return
 	}
 	if req.Enabled != nil {
 		m.Enabled = *req.Enabled
@@ -129,6 +186,52 @@ func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, m)
 }
 
+// maxBulkMonitors is the documented ceiling on POST /monitors/bulk. A
+// planned pause should never need more than this in one shot; a larger
+// body is almost certainly an unbounded script. There is no "all
+// monitors" shorthand on purpose — an accidental global disable is
+// exactly the failure this endpoint must not enable.
+const maxBulkMonitors = 100
+
+type bulkMonitorRequest struct {
+	IDs     []int64 `json:"ids"`
+	Enabled *bool   `json:"enabled"`
+}
+
+func (s *Server) bulkMonitors(w http.ResponseWriter, r *http.Request) {
+	var req bulkMonitorRequest
+	if !readJSON(w, r, &req) {
+		return
+	}
+	var details []FieldError
+	if len(req.IDs) == 0 {
+		details = append(details, FieldError{Field: "ids", Reason: "must not be empty"})
+	}
+	if len(req.IDs) > maxBulkMonitors {
+		details = append(details, FieldError{Field: "ids", Reason: "at most 100 monitors per request"})
+	}
+	if req.Enabled == nil {
+		details = append(details, FieldError{Field: "enabled", Reason: "enabled is required"})
+	}
+	if len(details) > 0 {
+		writeValidation(w, r, details)
+		return
+	}
+	updated, unknown, err := s.store.SetMonitorsEnabled(r.Context(), req.IDs, *req.Enabled)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if unknown == nil {
+		unknown = []int64{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"updated":     updated,
+		"unknown_ids": unknown,
+		"enabled":     *req.Enabled,
+	})
+}
+
 func (s *Server) deleteMonitor(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
@@ -139,5 +242,19 @@ func (s *Server) deleteMonitor(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeNoContent(w)
+}
+
+func (s *Server) duplicateMonitor(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
+		return
+	}
+	m, err := s.store.DuplicateMonitor(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, m)
 }
