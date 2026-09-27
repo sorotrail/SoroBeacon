@@ -1,0 +1,62 @@
+{{define "content"}}
+<h1>Saved Searches</h1>
+{{if .Searches}}
+<table>
+  <tr><th>Name</th><th>Filters</th><th>Default</th><th></th></tr>
+  {{range .Searches}}
+  <tr>
+    <td>{{.Name}}</td>
+    <td class="muted">
+      {{if .Filter.MonitorID}}monitor={{.Filter.MonitorID}} {{end}}
+      {{if .Filter.RuleID}}rule={{.Filter.RuleID}} {{end}}
+      {{if .Filter.ContractID}}contract={{.Filter.ContractID}} {{end}}
+      {{if .Filter.Sort}}sort={{.Filter.Sort}}{{end}}
+    </td>
+    <td>{{if .IsDefault}}<span class="pill on">default</span>{{end}}</td>
+    <td>
+      <form class="inline" method="get" action="/alerts">
+        {{if .Filter.MonitorID}}<input type="hidden" name="monitor_id" value="{{.Filter.MonitorID}}">{{end}}
+        {{if .Filter.RuleID}}<input type="hidden" name="rule_id" value="{{.Filter.RuleID}}">{{end}}
+        {{if .Filter.ContractID}}<input type="hidden" name="contract_id" value="{{.Filter.ContractID}}">{{end}}
+        {{if .Filter.Sort}}<input type="hidden" name="sort" value="{{.Filter.Sort}}">{{end}}
+        <button>Apply</button>
+      </form>
+      {{if not .IsDefault}}
+      <form class="inline" method="post" action="/searches/{{.ID}}/default"><button>Set default</button></form>
+      {{else}}
+      <form class="inline" method="post" action="/searches/{{.ID}}/undefault"><button>Unset default</button></form>
+      {{end}}
+      <form class="inline" method="post" action="/searches/{{.ID}}/delete"
+            onsubmit="return confirm('Delete saved search {{.Name}}?')"><button>Delete</button></form>
+    </td>
+  </tr>
+  {{end}}
+</table>
+{{else}}<p class="muted">No saved searches yet. Save a filter combination from the <a href="/alerts">alerts page</a>.</p>{{end}}
+
+<fieldset>
+  <legend>Save current filter</legend>
+  <form method="post" action="/searches">
+    <label for="search_name">Name</label>
+    <input type="text" id="search_name" name="name" required placeholder="Morning check">
+    <label for="search_monitor_id">Monitor</label>
+    <select id="search_monitor_id" name="monitor_id">
+      <option value="">All monitors</option>
+      {{range .Monitors}}
+      <option value="{{.ID}}">{{.Name}}</option>
+      {{end}}
+    </select>
+    <label for="search_rule_id">Rule ID</label>
+    <input type="number" id="search_rule_id" name="rule_id" min="1" placeholder="optional">
+    <label for="search_contract_id">Contract ID</label>
+    <input type="text" id="search_contract_id" name="contract_id" placeholder="optional">
+    <label for="search_sort">Sort</label>
+    <select id="search_sort" name="sort">
+      <option value="created_at_desc">Newest</option>
+      <option value="created_at_asc">Oldest</option>
+    </select>
+    <label><input type="checkbox" name="is_default" value="true"> Set as default</label>
+    <p><button>Save search</button></p>
+  </form>
+</fieldset>
+{{end}}

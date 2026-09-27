@@ -1,6 +1,7 @@
 package stellar
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -19,16 +20,19 @@ import (
 //
 // Contributors: to change how events are decoded (e.g. contract-spec-aware
 // decoding into named fields), implement this interface and wire it into the
-// poller in cmd/sorobeacon.
+// poller in cmd/sorobeacon. SpecDecoder is the built-in example: it wraps
+// another Decoder and adds DecodedEvent.Fields from the contract's spec.
 type Decoder interface {
-	DecodeEvent(ev Event) (*DecodedEvent, error)
+	// DecodeEvent decodes one event. ctx bounds any lookup the decoder needs
+	// (SpecDecoder uses it to fetch a contract's spec).
+	DecodeEvent(ctx context.Context, ev Event) (*DecodedEvent, error)
 }
 
 // DefaultDecoder prefers the RPC's xdrFormat:"json" fields when present and
 // falls back to decoding base64 XDR ScVals via the Stellar SDK.
 type DefaultDecoder struct{}
 
-func (DefaultDecoder) DecodeEvent(ev Event) (*DecodedEvent, error) {
+func (DefaultDecoder) DecodeEvent(_ context.Context, ev Event) (*DecodedEvent, error) {
 	out := &DecodedEvent{
 		ID:             ev.ID,
 		ContractID:     ev.ContractID,

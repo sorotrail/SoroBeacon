@@ -7,21 +7,69 @@
   <div class="stat"><b>{{.Stats.AlertsLast24}}</b> alerts (24h)</div>
   <div class="stat"><b>{{.Stats.LastLedger}}</b> last ledger</div>
 </div>
-<p class="muted">Last poll checkpoint: {{.Stats.LastPollAt.Format "2006-01-02 15:04:05 MST"}}</p>
+<p class="muted">Last poll checkpoint: {{formatTime .Stats.LastPollAt .Timezone}}{{with relTime .Stats.LastPollAt}} <span class="muted">({{.}})</span>{{end}}</p>
+<section class="alert-chart">
+  <h2>Alerts over time</h2>
+  {{if .AlertChart}}
+  {{.AlertChart}}
+  <p class="muted">Daily alert counts for the last 30 days. Buckets are UTC.</p>
+  {{else}}
+  <div class="empty">
+    <h2>No alerts in the last 30 days</h2>
+    <p>The series is empty rather than a flat axis, so a quiet period is not mistaken for a missing chart. Buckets are UTC.</p>
+  </div>
+  {{end}}
+</section>
+{{if .Poller}}
+<div class="stats">
+  <div class="stat"><b>{{.Poller.Lag}}</b> ledger lag</div>
+  <div class="stat"><b>{{.Poller.LastProcessedLedger}}</b> processed</div>
+  <div class="stat"><b>{{.Poller.LatestChainLedger}}</b> chain tip</div>
+</div>
+<p class="muted">Last successful poll: {{formatTime .Poller.LastSuccessfulPoll .Timezone}}</p>
+{{else}}
+<p class="muted">Poller lag: waiting for the first successful poll.</p>
+{{end}}
 
-<h2>Recent alerts</h2>
+{{if eq .Empty "no_monitors"}}
+<section class="empty">
+  <h2>Nothing is being watched yet</h2>
+  <p>Create a monitor for a Soroban contract to start matching on-chain events.</p>
+  <p><a href="/monitors">Create a monitor</a></p>
+</section>
+{{else if eq .Empty "monitors_disabled"}}
+<section class="empty">
+  <h2>All monitors are disabled</h2>
+  <p>Enable a monitor to start matching events. Disabled monitors keep their rules but do not fire.</p>
+  <p><a href="/monitors">Enable a monitor</a></p>
+</section>
+{{else if eq .Empty "no_channels"}}
+<section class="empty">
+  <h2>Monitors are watching, but alerts have nowhere to go</h2>
+  <p>Add a notification channel so a match can actually reach you.</p>
+  <p><a href="/channels">Add a channel</a></p>
+</section>
+{{else if eq .Empty "no_alerts"}}
+<section class="empty">
+  <h2>No alerts yet — that's expected</h2>
+  <p>Alerts only appear for events that occur after a monitor was created. An empty list here is healthy, not broken.</p>
+  <p><a href="/monitors">Review monitors</a></p>
+</section>
+{{end}}
+
 {{if .Alerts}}
+<h2>Recent alerts</h2>
 <table>
   <tr><th>ID</th><th>Monitor</th><th>Rule</th><th>Event</th><th>At</th></tr>
   {{range .Alerts}}
   <tr>
-    <td>{{.ID}}</td>
+    <td><a href="/alerts/{{.ID}}">{{.ID}}</a></td>
     <td>{{index $.MonitorNames .MonitorID}}</td>
     <td>#{{.RuleID}}</td>
-    <td><code>{{.EventID}}</code></td>
-    <td>{{.CreatedAt.Format "2006-01-02 15:04:05"}}</td>
+    <td>{{template "copyID" .EventID}}</td>
+    <td>{{formatTime .CreatedAt $.Timezone}}{{with relTime .CreatedAt}} <span class="muted">({{.}})</span>{{end}}</td>
   </tr>
   {{end}}
 </table>
-{{else}}<p class="muted">No alerts yet.</p>{{end}}
+{{end}}
 {{end}}
