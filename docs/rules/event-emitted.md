@@ -17,6 +17,7 @@ Matches when a contract emits an event — by name, by exact topic values, or bo
 | --- | --- | --- |
 | `event_name` | one of the two | Matches the event's **first topic** (the event name, by Soroban convention). |
 | `topic_equals` | one of the two | Map of topic **index** → expected value. Index `0` is the event name; user topics start at `1`. All entries must match. |
+| `cooldown` | no | Suppress repeat alerts from this rule for a window, e.g. `"5m"`. See [Rule cooldown](cooldown.md). |
 
 At least one of the two fields must be set. The contract itself is not part of the params — the monitor already scopes which contracts are watched.
 

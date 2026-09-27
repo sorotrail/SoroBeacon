@@ -182,6 +182,54 @@ func TestValueThreshold(t *testing.T) {
 			want:   false,
 		},
 		{
+			// With a contract spec, value_path addresses the spec's named
+			// fields rather than the raw positional value.
+			name:   "value_path addresses named spec fields",
+			params: `{"comparison": "gt", "threshold": 100, "value_path": "amount"}`,
+			event: &stellar.DecodedEvent{
+				Topics: []any{"transfer", "GFROM", "GTO"},
+				Value:  map[string]any{"amount": big.NewInt(5)},
+				Fields: map[string]any{"from": "GFROM", "to": "GTO", "amount": big.NewInt(500)},
+			},
+			want: true,
+		},
+		{
+			// A named topic-located parameter is addressable too.
+			name:   "value_path addresses a named topic parameter",
+			params: `{"comparison": "gte", "threshold": 500, "value_path": "amount"}`,
+			event: &stellar.DecodedEvent{
+				Topics: []any{"transfer", "GFROM", "GTO"},
+				Value:  big.NewInt(1),
+				Fields: map[string]any{"from": "GFROM", "to": "GTO", "amount": big.NewInt(500)},
+			},
+			want: true,
+		},
+		{
+			// A rule that predates the spec (no value_path) must keep
+			// matching the raw value even when the contract now exports a
+			// spec, otherwise making a contract spec-aware would silently
+			// stop existing alerts from firing.
+			name:   "bare value still matches when a spec is present",
+			params: `{"comparison": "gte", "threshold": 10}`,
+			event: &stellar.DecodedEvent{
+				Value:  big.NewInt(10),
+				Fields: map[string]any{"admin": "GADMIN"},
+			},
+			want: true,
+		},
+		{
+			// Named fields win when the path resolves there, but a path the
+			// spec does not name falls back to the raw value so a positional
+			// rule keeps working.
+			name:   "unmapped path falls back to the raw value",
+			params: `{"comparison": "gt", "threshold": 1, "value_path": "amount"}`,
+			event: &stellar.DecodedEvent{
+				Value:  map[string]any{"amount": big.NewInt(50)},
+				Fields: map[string]any{"admin": "GADMIN"},
+			},
+			want: true,
+		},
+		{
 			name:    "invalid comparison errors",
 			params:  `{"comparison": "wat", "threshold": 1}`,
 			event:   transferEvent(50),
@@ -211,7 +259,7 @@ func TestValueThresholdValidate(t *testing.T) {
 
 func TestRegistry(t *testing.T) {
 	r := NewRegistry()
-	assert.ElementsMatch(t, []string{TypeEventEmitted, TypeValueThreshold, TypeTokenEvent}, r.Types())
+	assert.ElementsMatch(t, []string{TypeEventEmitted, TypeValueThreshold, TypeTokenEvent, TypeFrequencyThreshold, TypeTopicRegex, TypeAddressWatchlist, TypeTopicPosition}, r.Types())
 
 	_, err := r.Evaluate(context.Background(), "unknown", transferEvent(1), json.RawMessage(`{}`))
 	assert.Error(t, err)
@@ -228,4 +276,66 @@ func mustBig(s string) *big.Int {
 		panic("bad big.Int literal " + s)
 	}
 	return v
+}
+
+// Benchmarks use the same decoded transfer events as the table tests so the
+// numbers reflect the real hot path (JSON params + a populated DecodedEvent),
+// not empty structs. Matching and non-matching cases are both measured: the
+// non-matching path is what the poller hits for most (rule, event) pairs.
+func BenchmarkEventEmitted(b *testing.B) {
+	ev := transferEvent(5)
+	e := EventEmitted{}
+	ctx := context.Background()
+	cases := []struct {
+		name  string
+		want  bool
+		param json.RawMessage
+	}{
+		{name: "match", want: true, param: json.RawMessage(`{"event_name":"transfer"}`)},
+		{name: "nomatch", want: false, param: json.RawMessage(`{"event_name":"mint"}`)},
+	}
+	for _, tt := range cases {
+		b.Run(tt.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				got, err := e.Evaluate(ctx, ev, tt.param)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if got != tt.want {
+					b.Fatalf("got %v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkValueThreshold(b *testing.B) {
+	matchEv := transferEvent(101)
+	missEv := transferEvent(100)
+	v := ValueThreshold{}
+	ctx := context.Background()
+	params := json.RawMessage(`{"comparison":"gt","threshold":100,"value_path":"amount"}`)
+	cases := []struct {
+		name string
+		ev   *stellar.DecodedEvent
+		want bool
+	}{
+		{name: "match", ev: matchEv, want: true},
+		{name: "nomatch", ev: missEv, want: false},
+	}
+	for _, tt := range cases {
+		b.Run(tt.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				got, err := v.Evaluate(ctx, tt.ev, params)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if got != tt.want {
+					b.Fatalf("got %v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
 }

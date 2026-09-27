@@ -9,10 +9,21 @@ services:
       POLL_INTERVAL: ${POLL_INTERVAL:-5s}
       HTTP_ADDR: ":8080"
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Optional. Left empty the quickstart stays open on localhost; set it in
+      # your shell or a .env file to put both the API and the dashboard behind
+      # a bearer token. The container healthcheck reads /api/v1/health, which
+      # is exempt from authentication, so it keeps working either way.
+      API_TOKEN: ${API_TOKEN:-}
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/api/v1/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
 
   postgres:
     image: postgres:16-alpine

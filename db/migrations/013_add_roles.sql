@@ -1,0 +1,7 @@
+-- +goose Up
+ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'admin';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'admin';
+
+-- +goose Down
+ALTER TABLE api_tokens DROP COLUMN IF EXISTS role;
+ALTER TABLE sessions DROP COLUMN IF EXISTS role;
