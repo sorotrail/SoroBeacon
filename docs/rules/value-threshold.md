@@ -19,6 +19,14 @@ Matches when a numeric value in an event's **data** crosses a threshold — "ale
 | `threshold` | yes | A JSON number, or a **string** for integers beyond 53 bits (Soroban's `i128`/`u128` amounts routinely are). |
 | `value_path` | no | Dot path into the event value: map keys and array indexes, e.g. `amount`, `price.numerator`, `0`. Omit when the value itself is the number. |
 | `event_name` | no | Only consider events with this name (first topic). |
+| `cooldown` | no | Suppress repeat alerts from this rule for a window, e.g. `"5m"`. See [Rule cooldown](cooldown.md). |
+
+When the contract exports a SEP-0048 spec, `value_path` first addresses the
+spec's **named fields** (both topic-located and data-located parameters, e.g.
+`amount`, `from`), so a rule can be written from the contract's documentation
+instead of counting topic positions. A path the spec does not name — and an
+omitted `value_path` — still falls back to the raw positional value, so rules
+written before the spec was available keep working.
 
 ## Matching semantics
 

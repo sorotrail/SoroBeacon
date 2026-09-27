@@ -30,11 +30,16 @@ type emailConfig struct {
 	// default, which leaves the subject exactly as before this option
 	// existed.
 	SubjectPrefix string `json:"subject_prefix"`
+	// Template optionally overrides the plain-text *body*; empty uses the
+	// shared default (see RenderText and docs/channels/templates.md). The
+	// subject is built separately from SubjectPrefix.
+	Template string `json:"template,omitempty"`
 }
 
 // Email sends alerts over SMTP (STARTTLS via net/smtp when offered).
 type Email struct {
 	cfg emailConfig
+	tpl channelTemplate
 }
 
 // NewEmail builds an Email notifier from channel config.
@@ -49,7 +54,11 @@ func NewEmail(config json.RawMessage) (Notifier, error) {
 	if cfg.Port == 0 {
 		cfg.Port = 587
 	}
-	return &Email{cfg: cfg}, nil
+	tpl, err := parseChannelTemplate(cfg.Template)
+	if err != nil {
+		return nil, fmt.Errorf("email: %w", err)
+	}
+	return &Email{cfg: cfg, tpl: tpl}, nil
 }
 
 // subject builds the alert's Subject header, honoring the configured
@@ -59,21 +68,30 @@ func (e *Email) subject(a Alert) string {
 	return e.cfg.SubjectPrefix + fmt.Sprintf("SoroBeacon alert: %s", a.MonitorName)
 }
 
-func (e *Email) Send(ctx context.Context, a Alert) error {
-	msg, err := RenderText(a)
+// body builds the full RFC 5322 message for an alert. Like subject it is
+// split out from Send so the rendered body (including a custom template) is
+// testable without a real SMTP connection.
+func (e *Email) body(a Alert) ([]byte, error) {
+	msg, err := e.tpl.render(a)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	subject := e.subject(a)
-	body := strings.Join([]string{
+	return []byte(strings.Join([]string{
 		"From: " + e.cfg.From,
 		"To: " + strings.Join(e.cfg.To, ", "),
-		"Subject: " + subject,
+		"Subject: " + e.subject(a),
 		"MIME-Version: 1.0",
 		"Content-Type: text/plain; charset=utf-8",
 		"",
 		msg,
-	}, "\r\n")
+	}, "\r\n")), nil
+}
+
+func (e *Email) Send(ctx context.Context, a Alert) error {
+	body, err := e.body(a)
+	if err != nil {
+		return err
+	}
 
 	addr := net.JoinHostPort(e.cfg.Host, fmt.Sprintf("%d", e.cfg.Port))
 	var auth smtp.Auth
@@ -84,7 +102,7 @@ func (e *Email) Send(ctx context.Context, a Alert) error {
 	// net/smtp has no context support; honor ctx cancellation coarsely.
 	done := make(chan error, 1)
 	go func() {
-		done <- smtp.SendMail(addr, auth, e.cfg.From, e.cfg.To, []byte(body))
+		done <- smtp.SendMail(addr, auth, e.cfg.From, e.cfg.To, body)
 	}()
 	select {
 	case err := <-done:

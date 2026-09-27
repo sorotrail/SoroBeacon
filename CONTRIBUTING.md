@@ -40,19 +40,18 @@ The README has worked examples for channels and rules.
   tokens and SMTP credentials. Keep them out of log lines, error messages,
   API responses and delivery `response_snippet`s.
 - **Migrations** are sequential files in `internal/store/migrations`
-  (`NNNN_name.up.sql` / `.down.sql`); never edit an applied migration.
+  (`NNNN_name.up.sql` / `.down.sql`); never edit an applied migration. The
+  SQLite backend has a parallel set at the same version numbers under
+  `internal/store/migrations/sqlite/`, because Postgres DDL does not run
+  unmodified on SQLite. `make migrate-new name=...` scaffolds both; a
+  migration with no SQLite change keeps a comment-only pair there.
 - **Structured logging** via `log/slog` with lower_snake_case keys.
 
 ## Good first issues
 
-- Encrypt `channels.config` at rest (design note: an envelope-encryption
-  interface in `internal/store` so the column stays opaque JSON).
-- API authentication (token middleware on `/api/v1`).
 - New rule types: absence-of-event ("no heartbeat for N minutes"),
   frequency ("more than N matches in M minutes").
 - New channels: Matrix, PagerDuty, ntfy.sh.
-- Contract-spec-aware decoding: fetch the contract spec and decode events
-  into named fields behind `stellar.Decoder`.
 - Dashboard improvements (kept deliberately minimal in the MVP).
 
 ## Pull requests

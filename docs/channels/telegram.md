@@ -29,3 +29,4 @@ curl -s -X POST localhost:8080/api/v1/channels/3/test
 | `bot_token` | yes | Token from BotFather. Treated as a secret. |
 | `chat_id` | yes | Target chat/group/channel ID (string). |
 | `api_base` | no | Override for `https://api.telegram.org` (self-hosted Bot API servers, tests). |
+| `template` | no | Go `text/template` overriding the message. See [Message templates](templates.md). |

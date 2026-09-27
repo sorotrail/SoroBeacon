@@ -33,6 +33,7 @@ The generic [`event_emitted`](event-emitted.md) rule can express all of this by 
 | `to` | no | Exact address in the incoming slot |
 | `min_amount` | no | Inclusive lower bound on the i128 amount |
 | `max_amount` | no | Inclusive upper bound on the i128 amount |
+| `cooldown` | no | Suppress repeat alerts from this rule for a window, e.g. `"5m"`. See [Rule cooldown](cooldown.md). |
 
 All filters combine with AND. Omitted filters don't constrain.
 

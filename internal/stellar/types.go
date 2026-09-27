@@ -16,6 +16,8 @@ const (
 	MaxContractIDsPerFilter = 5
 	// DefaultEventsLimit is the page size requested from getEvents.
 	DefaultEventsLimit = 100
+	// DefaultLedgersLimit is the page size requested from getLedgers.
+	DefaultLedgersLimit = 200
 )
 
 // EventFilter narrows getEvents results. Within a filter, contractIds are
@@ -75,6 +77,32 @@ type GetEventsResult struct {
 	Cursor       string  `json:"cursor,omitempty"`
 }
 
+// GetLedgersRequest are the params for the getLedgers RPC method. When
+// Pagination.Cursor is set, StartLedger must be omitted.
+type GetLedgersRequest struct {
+	StartLedger uint32      `json:"startLedger,omitempty"`
+	Pagination  *Pagination `json:"pagination,omitempty"`
+}
+
+// Ledger is one entry the getLedgers method returns. Only the identity
+// fields SoroBeacon needs are decoded; the header/metadata XDR blobs are
+// ignored because a reorg is detected by a ledger hash changing, not by
+// walking the parent chain.
+type Ledger struct {
+	Hash            string    `json:"hash"`
+	Sequence        uint32    `json:"sequence"`
+	LedgerCloseTime time.Time `json:"ledgerCloseTime"`
+}
+
+// GetLedgersResult is the getLedgers response. Newer RPC versions return a
+// top-level cursor for the next page; an empty cursor means the range is
+// drained.
+type GetLedgersResult struct {
+	Ledgers      []Ledger `json:"ledgers"`
+	LatestLedger uint32   `json:"latestLedger"`
+	Cursor       string   `json:"cursor,omitempty"`
+}
+
 // LatestLedger is the getLatestLedger response.
 type LatestLedger struct {
 	ID              string `json:"id"`
@@ -104,6 +132,13 @@ type DecodedEvent struct {
 	Topics []any
 	// Value is the decoded event data ScVal.
 	Value any
+	// Fields holds the same event data addressed by name when a contract
+	// spec was available (see SpecDecoder); it is nil otherwise, and rules
+	// that predate spec-aware decoding can ignore it. Both topic-located and
+	// data-located parameters appear here, keyed by the spec's parameter
+	// names, so value_threshold's value_path can say "amount" or "from"
+	// instead of counting topic positions.
+	Fields map[string]any
 }
 
 // EventName returns the first topic if it is a string (the conventional
