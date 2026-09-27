@@ -11,7 +11,16 @@ import (
 // callers that need to branch on the backend (for example config validation)
 // share one parser with the store constructor.
 func Scheme(databaseURL string) (string, error) {
-	u, err := url.Parse(databaseURL)
+	raw := strings.TrimSpace(databaseURL)
+	// Take the scheme textually rather than via url.Parse. A sqlite URL may
+	// carry a Windows path ("sqlite://C:\srv\beacon.db"), which url.Parse
+	// rejects outright — it reads "C:" as a host with an invalid port — so the
+	// caller could not even learn which backend was requested. It also means
+	// this function never parses credentials out of a Postgres URL.
+	if i := strings.Index(raw, "://"); i > 0 {
+		return strings.ToLower(raw[:i]), nil
+	}
+	u, err := url.Parse(raw)
 	if err != nil {
 		return "", fmt.Errorf("parse DATABASE_URL: %w", err)
 	}

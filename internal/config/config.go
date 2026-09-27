@@ -566,12 +566,12 @@ func (c Config) LogAttrs() []slog.Attr {
 		slog.String("poll_interval", c.PollInterval.String()),
 		slog.String("log_level", strings.ToLower(c.LogLevel.String())),
 		slog.String("network", c.Network.Name),
-		slog.String("rpc_url", c.RPCURL),
+		slog.String("rpc_url", redactURLCredentials(c.RPCURL)),
 		// The count, not the list: it is how an operator confirms at a
 		// glance that the failover set was read, and the URLs themselves
 		// already appear (first one above) in the poller's own lines.
 		slog.Int("rpc_endpoint_count", len(c.RPCURLs)),
-		slog.String("sorotrail_url", c.SoroTrailURL),
+		slog.String("sorotrail_url", redactURLCredentials(c.SoroTrailURL)),
 		slog.String("cors_allowed_origins", strings.Join(c.CORSAllowedOrigins, ",")),
 		slog.Bool("config_encryption_enabled", len(c.ConfigEncryptionKey) > 0),
 		// The provider name, never the token or any resolved value.
@@ -598,7 +598,17 @@ func redactDatabaseURL(raw string) string {
 		return ""
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" {
+	if err != nil {
+		// A sqlite URL can carry a Windows drive path ("sqlite://C:\srv\x.db"),
+		// which url.Parse rejects because it reads "C:" as a host with a bad
+		// port. It holds no credentials, so the operator can still be shown
+		// which file the process opened.
+		if strings.HasPrefix(strings.ToLower(raw), "sqlite:") {
+			return raw
+		}
+		return redacted
+	}
+	if u.Scheme == "" {
 		return redacted
 	}
 	if strings.EqualFold(u.Scheme, "sqlite") {
@@ -608,6 +618,23 @@ func redactDatabaseURL(raw string) string {
 		return redacted
 	}
 	return u.Scheme + "://" + u.Host + u.Path
+}
+
+// redactURLCredentials drops userinfo from a URL so an API key supplied as
+// basic auth cannot reach a log line, while keeping the rest readable. Like
+// redactDatabaseURL it fails closed, because a valid password is enough to
+// defeat url.Parse — a "%", a space or a "[" in the userinfo each do it — and
+// that is precisely the input worth protecting.
+func redactURLCredentials(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" {
+		return redacted
+	}
+	u.User = nil
+	return u.String()
 }
 
 // ParseRetention accepts Go durations (24h, 90m) plus a day suffix

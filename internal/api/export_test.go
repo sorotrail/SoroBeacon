@@ -113,6 +113,27 @@ func TestExportAlertsNDJSON_HeadersAndFormat(t *testing.T) {
 	if rows[0]["event_name"] != "xfer" {
 		t.Fatalf("event_name = %v, want xfer", rows[0]["event_name"])
 	}
+	// The rest of the row shape. ids are strings so a JavaScript client
+	// cannot round them off, ledger stays a number, and created_at is
+	// RFC3339 in UTC regardless of the stored location.
+	if rows[0]["monitor_id"] != "1" || rows[0]["rule_id"] != "2" {
+		t.Fatalf("monitor_id/rule_id = %v/%v, want 1/2", rows[0]["monitor_id"], rows[0]["rule_id"])
+	}
+	if rows[0]["event_id"] != "ev-1" {
+		t.Fatalf("event_id = %v, want ev-1", rows[0]["event_id"])
+	}
+	if rows[0]["contract_id"] != "C" {
+		t.Fatalf("contract_id = %v, want C", rows[0]["contract_id"])
+	}
+	if rows[0]["ledger"] != float64(1) {
+		t.Fatalf("ledger = %#v, want 1 as a number", rows[0]["ledger"])
+	}
+	if rows[0]["created_at"] != "2026-01-02T03:04:05Z" {
+		t.Fatalf("created_at = %v, want 2026-01-02T03:04:05Z", rows[0]["created_at"])
+	}
+	if rows[1]["id"] != "2" || rows[1]["contract_id"] != "D" {
+		t.Fatalf("second row = %v/%v, want 2/D", rows[1]["id"], rows[1]["contract_id"])
+	}
 }
 
 // TestExportAlertsNDJSON_StreamingLargeRowCount proves the export
@@ -124,7 +145,7 @@ func TestExportAlertsNDJSON_StreamingLargeRowCount(t *testing.T) {
 	alerts := make([]store.Alert, n)
 	for i := range alerts {
 		alerts[i] = store.Alert{
-			ID: int64(i + 1),
+			ID:      int64(i + 1),
 			Payload: json.RawMessage(`{"contract_id":"C","event_name":"e","ledger":1}`),
 		}
 	}

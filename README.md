@@ -369,6 +369,7 @@ and never returned in responses. Each has a page under
 [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md),
 [PagerDuty](docs/channels/pagerduty.md), [Email](docs/channels/email.md),
 [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md),
+[Lark](docs/channels/lark.md) and the [generic webhook](docs/channels/webhook.md).
 [DingTalk](docs/channels/dingtalk.md) and the
 [generic webhook](docs/channels/webhook.md).
 
@@ -389,6 +390,7 @@ curl -s -X POST localhost:8080/api/v1/channels -d '{
 # PagerDuty:{"routing_key": "R0UT1NGK3Y", "severity": "warning"}
 # Webex:    {"bot_token": "Y2lzY29zcGFyazovL3VzL1JPT00v...", "room_id": "Y2lzY29zcGFyazovL3VzL1JPT00v..."}
 # Signal:   {"api_url": "http://signal-cli:8080", "number": "+15551234567", "recipients": ["+15559876543"]}
+# Lark:     {"webhook_url": "https://open.larksuite.com/open-apis/bot/v2/hook/xxxx", "secret": "optional"}
 # DingTalk: {"webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=...", "secret": "SEC..."}
 
 curl -s localhost:8080/api/v1/channels
@@ -573,4 +575,5 @@ Decoded events use a small value vocabulary (`nil`, `bool`, `string`,
 ## License
 ### Notification Channels
 
+Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md), [Lark](docs/channels/lark.md), and generic [Webhooks](docs/channels/webhook.md).
 Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md), [DingTalk](docs/channels/dingtalk.md), and generic [Webhooks](docs/channels/webhook.md).

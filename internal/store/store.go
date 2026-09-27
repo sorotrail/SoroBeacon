@@ -172,13 +172,13 @@ type Channel struct {
 	// DigestWindowSeconds is the accumulation window when DigestMode is
 	// "window". Zero leaves digesting off even when a mode is set, so a
 	// half-filled form cannot silently batch forever.
-	DigestWindowSeconds int64     `json:"digest_window_seconds"`
+	DigestWindowSeconds int64 `json:"digest_window_seconds"`
 	// MinSeverity is the minimum alert severity this channel will receive.
 	// Empty means no filter (receive all severities), so channels created
 	// before the field existed keep today's behaviour. It is validated at
 	// the API boundary.
-	MinSeverity Severity `json:"min_severity"`
-	CreatedAt           time.Time `json:"created_at"`
+	MinSeverity Severity  `json:"min_severity"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // Alert records one rule match on one event. EventID is the source event's
@@ -490,6 +490,10 @@ type Alerts interface {
 	CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error)
 	GetAlert(ctx context.Context, id int64) (*Alert, error)
 	ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
+	// ListAlertsStream walks the same filter as ListAlerts, calling fn per
+	// row. f.Limit caps the total rows, not the page size, so an export
+	// streams with bounded memory. See streamAlerts for the guarantees.
+	ListAlertsStream(ctx context.Context, f AlertFilter, fn func(Alert) error) error
 	RecordDeliveryAttempt(ctx context.Context, d *DeliveryAttempt) error
 	// ListDeliveryAttempts returns attempts for one alert, oldest first.
 	// status empty means no filter; otherwise it is applied in SQL.

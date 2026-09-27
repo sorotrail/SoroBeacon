@@ -2,6 +2,7 @@ package docs
 
 import (
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -76,8 +77,12 @@ func TestSummaryLinksEveryNewPage(t *testing.T) {
 			t.Errorf("%s must exist: %v", page, err)
 			continue
 		}
-		base := filepath.Base(page)
-		if !strings.Contains(summary, "("+strings.TrimPrefix(filepath.Dir(page), "docs/")+"/"+base+")") {
+		// SUMMARY.md links are slash-separated and relative to docs/, so the
+		// entry is built with path, not filepath. filepath.Dir returns
+		// "docs\operations" on Windows, which no longer carries the "docs/"
+		// prefix being trimmed, and every page then looked unlinked.
+		base := path.Base(page)
+		if !strings.Contains(summary, "("+strings.TrimPrefix(path.Dir(page), "docs/")+"/"+base+")") {
 			t.Errorf("docs/SUMMARY.md does not link %s", page)
 		}
 	}

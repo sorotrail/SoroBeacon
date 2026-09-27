@@ -85,6 +85,9 @@ type fakeStore struct {
 	suppressed map[int64]int64     // rule id -> matches dropped this window
 	// ledgerHashes backs the reorg-detection half of the Store interface.
 	ledgerHashes map[uint32]string
+	// groupStates backs the alert-grouping half of the Store interface:
+	// group key -> alerts counted in the current window.
+	groupStates map[string]int64
 }
 
 func newFakeStore() *fakeStore {
@@ -96,6 +99,7 @@ func newFakeStore() *fakeStore {
 		lastFired:    map[int64]time.Time{},
 		suppressed:   map[int64]int64{},
 		ledgerHashes: map[uint32]string{},
+		groupStates:  map[string]int64{},
 	}
 }
 
@@ -767,4 +771,21 @@ func TestPollIgnoresDisabledRulesWhenDerivingTopics(t *testing.T) {
 	require.Len(t, rpc.requests, 1)
 	require.Len(t, rpc.requests[0].Filters, 1)
 	assert.Equal(t, [][]string{{"AAAADwAAAAh0cmFuc2Zlcg==", "**"}}, rpc.requests[0].Filters[0].Topics)
+}
+
+// The inhibition trio satisfies notify.DispatchStore. The poller tests are
+// about ingestion and fan-out, not suppression, so these are inert: no
+// inhibition pairs exist, so nothing is ever suppressed and the mark is
+// never reached. A test that wants to exercise suppression should set
+// inhibitions itself rather than relying on these defaults.
+func (f *fakeStore) ListInhibitionsForTarget(context.Context, int64) ([]store.Inhibition, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) RuleFiredWithin(context.Context, int64, time.Duration) (bool, error) {
+	return false, nil
+}
+
+func (f *fakeStore) MarkAlertInhibited(context.Context, int64, int64) error {
+	return nil
 }

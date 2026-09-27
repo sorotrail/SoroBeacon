@@ -87,6 +87,14 @@ func TestSQLiteFilePath(t *testing.T) {
 		{name: "absolute", url: "sqlite:///var/lib/sorobeacon/sorobeacon.db", want: "/var/lib/sorobeacon/sorobeacon.db"},
 		{name: "relative host form", url: "sqlite://relative/path.db", want: "relative/path.db"},
 		{name: "opaque", url: "sqlite:./data/sorobeacon.db", want: "./data/sorobeacon.db"},
+		// Windows paths, asserted on every platform: url.Parse reads the "C:"
+		// as a host with an invalid port and fails, so these went nowhere near
+		// the path extraction below until sqliteWindowsPath caught them. They
+		// are literals rather than t.TempDir() so Linux CI guards them too.
+		{name: "windows drive, backslashes", url: `sqlite://C:\srv\sorobeacon.db`, want: `C:\srv\sorobeacon.db`},
+		{name: "windows drive, forward slashes", url: "sqlite://C:/srv/sorobeacon.db", want: "C:/srv/sorobeacon.db"},
+		{name: "windows drive, no double slash", url: `sqlite:D:\data\sorobeacon.db`, want: `D:\data\sorobeacon.db`},
+		{name: "windows drive, lowercase", url: `sqlite://d:\data\sorobeacon.db`, want: `d:\data\sorobeacon.db`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -171,8 +179,15 @@ func TestBackendSelection(t *testing.T) {
 	assert.Equal(t, "postgres", BackendName("postgresql://localhost/db"))
 	assert.Equal(t, "sqlite", BackendName("sqlite:///var/lib/sorobeacon/sorobeacon.db"))
 	assert.Equal(t, "unknown", BackendName("mysql://localhost/db"))
+	// A Windows path must still name its backend. Reporting "unknown" here
+	// made a misconfigured-backend error out of a perfectly good DATABASE_URL.
+	assert.Equal(t, "sqlite", BackendName(`sqlite://C:\srv\sorobeacon.db`))
 
 	scheme, err := Scheme("sqlite:///tmp/x.db")
+	require.NoError(t, err)
+	assert.Equal(t, "sqlite", scheme)
+
+	scheme, err = Scheme(`sqlite://C:\srv\sorobeacon.db`)
 	require.NoError(t, err)
 	assert.Equal(t, "sqlite", scheme)
 
