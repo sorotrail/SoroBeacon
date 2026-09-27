@@ -492,6 +492,46 @@ func TestRedactDatabaseURLUnparseable(t *testing.T) {
 	assert.Equal(t, "", redactDatabaseURL(""))
 	assert.Equal(t, redacted, redactDatabaseURL("not a url"))
 	assert.Equal(t, redacted, redactDatabaseURL("http://["))
+	// A sqlite URL with a Windows drive path does not parse as a URL, but it
+	// carries no credentials, so the operator is still shown the file. Without
+	// this the whole startup line said "[redacted]" on Windows.
+	assert.Equal(t, `sqlite://C:\srv\sorobeacon.db`, redactDatabaseURL(`sqlite://C:\srv\sorobeacon.db`))
+}
+
+// TestLogAttrsRedactsURLCredentials covers the other two URLs in the startup
+// line. An RPC provider or a SoroTrail deployment behind basic auth puts the
+// key in the URL, and LogAttrs is the one place configuration is printed.
+func TestLogAttrsRedactsURLCredentials(t *testing.T) {
+	attrs := func(c Config) (map[string]string, string) {
+		got := map[string]string{}
+		var dump strings.Builder
+		for _, a := range c.LogAttrs() {
+			got[a.Key] = a.Value.String()
+			dump.WriteString(a.Key + "=" + a.Value.String() + "\n")
+		}
+		return got, dump.String()
+	}
+
+	got, blob := attrs(Config{
+		RPCURL:       "https://rpcuser:rpc-api-key@rpc.example.com/v1",
+		SoroTrailURL: "https://svc:trail-token@trail.example.com",
+		DatabaseURL:  "postgres://u:p@db.example:5432/beacon",
+	})
+	assert.Equal(t, "https://rpc.example.com/v1", got["rpc_url"])
+	assert.Equal(t, "https://trail.example.com", got["sorotrail_url"])
+	assert.NotContains(t, blob, "rpc-api-key")
+	assert.NotContains(t, blob, "trail-token")
+
+	// Fail closed: a valid password containing "%" defeats url.Parse, and the
+	// unparseable value must not fall through to the log verbatim.
+	got, blob = attrs(Config{
+		RPCURL:       "https://rpcuser:rpc%key@rpc.example.com/v1",
+		SoroTrailURL: "https://svc:tok en@trail.example.com",
+	})
+	assert.Equal(t, redacted, got["rpc_url"])
+	assert.Equal(t, redacted, got["sorotrail_url"])
+	assert.NotContains(t, blob, "rpc%key")
+	assert.NotContains(t, blob, "tok en")
 }
 
 func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
