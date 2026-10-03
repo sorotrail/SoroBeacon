@@ -76,20 +76,33 @@ func (f *fakeRPC) GetHealth(context.Context) (*stellar.Health, error) {
 // only used by the tracing tests, which run deliveries through a real
 // notify.Dispatcher; the plain poller tests never touch them.
 type fakeStore struct {
+	// mu guards every field below. The supervisor runs one poller per network
+	// concurrently against a single store, so the fake has to be safe for that
+	// too or its own test would be racy rather than the code under test.
+	mu       sync.Mutex
 	monitors []store.Monitor
 	rules    map[int64][]store.Rule // monitor id -> rules
 	state    store.IngestState
-	alerts   []store.Alert
-	dedup    map[string]bool // "ruleID/eventID"
-	channels []store.Channel
-	attached map[int64][]int64 // monitor id -> channel ids
-	attempts []store.DeliveryAttempt
+	// namedState is the per-network checkpoint, keyed by network name. The
+	// legacy single row above is what an unscoped poller writes, and the two
+	// are kept apart so a test can prove a scoped poller never touches it.
+	namedState map[string]store.IngestState
+	alerts     []store.Alert
+	dedup      map[string]bool // "ruleID/eventID"
+	channels   []store.Channel
+	attached   map[int64][]int64 // monitor id -> channel ids
+	attempts   []store.DeliveryAttempt
 
 	now        func() time.Time
 	lastFired  map[int64]time.Time // rule id -> last alert time
 	suppressed map[int64]int64     // rule id -> matches dropped this window
-	// ledgerHashes backs the reorg-detection half of the Store interface.
+	// ledgerHashes is the "" network's reorg window; namedWindows the per-network
+	// ones. Same split as the store's two tables.
 	ledgerHashes map[uint32]string
+	namedWindows map[string]map[uint32]string
+	// lastRetract records every retraction call in order, so a test can assert
+	// which network was corrected as well as from which ledger.
+	lastRetract []retraction
 	// groupStates backs the alert-grouping half of the Store interface:
 	// group key -> alerts counted in the current window.
 	groupStates map[string]int64
@@ -104,12 +117,14 @@ type fakeStore struct {
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		rules:        map[int64][]store.Rule{},
+		namedState:   map[string]store.IngestState{},
 		dedup:        map[string]bool{},
 		attached:     map[int64][]int64{},
 		now:          time.Now,
 		lastFired:    map[int64]time.Time{},
 		suppressed:   map[int64]int64{},
 		ledgerHashes: map[uint32]string{},
+		namedWindows: map[string]map[uint32]string{},
 		groupStates:  map[string]int64{},
 		inhibitions:  []store.Inhibition{},
 		absence:      map[string]time.Time{},
@@ -209,7 +224,23 @@ func (f *fakeStore) ListChannels(_ context.Context, enabledOnly bool) ([]store.C
 	return out, nil
 }
 
+// window returns one network's ledger-hash window, creating a named one on
+// first use.
+func (f *fakeStore) window(network string) map[uint32]string {
+	if network == "" {
+		return f.ledgerHashes
+	}
+	w := f.namedWindows[network]
+	if w == nil {
+		w = map[uint32]string{}
+		f.namedWindows[network] = w
+	}
+	return w
+}
+
 func (f *fakeStore) ListMonitors(_ context.Context, enabledOnly bool) ([]store.Monitor, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var out []store.Monitor
 	for _, m := range f.monitors {
 		if !enabledOnly || m.Enabled {
@@ -220,6 +251,8 @@ func (f *fakeStore) ListMonitors(_ context.Context, enabledOnly bool) ([]store.M
 }
 
 func (f *fakeStore) ListRules(_ context.Context, monitorID int64, enabledOnly bool) ([]store.Rule, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var out []store.Rule
 	for _, r := range f.rules[monitorID] {
 		if !enabledOnly || r.Enabled {
@@ -254,6 +287,8 @@ func (f *fakeStore) MarkAlertInhibited(_ context.Context, alertID, sourceRuleID 
 }
 
 func (f *fakeStore) CreateAlert(_ context.Context, a *store.Alert) (store.AlertOutcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	key := fmt.Sprintf("%d/%s", a.RuleID, a.EventID)
 	if f.dedup[key] {
 		return store.AlertDuplicate, nil // replay, not a fresh match
@@ -268,6 +303,15 @@ func (f *fakeStore) CreateAlert(_ context.Context, a *store.Alert) (store.AlertO
 	}
 	f.dedup[key] = true
 	a.ID = int64(len(f.alerts) + 1)
+	// The real store derives an alert's network from its monitor (the INSERT is
+	// a SELECT against monitors), so the fake does too: an alert's network is
+	// never whatever the caller happened to set.
+	for _, m := range f.monitors {
+		if m.ID == a.MonitorID {
+			a.Network = m.Network
+			break
+		}
+	}
 	if a.Cooldown > 0 {
 		a.SuppressedSinceLast = f.suppressed[a.RuleID]
 		f.suppressed[a.RuleID] = 0
@@ -289,9 +333,23 @@ func (f *fakeStore) CreateAlert(_ context.Context, a *store.Alert) (store.AlertO
 	return store.AlertCreated, nil
 }
 
-func (f *fakeStore) GetIngestState(context.Context) (store.IngestState, error) { return f.state, nil }
-func (f *fakeStore) SetIngestState(_ context.Context, s store.IngestState) error {
-	f.state = s
+func (f *fakeStore) GetIngestState(_ context.Context, network string) (store.IngestState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if network == "" {
+		return f.state, nil
+	}
+	return f.namedState[network], nil
+}
+
+func (f *fakeStore) SetIngestState(_ context.Context, network string, s store.IngestState) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if network == "" {
+		f.state = s
+		return nil
+	}
+	f.namedState[network] = s
 	return nil
 }
 
@@ -913,9 +971,9 @@ func TestRecordCycleCountsRuleEvaluations(t *testing.T) {
 	p.recordCycle(true, 0)
 
 	body := scrapeMetrics(t, m)
-	assert.Contains(t, body, "sorobeacon_events_scanned_total 3")
-	assert.Contains(t, body, "sorobeacon_events_matched_total 2")
-	assert.Contains(t, body, "sorobeacon_rule_evaluations_total 3")
+	assert.Contains(t, body, "sorobeacon_events_scanned_total{network=\"\"} 3")
+	assert.Contains(t, body, "sorobeacon_events_matched_total{network=\"\"} 2")
+	assert.Contains(t, body, "sorobeacon_rule_evaluations_total{network=\"\"} 3")
 }
 
 // scrapeMetrics renders the metrics endpoint into text.
@@ -970,3 +1028,11 @@ func (f *fakeStore) DueEscalations(context.Context, time.Time, int) ([]store.Esc
 func (f *fakeStore) AdvanceEscalation(context.Context, int64, int, time.Time) error { return nil }
 
 func (f *fakeStore) CompleteEscalation(context.Context, int64) error { return nil }
+
+// retraction is one RetractAlertsFromLedger call. The network is recorded
+// alongside the ledger because the two chains number ledgers independently: a
+// reorg on one must not retract the other's alerts, and only the pair proves it.
+type retraction struct {
+	network string
+	ledger  uint32
+}

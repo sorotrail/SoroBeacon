@@ -1,0 +1,85 @@
+{{define "content"}}
+<h1>API Tokens</h1>
+<p class="muted">Scoped credentials for scripts and CI: each one carries a list of scopes, expires
+  when you say, and can be revoked on its own. A token is shown once, here, at the moment it is
+  created — only a hash of it is stored, so this page cannot show it to you again.</p>
+
+{{if .Disabled}}
+<p><strong>Token management is not configured on this instance.</strong> The pages below need a
+  database that has run the <code>api_tokens</code> migration.</p>
+{{end}}
+
+{{with .NewToken}}
+<fieldset>
+  <legend>Copy this token now</legend>
+  <p>It will not be shown again, and it will not appear in this page's history — reload this page
+    and it is gone. If it is lost, revoke the token below and mint another.</p>
+  <pre><code id="new_token">{{.}}</code></pre>
+  <button type="button" class="copy-btn" onclick="navigator.clipboard.writeText(document.getElementById('new_token').textContent)">Copy</button>
+</fieldset>
+{{end}}
+
+{{if .Tokens}}
+<table>
+  <tr><th>Name</th><th>Token</th><th>Scopes</th><th>State</th><th>Created</th><th>Last used</th><th></th></tr>
+  {{range .Tokens}}
+  <tr>
+    <td>{{.Name}}</td>
+    <td><code>{{.Prefix}}…</code></td>
+    <td class="muted">{{.Scopes}}</td>
+    <td>
+      {{if .Revoked}}<span class="pill off">revoked</span>
+      {{else if eq .State "active"}}<span class="pill on">active</span>
+      {{else if eq .State "expired"}}<span class="pill off">expired</span>
+      {{else}}{{.State}}{{end}}
+    </td>
+    <td>{{formatTime .CreatedAt}}</td>
+    <td>{{if .LastUsedAt.IsZero}}<span class="muted">never</span>{{else}}{{formatTime .LastUsedAt}}{{end}}</td>
+    <td>
+      {{if not .Revoked}}
+      <form class="inline" method="post" action="/tokens/{{.ID}}/revoke"
+            onsubmit="return confirm('Revoke {{.Name}}? Anything using it stops working immediately.')">
+        <button>Revoke</button>
+      </form>
+      {{end}}
+    </td>
+  </tr>
+  {{end}}
+</table>
+{{else}}
+<p class="muted">No API tokens yet. Mint one below for the next script that needs to talk to this
+  instance, and give it only the scopes that script uses.</p>
+{{end}}
+
+{{if not .Disabled}}
+<fieldset>
+  <legend>New token</legend>
+  {{with .FormError}}<p><strong>{{.}}</strong></p>{{end}}
+  <form method="post" action="/tokens">
+    <label for="token_name">Name</label>
+    <input type="text" id="token_name" name="name" maxlength="64" placeholder="ci deploy">
+
+    <label for="token_expiry">Expires</label>
+    <select id="token_expiry" name="expires_in">
+      <option value="30">in 30 days</option>
+      <option value="90">in 90 days</option>
+      <option value="365">in 365 days</option>
+      <option value="">never</option>
+    </select>
+
+    <p>Scopes</p>
+    <div class="scopes">
+      {{range .Scopes}}
+      <label><input type="checkbox" name="scopes" value="{{.}}"> {{.}}</label>
+      {{end}}
+    </div>
+    <p class="muted">A token can only be given scopes the signed-in credential already has.
+      <code>monitors:write</code> creates, edits, deletes and imports monitors;
+      <code>channels:write</code> includes sending a test notification;
+      <code>tokens:write</code> mints and revokes tokens, and is how a credential could
+      widen itself — grant it deliberately.</p>
+    <p><button>Create token</button></p>
+  </form>
+</fieldset>
+{{end}}
+{{end}}

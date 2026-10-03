@@ -24,9 +24,14 @@ type templateInput struct {
 }
 
 type instantiateInput struct {
-	Name        string            `json:"name"`
-	ContractIDs []string          `json:"contract_ids"`
-	Parameters  map[string]string `json:"parameters"`
+	Name        string   `json:"name"`
+	ContractIDs []string `json:"contract_ids"`
+	// Network names the chain the instantiated monitor watches. A pointer so
+	// an omitted field (the primary, the only chain a single-network instance
+	// polls) stays distinguishable from one sent explicitly empty, which is a
+	// 400 rather than a silent default.
+	Network    *string           `json:"network"`
+	Parameters map[string]string `json:"parameters"`
 }
 
 type bulkInstantiateInput struct {
@@ -308,10 +313,15 @@ func (s *Server) buildMonitorFromTemplate(tmpl *store.MonitorTemplate, in instan
 			}
 		}
 	}
+	network, netErr := s.networkDetail(in.Network)
+	if netErr != nil {
+		problems = append(problems, *netErr)
+	}
 	m := &store.Monitor{
 		Name:        name,
 		ContractIDs: in.ContractIDs,
 		Enabled:     true,
+		Network:     network,
 	}
 	return m, problems
 }

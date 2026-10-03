@@ -132,6 +132,11 @@ config:
   # channel is taken out of rotation. 0 never auto-disables, which is the
   # behaviour every release before channel health had.
   channelDisableAfterFailures: 0
+  # NETWORKS: comma-separated chains this instance polls, primary first. Empty
+  # means the single chain NETWORK names, which is how every deployment before
+  # multi-network polling behaves. Per-network endpoints are set through
+  # NETWORKS_<NAME>_RPC_URL in extraEnv.
+  networks: ""
   # Per-client API token-bucket refill rate. 0 disables the limiter. Health
   # and readiness probes are always exempt.
   rateLimitRps: 0
@@ -229,6 +234,11 @@ auth:
   # unrecoverable, so back it up with the database. Generate with
   # `openssl rand -base64 32`.
   configEncryptionKey: ""
+  # WORKSPACE_TOKENS: comma-separated workspace=token bindings, which is what
+  # makes one instance multi-tenant. A credential decides which workspace a
+  # request acts on, so these are credentials and live in the Secret with
+  # apiToken. Empty leaves the instance single-tenant on the default workspace.
+  workspaceTokens: ""
   # Name of an existing Secret holding the two values above, so they can be
   # managed outside the release. When set, apiToken/configEncryptionKey are
   # ignored.
@@ -275,3 +285,25 @@ migrations:
   # Upper bound on the hook, in seconds. Must stay below Helm's
   # --timeout (default 5m) or the release times out before the Job does.
   activeDeadlineSeconds: 300
+
+# Single sign-on. With oidc.issuer empty (the default) SSO is off and the
+# dashboard uses its token form exactly as before. clientSecret is a credential
+# and is rendered into the auth Secret, never the ConfigMap.
+oidc:
+  issuer: ""
+  clientID: ""
+  clientSecret: ""
+  redirectURL: ""
+  # Space-separated extra scopes; the provider's openid/profile/email are
+  # requested regardless.
+  scopes: ""
+  # Comma-separated e-mail domains allowed to sign in. Empty allows any account
+  # the provider authenticates, which is only safe on a single-tenant issuer.
+  allowedDomains: ""
+  # The workspace an SSO user lands in. Empty means the default workspace.
+  workspace: ""
+  # Claim naming the user's workspace, for an issuer that carries one. Empty
+  # puts every SSO user in oidc.workspace.
+  workspaceClaim: ""
+  # How long a started login may take to come back.
+  loginStateTTL: "10m"

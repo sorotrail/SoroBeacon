@@ -9,6 +9,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 // TestReplicaUnavailable pins the one decision that separates "fall back" from
@@ -123,7 +125,9 @@ func TestBuildAlertQueryIsParameterised(t *testing.T) {
 		Limit:      25,
 	}
 
-	q, args := buildAlertQuery(f)
+	// System scope: the test pins the placeholder positions, and a tenant
+	// predicate would prepend one and shift every assertion below.
+	q, args := buildAlertQuery(workspace.WithSystem(context.Background()), f)
 
 	require.Len(t, args, 4)
 	assert.Equal(t, int64(7), args[0])
@@ -142,7 +146,7 @@ func TestBuildAlertQueryIsParameterised(t *testing.T) {
 // direction as the first page, so paging cannot skip or repeat a row once two
 // alerts share a timestamp.
 func TestBuildAlertQueryAscendingCursorOrdersBothSides(t *testing.T) {
-	q, args := buildAlertQuery(AlertFilter{Sort: "created_at_asc", AfterID: 42})
+	q, args := buildAlertQuery(workspace.WithSystem(context.Background()), AlertFilter{Sort: "created_at_asc", AfterID: 42})
 
 	require.Len(t, args, 2)
 	assert.Equal(t, int64(42), args[0])

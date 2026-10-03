@@ -192,6 +192,10 @@
           "minimum": 0,
           "description": "Ledger lag at which /readyz fails. 0 disables the check."
         },
+        "networks": {
+          "type": "string",
+          "description": "NETWORKS: comma-separated chains to poll, primary first. Empty means the single chain NETWORK names."
+        },
         "channelDisableAfterFailures": {
           "type": "integer",
           "minimum": 0,
@@ -364,6 +368,10 @@
           "type": "string",
           "description": "API_TOKEN value(s), comma-separated. Empty leaves the API open."
         },
+        "workspaceTokens": {
+          "type": "string",
+          "description": "WORKSPACE_TOKENS: comma-separated workspace=token bindings. A credential, rendered into the auth Secret."
+        },
         "configEncryptionKey": {
           "type": "string",
           "description": "CONFIG_ENCRYPTION_KEY: base64 AES-GCM key for channel config at rest."
@@ -381,6 +389,49 @@
           "type": "string",
           "minLength": 1,
           "description": "Key within the existing Secret that holds CONFIG_ENCRYPTION_KEY."
+        }
+      },
+      "additionalProperties": false
+    },
+    "oidc": {
+      "type": "object",
+      "properties": {
+        "issuer": {
+          "type": "string",
+          "description": "OIDC_ISSUER. Empty disables single sign-on."
+        },
+        "clientID": {
+          "type": "string",
+          "description": "OIDC_CLIENT_ID."
+        },
+        "clientSecret": {
+          "type": "string",
+          "description": "OIDC_CLIENT_SECRET. A credential, rendered into the auth Secret."
+        },
+        "redirectURL": {
+          "type": "string",
+          "description": "OIDC_REDIRECT_URL: this instance's /login/oidc/callback URL."
+        },
+        "scopes": {
+          "type": "string",
+          "description": "OIDC_SCOPES: space-separated extra scopes."
+        },
+        "allowedDomains": {
+          "type": "string",
+          "description": "OIDC_ALLOWED_DOMAINS: comma-separated e-mail domains allowed to sign in."
+        },
+        "workspace": {
+          "type": "string",
+          "description": "OIDC_WORKSPACE: the workspace an SSO user lands in."
+        },
+        "workspaceClaim": {
+          "type": "string",
+          "description": "OIDC_WORKSPACE_CLAIM: claim naming the user's workspace."
+        },
+        "loginStateTTL": {
+          "type": "string",
+          "pattern": "^[0-9]+(ms|s|m|h)$",
+          "description": "OIDC_LOGIN_STATE_TTL: how long a started login may take to return."
         }
       },
       "additionalProperties": false

@@ -116,6 +116,15 @@ LOG_LEVEL: {{ .Values.config.logLevel | quote }}
 MONITOR_SILENT_AFTER: {{ .Values.config.monitorSilentAfter | quote }}
 READYZ_LAG_THRESHOLD: {{ .Values.config.readyzLagThreshold | int64 | quote }}
 CHANNEL_DISABLE_AFTER_FAILURES: {{ .Values.config.channelDisableAfterFailures | int64 | quote }}
+NETWORKS: {{ .Values.config.networks | quote }}
+OIDC_ISSUER: {{ .Values.oidc.issuer | quote }}
+OIDC_CLIENT_ID: {{ .Values.oidc.clientID | quote }}
+OIDC_REDIRECT_URL: {{ .Values.oidc.redirectURL | quote }}
+OIDC_SCOPES: {{ .Values.oidc.scopes | quote }}
+OIDC_ALLOWED_DOMAINS: {{ .Values.oidc.allowedDomains | quote }}
+OIDC_WORKSPACE: {{ .Values.oidc.workspace | quote }}
+OIDC_WORKSPACE_CLAIM: {{ .Values.oidc.workspaceClaim | quote }}
+OIDC_LOGIN_STATE_TTL: {{ .Values.oidc.loginStateTTL | quote }}
 RATE_LIMIT_RPS: {{ .Values.config.rateLimitRps | quote }}
 RATE_LIMIT_BURST: {{ .Values.config.rateLimitBurst | int64 | quote }}
 RATE_LIMIT_TRUST_FORWARDED: {{ .Values.config.rateLimitTrustForwarded | toString | quote }}

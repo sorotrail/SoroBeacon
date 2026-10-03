@@ -49,7 +49,17 @@ type Config struct {
 	// Network is the Stellar network to monitor — its name, passphrase
 	// and RPC endpoint, resolved from NETWORK / RPC_URL /
 	// NETWORK_PASSPHRASE by ParseNetwork.
+	//
+	// It is the *primary* network: with NETWORKS set it is that list's first
+	// entry, and it is the network the startup upgrade labels pre-multi-network
+	// monitors and alerts with. Networks holds the full list to poll.
 	Network Network
+	// Networks is every Stellar network this instance polls, primary first,
+	// from NETWORKS (falling back to NETWORK alone). It is never empty, so
+	// single-network deployments are one-element lists rather than a special
+	// case — which is what keeps the poller supervisor free of any "if there
+	// is only one" branch.
+	Networks []Network
 	// RPCURL is the first Stellar RPC endpoint (JSON-RPC 2.0 over HTTP).
 	// This is Network.RPCURL; kept as a direct field since most call sites
 	// only need the URL.
@@ -90,7 +100,22 @@ type Config struct {
 	// authentication existed, and the process logs one startup warning.
 	// Hold the tokens here, not the raw string: the values are secrets and
 	// must never be logged or echoed.
+	//
+	// These tokens are unscoped: each one selects the default workspace.
+	// WORKSPACE_TOKENS (WorkspaceTokens below) is how a shared instance
+	// hands out one token per team.
 	APITokens []string
+	// WorkspaceTokens is the parsed WORKSPACE_TOKENS list, one
+	// workspace=token binding per comma-separated entry. It is what makes an
+	// instance multi-tenant over static credentials: the credential decides
+	// which workspace a request acts on, so no client can ask for another
+	// team's data. Load rejects an entry whose id is not a valid workspace id
+	// and a token that appears twice for two different workspaces.
+	WorkspaceTokens []WorkspaceToken
+	// OIDC is the parsed OIDC_* block. Enabled() is false with OIDC_ISSUER
+	// unset, which leaves single sign-on off and the dashboard on its static
+	// token exactly as before.
+	OIDC OIDC
 	// PollInterval is how often the poller asks the RPC for new events.
 	PollInterval time.Duration
 	// SourceMode selects where events come from: "rpc" (standalone,
@@ -251,15 +276,20 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
-	net, err := ParseNetwork(func(key string) string {
+	nets, err := ParseNetworks(func(key string) string {
 		return lookupConfigValue(key, fileValues)
 	})
 	if err != nil {
 		return Config{}, err
 	}
+	// The primary network is the list's first entry. With NETWORKS unset that
+	// entry is exactly what ParseNetwork resolves from NETWORK, so every
+	// consumer of the single-network fields below behaves as it always did.
+	net := nets[0]
 
 	cfg := Config{
 		Network:            net,
+		Networks:           nets,
 		RPCURL:             net.RPCURL,
 		RPCURLs:            net.RPCURLs,
 		DatabaseURL:        lookupConfigValue("DATABASE_URL", fileValues),
@@ -310,6 +340,14 @@ func Load() (Config, error) {
 	if cfg.SourceMode == "horizon" && cfg.HorizonURL == "" {
 		return cfg, fmt.Errorf("HORIZON_URL is required when SOURCE_MODE=horizon")
 	}
+	// The upstream source is one SoroTrail deployment reading one chain: it has
+	// no per-network request to make, so a second entry in NETWORKS would be
+	// polled by nobody. Fail here instead of starting a supervisor whose
+	// testnet unit never advances.
+	if cfg.SourceMode == "sorotrail" && len(cfg.Networks) > 1 {
+		return cfg, fmt.Errorf("NETWORKS=%s lists %d chains but SOURCE_MODE=sorotrail reads events from a single upstream deployment; use SOURCE_MODE=rpc to poll several networks",
+			strings.Join(NetworkNames(cfg.Networks), ","), len(cfg.Networks))
+	}
 
 	if v := lookupConfigValue("POLL_INTERVAL", fileValues); v != "" {
 		d, err := time.ParseDuration(v)
@@ -335,6 +373,27 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.APITokens = tokens
+
+	bound, err := parseWorkspaceTokens(lookupConfigValue("WORKSPACE_TOKENS", fileValues))
+	if err != nil {
+		return cfg, err
+	}
+	cfg.WorkspaceTokens = bound
+	// A token that names two workspaces is rejected at startup, not at the
+	// first request: resolution would otherwise depend on which configured
+	// entry the comparison happened to hit, which is the one failure mode
+	// tenancy cannot have.
+	if err := checkTokenWorkspaces(cfg.APITokens, cfg.WorkspaceTokens); err != nil {
+		return cfg, err
+	}
+
+	oidc, err := parseOIDC(func(key string) string {
+		return lookupConfigValue(key, fileValues)
+	})
+	if err != nil {
+		return cfg, err
+	}
+	cfg.OIDC = oidc
 
 	if v := lookupConfigValue("HTTP_MAX_BODY_BYTES", fileValues); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -716,6 +775,10 @@ func (c Config) LogAttrs() []slog.Attr {
 		// The count, never the tokens themselves: LogAttrs is the one place
 		// configuration is printed, and an API token is a credential.
 		slog.Int("api_token_count", len(c.APITokens)),
+		// The workspace ids are safe to print and useful on a startup line; the
+		// tokens that select them are not, so only the ids appear.
+		slog.Any("workspaces", c.Workspaces()),
+		slog.Bool("sso_enabled", c.OIDC.Enabled()),
 		slog.Bool("otlp_tracing_enabled", c.OTLP.Endpoint != ""),
 		slog.String("otlp_service_name", c.OTLP.ServiceName),
 		slog.Float64("otlp_sample_rate", c.OTLP.SampleRate),

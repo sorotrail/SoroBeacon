@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -42,6 +43,11 @@ func parseAlertFilter(w http.ResponseWriter, r *http.Request) (store.AlertFilter
 		f.RuleID = id
 	}
 	f.ContractID = q.Get("contract_id")
+	// Network narrows the listing to one chain, read the same way the monitor
+	// and channel listings read it (see parseListFilter). Unset means every
+	// network the instance polls, which is what a caller that predates
+	// multi-network sees.
+	f.Network = strings.ToLower(strings.TrimSpace(q.Get("network")))
 	// The term is trimmed here rather than left for the store because the cap
 	// is about the text actually searched: a term padded with spaces to one
 	// character over the limit is a short search whose padding is not part of
@@ -154,6 +160,9 @@ const alertExportPageSize = 500
 var alertCSVHeader = []string{
 	"id", "monitor_name", "rule_id", "severity", "contract_id",
 	"event_name", "event_id", "ledger", "created_at", "payload",
+	// Appended, never inserted: an importer keyed on column position keeps
+	// working, and a single-network instance simply exports it empty.
+	"network",
 }
 
 // exportAlertsCSV serves GET /alerts.csv. It shares parseAlertFilter with
@@ -256,6 +265,9 @@ func alertCSVRow(a store.Alert, monitorName string) []string {
 		strconv.FormatUint(uint64(p.Ledger), 10),
 		a.CreatedAt.UTC().Format(time.RFC3339),
 		csvSafe(string(a.Payload)),
+		// Which chain's node produced the row — on a multi-network instance
+		// the same contract id in two exports means two different contracts.
+		csvSafe(a.Network),
 	}
 }
 

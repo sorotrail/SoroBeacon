@@ -40,6 +40,14 @@ type PositionReader interface {
 	Position() poller.Position
 }
 
+// NetworkStatusReader is the multi-network supervisor's per-chain view, which
+// the overview page renders as one row per network. The supervisor satisfies
+// it; a bare poller does not, and the page then shows the single aggregate it
+// always showed.
+type NetworkStatusReader interface {
+	Statuses(ctx context.Context) []poller.NetworkStatus
+}
+
 // LeaderReader reports this instance's leader-election status, shown on the
 // overview page so an operator can tell which replica is polling.
 type LeaderReader interface {
@@ -60,7 +68,12 @@ type Server struct {
 	log      *slog.Logger
 	pages    map[string]*template.Template
 	poller   PositionReader
-	leader   LeaderReader
+	// networkNames are the chains this instance polls, primary first. With
+	// more than one, every list page grows a network filter and creating a
+	// monitor has to say which chain it means.
+	networkNames []string
+	networkState NetworkStatusReader
+	leader       LeaderReader
 	// silentAfter is how long since last_matched_at before a monitor is
 	// marked silent on the list. Zero means the New default (24h).
 	silentAfter time.Duration
@@ -70,6 +83,9 @@ type Server struct {
 	a     *auth.Authenticator
 	auth  *auth.Authenticator
 	roles *auth.RoleEnforcer
+	// tokenMgr mints and lists scoped API tokens for the dashboard's token
+	// page. Nil disables the page rather than showing one that cannot mint.
+	tokenMgr *auth.Manager
 }
 
 // monitorListRow is a monitor plus the last-matched cue rendered on the
@@ -212,7 +228,10 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 		pages:       map[string]*template.Template{},
 		silentAfter: 24 * time.Hour,
 	}
-	for _, page := range []string{"index", "monitors", "monitor", "channels", "channel-delete", "alerts", "alert", "maintenance", "login", "error", "rulebuilder", "searches", "deadletters"} {
+	// Every page the dashboard can render. A page missing from this list is a
+	// nil template at request time, which is a panic rather than a 500, so the
+	// list and the templates directory have to agree.
+	for _, page := range []string{"index", "monitors", "monitor", "channels", "channel-delete", "alerts", "alert", "maintenance", "login", "error", "rulebuilder", "searches", "tokens", "deadletters"} {
 		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/shortcuts.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, fmt.Errorf("parse template %s: %w", page, err)
@@ -223,9 +242,51 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 }
 
 // WithPoller attaches the ingest-position source shown on the overview page.
+// A source that reports per-network status — the multi-network supervisor —
+// is wired for that in the same call.
 func (s *Server) WithPoller(p PositionReader) *Server {
 	s.poller = p
+	if ns, ok := p.(NetworkStatusReader); ok {
+		s.networkState = ns
+	}
 	return s
+}
+
+// WithNetworks declares the chains this instance polls, primary first, so the
+// dashboard can filter by them and the new-monitor form can say which chain a
+// contract lives on. Passing config.NetworkNames(cfg.Networks) is the wire-up.
+func (s *Server) WithNetworks(names []string) *Server {
+	s.networkNames = names
+	return s
+}
+
+// defaultNetwork is the chain a dashboard-created monitor lands on: the
+// primary, which is the only chain a single-network instance polls. Empty when
+// no list was configured, which leaves a monitor unlabelled as it was before
+// networks existed.
+func (s *Server) defaultNetwork() string {
+	if len(s.networkNames) == 0 {
+		return ""
+	}
+	return s.networkNames[0]
+}
+
+// networkChoice validates a network named by a form or query string against
+// the configured list. Anything unknown or blank becomes the default rather
+// than an error: a filter that arrives with a stale name should show
+// something, and a create form left on its default should not be rejected
+// over a name the instance does not poll.
+func (s *Server) networkChoice(raw string) string {
+	n := strings.ToLower(strings.TrimSpace(raw))
+	if n == "" {
+		return s.defaultNetwork()
+	}
+	for _, cfg := range s.networkNames {
+		if cfg == n {
+			return n
+		}
+	}
+	return s.defaultNetwork()
 }
 
 // WithLeadership attaches the leader-election status shown on the overview
@@ -287,6 +348,10 @@ func (s *Server) Routes() chi.Router {
 	r.Get(loginPath, s.loginPage)
 	r.Post(loginPath, s.login)
 	r.Post(logoutPath, s.logout)
+	// OIDC sign-in, when a provider is configured. Both are exempt from the
+	// session gate (see authExempt); without one they are 404s.
+	r.Get(oidcStartPath, s.oidcStart)
+	r.Get(oidcCallbackPath, s.oidcCallback)
 
 	r.Get("/", s.index)
 	r.Get("/favicon.ico", s.favicon)
@@ -312,6 +377,10 @@ func (s *Server) Routes() chi.Router {
 	r.Post("/channels/{id}/toggle", s.toggleChannel)
 
 	r.Get("/rulebuilder/{type}", s.ruleBuilderFields)
+
+	r.Get("/tokens", s.tokens)
+	r.Post("/tokens", s.createToken)
+	r.Post("/tokens/{id}/revoke", s.revokeToken)
 
 	r.Get("/searches", s.searches)
 	r.Post("/searches", s.createSearch)
@@ -633,6 +702,12 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 			data["Poller"] = pos
 		}
 	}
+	// One row per chain on a multi-network instance. The aggregate above is
+	// deliberately the worst network, so an overview that showed only it
+	// would hide which chain an operator needs to look at.
+	if s.networkState != nil && len(s.networkNames) > 1 {
+		data["NetworkStatuses"] = s.networkState.Statuses(r.Context())
+	}
 	if s.leader != nil {
 		data["Leadership"] = s.leader.Status()
 	}
@@ -687,6 +762,10 @@ func alertChartSVG(days []store.AlertDayCount) template.HTML {
 func (s *Server) monitors(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f := store.ListFilter{Limit: 50, Query: strings.TrimSpace(q.Get("q"))}
+	// Network narrows the list to one chain. It arrives from a select whose
+	// options are this instance's configured networks, so it can only ever be
+	// a name the store has rows for.
+	f.Network = strings.ToLower(strings.TrimSpace(q.Get("network")))
 	switch q.Get("enabled") {
 	case "true":
 		t := true
@@ -736,21 +815,29 @@ func (s *Server) monitors(w http.ResponseWriter, r *http.Request) {
 		"Title": "Monitors", "Monitors": s.monitorRows(monitors, tzFromRequest(r), time.Now()), "NextCursor": next,
 		"Empty": empty,
 		"Query": f.Query, "Enabled": enabled, "Sort": sort,
+		"Network": f.Network,
+		// Networks is the filter's option list: one chain needs no control at
+		// all, so the template only renders it when there is a choice to make.
+		"Networks":   s.networkNames,
+		"NewNetwork": s.defaultNetwork(),
 	}
 	if next != "" {
 		// template.URL so q/enabled/sort query separators are not %26-escaped.
-		data["OlderHref"] = template.URL("/monitors?" + monitorFilterQuery(f.Query, enabled, f.Sort) + "cursor=" + next)
+		data["OlderHref"] = template.URL("/monitors?" + monitorFilterQuery(f.Query, enabled, f.Sort, f.Network) + "cursor=" + next)
 	}
 	s.render(w, r, "monitors", data)
 }
 
-// monitorFilterQuery is the q/enabled/sort prefix preserved on the Older
-// paging link so filters survive navigation. Empty when every control is
+// monitorFilterQuery is the q/enabled/sort/network prefix preserved on the
+// Older paging link so filters survive navigation. Empty when every control is
 // at its default, so the existing `?cursor=` link stays stable.
-func monitorFilterQuery(q, enabled, sort string) string {
+func monitorFilterQuery(q, enabled, sort, network string) string {
 	v := url.Values{}
 	if q != "" {
 		v.Set("q", q)
+	}
+	if network != "" {
+		v.Set("network", network)
 	}
 	if enabled == "true" || enabled == "false" {
 		v.Set("enabled", enabled)
@@ -778,7 +865,15 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	m := store.Monitor{Name: name, ContractIDs: contracts, Enabled: true}
+	// The form's network select is hidden on a single-chain instance, so the
+	// value is usually empty and lands on the primary — which is the only
+	// chain there is. An unlabelled monitor would be polled by nobody.
+	m := store.Monitor{
+		Name:        name,
+		ContractIDs: contracts,
+		Enabled:     true,
+		Network:     s.networkChoice(r.FormValue("network")),
+	}
 	if err := s.store.CreateMonitor(r.Context(), &m); err != nil {
 		s.fail(w, err)
 		return
@@ -1456,7 +1551,12 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 		"HasFilters": selected != 0 || selectedRule != 0 || f.ContractID != "" ||
 			severity != "" || search != "" || !f.From.IsZero() || !f.To.IsZero(),
 		"ExportHref": alertExportHref(f),
-		"Empty":      emptyKind(monitors, channels, alerts),
+		// The network filter and the per-row network column only appear on a
+		// multi-network instance; with one chain there is nothing to choose
+		// between and the page looks exactly as it did.
+		"Networks": s.networkNames,
+		"Network":  f.Network,
+		"Empty":    emptyKind(monitors, channels, alerts),
 	}
 	if next != "" {
 		// template.URL so filter query separators are not %26-escaped.
@@ -1514,6 +1614,11 @@ func alertFilterQuery(f store.AlertFilter) string {
 	}
 	if f.Sort != "" && f.Sort != "created_at_desc" {
 		v.Set("sort", f.Sort)
+	}
+	// The network has to survive paging too: an Older link that dropped it
+	// would widen the page to every chain halfway through a result set.
+	if f.Network != "" {
+		v.Set("network", f.Network)
 	}
 	// The bounds go out as instants, not as the calendar dates the form
 	// collected: re-deriving the exclusive end from a date would add the day

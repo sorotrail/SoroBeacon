@@ -403,11 +403,11 @@ func TestAlertFilterQueryOmitsDefaults(t *testing.T) {
 		t.Fatalf("default sort = %q, want empty", got)
 	}
 	got := alertFilterQuery(store.AlertFilter{
-		MonitorID: 7, RuleID: 9, ContractID: "CAAA", Sort: "created_at_asc",
+		MonitorID: 7, RuleID: 9, ContractID: "CAAA", Sort: "created_at_asc", Network: "mainnet",
 	})
 	if !strings.Contains(got, "monitor_id=7") || !strings.Contains(got, "rule_id=9") ||
 		!strings.Contains(got, "contract_id=CAAA") || !strings.Contains(got, "sort=created_at_asc") ||
-		!strings.HasSuffix(got, "&") {
+		!strings.Contains(got, "network=mainnet") || !strings.HasSuffix(got, "&") {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -530,13 +530,13 @@ func TestAlertsPageRendersExportLink(t *testing.T) {
 }
 
 func TestMonitorFilterQueryOmitsDefaults(t *testing.T) {
-	if got := monitorFilterQuery("", "", ""); got != "" {
+	if got := monitorFilterQuery("", "", "", ""); got != "" {
 		t.Fatalf("defaults = %q, want empty so ?cursor= stays stable", got)
 	}
-	if got := monitorFilterQuery("", "", "name"); got != "" {
+	if got := monitorFilterQuery("", "", "name", ""); got != "" {
 		t.Fatalf("default sort = %q, want empty", got)
 	}
-	got := monitorFilterQuery("treasury", "false", "id")
+	got := monitorFilterQuery("treasury", "false", "id", "testnet")
 	if !strings.Contains(got, "q=treasury") || !strings.Contains(got, "enabled=false") || !strings.Contains(got, "sort=id") || !strings.HasSuffix(got, "&") {
 		t.Fatalf("got %q", got)
 	}

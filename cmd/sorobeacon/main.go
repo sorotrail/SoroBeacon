@@ -40,6 +40,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/store"
 	"github.com/sorotrail/sorobeacon/internal/telemetry"
 	"github.com/sorotrail/sorobeacon/internal/web"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 // main dispatches on the arguments. With none, the binary is the monitoring
@@ -115,11 +116,45 @@ func run() error {
 	// at /login also satisfies the API middleware — the dashboard links
 	// straight to /api/v1/alerts.csv, which a browser fetches without
 	// headers. The tokens themselves are never logged.
-	authn := auth.New(cfg.APITokens, auth.DefaultSessionTTL)
-	warnIfAPITokenUnset(log, cfg.APITokens)
+	//
+	// Each credential also carries the workspace it acts on: API_TOKEN
+	// entries act on the default workspace and WORKSPACE_TOKENS entries on
+	// their own, which is how one instance serves several teams without any
+	// of them being able to ask for someone else's data.
+	bindings, err := cfg.AuthBindings()
+	if err != nil {
+		return err
+	}
+	authn := auth.NewBound(bindings, auth.DefaultSessionTTL)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// The work this process does on its own behalf — ingesting ledgers,
+	// delivering alerts, pruning history — belongs to no single workspace: it
+	// acts across all of them. Marking the background context once here is
+	// what keeps a store method from silently reading it as a request from the
+	// default tenant instead.
+	sysCtx := workspace.WithSystem(ctx)
+
+	// Single sign-on, when a provider is configured. Discovery happens here, at
+	// startup, rather than on the first visitor's click: a mistyped
+	// OIDC_ISSUER, a client id the provider does not know or a provider that is
+	// down is a failure in the deploy log, which is where an operator is
+	// looking, and not a colleague unable to sign in three days later.
+	if cfg.OIDC.Enabled() {
+		discoverCtx, cancel := context.WithTimeout(ctx, startupNetworkTimeout)
+		defer cancel()
+		provider, err := auth.NewOIDCProvider(discoverCtx, cfg.OIDC.AuthOIDC())
+		if err != nil {
+			return err
+		}
+		authn.WithOIDC(provider)
+		// The issuer URL is configuration, not a secret; the client secret is
+		// not named here and never is.
+		log.Info("single sign-on enabled", "issuer", cfg.OIDC.Issuer,
+			"workspace", cfg.OIDC.Workspace, "allowed_domains", len(cfg.OIDC.AllowedDomains))
+	}
+	warnIfAuthDisabled(log, authn.Enabled())
 
 	// Tracing is entirely off unless OTLP_ENDPOINT is set; with it unset
 	// Setup installs a no-op provider, spans cost nothing and Shutdown is
@@ -219,6 +254,24 @@ func run() error {
 		}
 	}
 
+	// Tenancy. The configured credentials name the workspaces this instance
+	// serves, so the table is written from configuration at startup. It is
+	// idempotent by design: a restart records the same tenants and never
+	// overwrites a name, and 'default' already exists from the migration.
+	for _, ws := range cfg.Workspaces() {
+		if err := st.EnsureWorkspace(ctx, ws); err != nil {
+			return err
+		}
+	}
+
+	// Scoped API tokens. One manager, shared by the API and the dashboard, so
+	// a token minted from either is subject to the same rules about what it
+	// may hold. The authenticator gets it too: a bearer string shaped like a
+	// token (auth.TokenPrefix) is authenticated through this, while API_TOKEN
+	// and WORKSPACE_TOKENS stay the unrestricted operator credentials.
+	tokens := auth.NewManager(st, log)
+	authn.WithTokens(tokens)
+
 	// Pipeline: event source -> rules -> alerts -> channels. The source is
 	// the single seam between the poller and wherever events come from. The
 	// backfill subcommand shares this wiring so a replay reads exactly what
@@ -289,6 +342,7 @@ func run() error {
 	// HTTP: JSON API under /api/v1, dashboard at /.
 	apiSrv := api.New(st, registry, factory, health, log).
 		WithPoller(p).
+		WithNetworks(config.NetworkNames(cfg.Networks)).
 		WithLeadership(leader).
 		WithReadyzLagThreshold(cfg.ReadyzLagThreshold).
 		WithRateLimit(api.RateLimitConfig{
@@ -303,7 +357,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	webSrv.WithPoller(p).WithLeadership(leader).WithSilentAfter(cfg.MonitorSilentAfter).WithAuth(authn)
+	webSrv.WithPoller(p).WithLeadership(leader).WithSilentAfter(cfg.MonitorSilentAfter).WithAuth(authn).
+		WithNetworks(config.NetworkNames(cfg.Networks)).WithTokens(tokens)
 	root := chi.NewRouter()
 	// RequestLog must sit outside Recoverer so a panic still emits the
 	// access line after chi writes 500. reqid first so the line can
@@ -408,7 +463,11 @@ func run() error {
 	leaderDone := make(chan struct{})
 	go func() {
 		defer close(leaderDone)
-		leader.Run(ctx, job)
+		// sysCtx, not ctx: everything this job drives — the poller, the
+		// retention pruner, the digest flusher, the escalation stepper — acts
+		// across every workspace, and a plain context would be read by the
+		// store as a request from the default tenant.
+		leader.Run(sysCtx, job)
 	}()
 
 	select {
@@ -621,21 +680,24 @@ func warnIfChannelConfigUnencrypted(log *slog.Logger, key []byte) {
 	}
 }
 
-// warnIfAPITokenUnset logs one warning at startup when API_TOKEN is unset.
-// Both the API and the dashboard stay open, which is how the docker-compose
-// quickstart and every existing deployment behave — so this is a warning and
-// not a startup failure. The operator should still know: an unauthenticated
-// API can create, rewrite and delete monitors and channels from anywhere the
-// port is reachable.
-func warnIfAPITokenUnset(log *slog.Logger, tokens []string) {
-	if len(tokens) == 0 {
-		log.Warn("API authentication is disabled; set API_TOKEN to require a bearer token on /api/v1 and a sign-in on the dashboard")
+// warnIfAuthDisabled logs one warning at startup when no credential is
+// configured — neither API_TOKEN nor WORKSPACE_TOKENS. Both the API and the
+// dashboard stay open, which is how the docker-compose quickstart and every
+// existing deployment behave — so this is a warning and not a startup
+// failure. The operator should still know: an unauthenticated API can create,
+// rewrite and delete monitors and channels from anywhere the port is
+// reachable, and with no credential there is nothing to resolve a request's
+// workspace from either, so everything is the default tenant's.
+func warnIfAuthDisabled(log *slog.Logger, enabled bool) {
+	if !enabled {
+		log.Warn("API authentication is disabled; set API_TOKEN (or WORKSPACE_TOKENS for one token per workspace, or OIDC_ISSUER for single sign-on) to require a bearer token on /api/v1 and a sign-in on the dashboard")
 	}
 }
 
-// startupNetworkTimeout bounds the startup passphrase sweep across every
-// configured endpoint, so a set of unreachable endpoints delays boot by at
-// most this long rather than once per endpoint's own HTTP timeout.
+// startupNetworkTimeout bounds the network calls a boot makes: the passphrase
+// sweep across every configured endpoint, and OIDC discovery. A set of
+// unreachable endpoints delays boot by at most this long rather than once per
+// endpoint's own HTTP timeout, and the same is true of a provider that is down.
 const startupNetworkTimeout = 15 * time.Second
 
 // verifyNetworkEndpoints asks every configured RPC endpoint which network it

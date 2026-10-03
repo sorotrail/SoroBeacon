@@ -263,6 +263,11 @@ func configEnvVars(t *testing.T) []string {
 		regexp.MustCompile(`valueOrFallback\("([A-Z0-9_]+)"`),
 		regexp.MustCompile(`parseInt32EnvWithFile\("([A-Z0-9_]+)"`),
 		regexp.MustCompile(`parseDurationEnvWithFile\("([A-Z0-9_]+)"`),
+		// The per-network parser reads through a get(name) closure so one
+		// function can serve both the NETWORK_* and the NETWORKS_<name>_*
+		// forms. Without this pattern RPC_URL and NETWORK_PASSPHRASE go unseen,
+		// which the require above is there to catch.
+		regexp.MustCompile(`\bget\("([A-Z0-9_]+)"\)`),
 	}
 	// The chart lives at deploy/helm/sorobeacon, so the config package is
 	// three levels up.

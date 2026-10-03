@@ -316,11 +316,34 @@ func (m *Metrics) sampleHistogram(t *testing.T, name string, labels map[string]s
 // hasLabels reports whether sample carries exactly the wanted label pairs.
 // Labels are compared as a set because prometheus does not promise an order.
 func hasLabels(sample *dto.Metric, want map[string]string) bool {
-	if len(sample.GetLabel()) != len(want) {
-		return false
-	}
 	for _, pair := range sample.GetLabel() {
+		if _, asked := want[pair.GetName()]; !asked {
+			// Every ingest metric carries the network label, and on a
+			// single-network instance its value is the empty string. A test
+			// that does not name it is asking about that instance, so an
+			// empty network is not a distinguishing label. Any other
+			// unasked-for label still fails: it would mean the metric gained
+			// a dimension the test has not been reviewed for.
+			if pair.GetName() == networkLabel && pair.GetValue() == "" {
+				continue
+			}
+			return false
+		}
 		if want[pair.GetName()] != pair.GetValue() {
+			return false
+		}
+	}
+	// Every label the caller named has to be present, so a typo in a test is
+	// still a failure rather than a match against the first sample.
+	for name := range want {
+		found := false
+		for _, pair := range sample.GetLabel() {
+			if pair.GetName() == name {
+				found = true
+				break
+			}
+		}
+		if !found {
 			return false
 		}
 	}
