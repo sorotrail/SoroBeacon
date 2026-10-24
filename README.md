@@ -108,6 +108,7 @@ vs optional, secrets, and `SOURCE_MODE`-only notes — is
 | `REORG_CONFIRMATION_DEPTH` | `0`                       | Ledgers an event must be buried before it may alert |
 | `LOG_LEVEL`     | `info`                                 | `debug` \| `info` \| `warn` \| `error`       |
 | `READYZ_LAG_THRESHOLD` | `0` (disabled)                  | Fail `/readyz` when poller ledger lag exceeds this; 0 leaves probes unchanged |
+| `HEARTBEAT_URL` | _(unset, off)_                   | External dead-man's switch: while ingest is healthy the leader pings this URL and the external service alerts when the pings stop. Never logged. |
 | `RATE_LIMIT_RPS` | `0` (off)                             | Per-client API requests per second           |
 | `RATE_LIMIT_BURST` | `ceil(RPS)` when enabled            | Per-client token-bucket size                 |
 | `RATE_LIMIT_TRUST_FORWARDED` | `false`                  | Key clients by `X-Forwarded-For` (proxy only) |

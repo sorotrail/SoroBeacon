@@ -704,6 +704,9 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"http_addr",
 		"source_mode",
 		"poll_interval",
+		"heartbeat_enabled",
+		"heartbeat_interval",
+		"heartbeat_failure_pings",
 		"log_level",
 		"network",
 		"rpc_url",
@@ -727,6 +730,87 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"graphql_max_complexity",
 		"channel_disable_after_failures",
 	}, keys)
+}
+
+// The heartbeat URL is a credential: its path is what identifies the
+// monitor to the external service, so the one place configuration is
+// printed must contain neither the URL nor anything derived from it. What it
+// may print is the opt-in shape — on/off, interval, failure pings configured.
+func TestLogAttrsNeverPrintTheHeartbeatURL(t *testing.T) {
+	cfg := Config{
+		HeartbeatURL:           "https://hc.example.com/ping/deadbeef-1111-2222-3333-444444444444",
+		HeartbeatInterval:      time.Minute,
+		HeartbeatFailureSuffix: "/fail",
+	}
+	got := map[string]string{}
+	var blob strings.Builder
+	for _, a := range cfg.LogAttrs() {
+		got[a.Key] = a.Value.String()
+		blob.WriteString(a.Key + "=" + a.Value.String() + "\n")
+	}
+	assert.NotContains(t, blob.String(), "deadbeef", "the heartbeat URL must never be logged")
+	assert.NotContains(t, blob.String(), "hc.example.com", "not even the host is printed")
+	assert.Equal(t, "true", got["heartbeat_enabled"])
+	assert.Equal(t, "true", got["heartbeat_failure_pings"])
+	assert.Equal(t, "1m0s", got["heartbeat_interval"])
+}
+
+func TestLoadHeartbeat(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("HEARTBEAT_URL", "https://hc.example.com/ping/deadbeef-1111-2222-3333-444444444444")
+	t.Setenv("HEARTBEAT_INTERVAL", "30s")
+	t.Setenv("HEARTBEAT_FAILURE_SUFFIX", "/fail")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "https://hc.example.com/ping/deadbeef-1111-2222-3333-444444444444", cfg.HeartbeatURL)
+	assert.Equal(t, 30*time.Second, cfg.HeartbeatInterval)
+	assert.Equal(t, "/fail", cfg.HeartbeatFailureSuffix)
+
+	// Unset means off, exactly as before the feature existed: no URL, no
+	// failure pings, and the default interval waiting for an opt-in.
+	t.Setenv("HEARTBEAT_URL", "")
+	t.Setenv("HEARTBEAT_INTERVAL", "")
+	t.Setenv("HEARTBEAT_FAILURE_SUFFIX", "")
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.HeartbeatURL)
+	assert.Empty(t, cfg.HeartbeatFailureSuffix)
+	assert.Equal(t, DefaultHeartbeatInterval, cfg.HeartbeatInterval)
+}
+
+func TestLoadRejectsBadHeartbeatConfig(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("POLL_INTERVAL", "5s")
+
+	cases := []struct {
+		name string
+		url  string
+		iv   string
+		fail string
+	}{
+		{name: "not a URL", url: "hc.example.com", iv: "30s"},
+		{name: "wrong scheme", url: "ftp://hc.example.com/ping/x", iv: "30s"},
+		{name: "unparseable duration", url: "https://hc.example.com/ping/x", iv: "banana"},
+		{name: "zero interval", url: "https://hc.example.com/ping/x", iv: "0s"},
+		{name: "interval not above the poll interval", url: "https://hc.example.com/ping/x", iv: "5s"},
+		{name: "suffix without a leading slash", url: "https://hc.example.com/ping/x", iv: "30s", fail: "fail"},
+		{name: "suffix without a URL", iv: "30s", fail: "/fail"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HEARTBEAT_URL", tc.url)
+			t.Setenv("HEARTBEAT_INTERVAL", tc.iv)
+			t.Setenv("HEARTBEAT_FAILURE_SUFFIX", tc.fail)
+			_, err := Load()
+			require.Error(t, err)
+			// The URL is a credential even when it is rejected: the error
+			// says what is wrong without echoing the value.
+			if tc.url != "" {
+				assert.NotContains(t, err.Error(), tc.url)
+			}
+		})
+	}
 }
 
 func TestLoadAPITokens(t *testing.T) {

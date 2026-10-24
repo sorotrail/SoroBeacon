@@ -102,12 +102,13 @@ them.
 
 | Routes | Required scopes |
 | --- | --- |
-| `GET /monitors`, `GET /monitors/{id}`, `GET /monitors/{id}/rules`, `POST /monitors/{id}/rules/dry-run` | `monitors:read` (dry-run also `alerts:read`) |
-| `POST /monitors`, `PATCH`/`DELETE /monitors/{id}`, `POST /monitors/{id}/duplicate`, `POST /monitors/{id}/rules`, `POST /monitors/{id}/rules/bulk`, `PATCH`/`DELETE /monitors/{id}/rules/{ruleID}`, `POST /monitors/import`, `DELETE /monitors/{id}/escalation` | `monitors:write` |
+| `GET /monitors`, `GET /monitors/{id}`, `GET /monitors/{id}/rules`, `GET /monitors/trash`, `POST /monitors/{id}/rules/dry-run` | `monitors:read` (dry-run also `alerts:read`) |
+| `POST /monitors`, `POST /monitors/bulk`, `PATCH`/`DELETE /monitors/{id}`, `POST /monitors/{id}/duplicate`, `POST /monitors/{id}/soft-delete`, `POST /monitors/{id}/restore`, `POST /monitors/{id}/rules`, `POST /monitors/{id}/rules/bulk`, `PATCH`/`DELETE /monitors/{id}/rules/{ruleID}`, `POST /monitors/import`, `DELETE /monitors/{id}/escalation` | `monitors:write` |
 | `GET /monitors/{id}/escalation` | `monitors:read` |
 | `PUT /monitors/{id}/escalation` | `monitors:write` + `channels:write` |
 | `GET /channels`, `GET /channels/{id}` | `channels:read` |
-| `POST /channels`, `PATCH`/`DELETE /channels/{id}`, `POST /channels/{id}/test` | `channels:write` |
+| `POST /channels`, `POST /channels/bulk`, `POST /channels/{id}/duplicate`, `PATCH`/`DELETE /channels/{id}`, `POST /channels/{id}/test` | `channels:write` |
+| `GET /channels/{id}/stats` | `stats:read` |
 | `GET /templates`, `GET /templates/{id}` | `templates:read` |
 | `POST /templates`, `PATCH`/`DELETE /templates/{id}`, `POST /templates/{id}/instantiate`, `POST /templates/{id}/instantiate/bulk` | `templates:write` (instantiate also `monitors:write`) |
 | `GET /alerts`, `GET /alerts.csv`, `GET /alerts/export`, `GET /alerts/stream`, `GET /alerts/{id}/deliveries`, `GET /dead-letters`, `GET /inhibitions`, `GET /maintenance-windows`, `GET /maintenance-windows/{id}` | `alerts:read` |

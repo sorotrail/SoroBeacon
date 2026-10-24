@@ -242,6 +242,10 @@ type server struct {
 	leader     leaderLease
 	archiver   store.AlertArchiver
 	tel        *telemetry.Provider
+	// heartbeat is the external dead-man's switch, non-nil only when
+	// HEARTBEAT_URL is configured. It runs inside job so only the leader
+	// pings.
+	heartbeat *poller.Heartbeat
 
 	httpSrv      *http.Server
 	grpcSrv      *sorogrpc.Server
@@ -546,6 +550,27 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 		WithEnricher(enricher).
 		WithReorg(cfg.ReorgTrackingWindow, cfg.ReorgConfirmationDepth)
 
+	// Heartbeat (HEARTBEAT_URL): an external dead-man's switch fed only
+	// while ingest is demonstrably healthy. It reads the same position
+	// snapshot /readyz uses and shares the readiness lag threshold, so
+	// "healthy" means the same thing in both places, and it reuses the
+	// store's Ping for the database half of the question. Built here but
+	// started inside job, so with several replicas only the leader pings.
+	var heartbeat *poller.Heartbeat
+	if cfg.HeartbeatURL != "" {
+		heartbeat = poller.NewHeartbeat(poller.HeartbeatConfig{
+			URL:           cfg.HeartbeatURL,
+			Interval:      cfg.HeartbeatInterval,
+			FailureSuffix: cfg.HeartbeatFailureSuffix,
+			LagThreshold:  cfg.ReadyzLagThreshold,
+		}, p, st.Ping, m, log)
+		// The URL is a credential; only the shape of the configuration is
+		// logged, never anything derived from the URL itself.
+		log.Info("external heartbeat enabled",
+			"interval", cfg.HeartbeatInterval.String(),
+			"failure_pings", cfg.HeartbeatFailureSuffix != "")
+	}
+
 	// HTTP: JSON API under /api/v1, dashboard at /.
 	apiSrv := api.New(st, registry, factory, health, log).
 		WithPoller(p).
@@ -631,6 +656,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 
 	srv.poller = p
 	srv.dispatcher = dispatcher
+	srv.heartbeat = heartbeat
 	srv.archiver = archiver
 	srv.httpSrv = httpSrv
 	srv.prunerEnabled = cfg.AlertRetention > 0
@@ -773,6 +799,14 @@ func (s *server) job(ctx context.Context) {
 	start(func(ctx context.Context) {
 		s.dispatcher.RunEscalations(ctx)
 	})
+	// The heartbeat runs inside the job rather than beside it: leadership
+	// is what gates every send-on-a-timer loop in this process, and only
+	// the leader's pings should feed the external service. Run checks
+	// immediately on start, so a leadership hand-over cannot open a gap
+	// longer than one interval.
+	if s.heartbeat != nil {
+		start(s.heartbeat.Run)
+	}
 	s.poller.Run(ctx)
 	wg.Wait()
 }

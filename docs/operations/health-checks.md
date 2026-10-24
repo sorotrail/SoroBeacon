@@ -184,6 +184,88 @@ healthcheck:
 A load balancer only needs the one endpoint: `GET /api/v1/readyz`, expect
 `200`, remove the target on anything else. It never needs `API_TOKEN`.
 
+## Heartbeat — an external dead-man's switch
+
+`/readyz` and `/health` answer when something asks them. The failure they
+cannot report is the instance nobody is asking: if the process dies, the
+poller wedges, or the RPC stops returning events, no alert fires — the
+silence looks exactly like a quiet chain. `/readyz` helps only if something
+is polling it, and small deployments often have nothing that does.
+
+`HEARTBEAT_URL` closes that gap. While ingest is demonstrably healthy the
+leader pings an external service — Healthchecks.io, Cronitor, Better Stack,
+an Uptime Kuma push monitor, or any HTTP endpoint — on a schedule, and the
+external service alerts when the pings stop.
+
+The design point is what a ping *proves*. A ping sent by a mere timer says
+only that the process is alive, so SoroBeacon sends its ping only when:
+
+* the poller has completed a **new successful cycle** since the last check
+  (ingest progress, not liveness — a wedged poller stops the pings within
+  one interval),
+* ledger lag is within `READYZ_LAG_THRESHOLD` when one is configured (the
+  same cut-off `/readyz` uses, so "healthy" means one thing across the
+  process), and
+* the store answers a ping — alerts could not be written otherwise.
+
+### Configuration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HEARTBEAT_URL` | unset (off) | The ping endpoint. Treated as a **credential**: its path identifies your monitor, so it is never logged, never printed in the startup configuration line and never appears in an error message. |
+| `HEARTBEAT_INTERVAL` | `1m` | How often ingest health is re-evaluated and a healthy instance pings. Must be longer than `POLL_INTERVAL` — a ping requires a *new* successful poll since the previous check, so an interval at or below the poll cycle would read as no progress and is rejected at startup. |
+| `HEARTBEAT_FAILURE_SUFFIX` | unset (success pings only) | When set (e.g. `/fail`), one failure ping per outage goes to `HEARTBEAT_URL` + suffix, for services that accept an explicit "I'm down" signal. Unset means success pings only: the external service notices the silence itself. |
+
+**Only the leader pings.** The watcher runs inside the lease-gated job, so a
+multi-replica deployment produces one stream of pings, and a leadership
+hand-over starts the new leader with an immediate check — a change of leader
+cannot open a gap longer than one interval.
+
+Before the first successful poll nothing is pinged at all: there is no
+working state to report yet, and the external service's own "no data" state
+already covers it. Once pings have flowed, a detected failure sends one
+failure ping per outage (not one per check, so a long outage does not hammer
+the external service), and a recovered poller resumes the success pings.
+
+`sorobeacon_heartbeat_last_success_timestamp_seconds` records the time of the
+last successful ping, so `/metrics` can confirm from inside the instance
+that the external service was being fed.
+
+### Worked example: Healthchecks.io
+
+1. Create a monitor on [healthchecks.io](https://healthchecks.io) (the free
+tier is enough) and copy its ping URL. It looks like
+   `https://hc.example.com/ping/<your-monitor-uuid>` — the UUID is the
+   credential, so treat the URL the way you would an API token.
+2. Configure SoroBeacon:
+
+   ```bash
+   HEARTBEAT_URL=https://hc.example.com/ping/<your-monitor-uuid>
+   HEARTBEAT_INTERVAL=1m
+   HEARTBEAT_FAILURE_SUFFIX=/fail
+   ```
+
+   Set the monitor's period on healthchecks.io comfortably above
+   `HEARTBEAT_INTERVAL` (three minutes for a one-minute interval), so one
+   late ping does not page you.
+3. Restart the instance. The startup log confirms the shape of what was
+   configured — `external heartbeat enabled interval=1m0s failure_pings=true`
+   — and never the URL itself. The monitor flips to *Up* within a minute.
+4. Break it on purpose: stop the instance (or block its RPC). The monitor
+goes *Down* at once through the `/fail` ping, or when healthchecks.io's
+   grace period expires if you left `HEARTBEAT_FAILURE_SUFFIX` unset.
+
+### Why not just ping from a timer?
+
+A timer ping keeps feeding the external service while the poller is wedged —
+the exact failure this exists to catch. Because the ping follows a successful
+poll cycle, all of these stop the pings and open the silence the external
+service alerts on:
+
+* the poll loop is stuck (no new successful cycle completes),
+* ledger lag passes `READYZ_LAG_THRESHOLD` while polls still run,
+* the store is unreachable.
+
 ## Verifying it yourself
 
 Healthy path and failure path against a running instance, including the

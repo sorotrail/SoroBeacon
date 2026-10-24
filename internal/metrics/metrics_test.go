@@ -432,5 +432,21 @@ func TestDeadLetterPanicAndNetworkAreNilSafe(t *testing.T) {
 		m.SetDeadLetters(3)
 		m.RecordDeadLetter()
 		m.ClearDeadLetter()
+		m.RecordHeartbeatSuccess()
 	})
+}
+
+// The heartbeat metric is the inside-the-instance record that the external
+// dead-man's switch was being fed: it is zero until the first successful
+// ping and stamps the time on every one after that, so an operator can see
+// from /metrics when the external service last heard from this instance.
+func TestRecordHeartbeatSuccess(t *testing.T) {
+	m := New()
+
+	// A metrics handler scrape is what a dashboard would see; reading the
+	// registry directly is the same value without the HTTP round-trip.
+	m.RecordHeartbeatSuccess()
+	got := m.sampleValue(t, "sorobeacon_heartbeat_last_success_timestamp_seconds", nil)
+	assert.InDelta(t, float64(time.Now().Unix()), got, 5,
+		"the gauge should stamp the moment of the last successful ping")
 }

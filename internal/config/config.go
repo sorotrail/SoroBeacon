@@ -40,6 +40,12 @@ const (
 	// Stellar and a few getLedgers pages per cycle — cheap, and deep enough
 	// to cover the practical reorg depth.
 	DefaultReorgTrackingWindow uint32 = 128
+	// DefaultHeartbeatInterval is how often a healthy instance pings
+	// HEARTBEAT_URL when HEARTBEAT_INTERVAL is unset. It must stay
+	// comfortably longer than the poll interval: the ping is sent only
+	// when a new successful poll appeared since the last check, so an
+	// interval at or below the poll cycle would read as no progress.
+	DefaultHeartbeatInterval = time.Minute
 	// DefaultGraphQLMaxDepth is the maximum query depth for GraphQL.
 	// DefaultGraphQLMaxComplexity is the maximum query complexity for GraphQL.
 	DefaultGraphQLMaxDepth      = 10
@@ -164,6 +170,23 @@ type Config struct {
 	// ReadyzLagThreshold is the ledger lag at which /readyz fails.
 	// Zero (the default) disables the check so existing probes stay green.
 	ReadyzLagThreshold uint32
+	// HeartbeatURL enables the external dead-man's switch: when set, the
+	// leader pings this URL while ingest is demonstrably healthy
+	// (HEARTBEAT_URL). The URL is a credential — its path identifies the
+	// monitor to the external service — so it is never logged, never
+	// printed in LogAttrs, and never included in an error message.
+	HeartbeatURL string
+	// HeartbeatInterval is how often the health of ingest is re-evaluated
+	// (HEARTBEAT_INTERVAL); DefaultHeartbeatInterval when unset, and Load
+	// rejects a value at or below PollInterval because a heartbeat faster
+	// than the poll cycle could never observe new progress.
+	HeartbeatInterval time.Duration
+	// HeartbeatFailureSuffix, when set, enables one failure ping per
+	// outage to HeartbeatURL+suffix (HEARTBEAT_FAILURE_SUFFIX, e.g.
+	// "/fail" — the convention Healthchecks.io and most other
+	// dead-man's-switch services use). Unset means success pings only:
+	// the external service notices the silence itself.
+	HeartbeatFailureSuffix string
 	// RateLimitRPS is the per-client API token-bucket refill rate.
 	// Zero (default) disables the limiter.
 	RateLimitRPS float64
@@ -378,6 +401,7 @@ func LoadProblems() (Config, []Problem) {
 		DatabaseURL:        lookupConfigValue("DATABASE_URL", fileValues),
 		InstanceName:       strings.TrimSpace(lookupConfigValue("INSTANCE_NAME", fileValues)),
 		PollInterval:       DefaultPollInterval,
+		HeartbeatInterval:  DefaultHeartbeatInterval,
 		HTTPAddr:           valueOrFallback("HTTP_ADDR", fileValues, DefaultHTTPAddr),
 		HTTPMaxBodyBytes:   DefaultHTTPMaxBodyBytes,
 		LogLevel:           slog.LevelInfo,
@@ -508,6 +532,36 @@ func LoadProblems() (Config, []Problem) {
 		} else {
 			cfg.ReadyzLagThreshold = uint32(n)
 		}
+	}
+	// Heartbeat. The URL is parsed only to validate its shape: it is a
+	// credential, so neither it nor anything derived from it is ever
+	// echoed back in an error. It is validated after POLL_INTERVAL (which
+	// is parsed above) because the interval comparison depends on it.
+	if v := lookupConfigValue("HEARTBEAT_URL", fileValues); v != "" {
+		u, err := url.Parse(v)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return cfg, fmt.Errorf("invalid HEARTBEAT_URL: want an http(s) URL with a host (the URL itself is not printed because its path is a credential)")
+		}
+		cfg.HeartbeatURL = v
+	}
+	if v := lookupConfigValue("HEARTBEAT_INTERVAL", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return cfg, fmt.Errorf("invalid HEARTBEAT_INTERVAL %q (want a positive duration like 30s or 5m)", v)
+		}
+		cfg.HeartbeatInterval = d
+	}
+	if v := lookupConfigValue("HEARTBEAT_FAILURE_SUFFIX", fileValues); v != "" {
+		if !strings.HasPrefix(v, "/") {
+			return cfg, fmt.Errorf("invalid HEARTBEAT_FAILURE_SUFFIX %q (want a path suffix starting with /, like /fail)", v)
+		}
+		cfg.HeartbeatFailureSuffix = v
+	}
+	if cfg.HeartbeatFailureSuffix != "" && cfg.HeartbeatURL == "" {
+		return cfg, fmt.Errorf("HEARTBEAT_FAILURE_SUFFIX %q is set but HEARTBEAT_URL is not: there is no endpoint to fail", cfg.HeartbeatFailureSuffix)
+	}
+	if cfg.HeartbeatURL != "" && cfg.HeartbeatInterval <= cfg.PollInterval {
+		return cfg, fmt.Errorf("HEARTBEAT_INTERVAL %s must be longer than POLL_INTERVAL %s: a ping is sent only when a new successful poll appeared since the last check, so a heartbeat at or below the poll interval would read as no progress", cfg.HeartbeatInterval, cfg.PollInterval)
 	}
 	if v := lookupConfigValue("RATE_LIMIT_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
@@ -920,6 +974,12 @@ func (c Config) LogAttrs() []slog.Attr {
 		slog.String("http_addr", c.HTTPAddr),
 		slog.String("source_mode", c.SourceMode),
 		slog.String("poll_interval", c.PollInterval.String()),
+		// On/off, the interval and whether failure pings are configured —
+		// never the URL: its path is the credential the external service
+		// keys on, and LogAttrs is the one place configuration is printed.
+		slog.Bool("heartbeat_enabled", c.HeartbeatURL != ""),
+		slog.String("heartbeat_interval", c.HeartbeatInterval.String()),
+		slog.Bool("heartbeat_failure_pings", c.HeartbeatFailureSuffix != ""),
 		slog.String("log_level", strings.ToLower(c.LogLevel.String())),
 		slog.String("network", c.Network.Name),
 		slog.String("rpc_url", redactURLCredentials(c.RPCURL)),

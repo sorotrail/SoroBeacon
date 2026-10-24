@@ -49,22 +49,27 @@ type Metrics struct {
 	eventsMatched   *prometheus.CounterVec
 	ruleEvaluations *prometheus.CounterVec
 	// Per-rule-type metrics (cardinality bounded by rule type names)
-	ruleEvalsTotal    *prometheus.CounterVec
-	ruleMatchesTotal  *prometheus.CounterVec
-	ruleErrorsTotal   *prometheus.CounterVec
-	ruleDuration      *prometheus.HistogramVec
-	alertsFired     *prometheus.CounterVec
-	deliveries      *prometheus.CounterVec
-	throttles       *prometheus.CounterVec
-	httpDuration    *prometheus.HistogramVec
-	lastPollAgoSec  *prometheus.GaugeVec
-	pollPanics      *prometheus.CounterVec
-	breakerStates   *prometheus.GaugeVec
+	ruleEvalsTotal   *prometheus.CounterVec
+	ruleMatchesTotal *prometheus.CounterVec
+	ruleErrorsTotal  *prometheus.CounterVec
+	ruleDuration     *prometheus.HistogramVec
+	alertsFired      *prometheus.CounterVec
+	deliveries       *prometheus.CounterVec
+	throttles        *prometheus.CounterVec
+	httpDuration     *prometheus.HistogramVec
+	lastPollAgoSec   *prometheus.GaugeVec
+	pollPanics       *prometheus.CounterVec
+	breakerStates    *prometheus.GaugeVec
 
 	storeReads     *prometheus.CounterVec
 	storeFallbacks prometheus.Counter
 	replicaEnabled prometheus.Gauge
 	deadLetters    prometheus.Gauge
+	// heartbeatLastSuccess is the unix time of the last heartbeat ping that
+	// confirmed ingest was healthy. Zero (unset) means none has succeeded
+	// since the process started, which is the signal a dashboard alert can
+	// be built on.
+	heartbeatLastSuccess prometheus.Gauge
 }
 
 // networkLabel is the Prometheus label every ingest metric carries.
@@ -209,12 +214,17 @@ func New() *Metrics {
 			Name: "sorobeacon_dead_letters_total",
 			Help: "Current number of dead-lettered delivery attempts waiting for review or re-drive.",
 		}),
+
+		heartbeatLastSuccess: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_heartbeat_last_success_timestamp_seconds",
+			Help: "Unix time of the last heartbeat ping sent while ingest was healthy; 0 when none has succeeded this run.",
+		}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
 		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired, m.deliveries, m.throttles,
 		m.httpDuration, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
 		m.reorgsTotal, m.lastReorgLedger, m.breakerStates, m.pollPanics,
-		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.deadLetters,
+		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.deadLetters, m.heartbeatLastSuccess,
 		m.ruleEvalsTotal, m.ruleMatchesTotal, m.ruleErrorsTotal, m.ruleDuration)
 	return m
 }
@@ -444,6 +454,17 @@ func (m *Metrics) RecordDeadLetter() {
 		return
 	}
 	m.deadLetters.Inc()
+}
+
+// RecordHeartbeatSuccess stamps the last time a heartbeat ping confirmed
+// that ingest was healthy. It is how an operator proves from inside the
+// instance that the external dead-man's switch was being fed, without
+// looking at the external service.
+func (m *Metrics) RecordHeartbeatSuccess() {
+	if m == nil {
+		return
+	}
+	m.heartbeatLastSuccess.SetToCurrentTime()
 }
 
 // ClearDeadLetter decrements the number of dead letters after a successful

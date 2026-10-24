@@ -63,7 +63,10 @@ func (s *Server) listDeadLetters(w http.ResponseWriter, r *http.Request) {
 	data := map[string]any{
 		"DeadLetters": vms,
 	}
-	s.render(w, r, "deadletters.html", data)
+	// The page key is the bare name New() parses under: a name that is not
+	// in that list resolves to a nil template, which panics the request
+	// instead of failing it.
+	s.render(w, r, "deadletters", data)
 }
 
 func (s *Server) redriveDeadLetter(w http.ResponseWriter, r *http.Request) {

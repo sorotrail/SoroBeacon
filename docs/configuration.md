@@ -450,6 +450,36 @@ at `warn` and counted in `sorobeacon_reorgs_total`.
 | `REORG_TRACKING_WINDOW` | integer (ledgers) | `128` | optional | How many recent ledger hashes to keep and re-check. `0` disables detection (the behaviour before the feature). Roughly ten minutes of Stellar history at the default, and one `getLedgers` call per cycle. A source that cannot report ledger hashes (SoroTrail, or an RPC node too old for `getLedgers`) simply has no detection. |
 | `REORG_CONFIRMATION_DEPTH` | integer (ledgers) | `0` | optional | Hold an event until it is this many ledgers behind the tip before evaluating it. Trades alert latency for fewer retractions; `0` alerts immediately, the historical default. |
 
+## Heartbeat (dead-man's switch)
+
+SoroBeacon cannot alert you about its own silence: if the process dies, the
+poller wedges, or the RPC stops returning events, no alert fires — the
+silence looks exactly like a quiet chain. `HEARTBEAT_URL` closes that gap by
+pinging an external dead-man's-switch service (Healthchecks.io, Cronitor,
+Better Stack, an Uptime Kuma push monitor, or any HTTP endpoint) while ingest
+is demonstrably healthy; the external service alerts when the pings stop.
+
+The ping is tied to **ingest progress, not to a timer**: it is sent only when
+the poller has completed a new successful cycle since the last check, when
+ledger lag is within `READYZ_LAG_THRESHOLD` (if one is set), and when the
+store answers a ping. A wedged poller therefore stops the pings within one
+interval — which is the signal the external service watches for. See the
+[health and readiness guide](operations/health-checks.md#heartbeat--an-external-dead-mans-switch)
+for a worked example.
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `HEARTBEAT_URL` | http(s) URL | unset (off) | optional | The ping endpoint. Treated as a **credential**: its path identifies your monitor, so it is never logged, never printed in the startup configuration line, and never appears in an error message. Validated at load (shape only — the value is not echoed on failure). |
+| `HEARTBEAT_INTERVAL` | Go duration | `1m` | optional | How often ingest health is re-evaluated and a healthy instance pings. Must be **longer than `POLL_INTERVAL`**: a ping requires a new successful poll since the previous check, so an interval at or below the poll cycle would read as no progress and is rejected at startup. |
+| `HEARTBEAT_FAILURE_SUFFIX` | path suffix | unset (success pings only) | optional | When set (e.g. `/fail`), one failure ping per outage goes to `HEARTBEAT_URL` + suffix, for services that accept an explicit down signal. Unset means success pings only: the external service notices the silence itself. Requires `HEARTBEAT_URL`. |
+
+With several replicas behind the lease, only the leader pings, and a
+leadership hand-over starts the new leader with an immediate check — a
+change of leader cannot open a gap longer than one interval.
+`sorobeacon_heartbeat_last_success_timestamp_seconds` records the time of the
+last successful ping so `/metrics` can confirm the external service was
+being fed (see the [metrics reference](reference/metrics.md)).
+
 ## Retention and archiving
 
 | Variable | Type | Default | Required | What it does |
