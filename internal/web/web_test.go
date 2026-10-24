@@ -1294,6 +1294,126 @@ func TestToggleRule(t *testing.T) {
 	}
 }
 
+// **New tests for malformed/unknown ID handling**
+
+func TestToggleRuleWithMalformedIDs(t *testing.T) {
+	// Tests ensure that routes with malformed or unknown IDs return 404
+	// rather than panicking or returning unexpected status codes.
+	st := &ruleToggleStore{rule: store.Rule{ID: 5, MonitorID: 1, Type: "transfer", Enabled: true}}
+	s, err := New(st, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	tests := []struct {
+		name       string
+		path       string
+		expected   int
+		formValues map[string]string
+	}{
+		{"malformed monitor ID",
+		"/monitors/abc/rules/5/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"malformed rule ID",
+		"/monitors/1/rules/abc/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"unknown monitor ID",
+		"/monitors/9999/rules/5/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"unknown rule ID",
+		"/monitors/1/rules/9999/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"empty monitor ID",
+		"/monitors//rules/5/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"empty rule ID",
+		"/monitors/1/rules//toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"nil monitor ID (zero)",
+		"/monitors/0/rules/5/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"nil rule ID (zero)",
+		"/monitors/1/rules/0/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"very long monitor ID",
+		"/monitors/99999999999999999/rules/5/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"very long rule ID",
+		"/monitors/1/rules/99999999999999999/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"special chars in monitor ID",
+		"/monitors/!@#/rules/5/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"special chars in rule ID",
+		"/monitors/1/rules/!@#/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"unicode monitor ID",
+		"/monitors/日本語/rules/5/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"unicode rule ID",
+		"/monitors/1/rules/日本語/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"floating point monitor ID",
+		"/monitors/1.5/rules/5/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"1-digit monitor ID",
+		"/monitors/1/rules/5/toggle",
+			http.StatusSeeOther,
+			map[string]string{},
+		},
+		{"1-digit rule ID",
+		"/monitors/1/rules/1/toggle",
+			http.StatusSeeOther,
+			map[string]string{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res, err := client.Post(srv.URL+tt.path, "application/x-www-form-urlencoded", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			res.Body.Close()
+			if res.StatusCode != tt.expected {
+				t.Fatalf("%s: got status %d, want %d", tt.name, res.StatusCode, tt.expected)
+			}
+		})
+	}
+}
+
 // deliveriesStore backs GET /alerts/{id}/deliveries with a fixed set of
 // attempts and one named channel.
 type deliveriesStore struct {
