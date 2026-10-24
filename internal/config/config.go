@@ -32,6 +32,10 @@ const (
 	// DefaultMonitorSilentAfter is how long since last_matched_at before
 	// the monitors list treats a monitor as silent.
 	DefaultMonitorSilentAfter = 24 * time.Hour
+	// DefaultShutdownGracePeriod is how long to wait for in-flight deliveries
+	// before persisting them as retries and exiting.
+	DefaultShutdownGracePeriod = 30 * time.Second
+
 	DefaultFlappingEpisodes   = 3
 	DefaultFlappingWindow     = 15 * time.Minute
 	DefaultFlappingQuietAfter = 2 * time.Minute
@@ -185,6 +189,9 @@ type Config struct {
 	// MonitorSilentAfter is how long since last_matched_at before the
 	// dashboard marks a monitor silent. Default 24h.
 	MonitorSilentAfter time.Duration
+	// ShutdownGracePeriod is how long to wait for in-flight deliveries
+	// before persisting them as retries and exiting.
+	ShutdownGracePeriod time.Duration
 	// FlappingEpisodes is the number of alert episodes in FlappingWindow
 	// that trigger notification damping.
 	FlappingEpisodes int
@@ -382,9 +389,12 @@ func LoadProblems() (Config, []Problem) {
 		HTTPMaxBodyBytes:   DefaultHTTPMaxBodyBytes,
 		LogLevel:           slog.LevelInfo,
 		MonitorSilentAfter: DefaultMonitorSilentAfter,
-		FlappingEpisodes:   DefaultFlappingEpisodes,
-		FlappingWindow:     DefaultFlappingWindow,
-		FlappingQuietAfter: DefaultFlappingQuietAfter,
+		// Without this the zero value would make the shutdown drain give up
+		// immediately, which is the opposite of what the grace period is for.
+		ShutdownGracePeriod: DefaultShutdownGracePeriod,
+		FlappingEpisodes:    DefaultFlappingEpisodes,
+		FlappingWindow:      DefaultFlappingWindow,
+		FlappingQuietAfter:  DefaultFlappingQuietAfter,
 		// Detection is on by default; confirmation depth off, so a monitor
 		// alerts exactly as soon as it did before this feature.
 		ReorgTrackingWindow:    DefaultReorgTrackingWindow,
@@ -549,6 +559,17 @@ func LoadProblems() (Config, []Problem) {
 			ps.add("MONITOR_SILENT_AFTER", fmt.Errorf("MONITOR_SILENT_AFTER %q must be greater than 0", v))
 		default:
 			cfg.MonitorSilentAfter = d
+		}
+	}
+
+	if v := lookupConfigValue("SHUTDOWN_GRACE_PERIOD", fileValues); v != "" {
+		switch d, err := time.ParseDuration(v); {
+		case err != nil:
+			ps.add("SHUTDOWN_GRACE_PERIOD", fmt.Errorf("invalid SHUTDOWN_GRACE_PERIOD %q: %w", v, err))
+		case d <= 0:
+			ps.add("SHUTDOWN_GRACE_PERIOD", fmt.Errorf("SHUTDOWN_GRACE_PERIOD %q must be greater than 0", v))
+		default:
+			cfg.ShutdownGracePeriod = d
 		}
 	}
 

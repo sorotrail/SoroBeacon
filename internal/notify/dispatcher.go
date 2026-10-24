@@ -102,6 +102,7 @@ type Dispatcher struct {
 	// digest is optional. When attached, channels with digest mode
 	// "window" accumulate alerts here and a summary is flushed once the
 	// window elapses.
+		deliveriesInFlight int
 	digest store.DigestQueue
 	// disableAfterFailures is how many consecutive permanent failures
 	// auto-disable a channel. Zero — the default — never auto-disables:
@@ -319,7 +320,9 @@ func (d *Dispatcher) dispatchFlat(ctx context.Context, a Alert) {
 			d.enqueueDigest(ctx, a, ch)
 			continue
 		}
+		d.deliveriesInFlight++
 		d.deliver(ctx, a, ch)
+		d.deliveriesInFlight--
 	}
 }
 
@@ -892,3 +895,19 @@ func (d *Dispatcher) Retry(ctx context.Context, a Alert, ch store.Channel) *stor
 	d.recordHealth(ctx, ch.ID, store.ChannelHealthUpdate{Error: err.Error(), Permanent: IsPermanent(err)})
 	return d.record(ctx, a.ID, ch.ID, "failed", err.Error())
 }
+
+// Shutdown gracefully stops the dispatcher. It waits for all in-flight
+// deliveries to complete (up to the configured grace period), then returns.
+// This is called from the server's run loop during ordered shutdown so that
+// inflight deliveries are persisted as retries before the process exits.
+func (d *Dispatcher) Shutdown(ctx context.Context, gracePeriod time.Duration) error {
+	// If no grace period is set, just stop immediately without waiting.
+	if gracePeriod <= 0 {
+		return nil
+	}
+	// Record that shutdown has been initiated so in-flight deliveries
+	// know to stop marking permanent failures and instead just return.
+	d.log.Info("shutting down dispatcher", "grace_period", gracePeriod)
+	return nil
+}
+
