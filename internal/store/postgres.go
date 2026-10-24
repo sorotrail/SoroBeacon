@@ -2105,18 +2105,7 @@ func (p *Postgres) RecordDeliveryAttempt(ctx context.Context, d *DeliveryAttempt
 // can see the alert behind it. The join includes created_at because that pair
 // is the alerts primary key once the table is partitioned.
 func (p *Postgres) ListDeliveryAttempts(ctx context.Context, alertID int64, status string) ([]DeliveryAttempt, error) {
-	q := `SELECT da.id, da.alert_id, da.channel_id, da.status, da.response_snippet, da.attempted_at
-		 FROM delivery_attempts da
-		 JOIN alerts a ON a.id = da.alert_id AND a.created_at = da.alert_created_at
-		 WHERE da.alert_id = $1 AND a.workspace_id = $2`
-	args := []any{alertID, workspaceID(ctx)}
-	if status != "" {
-		// Applied in SQL so a busy alert does not ship every attempt just
-		// so the client can throw most of them away.
-		q += ` AND da.status = $3`
-		args = append(args, status)
-	}
-	q += ` ORDER BY da.id`
+	q, args := buildDeliveryAttemptsQuery(alertID, status, workspaceID(ctx))
 	rows, err := p.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -2126,6 +2115,26 @@ func (p *Postgres) ListDeliveryAttempts(ctx context.Context, alertID int64, stat
 		err := row.Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.Status, &d.ResponseSnippet, &d.AttemptedAt)
 		return d, err
 	})
+}
+
+// buildDeliveryAttemptsQuery builds the ListDeliveryAttempts statement and
+// its arguments. The listing and the EXPLAIN regression test over it
+// (alert_indexes_test.go) both call this, so the plan the test pins is the
+// plan the dashboard actually runs.
+func buildDeliveryAttemptsQuery(alertID int64, status string, ws workspace.ID) (string, []any) {
+	q := `SELECT da.id, da.alert_id, da.channel_id, da.status, da.response_snippet, da.attempted_at
+		 FROM delivery_attempts da
+		 JOIN alerts a ON a.id = da.alert_id AND a.created_at = da.alert_created_at
+		 WHERE da.alert_id = $1 AND a.workspace_id = $2`
+	args := []any{alertID, ws}
+	if status != "" {
+		// Applied in SQL so a busy alert does not ship every attempt just
+		// so the client can throw most of them away.
+		q += ` AND da.status = $3`
+		args = append(args, status)
+	}
+	q += ` ORDER BY da.id`
+	return q, args
 }
 
 // --- maintenance windows ---
