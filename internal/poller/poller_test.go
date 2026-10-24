@@ -41,9 +41,12 @@ func contractID(seed byte) string {
 
 var contractA = contractID(0xA1)
 
-// fakeRPC serves scripted getEvents responses and records requests.
+// fakeRPC serves scripted getEvents responses and records requests. oldest
+// is what getHealth reports as the oldest retained ledger (0 = unreported),
+// which is what the poller's retention check compares its checkpoint with.
 type fakeRPC struct {
 	latest    uint32
+	oldest    uint32
 	responses []*stellar.GetEventsResult
 	requests  []stellar.GetEventsRequest
 }
@@ -67,7 +70,7 @@ func (f *fakeRPC) GetNetwork(context.Context) (*stellar.Network, error) {
 }
 
 func (f *fakeRPC) GetHealth(context.Context) (*stellar.Health, error) {
-	return &stellar.Health{Status: "healthy"}, nil
+	return &stellar.Health{Status: "healthy", OldestLedger: f.oldest}, nil
 }
 
 // fakeStore implements poller.Store in memory, including the rule cooldown
@@ -114,6 +117,9 @@ type fakeStore struct {
 	// can throw the poller away and prove the clock survived "a restart".
 	absence     map[string]time.Time
 	alertErrors map[string]error
+	// retentionGaps records every RecordRetentionGap call in order, so a
+	// test can assert a detected hole was persisted, not merely logged.
+	retentionGaps []store.RetentionGap
 }
 
 func newFakeStore() *fakeStore {
@@ -369,6 +375,17 @@ func (f *fakeStore) SetIngestState(_ context.Context, network string, s store.In
 		return nil
 	}
 	f.namedState[network] = s
+	return nil
+}
+
+// RecordRetentionGap satisfies RetentionGapRecorder so a test can assert a
+// detected hole was persisted, not merely logged.
+func (f *fakeStore) RecordRetentionGap(_ context.Context, network string, fromLedger, toLedger uint32, detectedAt time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.retentionGaps = append(f.retentionGaps, store.RetentionGap{
+		Network: network, FromLedger: fromLedger, ToLedger: toLedger, DetectedAt: detectedAt,
+	})
 	return nil
 }
 

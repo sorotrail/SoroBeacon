@@ -565,7 +565,8 @@ create/update and never returned in responses. Each has a page under
 [Webex](docs/channels/webex.md), [DingTalk](docs/channels/dingtalk.md),
 [Google Chat](docs/channels/googlechat.md), [Opsgenie](docs/channels/opsgenie.md),
 [Gotify](docs/channels/gotify.md), [AWS SNS](docs/channels/sns.md),
-[Lark](docs/channels/lark.md), [ntfy](docs/channels/ntfy.md) and the
+[Lark](docs/channels/lark.md), [ntfy](docs/channels/ntfy.md),
+[Microsoft Teams](docs/channels/teams.md) and the
 [generic webhook](docs/channels/webhook.md).
 For self-hosted chat and phone push there are also
 [Mattermost](docs/channels/mattermost.md), [Rocket.Chat](docs/channels/rocketchat.md),
@@ -595,6 +596,7 @@ curl -s -X POST localhost:8080/api/v1/channels -d '{
 # Opsgenie: {"api_key": "geniekey-...", "region": "us", "priority": "P3"}
 # Gotify:   {"server_url": "https://gotify.example.com", "token": "app-token", "priority": 5}
 # AWS SNS:  {"topic_arn": "arn:aws:sns:us-east-1:123456789012:sorobeacon", "region": "us-east-1"}
+# Teams:    {"webhook_url": "https://<tenant>.webhook.office.com/webhookb2/..."}
 
 curl -s localhost:8080/api/v1/channels
 curl -s -X PATCH localhost:8080/api/v1/channels/1 -d '{"enabled": false}'
@@ -805,7 +807,7 @@ Decoded events use a small value vocabulary (`nil`, `bool`, `string`,
 
 ## Notification Channels
 
-Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md), [DingTalk](docs/channels/dingtalk.md), [Google Chat](docs/channels/googlechat.md), [Opsgenie](docs/channels/opsgenie.md), [Gotify](docs/channels/gotify.md), [AWS SNS](docs/channels/sns.md), [ntfy](docs/channels/ntfy.md), and generic [Webhooks](docs/channels/webhook.md).
+Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md), [DingTalk](docs/channels/dingtalk.md), [Google Chat](docs/channels/googlechat.md), [Opsgenie](docs/channels/opsgenie.md), [Gotify](docs/channels/gotify.md), [AWS SNS](docs/channels/sns.md), [ntfy](docs/channels/ntfy.md), [Microsoft Teams](docs/channels/teams.md), and generic [Webhooks](docs/channels/webhook.md).
 
 ## License
 

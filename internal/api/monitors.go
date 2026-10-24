@@ -40,6 +40,27 @@ type monitorRequest struct {
 	// multi-network keeps working — and keeps meaning the chain it already
 	// polled.
 	Network *string `json:"network"`
+	// Tags are free-form labels for grouping and filtering. Omitted leaves
+	// the tag set unchanged on update and empty on create, so a client that
+	// predates tags behaves exactly as before.
+	Tags *[]string `json:"tags"`
+}
+
+// tagsDetail validates and normalises a requested tag list. The length limits
+// are an API concern — a request over the limit is rejected with a field
+// error instead of being silently truncated — while normalisation (trim,
+// lowercase, dedupe, drop quotes/controls) is the store's, applied again on
+// write so every path stores one canonical set.
+func tagsDetail(raw []string) ([]string, *FieldError) {
+	if len(raw) > store.MaxMonitorTags {
+		return nil, &FieldError{Field: "tags", Reason: fmt.Sprintf("at most %d tags per monitor", store.MaxMonitorTags)}
+	}
+	for i, t := range raw {
+		if len(strings.TrimSpace(t)) > store.MaxTagLen {
+			return nil, &FieldError{Field: fmt.Sprintf("tags[%d]", i), Reason: fmt.Sprintf("tags are at most %d characters", store.MaxTagLen)}
+		}
+	}
+	return store.NormalizeTags(raw), nil
 }
 
 // networkDetail validates an optional network against the chains this instance
@@ -111,6 +132,14 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 	if nerr != nil {
 		details = append(details, *nerr)
 	}
+	var tags []string
+	if req.Tags != nil {
+		var terr *FieldError
+		tags, terr = tagsDetail(*req.Tags)
+		if terr != nil {
+			details = append(details, *terr)
+		}
+	}
 	if len(details) > 0 {
 		writeValidation(w, r, details)
 		return
@@ -121,6 +150,7 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 		Enabled:     req.Enabled == nil || *req.Enabled,
 		Priority:    priority.Normalized(),
 		Network:     network,
+		Tags:        tags,
 	}
 	if err := s.store.CreateMonitor(r.Context(), &m); err != nil {
 		s.fail(w, r, err)
@@ -248,6 +278,14 @@ func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 			Field:  "network",
 			Reason: fmt.Sprintf("a monitor's network is fixed (%q): delete and recreate the monitor to move it to another chain", m.Network),
 		})
+	}
+	if req.Tags != nil {
+		tags, terr := tagsDetail(*req.Tags)
+		if terr != nil {
+			details = append(details, *terr)
+		} else {
+			m.Tags = tags
+		}
 	}
 	if len(details) > 0 {
 		writeValidation(w, r, details)

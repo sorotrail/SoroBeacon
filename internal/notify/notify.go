@@ -122,6 +122,7 @@ const (
 	TypeGoogleChat   = "googlechat"
 	TypeOpsgenie     = "opsgenie"
 	TypeGotify       = "gotify"
+	TypeTeams        = "teams"
 	TypeSNS          = "sns"
 	TypeJSONTemplate = "jsontemplate"
 )
@@ -150,6 +151,7 @@ func DefaultFactory() *Factory {
 	f.Register(TypeGoogleChat, NewGoogleChat)
 	f.Register(TypeOpsgenie, NewOpsgenie)
 	f.Register(TypeGotify, NewGotify)
+	f.Register(TypeTeams, NewTeams)
 	f.Register(TypeSNS, NewSNS)
 	f.Register(TypeJSONTemplate, NewJSONTemplate)
 	return f

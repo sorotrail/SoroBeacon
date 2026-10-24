@@ -645,14 +645,14 @@ func TestAlertsPageRendersExportLink(t *testing.T) {
 }
 
 func TestMonitorFilterQueryOmitsDefaults(t *testing.T) {
-	if got := monitorFilterQuery("", "", "", ""); got != "" {
+	if got := monitorFilterQuery("", "", "", "", nil); got != "" {
 		t.Fatalf("defaults = %q, want empty so ?cursor= stays stable", got)
 	}
-	if got := monitorFilterQuery("", "", "name", ""); got != "" {
+	if got := monitorFilterQuery("", "", "name", "", nil); got != "" {
 		t.Fatalf("default sort = %q, want empty", got)
 	}
-	got := monitorFilterQuery("treasury", "false", "id", "testnet")
-	if !strings.Contains(got, "q=treasury") || !strings.Contains(got, "enabled=false") || !strings.Contains(got, "sort=id") || !strings.HasSuffix(got, "&") {
+	got := monitorFilterQuery("treasury", "false", "id", "testnet", []string{"ops"})
+	if !strings.Contains(got, "q=treasury") || !strings.Contains(got, "enabled=false") || !strings.Contains(got, "sort=id") || !strings.Contains(got, "tag=ops") || !strings.HasSuffix(got, "&") {
 		t.Fatalf("got %q", got)
 	}
 }

@@ -34,6 +34,9 @@ type conformanceStore interface {
 	rawChannelConfig(ctx context.Context, id int64) ([]byte, error)
 	// setCipher installs (or replaces) the config cipher.
 	setCipher(c ConfigCipher)
+	// setEventArchiveIngestedAt backdates one archived event row, so the
+	// retention pruner's cutoff can be tested without sleeping.
+	setEventArchiveIngestedAt(ctx context.Context, eventID string, at time.Time) error
 }
 
 // conformanceFactory returns a fresh, empty store for one test.
@@ -49,6 +52,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("SetMonitorsEnabledAtomicUnknownIDs", func(t *testing.T) { testSetMonitorsEnabled(t, newStore) })
 	t.Run("MonitorsAndChannelsKeysetPagination", func(t *testing.T) { testKeysetPagination(t, newStore) })
 	t.Run("ListMonitorsPageSearchFilterSort", func(t *testing.T) { testListMonitorsPage(t, newStore) })
+	t.Run("MonitorTagsNormaliseFilterUpdateAndDuplicate", func(t *testing.T) { testMonitorTags(t, newStore) })
 	t.Run("RuleCRUDAndCascade", func(t *testing.T) { testRuleCRUD(t, newStore) })
 	t.Run("CreateRulesAtomic", func(t *testing.T) { testCreateRulesAtomic(t, newStore) })
 	t.Run("CreateMonitorWithRulesIsAtomic", func(t *testing.T) { testCreateMonitorWithRules(t, newStore) })
@@ -70,6 +74,8 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("ContractIngestCursors", func(t *testing.T) { testContractIngestCursors(t, newStore) })
 	t.Run("AbsenceStateRoundTrip", func(t *testing.T) { testAbsenceState(t, newStore) })
 	t.Run("GetStats", func(t *testing.T) { testGetStats(t, newStore) })
+	t.Run("RetentionGapsRecordedAndSurfacedInStats", func(t *testing.T) { testRetentionGaps(t, newStore) })
+	t.Run("EventArchiveRecordsFiltersPagesAndPrunes", func(t *testing.T) { testEventArchive(t, newStore) })
 	t.Run("GetMonitorStats", func(t *testing.T) { testGetMonitorStats(t, newStore) })
 	t.Run("ChannelDeliveryStatsAggregation", func(t *testing.T) { testChannelDeliveryStats(t, newStore) })
 	t.Run("AlertCountsByDayZeroFillAndWindow", func(t *testing.T) { testAlertCountsByDay(t, newStore) })

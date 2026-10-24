@@ -779,6 +779,9 @@ func (s *Server) monitors(w http.ResponseWriter, r *http.Request) {
 	// options are this instance's configured networks, so it can only ever be
 	// a name the store has rows for.
 	f.Network = strings.ToLower(strings.TrimSpace(q.Get("network")))
+	// A repeated tag= ANDs, matching the API's ?tag= semantics. Normalisation
+	// drops blanks, so an empty field is no filter.
+	f.Tags = store.NormalizeTags(q["tag"])
 	switch q.Get("enabled") {
 	case "true":
 		t := true
@@ -829,6 +832,9 @@ func (s *Server) monitors(w http.ResponseWriter, r *http.Request) {
 		"Empty": empty,
 		"Query": f.Query, "Enabled": enabled, "Sort": sort,
 		"Network": f.Network,
+		// Tags is the tag filter repopulated in the form; the rows carry
+		// their own tag lists.
+		"Tags": strings.Join(f.Tags, " "),
 		// Networks is the filter's option list: one chain needs no control at
 		// all, so the template only renders it when there is a choice to make.
 		"Networks":   s.networkNames,
@@ -836,21 +842,24 @@ func (s *Server) monitors(w http.ResponseWriter, r *http.Request) {
 	}
 	if next != "" {
 		// template.URL so q/enabled/sort query separators are not %26-escaped.
-		data["OlderHref"] = template.URL("/monitors?" + monitorFilterQuery(f.Query, enabled, f.Sort, f.Network) + "cursor=" + next)
+		data["OlderHref"] = template.URL("/monitors?" + monitorFilterQuery(f.Query, enabled, f.Sort, f.Network, f.Tags) + "cursor=" + next)
 	}
 	s.render(w, r, "monitors", data)
 }
 
-// monitorFilterQuery is the q/enabled/sort/network prefix preserved on the
+// monitorFilterQuery is the q/enabled/sort/network/tag prefix preserved on the
 // Older paging link so filters survive navigation. Empty when every control is
 // at its default, so the existing `?cursor=` link stays stable.
-func monitorFilterQuery(q, enabled, sort, network string) string {
+func monitorFilterQuery(q, enabled, sort, network string, tags []string) string {
 	v := url.Values{}
 	if q != "" {
 		v.Set("q", q)
 	}
 	if network != "" {
 		v.Set("network", network)
+	}
+	for _, t := range tags {
+		v.Add("tag", t)
 	}
 	if enabled == "true" || enabled == "false" {
 		v.Set("enabled", enabled)
@@ -886,6 +895,7 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 		ContractIDs: contracts,
 		Enabled:     true,
 		Network:     s.networkChoice(r.FormValue("network")),
+		Tags:        splitTags(r.FormValue("tags")),
 	}
 	if err := s.store.CreateMonitor(r.Context(), &m); err != nil {
 		s.fail(w, err)
@@ -2161,4 +2171,12 @@ func splitLines(s string) []string {
 		}
 	}
 	return out
+}
+
+// splitTags parses the dashboard's tags form field: tags separated by
+// commas, spaces or newlines, e.g. "treasury, mainnet". Normalisation
+// (trim, lowercase, dedupe) is the store's, so the dashboard and the API
+// always store one canonical set.
+func splitTags(s string) []string {
+	return store.NormalizeTags(splitLines(s))
 }

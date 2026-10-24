@@ -367,6 +367,9 @@ func parseListFilter(w http.ResponseWriter, r *http.Request) (store.ListFilter, 
 	// Network narrows a list to one chain. Unset means every network an
 	// instance polls, which is what a caller that predates multi-network sees.
 	f.Network = strings.ToLower(strings.TrimSpace(q.Get("network")))
+	// A repeated ?tag= ANDs: the caller gets monitors carrying every named
+	// tag. Normalisation drops blanks, so ?tag= with no value is no filter.
+	f.Tags = store.NormalizeTags(q["tag"])
 	if v := q.Get("sort"); v != "" {
 		switch v {
 		case "name", "id", "created_at":

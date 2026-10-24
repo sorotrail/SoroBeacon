@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/sorotrail/sorobeacon/internal/store"
@@ -166,6 +167,116 @@ func TestListMonitors_CursorAndLimitPassedThrough(t *testing.T) {
 	}
 	if ps.gotFilter.Limit != 10 || ps.gotFilter.AfterID != 42 || !ps.gotFilter.EnabledOnly {
 		t.Fatalf("filter = %+v, want limit=10 afterID=42 enabled", ps.gotFilter)
+	}
+}
+
+func TestListMonitors_TagFilterPassedThroughAndNormalised(t *testing.T) {
+	ps := &pageStore{n: 1}
+	// A repeated ?tag= ANDs, and each value is normalised (trimmed,
+	// lowercased, deduplicated) before it reaches the store.
+	code, _ := getJSON(t, ps, "/monitors?tag=Ops&tag=+treasury+&tag=ops")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	want := []string{"ops", "treasury"}
+	if len(ps.gotFilter.Tags) != len(want) {
+		t.Fatalf("Tags = %v, want %v", ps.gotFilter.Tags, want)
+	}
+	for i := range want {
+		if ps.gotFilter.Tags[i] != want[i] {
+			t.Fatalf("Tags = %v, want %v", ps.gotFilter.Tags, want)
+		}
+	}
+}
+
+func TestListMonitors_NoTagParamMeansNoFilter(t *testing.T) {
+	ps := &pageStore{n: 1}
+	if code, _ := getJSON(t, ps, "/monitors"); code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if len(ps.gotFilter.Tags) != 0 {
+		t.Fatalf("Tags = %v, want empty", ps.gotFilter.Tags)
+	}
+}
+
+// monitorCaptureStore records the monitor CreateMonitor was handed, so a
+// handler test can assert what would have been stored.
+type monitorCaptureStore struct {
+	store.Store
+	created store.Monitor
+}
+
+func (s *monitorCaptureStore) CreateMonitor(_ context.Context, m *store.Monitor) error {
+	s.created = *m
+	m.ID = 1
+	return nil
+}
+
+func TestCreateMonitor_NormalisesAndStoresTags(t *testing.T) {
+	st := &monitorCaptureStore{}
+	srv := httptest.NewServer(newProbeServer(st, &fakeRPC{}))
+	defer srv.Close()
+
+	body := `{"name":"treasury","contract_ids":["CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"],"tags":["Ops"," ops ","Treasury"]}`
+	res, err := http.Post(srv.URL+"/monitors", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", res.StatusCode)
+	}
+	want := []string{"ops", "treasury"}
+	if len(st.created.Tags) != len(want) {
+		t.Fatalf("stored tags = %v, want %v (trimmed, lowercased, deduplicated)", st.created.Tags, want)
+	}
+	for i := range want {
+		if st.created.Tags[i] != want[i] {
+			t.Fatalf("stored tags = %v, want %v", st.created.Tags, want)
+		}
+	}
+}
+
+func TestCreateMonitor_WithoutTagsStoresEmptyList(t *testing.T) {
+	st := &monitorCaptureStore{}
+	srv := httptest.NewServer(newProbeServer(st, &fakeRPC{}))
+	defer srv.Close()
+
+	body := `{"name":"treasury","contract_ids":["CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"]}`
+	res, err := http.Post(srv.URL+"/monitors", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", res.StatusCode)
+	}
+	if st.created.Tags == nil || len(st.created.Tags) != 0 {
+		t.Fatalf("stored tags = %v, want an explicit empty list", st.created.Tags)
+	}
+}
+
+func TestCreateMonitor_RejectsTooManyTags(t *testing.T) {
+	tags := make([]string, store.MaxMonitorTags+1)
+	for i := range tags {
+		tags[i] = "tag" + string(rune('a'+i%26)) + string(rune('a'+i/26))
+	}
+	quoted, err := json.Marshal(tags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := &monitorCaptureStore{}
+	srv := httptest.NewServer(newProbeServer(st, &fakeRPC{}))
+	defer srv.Close()
+
+	body := `{"name":"treasury","contract_ids":["CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"],"tags":` + string(quoted) + `}`
+	res, err := http.Post(srv.URL+"/monitors", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for more than %d tags", res.StatusCode, store.MaxMonitorTags)
 	}
 }
 

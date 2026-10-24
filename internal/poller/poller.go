@@ -85,6 +85,15 @@ type Dispatcher interface {
 	Dispatch(ctx context.Context, a notify.Alert)
 }
 
+// RetentionGapRecorder is implemented by stores that persist retention gaps
+// (store.RetentionGaps). It is asserted rather than a method on Store so a
+// store that predates the feature — or a test fake with nothing to record —
+// keeps compiling; both real backends implement it, which is what makes a
+// detected gap survive a restart instead of living only in a log line.
+type RetentionGapRecorder interface {
+	RecordRetentionGap(ctx context.Context, network string, fromLedger, toLedger uint32, detectedAt time.Time) error
+}
+
 // Poller runs the ingest loop: getEvents from the last checkpoint, decode,
 // match rules, create + dispatch alerts, advance the checkpoint.
 type Poller struct {
@@ -516,6 +525,20 @@ func (p *Poller) Poll(ctx context.Context) error {
 		}
 	}
 
+	// A checkpoint older than the source's retention window can never be
+	// read: getEvents errors, or silently returns from oldestLedger, and
+	// the events in between are unrecoverably gone either way. Jumping to
+	// the oldest retained ledger turns an erroring loop into a resume, and
+	// recording the hole turns silent data loss into a visible one. A
+	// resume inside the window records nothing and changes nothing.
+	oldestRetained, retentionErr := p.checkRetention(ctx, &state)
+	if retentionErr != nil {
+		// Not being able to ask is not a reason to fail the cycle: the
+		// fetch below surfaces a real outage on its own, and a source
+		// that cannot answer has nothing to clamp to.
+		p.log.Warn("retention check failed", "err", retentionErr)
+	}
+
 	storedCursors, err := p.store.ListContractCursors(ctx, p.network)
 	if err != nil {
 		return err
@@ -536,6 +559,16 @@ func (p *Poller) Poll(ctx context.Context) error {
 				lastLedger = coldStartLedger - 1
 			}
 			if err := p.store.InitializeContractCursor(ctx, p.network, w.ContractID, lastLedger); err != nil {
+				return err
+			}
+		}
+		// A contract cursor that fell behind retention would start this
+		// cycle at ledgers the source has forgotten, exactly like the
+		// checkpoint checkRetention clamped above. AdvanceContractCursor
+		// ignores stale writes, so an already-current cursor is untouched.
+		if oldestRetained > 1 && lastLedger+1 < oldestRetained {
+			lastLedger = oldestRetained - 1
+			if err := p.store.AdvanceContractCursor(ctx, p.network, w.ContractID, lastLedger); err != nil {
 				return err
 			}
 		}
@@ -674,6 +707,56 @@ func (p *Poller) Poll(ctx context.Context) error {
 	}
 	p.recordPosition(processed, tip, time.Now())
 	return nil
+}
+
+// checkRetention compares the resume point against the oldest ledger the
+// source still serves and, when the checkpoint has fallen behind, records
+// the gap and advances state (persisting it) so the cycle that follows
+// starts at the oldest retained ledger. It returns that ledger — 0 when the
+// source does not report one, when the store has no checkpoint yet, or when
+// the checkpoint is inside the window — so the caller can clamp each
+// contract cursor to the same boundary.
+//
+// A resume inside the retention window records nothing and changes nothing:
+// the comparison is the whole feature. When a source cannot answer, or the
+// store cannot persist the record, the jump still happens if the numbers
+// are known — a visible warning beats an erroring loop either way.
+func (p *Poller) checkRetention(ctx context.Context, state *store.IngestState) (uint32, error) {
+	rep, ok := p.source.(RetentionReporter)
+	if !ok || state.LastLedger == 0 {
+		return 0, nil
+	}
+	oldest, err := rep.OldestLedger(ctx)
+	if err != nil {
+		return 0, err
+	}
+	// Oldest is the first retained ledger, so the first unreadable one is
+	// oldest-1; oldest < 2 means "unknown" or an unusable window, and there
+	// is nothing sensible to jump to.
+	if oldest < 2 || state.LastLedger+1 >= oldest {
+		return oldest, nil
+	}
+	from, to := state.LastLedger+1, oldest-1
+	p.log.Warn("checkpoint fell outside source retention; jumping to the oldest retained ledger",
+		"gap_from_ledger", from,
+		"gap_to_ledger", to,
+		"ledgers_missed", to-from+1)
+	rec, ok := p.store.(RetentionGapRecorder)
+	if !ok {
+		// The hole is real either way; say so loudly even where this store
+		// cannot keep the record.
+		p.log.Warn("store cannot persist retention gaps; this record lives only in the log")
+	} else if err := rec.RecordRetentionGap(ctx, p.network, from, to, p.now()); err != nil {
+		// Detection still proceeds: refusing to jump because the record
+		// failed would trade a visible gap for an erroring poller.
+		p.log.Error("record retention gap", "err", err)
+	}
+	state.LastLedger = to
+	state.LastCursor = ""
+	if err := p.store.SetIngestState(ctx, p.network, *state); err != nil {
+		return 0, err
+	}
+	return oldest, nil
 }
 
 // handleEvent runs every enabled rule of every monitor watching the

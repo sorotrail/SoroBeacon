@@ -35,7 +35,8 @@ func newTestPostgres(t *testing.T) conformanceStore {
 
 	_, err = st.pool.Exec(context.Background(),
 		`TRUNCATE monitors, rules, channels, monitor_channels, alerts, delivery_attempts, contract_ingest_cursors, api_tokens,
-		        escalation_policies, escalation_steps, escalation_step_channels, alert_escalations
+		        escalation_policies, escalation_steps, escalation_step_channels, alert_escalations,
+		        retention_gaps, event_archive
 		 RESTART IDENTITY CASCADE;
 		 UPDATE ingest_state SET last_ledger = 0, last_cursor = '' WHERE id = 1`)
 	require.NoError(t, err)
@@ -124,7 +125,8 @@ func rawChannelConfig(t *testing.T, st *Postgres, id int64) []byte {
 func (p *Postgres) resetConformance(ctx context.Context) error {
 	_, err := p.pool.Exec(ctx,
 		`TRUNCATE monitors, rules, channels, monitor_channels, alerts, delivery_attempts, contract_ingest_cursors, api_tokens,
-		         saved_searches, monitor_templates, audit_log, pending_digests, maintenance_windows RESTART IDENTITY CASCADE;
+		         saved_searches, monitor_templates, audit_log, pending_digests, maintenance_windows,
+		         retention_gaps, event_archive RESTART IDENTITY CASCADE;
 		 UPDATE ingest_state SET last_ledger = 0, last_cursor = '' WHERE id = 1`)
 	return err
 }
@@ -152,3 +154,9 @@ func (p *Postgres) rawChannelConfig(ctx context.Context, id int64) ([]byte, erro
 }
 
 func (p *Postgres) setCipher(c ConfigCipher) { p.cipher = c }
+
+func (p *Postgres) setEventArchiveIngestedAt(ctx context.Context, eventID string, at time.Time) error {
+	_, err := p.pool.Exec(ctx,
+		`UPDATE event_archive SET ingested_at = $1 WHERE event_id = $2`, at, eventID)
+	return err
+}

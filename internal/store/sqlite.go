@@ -248,6 +248,16 @@ func sqliteCreatedAt(t time.Time) any {
 	return sqliteTimeString(t)
 }
 
+// sqliteNullTime renders a *time.Time for a nullable TEXT timestamp column:
+// a nil pointer stays SQL NULL, an instant becomes the fixed-width UTC
+// layout. Used by the event archive, whose ledger close time is optional.
+func sqliteNullTime(t *time.Time) any {
+	if t == nil || t.IsZero() {
+		return nil
+	}
+	return sqliteTimeString(*t)
+}
+
 // parseSQLiteTime reverses sqliteTimeString. An empty string is the zero time
 // so a NULL / absent timestamp never becomes an error.
 func parseSQLiteTime(s string) (time.Time, error) {
@@ -323,6 +333,13 @@ func (s *SQLite) CreateMonitor(ctx context.Context, m *Monitor) error {
 	if err != nil {
 		return err
 	}
+	// Normalised here rather than at each caller so every write path —
+	// API, dashboard, import — stores one canonical tag set.
+	m.Tags = NormalizeTags(m.Tags)
+	tagJSON, err := json.Marshal(m.Tags)
+	if err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return mapSQLiteErr(err)
@@ -330,10 +347,10 @@ func (s *SQLite) CreateMonitor(ctx context.Context, m *Monitor) error {
 	defer func() { _ = tx.Rollback() }()
 	var created string
 	if err := tx.QueryRowContext(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+		`INSERT INTO monitors (name, contract_ids, tags, enabled, priority, workspace_id, network, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
 		 RETURNING id, created_at`,
-		m.Name, string(ids), boolToInt(m.Enabled), string(m.Priority.Normalized()), workspaceID(ctx), m.Network, sqliteCreatedAt(m.CreatedAt),
+		m.Name, string(ids), string(tagJSON), boolToInt(m.Enabled), string(m.Priority.Normalized()), workspaceID(ctx), m.Network, sqliteCreatedAt(m.CreatedAt),
 	).Scan(&m.ID, &created); err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -347,7 +364,7 @@ func (s *SQLite) CreateMonitor(ctx context.Context, m *Monitor) error {
 func (s *SQLite) GetMonitor(ctx context.Context, id int64) (*Monitor, error) {
 	ws := workspaceID(ctx)
 	m, err := scanSQLiteMonitor(s.db.QueryRowContext(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = ? AND workspace_id = ?`, id, ws))
+		`SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = ? AND workspace_id = ?`, id, ws))
 	if err != nil {
 		return nil, err
 	}
@@ -386,7 +403,7 @@ func (s *SQLite) monitorChannelIDs(ctx context.Context, monitorID int64, ws work
 // workspace's enabled monitors or a monitor in a second tenant would silently
 // stop being polled.
 func (s *SQLite) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE 1 = 1 AND deleted_at IS NULL`
+	q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE 1 = 1 AND deleted_at IS NULL`
 	args := []any{}
 	if ws, scoped := tenantWorkspace(ctx); scoped {
 		q += ` AND workspace_id = ?`
@@ -418,7 +435,7 @@ func (s *SQLite) queryMonitors(ctx context.Context, q string, args ...any) ([]Mo
 
 func (s *SQLite) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor, error) {
 	ws := workspaceID(ctx)
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE workspace_id = ? AND deleted_at IS NULL`
+	q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE workspace_id = ? AND deleted_at IS NULL`
 	args := []any{ws}
 	if f.Query != "" {
 		// instr + lower is a parameterized substring match without LIKE
@@ -429,6 +446,14 @@ func (s *SQLite) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor,
 	if f.Network != "" {
 		q += ` AND network = ?`
 		args = append(args, f.Network)
+	}
+	for _, t := range NormalizeTags(f.Tags) {
+		// The quoted element ("treasury") can only match one exact tag in
+		// the JSON text — the closing quote rules out partial matches —
+		// so the substring search is an exact tag test, matching the
+		// Postgres @> containment clause. Repeated tags AND together.
+		q += ` AND instr(tags, ?) > 0`
+		args = append(args, `"`+t+`"`)
 	}
 	switch {
 	case f.Enabled != nil && *f.Enabled:
@@ -473,6 +498,11 @@ func (s *SQLite) UpdateMonitor(ctx context.Context, m *Monitor) error {
 	if err != nil {
 		return err
 	}
+	m.Tags = NormalizeTags(m.Tags)
+	tagJSON, err := json.Marshal(m.Tags)
+	if err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return mapSQLiteErr(err)
@@ -484,8 +514,8 @@ func (s *SQLite) UpdateMonitor(ctx context.Context, m *Monitor) error {
 		return mapSQLiteErr(err)
 	}
 	res, err := tx.ExecContext(ctx,
-		`UPDATE monitors SET name = ?, contract_ids = ?, enabled = ?, priority = ? WHERE id = ? AND workspace_id = ?`,
-		m.Name, string(ids), boolToInt(m.Enabled), string(m.Priority.Normalized()), m.ID, workspaceID(ctx))
+		`UPDATE monitors SET name = ?, contract_ids = ?, tags = ?, enabled = ?, priority = ? WHERE id = ? AND workspace_id = ?`,
+		m.Name, string(ids), string(tagJSON), boolToInt(m.Enabled), string(m.Priority.Normalized()), m.ID, workspaceID(ctx))
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -603,7 +633,7 @@ func (s *SQLite) RestoreMonitor(ctx context.Context, id int64) error {
 // ListDeletedMonitors returns soft-deleted monitors (the "trash").
 func (s *SQLite) ListDeletedMonitors(ctx context.Context, f ListFilter) ([]Monitor, error) {
 	ws := workspaceID(ctx)
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE workspace_id = ? AND deleted_at IS NOT NULL`
+	q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE workspace_id = ? AND deleted_at IS NOT NULL`
 	args := []any{ws}
 	if f.Query != "" {
 		q += ` AND instr(lower(name), lower(?)) > 0`
@@ -804,7 +834,7 @@ func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, erro
 
 	ws := workspaceID(ctx)
 	src, err := scanSQLiteMonitor(tx.QueryRowContext(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = ? AND workspace_id = ?`, id, ws))
+		`SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = ? AND workspace_id = ?`, id, ws))
 	if err != nil {
 		return nil, err
 	}
@@ -848,11 +878,18 @@ func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, erro
 		Enabled:     false,                     // never inherit enabled: a duplicate must be reviewed first
 		Priority:    src.Priority.Normalized(), // priority is queue position, not a safety switch, so the copy keeps it
 		Network:     src.Network,               // the copy watches the same contract ids, which only exist on this chain
+		// Tags group related monitors, so a duplicate belongs in the same
+		// groups until an operator says otherwise.
+		Tags: NormalizeTags(src.Tags),
+	}
+	tagJSON, err := json.Marshal(dup.Tags)
+	if err != nil {
+		return nil, err
 	}
 	var created string
 	if err := tx.QueryRowContext(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network) VALUES (?, ?, ?, ?, ?, ?) RETURNING id, created_at`,
-		dup.Name, string(ids), boolToInt(dup.Enabled), string(dup.Priority), ws, dup.Network,
+		`INSERT INTO monitors (name, contract_ids, tags, enabled, priority, workspace_id, network) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id, created_at`,
+		dup.Name, string(ids), string(tagJSON), boolToInt(dup.Enabled), string(dup.Priority), ws, dup.Network,
 	).Scan(&dup.ID, &created); err != nil {
 		return nil, mapSQLiteErr(err)
 	}
@@ -928,18 +965,27 @@ type queryer interface {
 func scanSQLiteMonitor(r rowScanner) (*Monitor, error) {
 	var m Monitor
 	var ids string
+	var tags string
 	var enabled int64
 	var created string
 	var lastMatched sql.NullString
 	var deleted sql.NullString
 	var priority string
-	if err := r.Scan(&m.ID, &m.Name, &ids, &enabled, &created, &lastMatched, &priority, &m.Network, &deleted); err != nil {
+	if err := r.Scan(&m.ID, &m.Name, &ids, &tags, &enabled, &created, &lastMatched, &priority, &m.Network, &deleted); err != nil {
 		return nil, mapSQLiteErr(err)
 	}
 	m.Priority = Priority(priority).Normalized()
 	m.Enabled = enabled != 0
 	if err := json.Unmarshal([]byte(ids), &m.ContractIDs); err != nil {
 		return nil, fmt.Errorf("monitor %d: bad contract_ids: %w", m.ID, err)
+	}
+	if err := json.Unmarshal([]byte(tags), &m.Tags); err != nil {
+		return nil, fmt.Errorf("monitor %d: bad tags: %w", m.ID, err)
+	}
+	if m.Tags == nil {
+		// A monitor without tags reads back as an empty list, not nil, so
+		// JSON output is always an array.
+		m.Tags = []string{}
 	}
 	var err error
 	if m.CreatedAt, err = parseSQLiteTime(created); err != nil {
@@ -1519,7 +1565,7 @@ func (s *SQLite) DeleteChannel(ctx context.Context, id int64) error {
 
 func (s *SQLite) ListMonitorsForChannel(ctx context.Context, channelID int64) ([]Monitor, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT m.id, m.name, m.contract_ids, m.enabled, m.created_at, m.last_matched_at, m.priority
+		`SELECT m.id, m.name, m.contract_ids, m.tags, m.enabled, m.created_at, m.last_matched_at, m.priority, m.network, m.deleted_at
 		 FROM monitors m
 		 JOIN monitor_channels mc ON mc.monitor_id = m.id
 		 WHERE mc.channel_id = ? AND m.workspace_id = ?
@@ -2876,7 +2922,212 @@ func (s *SQLite) GetStats(ctx context.Context) (Stats, error) {
 		return st, err
 	}
 	summarizeCheckpoints(&st, cps)
+	// The most recent retention gap is an instance fact like last_ledger,
+	// not tenant data: if the service lost history, every operator of this
+	// instance needs to know. No recorded gap is the healthy case and leaves
+	// the field nil, which JSON omits.
+	gap, err := s.LatestRetentionGap(ctx, "")
+	switch {
+	case err == nil:
+		st.RetentionGap = &gap
+	case errors.Is(err, ErrNotFound):
+		// No gap ever recorded; report the shape GET /stats always had.
+	default:
+		return st, err
+	}
 	return st, nil
+}
+
+// --- retention gaps ---
+
+// RecordRetentionGap persists one detected hole in ingest history. There is
+// no dedup: each detection is a real observation, and the poller only
+// detects once per resume.
+func (s *SQLite) RecordRetentionGap(ctx context.Context, network string, fromLedger, toLedger uint32, detectedAt time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO retention_gaps (network, from_ledger, to_ledger, detected_at)
+		 VALUES (?, ?, ?, ?)`,
+		network, int64(fromLedger), int64(toLedger), sqliteTimeString(detectedAt.UTC()))
+	return mapSQLiteErr(err)
+}
+
+// LatestRetentionGap returns the most recently detected gap for network, or
+// across every network when network is empty. ErrNotFound when none was ever
+// recorded — the healthy case, which callers treat as "no gap to report"
+// rather than an error.
+func (s *SQLite) LatestRetentionGap(ctx context.Context, network string) (RetentionGap, error) {
+	var g RetentionGap
+	var from, to int64
+	var detected string
+	query := `SELECT id, network, from_ledger, to_ledger, detected_at
+	          FROM retention_gaps ORDER BY detected_at DESC, id DESC LIMIT 1`
+	var row *sql.Row
+	if network == "" {
+		row = s.db.QueryRowContext(ctx, query)
+	} else {
+		row = s.db.QueryRowContext(ctx,
+			`SELECT id, network, from_ledger, to_ledger, detected_at
+		     FROM retention_gaps WHERE network = ?
+		     ORDER BY detected_at DESC, id DESC LIMIT 1`, network)
+	}
+	if err := row.Scan(&g.ID, &g.Network, &from, &to, &detected); err != nil {
+		return RetentionGap{}, mapSQLiteErr(err)
+	}
+	var err error
+	if g.DetectedAt, err = parseSQLiteTime(detected); err != nil {
+		return RetentionGap{}, err
+	}
+	g.FromLedger, g.ToLedger = uint32(from), uint32(to)
+	return g, nil
+}
+
+// --- event archive ---
+
+// RecordEvents upserts one page of decoded events into the replay archive.
+// INSERT OR IGNORE over the (network, event_id) unique key makes the write
+// idempotent under the re-reads a crash or a confirmation-depth hold causes
+// — the same event arriving twice keeps one row.
+func (s *SQLite) RecordEvents(ctx context.Context, network string, events []ArchivedEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for i := range events {
+		ev := &events[i]
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO event_archive
+			 (network, event_id, contract_id, ledger, ledger_closed_at, tx_hash, event_name, topics, value, fields, ingested_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			network, ev.EventID, ev.ContractID, int64(ev.Ledger), sqliteNullTime(ev.LedgerClosedAt),
+			ev.TxHash, ev.EventName, string(archivedTopics(ev.Topics)), stringOrNULL(ev.Value), stringOrNULL(ev.Fields),
+			sqliteTimeString(time.Now().UTC())); err != nil {
+			return mapSQLiteErr(err)
+		}
+	}
+	return mapSQLiteErr(tx.Commit())
+}
+
+// archivedTopics returns the JSON array to archive, defaulting to "[]" so a
+// nil RawMessage cannot violate the column's NOT NULL.
+func archivedTopics(topics json.RawMessage) json.RawMessage {
+	if len(topics) == 0 {
+		return json.RawMessage(`[]`)
+	}
+	return topics
+}
+
+// stringOrNULL renders optional JSON for a nullable TEXT column.
+func stringOrNULL(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	return string(raw)
+}
+
+// sqliteArchiveFilterClause builds the WHERE clauses shared by the archive
+// read paths, so List and Count can never disagree about what matches. Each
+// clause appends its own args in order.
+func sqliteArchiveFilterClause(f EventArchiveFilter, q *string, args *[]any) {
+	*q += ` WHERE 1 = 1`
+	if f.Network != "" {
+		*q += ` AND network = ?`
+		*args = append(*args, f.Network)
+	}
+	if len(f.ContractIDs) > 0 {
+		*q += ` AND contract_id IN (` + placeholders(len(f.ContractIDs)) + `)`
+		for _, id := range f.ContractIDs {
+			*args = append(*args, id)
+		}
+	}
+	if f.FromLedger > 0 {
+		*q += ` AND ledger >= ?`
+		*args = append(*args, int64(f.FromLedger))
+	}
+	if f.ToLedger > 0 {
+		*q += ` AND ledger <= ?`
+		*args = append(*args, int64(f.ToLedger))
+	}
+	if f.AfterID > 0 {
+		*q += ` AND id > ?`
+		*args = append(*args, f.AfterID)
+	}
+}
+
+// ListArchivedEvents returns matching archived events oldest-first by id, so
+// a replay walks forward through history and pages with the id keyset.
+func (s *SQLite) ListArchivedEvents(ctx context.Context, f EventArchiveFilter) ([]ArchivedEvent, error) {
+	q := `SELECT id, network, event_id, contract_id, ledger, ledger_closed_at, tx_hash, event_name, topics, value, fields, ingested_at
+	      FROM event_archive`
+	var args []any
+	sqliteArchiveFilterClause(f, &q, &args)
+	q += ` ORDER BY id ASC LIMIT ?`
+	args = append(args, pageLimit(f.Limit))
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []ArchivedEvent
+	for rows.Next() {
+		ev, err := scanSQLiteArchivedEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
+// CountArchivedEvents returns how many events match f. Replay calls it first
+// so a range too expensive to evaluate is rejected before any evaluation
+// runs rather than hanging mid-request.
+func (s *SQLite) CountArchivedEvents(ctx context.Context, f EventArchiveFilter) (int64, error) {
+	q := `SELECT count(*) FROM event_archive`
+	var args []any
+	sqliteArchiveFilterClause(f, &q, &args)
+	var count int64
+	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&count); err != nil {
+		return 0, mapSQLiteErr(err)
+	}
+	return count, nil
+}
+
+// scanSQLiteArchivedEvent reads one event_archive row. Timestamps are TEXT
+// in the fixed-width UTC layout and parsed; value and fields may be NULL,
+// which stays a nil RawMessage.
+func scanSQLiteArchivedEvent(r rowScanner) (ArchivedEvent, error) {
+	var ev ArchivedEvent
+	var ledger int64
+	var closed sql.NullString
+	var topics string
+	var value, fields sql.NullString
+	var ingested string
+	if err := r.Scan(&ev.ID, &ev.Network, &ev.EventID, &ev.ContractID, &ledger, &closed,
+		&ev.TxHash, &ev.EventName, &topics, &value, &fields, &ingested); err != nil {
+		return ArchivedEvent{}, mapSQLiteErr(err)
+	}
+	ev.Ledger = uint32(ledger)
+	ev.Topics = json.RawMessage(topics)
+	if value.Valid && value.String != "" {
+		ev.Value = json.RawMessage(value.String)
+	}
+	if fields.Valid && fields.String != "" {
+		ev.Fields = json.RawMessage(fields.String)
+	}
+	var err error
+	if closed.Valid && closed.String != "" {
+		if ev.LedgerClosedAt, err = parseSQLiteTime(closed.String); err != nil {
+			return ArchivedEvent{}, err
+		}
+	}
+	if ev.IngestedAt, err = parseSQLiteTime(ingested); err != nil {
+		return ArchivedEvent{}, err
+	}
+	return ev, nil
 }
 
 // ingestCheckpoints reads every network's cursor, newest poll first. The legacy

@@ -290,6 +290,9 @@ func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
 	if err != nil {
 		return err
 	}
+	// Normalised here rather than at each caller so every write path —
+	// API, dashboard, import — stores one canonical tag set.
+	m.Tags = NormalizeTags(m.Tags)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -299,10 +302,10 @@ func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
 		return err
 	}
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()))
+		`INSERT INTO monitors (name, contract_ids, tags, enabled, priority, workspace_id, network, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, now()))
 		 RETURNING id, created_at`,
-		m.Name, ids, m.Enabled, m.Priority.Normalized(), workspaceID(ctx), m.Network, pgCreatedAt(m.CreatedAt),
+		m.Name, ids, m.Tags, m.Enabled, m.Priority.Normalized(), workspaceID(ctx), m.Network, pgCreatedAt(m.CreatedAt),
 	).Scan(&m.ID, &m.CreatedAt); err != nil {
 		// A name already taken in this workspace violates the unique index, and
 		// that is the request's fault rather than the server's: mapErr turns
@@ -315,7 +318,7 @@ func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
 func (p *Postgres) GetMonitor(ctx context.Context, id int64) (*Monitor, error) {
 	ws := workspaceID(ctx)
 	m, err := scanMonitor(p.pool.QueryRow(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
+		`SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
 	if err != nil {
 		return nil, err
 	}
@@ -379,7 +382,7 @@ func (p *Postgres) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monito
 }
 
 func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE workspace_id = $1 AND deleted_at IS NULL`
+	q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE workspace_id = $1 AND deleted_at IS NULL`
 	args := []any{workspaceID(ctx)}
 	n := 1
 	arg := func(v any) string {
@@ -394,6 +397,13 @@ func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monito
 	}
 	if f.Network != "" {
 		q += ` AND network = ` + arg(f.Network)
+	}
+	for _, t := range NormalizeTags(f.Tags) {
+		// @> containment with a single-element array is exactly what the
+		// GIN index added in migration 0032 is built for, so tag filters
+		// stay indexed. Repeated tags AND together: every tag must be
+		// carried.
+		q += ` AND tags @> ` + arg([]string{t})
 	}
 	switch {
 	case f.Enabled != nil && *f.Enabled:
@@ -459,6 +469,7 @@ func (p *Postgres) UpdateMonitor(ctx context.Context, m *Monitor) error {
 	if err != nil {
 		return err
 	}
+	m.Tags = NormalizeTags(m.Tags)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -474,8 +485,8 @@ func (p *Postgres) UpdateMonitor(ctx context.Context, m *Monitor) error {
 		return mapErr(err)
 	}
 	tag, err := tx.Exec(ctx,
-		`UPDATE monitors SET name = $3, contract_ids = $4, enabled = $5, priority = $6 WHERE id = $1 AND workspace_id = $2`,
-		m.ID, workspaceID(ctx), m.Name, ids, m.Enabled, m.Priority.Normalized())
+		`UPDATE monitors SET name = $3, contract_ids = $4, tags = $5, enabled = $6, priority = $7 WHERE id = $1 AND workspace_id = $2`,
+		m.ID, workspaceID(ctx), m.Name, ids, m.Tags, m.Enabled, m.Priority.Normalized())
 	if err != nil {
 		return err
 	}
@@ -592,7 +603,7 @@ func (p *Postgres) RestoreMonitor(ctx context.Context, id int64) error {
 
 // ListDeletedMonitors returns soft-deleted monitors (the "trash").
 func (p *Postgres) ListDeletedMonitors(ctx context.Context, f ListFilter) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE workspace_id = $1 AND deleted_at IS NOT NULL`
+	q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE workspace_id = $1 AND deleted_at IS NOT NULL`
 	args := []any{workspaceID(ctx)}
 	n := 1
 	arg := func(v any) string {
@@ -688,7 +699,7 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 	}
 
 	src, err := scanMonitor(tx.QueryRow(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
+		`SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
 	if err != nil {
 		return nil, err
 	}
@@ -750,11 +761,14 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 		// The network is not a reviewable setting: the copy watches the same
 		// contract ids, which only exist on the source's chain.
 		Network: src.Network,
+		// Tags group related monitors, so a duplicate belongs in the same
+		// groups until an operator says otherwise.
+		Tags: NormalizeTags(src.Tags),
 	}
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network) VALUES ($1, $2, $3, $4, $5, $6)
+		`INSERT INTO monitors (name, contract_ids, tags, enabled, priority, workspace_id, network) VALUES ($1, $2, $3, $4, $5, $6, $7)
 		 RETURNING id, created_at`,
-		copy.Name, ids, copy.Enabled, copy.Priority, ws, copy.Network,
+		copy.Name, ids, copy.Tags, copy.Enabled, copy.Priority, ws, copy.Network,
 	).Scan(&copy.ID, &copy.CreatedAt); err != nil {
 		return nil, err
 	}
@@ -879,13 +893,20 @@ type rowScanner interface{ Scan(dest ...any) error }
 func scanMonitor(r rowScanner) (*Monitor, error) {
 	var m Monitor
 	var ids []byte
+	var tags []string
 	var priority string
 	var deletedAt *time.Time
-	if err := r.Scan(&m.ID, &m.Name, &ids, &m.Enabled, &m.CreatedAt, &m.LastMatchedAt, &priority, &m.Network, &deletedAt); err != nil {
+	if err := r.Scan(&m.ID, &m.Name, &ids, &tags, &m.Enabled, &m.CreatedAt, &m.LastMatchedAt, &priority, &m.Network, &deletedAt); err != nil {
 		return nil, mapErr(err)
 	}
 	m.Priority = Priority(priority).Normalized()
 	m.DeletedAt = deletedAt
+	m.Tags = tags
+	if m.Tags == nil {
+		// A monitor without tags reads back as an empty list, not nil, so
+		// JSON output is always an array.
+		m.Tags = []string{}
+	}
 	if err := json.Unmarshal(ids, &m.ContractIDs); err != nil {
 		return nil, fmt.Errorf("monitor %d: bad contract_ids: %w", m.ID, err)
 	}
@@ -1306,7 +1327,7 @@ func (p *Postgres) DeleteChannel(ctx context.Context, id int64) error {
 
 func (p *Postgres) ListMonitorsForChannel(ctx context.Context, channelID int64) ([]Monitor, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT m.id, m.name, m.contract_ids, m.enabled, m.created_at, m.last_matched_at, m.priority
+		`SELECT m.id, m.name, m.contract_ids, m.tags, m.enabled, m.created_at, m.last_matched_at, m.priority, m.network, m.deleted_at
 		 FROM monitors m
 		 JOIN monitor_channels mc ON mc.monitor_id = m.id
 		 WHERE mc.channel_id = $1 AND m.workspace_id = $2
@@ -2413,16 +2434,173 @@ func (p *Postgres) SetIngestState(ctx context.Context, network string, s IngestS
 			`UPDATE ingest_state SET last_ledger = $1, last_cursor = $2, updated_at = now() WHERE id = 1`,
 			int64(s.LastLedger), s.LastCursor)
 		return err
-	}
-	_, err := p.pool.Exec(ctx, `
-		INSERT INTO network_ingest_state (network, last_ledger, last_cursor, updated_at)
+	}	_, err := p.pool.Exec(ctx,
+		`INSERT INTO network_ingest_state (network, last_ledger, last_cursor, updated_at)
 		VALUES ($1, $2, $3, now())
 		ON CONFLICT (network) DO UPDATE
 		    SET last_ledger = EXCLUDED.last_ledger,
 		        last_cursor = EXCLUDED.last_cursor,
-		        updated_at  = EXCLUDED.updated_at`,
+		    updated_at  = EXCLUDED.updated_at`,
 		network, int64(s.LastLedger), s.LastCursor)
 	return err
+}
+
+// --- retention gaps ---
+
+// RecordRetentionGap persists one detected hole in ingest history. There is
+// no dedup: each detection is a real observation, and the poller only
+// detects once per resume.
+func (p *Postgres) RecordRetentionGap(ctx context.Context, network string, fromLedger, toLedger uint32, detectedAt time.Time) error {
+	_, err := p.pool.Exec(ctx,
+		`INSERT INTO retention_gaps (network, from_ledger, to_ledger, detected_at)
+		 VALUES ($1, $2, $3, $4)`,
+		network, int64(fromLedger), int64(toLedger), detectedAt)
+	return err
+}
+
+// LatestRetentionGap returns the most recently detected gap for network, or
+// across every network when network is empty. ErrNotFound when none was ever
+// recorded — the healthy case, which callers treat as "no gap to report"
+// rather than an error.
+func (p *Postgres) LatestRetentionGap(ctx context.Context, network string) (RetentionGap, error) {
+	var g RetentionGap
+	var from, to int64
+	scan := func(row pgx.Row) error {
+		return row.Scan(&g.ID, &g.Network, &from, &to, &g.DetectedAt)
+	}
+	var err error
+	if network == "" {
+		err = p.queryRowFallback(ctx, scan,
+			`SELECT id, network, from_ledger, to_ledger, detected_at
+		     FROM retention_gaps ORDER BY detected_at DESC, id DESC LIMIT 1`)
+	} else {
+		err = p.queryRowFallback(ctx, scan,
+			`SELECT id, network, from_ledger, to_ledger, detected_at
+		     FROM retention_gaps WHERE network = $1
+		     ORDER BY detected_at DESC, id DESC LIMIT 1`, network)
+	}
+	if err != nil {
+		return RetentionGap{}, mapErr(err)
+	}
+	g.FromLedger, g.ToLedger = uint32(from), uint32(to)
+	return g, nil
+}
+
+// --- event archive ---
+
+// RecordEvents upserts one page of decoded events into the replay archive.
+// One batched round-trip regardless of page size: a poll cycle would
+// otherwise pay one network hop per event. ON CONFLICT (network, event_id)
+// DO NOTHING makes the write idempotent under the re-reads a crash or a
+// confirmation-depth hold causes — the same event arriving twice keeps one
+// row.
+func (p *Postgres) RecordEvents(ctx context.Context, network string, events []ArchivedEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for i := range events {
+		ev := &events[i]
+		batch.Queue(
+			`INSERT INTO event_archive (network, event_id, contract_id, ledger, ledger_closed_at, tx_hash, event_name, topics, value, fields)
+		     VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, '[]'::jsonb), $9, $10)
+		     ON CONFLICT (network, event_id) DO NOTHING`,
+			network, ev.EventID, ev.ContractID, int64(ev.Ledger), ev.LedgerClosedAt, ev.TxHash, ev.EventName,
+			ev.Topics, ev.Value, ev.Fields,
+		)
+	}
+	results := p.pool.SendBatch(ctx, batch)
+	defer results.Close() //nolint:errcheck // Close after a prior failure is a no-op
+	for range events {
+		if _, err := results.Exec(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// archiveFilterClause builds the WHERE clauses shared by the archive read
+// paths, so List and Count can never disagree about what matches. arg binds
+// each value and returns its placeholder.
+func archiveFilterClause(f EventArchiveFilter, arg func(any) string) string {
+	q := ` WHERE 1 = 1`
+	if f.Network != "" {
+		q += ` AND network = ` + arg(f.Network)
+	}
+	if len(f.ContractIDs) > 0 {
+		q += ` AND contract_id = ANY(` + arg(f.ContractIDs) + `)`
+	}
+	if f.FromLedger > 0 {
+		q += ` AND ledger >= ` + arg(int64(f.FromLedger))
+	}
+	if f.ToLedger > 0 {
+		q += ` AND ledger <= ` + arg(int64(f.ToLedger))
+	}
+	if f.AfterID > 0 {
+		q += ` AND id > ` + arg(f.AfterID)
+	}
+	return q
+}
+
+// ListArchivedEvents returns matching archived events oldest-first by id, so
+// a replay walks forward through history and pages with the id keyset.
+func (p *Postgres) ListArchivedEvents(ctx context.Context, f EventArchiveFilter) ([]ArchivedEvent, error) {
+	args := []any{}
+	n := 0
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	q := `SELECT id, network, event_id, contract_id, ledger, ledger_closed_at, tx_hash, event_name, topics, value, fields, ingested_at
+	     FROM event_archive` + archiveFilterClause(f, arg) +
+		` ORDER BY id ASC LIMIT ` + arg(pageLimit(f.Limit))
+	rows, err := p.queryRows(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ArchivedEvent
+	for rows.Next() {
+		ev, err := scanArchivedEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
+// CountArchivedEvents returns how many events match f. Replay calls it first
+// so a range too expensive to evaluate is rejected before any evaluation
+// runs rather than hanging mid-request.
+func (p *Postgres) CountArchivedEvents(ctx context.Context, f EventArchiveFilter) (int64, error) {
+	args := []any{}
+	n := 0
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	var count int64
+	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&count)
+	}, `SELECT count(*) FROM event_archive`+archiveFilterClause(f, arg), args...)
+	return count, err
+}
+
+// scanArchivedEvent reads one event_archive row. Topics/value/fields are
+// JSONB columns scanned as raw JSON; value and fields are NULL for events
+// whose decode produced nothing, which stays a nil RawMessage.
+func scanArchivedEvent(r rowScanner) (ArchivedEvent, error) {
+	var ev ArchivedEvent
+	var ledger int64
+	if err := r.Scan(&ev.ID, &ev.Network, &ev.EventID, &ev.ContractID, &ledger, &ev.LedgerClosedAt,
+		&ev.TxHash, &ev.EventName, &ev.Topics, &ev.Value, &ev.Fields, &ev.IngestedAt); err != nil {
+		return ArchivedEvent{}, mapErr(err)
+	}
+	ev.Ledger = uint32(ledger)
+	return ev, nil
 }
 
 const contractCursorRefsLock int64 = 0x534f524f435552
@@ -2691,7 +2869,23 @@ func (p *Postgres) GetStats(ctx context.Context) (Stats, error) {
 			(SELECT count(*) FROM alerts WHERE workspace_id = $1 AND created_at > now() - interval '24 hours'),
 			(SELECT last_ledger FROM ingest_state WHERE id = 1),
 			(SELECT updated_at FROM ingest_state WHERE id = 1)`, workspaceID(ctx))
-	return s, err
+	if err != nil {
+		return s, err
+	}
+	// The most recent retention gap is an instance fact like last_ledger,
+	// not tenant data: if the service lost history, every operator of this
+	// instance needs to know. No recorded gap is the healthy case and leaves
+	// the field nil, which JSON omits.
+	gap, err := p.LatestRetentionGap(ctx, "")
+	switch {
+	case err == nil:
+		s.RetentionGap = &gap
+	case errors.Is(err, ErrNotFound):
+		// No gap ever recorded; report the shape GET /stats always had.
+	default:
+		return s, err
+	}
+	return s, nil
 }
 
 // AlertCountsByDay returns the daily alert totals behind the dashboard chart.

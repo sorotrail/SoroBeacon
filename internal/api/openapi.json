@@ -92,6 +92,14 @@
             "description": "Only monitors watching this Stellar chain. Omitted means every chain this instance polls."
           },
           {
+            "name": "tag",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Only monitors carrying this tag. Repeat the parameter to require several tags (AND). Tags are matched after normalisation (trimmed, lowercased)."
+          },
+          {
             "name": "limit",
             "in": "query",
             "schema": {
@@ -1805,9 +1813,10 @@
     "/stats": {
       "get": {
         "summary": "Service statistics",
+        "description": "Instance counters plus the ingest checkpoint. When the poller has ever detected its checkpoint falling outside the source's event retention, the response carries retention_gap (network, from_ledger, to_ledger, detected_at) describing the most recent hole in ingest history; it is omitted when no gap has been recorded.",
         "responses": {
           "200": {
-            "description": "Counts of monitors, rules, alerts and deliveries",
+            "description": "Counts of monitors, rules, alerts and deliveries, the ingest checkpoint, and the most recent retention gap when one was recorded",
             "content": {
               "application/json": {
                 "schema": {
@@ -2665,6 +2674,13 @@
             "type": "string",
             "description": "Stellar chain this monitor watches. Empty on rows created before multi-network ingestion, which startup labels with the primary network."
           },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Free-form labels for grouping and filtering, normalised to trimmed lowercase unique strings before storage. Always an array; empty when the monitor carries no tags."
+          },
           "channel_ids": {
             "type": "array",
             "items": {
@@ -2799,6 +2815,15 @@
           "network": {
             "type": "string",
             "description": "Stellar chain these contract ids live on, chosen at creation. Omitted means the instance's primary network (the first entry in NETWORKS, or NETWORK when unset). A name this instance does not poll is rejected: the monitor would match nothing forever. A monitor's network cannot be changed afterwards — a contract id resolves to a different contract on another chain, and the alerts already stored keep their old label — so moving one means deleting and recreating it."
+          },
+          "tags": {
+            "type": "array",
+            "maxItems": 25,
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "description": "Free-form labels for grouping and filtering. Values are trimmed, lowercased and deduplicated before storage, so \"Treasury\" and \"treasury\" are one tag. Omitted leaves the set unchanged on update and empty on create."
           },
           "channel_ids": {
             "type": "array",

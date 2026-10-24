@@ -154,11 +154,60 @@ type Monitor struct {
 	// instance's primary network at startup; a newly created monitor always
 	// carries the network it was created for.
 	Network string `json:"network"`
+	// Tags are free-form labels for grouping and filtering. They are
+	// normalised (trimmed, lowercased, deduplicated — see NormalizeTags)
+	// before storage, and an untagged monitor keeps an empty list rather
+	// than nil so JSON output is always an array.
+	Tags []string `json:"tags"`
 	// DeletedAt is set when the monitor is soft-deleted. Nil means active.
 	// A soft-deleted monitor stops alerting immediately but can be restored
 	// within the restore window. When set, the monitor is excluded from
 	// evaluation and regular listings.
 	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+}
+
+// MaxMonitorTags bounds how many tags one monitor may carry, and MaxTagLen
+// bounds one tag's length. Tags are free-form operator input that lands in
+// an indexed array column and in every monitor listing response, so an
+// unbounded list would be a payload-size and index-bloat footgun rather
+// than a feature.
+const (
+	MaxMonitorTags = 25
+	MaxTagLen      = 64
+)
+
+// NormalizeTags trims, lowercases and deduplicates tags, dropping empty
+// ones and any " or control characters, so "Treasury", " treasury " and
+// "treasury" are one tag and a monitor's tag set is stable under
+// reordering. Dropping quotes also keeps the SQLite filter (an instr match
+// over the quoted JSON text) an exact tag test on both backends. The result
+// is never nil, so it serialises as [] rather than null and writes cleanly
+// to a NOT NULL column.
+func NormalizeTags(tags []string) []string {
+	if len(tags) == 0 {
+		return []string{}
+	}
+	seen := make(map[string]struct{}, len(tags))
+	out := make([]string, 0, len(tags))
+	for _, t := range tags {
+		t = strings.ToLower(strings.TrimSpace(t))
+		t = strings.Map(func(r rune) rune {
+			if r < 0x20 || r == 0x7f || r == '"' {
+				return -1
+			}
+			return r
+		}, t)
+		t = strings.TrimSpace(t)
+		if t == "" {
+			continue
+		}
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
 }
 
 // Rule is one condition evaluated against every event of its monitor's
@@ -629,6 +678,34 @@ type IngestState struct {
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
+// RetentionGap is one recorded hole in ingest history: the checkpoint had
+// fallen outside the source's retention window, so ledgers
+[FromLedger, ToLedger] can never be read. It is persisted rather than only
+// logged so the gap survives restarts and can be surfaced to operators —
+// silent data loss is the failure this record exists to prevent.
+type RetentionGap struct {
+	ID         int64     `json:"id"`
+	Network    string    `json:"network"`
+	FromLedger uint32    `json:"from_ledger"`
+	ToLedger   uint32    `json:"to_ledger"`
+	DetectedAt time.Time `json:"detected_at"`
+}
+
+// RetentionGaps persists holes in ingest history so they remain visible
+// after a restart. There is no read-all method: the dashboard and GET
+// /stats ask for the most recent gap, per network or across the instance,
+// and that is the question this exists to answer.
+type RetentionGaps interface {
+	// RecordRetentionGap persists one detected gap. Duplicate detections of
+	// the same hole are recorded again: each detection is a real observation
+	// and the caller only detects once per resume.
+	RecordRetentionGap(ctx context.Context, network string, fromLedger, toLedger uint32, detectedAt time.Time) error
+	// LatestRetentionGap returns the most recently detected gap for network,
+	// or ErrNotFound when none was ever recorded. An empty network asks for
+	// the most recent gap across all networks.
+	LatestRetentionGap(ctx context.Context, network string) (RetentionGap, error)
+}
+
 // ContractCursor is the inclusive ledger boundary durably processed for one
 // contract. Events within that ledger are replayed together after a crash.
 type ContractCursor struct {
@@ -852,6 +929,11 @@ type ListFilter struct {
 	// Network filters monitors by the Stellar network they watch. Empty
 	// means every network. Only meaningful for monitors.
 	Network string
+	// Tags filters monitors by tag. Every tag must be carried (AND, not
+	// OR), which is what a repeated ?tag= parameter means. Empty means no
+	// tag filter. Only meaningful for monitors; the store normalises them
+	// before they reach SQL.
+	Tags []string
 }
 
 // Stats is the aggregate snapshot served by GET /stats.
@@ -860,7 +942,9 @@ type ListFilter struct {
 // network they are that network's, and with several they come from whichever
 // checkpoint advanced most recently. Networks carries the per-network detail
 // so a dashboard can tell "testnet is current, mainnet is two hours behind"
-// instead of showing one blended number that hides it.
+// instead of showing one blended number that hides it. RetentionGap, when
+// set, is the most recent detected hole in ingest history — silent data loss
+// is the failure it exists to make loud.
 type Stats struct {
 	Monitors     int64          `json:"monitors"`
 	Rules        int64          `json:"rules"`
@@ -870,6 +954,11 @@ type Stats struct {
 	LastLedger   uint32         `json:"last_ledger"`
 	LastPollAt   time.Time      `json:"last_poll_at"`
 	Networks     []NetworkStats `json:"networks,omitempty"`
+	// RetentionGap is the most recently detected retention gap across all
+	// networks, or nil when none has ever been recorded — a nil gap is
+	// omitted from JSON so a healthy instance reports exactly the shape it
+	// always did.
+	RetentionGap *RetentionGap `json:"retention_gap,omitempty"`
 }
 
 // NetworkStats is one network's ingest checkpoint as stored, independent of
@@ -1147,6 +1236,70 @@ type ContractIngest interface {
 	RewindContractCursors(ctx context.Context, network string, lastLedger uint32) error
 }
 
+// ArchivedEvent is one ingested contract event kept for replay. It is the
+// decoded shape (the same one rule evaluators operate on), so a replay can
+// feed the production evaluator path directly instead of re-decoding XDR.
+type ArchivedEvent struct {
+	ID             int64           `json:"id"`
+	Network        string          `json:"network"`
+	EventID        string          `json:"event_id"`
+	ContractID     string          `json:"contract_id"`
+	Ledger         uint32          `json:"ledger"`
+	LedgerClosedAt *time.Time      `json:"ledger_closed_at,omitempty"`
+	TxHash         string          `json:"tx_hash"`
+	EventName      string          `json:"event_name"`
+	Topics         json.RawMessage `json:"topics"`
+	Value          json.RawMessage `json:"value,omitempty"`
+	Fields         json.RawMessage `json:"fields,omitempty"`
+	IngestedAt     time.Time       `json:"ingested_at"`
+}
+
+// EventArchiveFilter narrows ListArchivedEvents and CountArchivedEvents.
+// Zero values mean "no constraint" besides the store's page size.
+type EventArchiveFilter struct {
+	// Network restricts to one chain. Empty means every network.
+	Network string
+	// ContractIDs restricts to the given contracts (the replay caller passes
+	// its monitor's). Empty means every contract.
+	ContractIDs []string
+	// FromLedger and ToLedger are an inclusive ledger range. Zero From means
+	// no lower bound; zero To means no upper bound.
+	FromLedger uint32
+	ToLedger   uint32
+	// Limit caps the rows ListArchivedEvents returns (the store applies its
+	// own default and cap). CountArchivedEvents ignores it.
+	Limit int
+	// AfterID is the keyset cursor: events with id greater than this, oldest
+	// first, so replay pages forward through the archive.
+	AfterID int64
+}
+
+// EventArchive persists the raw event corpus replay evaluates against. The
+// poller writes every event it ingests; replay reads it back. Retention is
+// bounded (see RunEventArchivePruner), so it is a replay window rather than
+// a second copy of the chain.
+//
+// This is deliberately a separate interface from Store's other halves: the
+// poller only archives when its store implements it (see
+// poller.EventArchiver), so a store that cannot retain events keeps
+// everything else working and replay simply reports an empty corpus.
+type EventArchive interface {
+	// RecordEvents upserts archived events, keyed on (network, event_id):
+	// the poller re-reads ledger windows after a crash or a
+	// confirmation-depth hold, and the unique key turns that re-read into a
+	// no-op instead of duplicating the corpus. An empty slice is a no-op.
+	RecordEvents(ctx context.Context, network string, events []ArchivedEvent) error
+	// ListArchivedEvents returns matching events oldest-first by id, at most
+	// f.Limit of them (default and cap applied by the store).
+	ListArchivedEvents(ctx context.Context, f EventArchiveFilter) ([]ArchivedEvent, error)
+	// CountArchivedEvents returns how many events match f, so a replay can
+	// reject a range that is too expensive before evaluating anything.
+	CountArchivedEvents(ctx context.Context, f EventArchiveFilter) (int64, error)
+	// DeleteExpiredEvents removes up to limit events ingested strictly before
+	// cutoff. The bounded-retention pruner calls it in batches.
+	DeleteExpiredEvents(ctx context.Context, cutoff time.Time, limit int) (int64, error)
+}
+
 // Absence persists the last-seen clocks that absence-of-event rules measure
 // silence against.
 type Absence interface {
@@ -1413,6 +1566,8 @@ type Store interface {
 	Absence
 	Backfills
 	Ledgers
+	RetentionGaps
+	EventArchive
 	SavedSearches
 	MonitorTemplates
 	Audits

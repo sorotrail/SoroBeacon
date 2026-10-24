@@ -184,3 +184,105 @@ func RunAlertPruner(ctx context.Context, st AlertPruner, retention, interval tim
 		}
 	}
 }
+
+// DeleteExpiredEvents removes up to limit archived events ingested strictly
+// before cutoff. Unlike alerts there is nothing to archive first or cascade
+// after: the rows being deleted *are* the event archive, read only by
+// replay. limit is clamped to DefaultPruneBatch when it is not positive.
+func (p *Postgres) DeleteExpiredEvents(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = DefaultPruneBatch
+	}
+	var deleted int64
+	err := p.pool.QueryRow(ctx, `
+		WITH expired AS (
+			SELECT id FROM event_archive
+			WHERE ingested_at < $1
+			ORDER BY ingested_at ASC, id ASC
+			LIMIT $2
+		),
+		deleted_events AS (
+			DELETE FROM event_archive e
+			USING expired x
+			WHERE e.id = x.id
+			RETURNING e.id
+		)
+		SELECT count(*) FROM deleted_events`, cutoff, limit).Scan(&deleted)
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
+}
+
+// DeleteExpiredEvents is the SQLite counterpart; see the Postgres method.
+func (s *SQLite) DeleteExpiredEvents(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = DefaultPruneBatch
+	}
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM event_archive WHERE id IN (
+			SELECT id FROM event_archive WHERE ingested_at < ?
+			ORDER BY ingested_at ASC, id ASC LIMIT ?
+		)`, sqliteTimeString(cutoff.UTC()), limit)
+	if err != nil {
+		return 0, mapSQLiteErr(err)
+	}
+	return res.RowsAffected()
+}
+
+// RunEventArchivePruner deletes archived events older than retention in
+// batches until ctx is cancelled. Unlike alert retention there is no
+// archive-first phase — the rows being deleted are the archive — so a
+// non-positive retention is the only off switch, and it is what keeps the
+// replay corpus bounded rather than a second copy of the chain. One pass
+// runs immediately, then on interval (DefaultPruneInterval when interval
+// is not positive).
+func RunEventArchivePruner(ctx context.Context, st EventArchive, retention, interval time.Duration, batch int, log *slog.Logger) {
+	if retention <= 0 {
+		return
+	}
+	if batch <= 0 {
+		batch = DefaultPruneBatch
+	}
+	if interval <= 0 {
+		interval = DefaultPruneInterval
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	log.Info("event archive pruner started",
+		"retention", retention.String(),
+		"interval", interval.String(),
+		"batch", batch,
+	)
+
+	pruneOnce := func() {
+		cutoff := time.Now().UTC().Add(-retention)
+		var deleted int64
+		for {
+			n, err := st.DeleteExpiredEvents(ctx, cutoff, batch)
+			if err != nil {
+				log.Error("event archive prune failed", "error", err, "cutoff", cutoff)
+				return
+			}
+			deleted += n
+			if n < int64(batch) {
+				break
+			}
+		}
+		log.Info("event archive prune", "deleted", deleted, "cutoff", cutoff)
+	}
+
+	pruneOnce()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("event archive pruner stopped")
+			return
+		case <-t.C:
+			pruneOnce()
+		}
+	}
+}
