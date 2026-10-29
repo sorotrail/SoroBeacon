@@ -58,6 +58,10 @@ The README has worked examples for channels and rules.
   into named fields behind `stellar.Decoder`.
 - Dashboard improvements (kept deliberately minimal in the MVP).
 
+## Code of Conduct
+
+[Contributor Convenant v2.1](CODE_OF_CONDUCT.md) governs this project's community interactions.
+
 ## Pull requests
 
 - Keep PRs focused; separate refactors from features.
