@@ -44,12 +44,18 @@ type Ingestor struct {
 // NewIngestor wires an Ingestor. d receives every alert unless the caller
 // disables delivery (HandleOptions.Deliver).
 func NewIngestor(st IngestStore, reg *rules.Registry, d Dispatcher, log *slog.Logger) *Ingestor {
+	if reg != nil {
+		reg.WithLogger(log)
+	}
 	return &Ingestor{store: st, registry: reg, dispatch: d, log: log}
 }
 
 // WithMetrics attaches Prometheus instrumentation to alert evaluation.
 func (in *Ingestor) WithMetrics(m *metrics.Metrics) *Ingestor {
 	in.metrics = m
+	if in.registry != nil && m != nil {
+		in.registry.WithPanicObserver(m.RecordPanic)
+	}
 	return in
 }
 
@@ -99,12 +105,22 @@ func (in *Ingestor) Handle(ctx context.Context, decoded *stellar.DecodedEvent, m
 			continue
 		}
 		for _, rule := range ruleList {
-			// The rule id rides in the context so a stateful evaluator (the
-			// frequency rule) can key its per-rule state.
-			ruleCtx := rules.WithRuleID(ctx, rule.ID)
+			// The rule and monitor ids ride in the context so stateful
+			// evaluators and the isolation boundary can attribute state,
+			// timeouts, and panics to the exact rule and workspace.
+			ruleCtx := rules.WithMonitorID(rules.WithRuleID(ctx, rule.ID), m.ID)
+			start := time.Now()
 			matched, err := in.registry.Evaluate(ruleCtx, rule.Type, decoded, rule.Params)
+			duration := time.Since(start)
+			if in.metrics != nil {
+				in.metrics.RecordRuleEval(rule.Type, matched, err, duration)
+			}
 			if err != nil {
-				in.log.Warn("rule evaluation failed", "rule_id", rule.ID, "event_id", decoded.ID, "err", err)
+				if rules.IsRuleQuarantined(err) {
+					in.log.Debug("skipping quarantined rule", "rule_id", rule.ID, "monitor_id", m.ID, "event_id", decoded.ID)
+					continue
+				}
+				in.log.Warn("rule evaluation failed", "rule_id", rule.ID, "monitor_id", m.ID, "event_id", decoded.ID, "err", err)
 				continue
 			}
 			if !matched {

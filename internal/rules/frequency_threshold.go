@@ -76,6 +76,9 @@ type FrequencyThreshold struct {
 	now func() time.Time
 	// matchLog rebuilds state after a restart; nil disables the rebuild.
 	matchLog MatchLog
+	// maxMatches caps how many timestamps a single rule retains in memory.
+	// Zero uses DefaultMaxFrequencyMatches.
+	maxMatches int
 }
 
 // freqState is one rule's rolling window and firing state.
@@ -93,6 +96,18 @@ type freqState struct {
 	seeded bool
 }
 
+func (s *freqState) clone() freqState {
+	if s == nil {
+		return freqState{}
+	}
+	cp := *s
+	if len(s.matches) > 0 {
+		cp.matches = make([]time.Time, len(s.matches))
+		copy(cp.matches, s.matches)
+	}
+	return cp
+}
+
 // frequencyEventPrefix marks the synthetic alert id a frequency rule stores
 // its alert under. It keeps the id recognisable in the alerts table and lets
 // a restart recover the episode start from the stored row.
@@ -102,7 +117,11 @@ const frequencyEventPrefix = "frequency:"
 // restart rebuild; wire a MatchLog with WithMatchLog to persist across
 // restarts.
 func NewFrequencyThreshold() *FrequencyThreshold {
-	return &FrequencyThreshold{states: map[int64]*freqState{}, now: time.Now}
+	return &FrequencyThreshold{
+		states:     map[int64]*freqState{},
+		now:        time.Now,
+		maxMatches: DefaultMaxFrequencyMatches,
+	}
 }
 
 // WithClock overrides the clock, for tests.
@@ -116,6 +135,38 @@ func (f *FrequencyThreshold) WithClock(now func() time.Time) *FrequencyThreshold
 func (f *FrequencyThreshold) WithMatchLog(l MatchLog) *FrequencyThreshold {
 	f.matchLog = l
 	return f
+}
+
+// WithMaxMatches overrides the per-rule cap on tracked match timestamps. A
+// non-positive value restores DefaultMaxFrequencyMatches.
+func (f *FrequencyThreshold) WithMaxMatches(max int) *FrequencyThreshold {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if max <= 0 {
+		f.maxMatches = DefaultMaxFrequencyMatches
+	} else {
+		f.maxMatches = max
+	}
+	return f
+}
+
+// TrackedMatchCount returns how many match timestamps ruleID currently holds
+// in memory.
+func (f *FrequencyThreshold) TrackedMatchCount(ruleID int64) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s := f.states[ruleID]
+	if s == nil {
+		return 0
+	}
+	return len(s.matches)
+}
+
+func (f *FrequencyThreshold) maxMatchesCap() int {
+	if f.maxMatches <= 0 {
+		return DefaultMaxFrequencyMatches
+	}
+	return f.maxMatches
 }
 
 func (f *FrequencyThreshold) clock() time.Time {
@@ -184,6 +235,9 @@ func (*FrequencyThreshold) EventNames(params json.RawMessage) ([]string, bool) {
 }
 
 func (f *FrequencyThreshold) Evaluate(ctx context.Context, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	p, err := parseFrequencyThreshold(params)
 	if err != nil {
 		return false, err
@@ -200,21 +254,35 @@ func (f *FrequencyThreshold) Evaluate(ctx context.Context, ev *stellar.DecodedEv
 	ruleID := RuleID(ctx)
 
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	s := f.state(ruleID)
-	if !s.seeded {
-		if !f.seed(ctx, s, ruleID, now, window) {
+	snapshot := f.state(ruleID).clone()
+	capMatches := f.maxMatchesCap()
+	f.mu.Unlock()
+
+	if !snapshot.seeded {
+		// Rebuild state outside f.mu so one rule waiting on MatchLog never
+		// blocks other frequency_threshold rules across monitors, and only
+		// commit the seeded state once the rebuild succeeds completely.
+		if !f.seed(ctx, &snapshot, ruleID, now, window, capMatches) {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
 			// The durable state could not be read, so firing now could
 			// duplicate an alert the rule already sent. Skip this event and
 			// retry the rebuild on the next one.
 			return false, nil
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 
 	// Old matches leave the window as new ones arrive, so a slow trickle
 	// never accumulates into a false positive.
-	s.matches = pruneBefore(s.matches, now.Add(-window))
-	s.matches = append(s.matches, now)
+	snapshot.matches = pruneBefore(snapshot.matches, now.Add(-window))
+	snapshot.matches = append(snapshot.matches, now)
+	if len(snapshot.matches) > capMatches {
+		snapshot.matches = snapshot.matches[len(snapshot.matches)-capMatches:]
+	}
 
 	// Re-arm only once the window that produced the last alert has fully
 	// elapsed: a sustained condition alerts at most once per window, and a
@@ -222,16 +290,21 @@ func (f *FrequencyThreshold) Evaluate(ctx context.Context, ev *stellar.DecodedEv
 	// comparison is strict so the episode's own window start has aged out by
 	// the time the next episode begins — otherwise the next fire would reuse
 	// the previous synthetic id and be dropped as a duplicate.
-	if s.armed && now.After(s.episode.Add(window)) {
-		s.armed = false
+	if snapshot.armed && now.After(snapshot.episode.Add(window)) {
+		snapshot.armed = false
 	}
 
-	if !s.armed && len(s.matches) >= p.Count {
-		s.armed = true
-		s.episode = s.matches[0]
-		return true, nil
+	fired := false
+	if !snapshot.armed && len(snapshot.matches) >= p.Count {
+		snapshot.armed = true
+		snapshot.episode = snapshot.matches[0]
+		fired = true
 	}
-	return false, nil
+
+	f.mu.Lock()
+	*f.state(ruleID) = snapshot
+	f.mu.Unlock()
+	return fired, nil
 }
 
 // AlertEventID implements AlertEventIDer: while an episode is active it returns
@@ -251,12 +324,17 @@ func (f *FrequencyThreshold) AlertEventID(ctx context.Context, _ *stellar.Decode
 // restart. It reports false when the durable state could not be read, leaving
 // the state unseeded so the next event tries again rather than silently
 // starting from an empty count (and firing an alert the rule already sent).
-func (f *FrequencyThreshold) seed(ctx context.Context, s *freqState, ruleID int64, now time.Time, window time.Duration) bool {
+func (f *FrequencyThreshold) seed(ctx context.Context, s *freqState, ruleID int64, now time.Time, window time.Duration, capMatches int) bool {
 	if f.matchLog == nil || ruleID == 0 {
 		s.seeded = true
 		return true
 	}
-	records, err := f.matchLog.RecentMatches(ctx, ruleID, now.Add(-window))
+	var records []MatchRecord
+	err := RecordDependencyCall(ctx, func(depCtx context.Context) error {
+		var callErr error
+		records, callErr = f.matchLog.RecentMatches(depCtx, ruleID, now.Add(-window))
+		return callErr
+	})
 	if err != nil {
 		return false
 	}
@@ -271,6 +349,9 @@ func (f *FrequencyThreshold) seed(ctx context.Context, s *freqState, ruleID int6
 		}
 	}
 	sort.Slice(s.matches, func(i, j int) bool { return s.matches[i].Before(s.matches[j]) })
+	if len(s.matches) > capMatches {
+		s.matches = s.matches[len(s.matches)-capMatches:]
+	}
 	if episodeAt.IsZero() {
 		return true
 	}

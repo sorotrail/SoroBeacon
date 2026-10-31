@@ -49,6 +49,12 @@ The rolling window lives in memory, keyed per rule, and is **rebuilt from the
 count and the "already fired" state survive the process instead of silently
 resetting.
 
+## Bounded state and evaluation isolation
+
+* **Bounded per-rule memory (`DefaultMaxFrequencyMatches = 10,000`)**: Each rule retains at most `10,000` timestamps in memory inside its rolling window (configurable via `WithMaxMatches`). If a wide window receives more matching events than this cap, the oldest timestamps are evicted so one noisy contract cannot grow memory without bound.
+* **Atomic state updates & lock-free seeding**: Rebuilding a rule's window from `MatchLog` happens outside the state lock and commits atomically only after evaluation succeeds, so a slow database read or recovered panic never blocks other rules or leaves partial state behind.
+* **Per-rule evaluation isolation & quarantine**: Every rule evaluation is bounded by `DefaultRuleEvalTimeout` (`100ms`). A panic or rule-attributed timeout is recovered, counted in Prometheus (`sorobeacon_rule_errors_total`, `sorobeacon_poll_panics_total`), and quarantines the rule after `DefaultQuarantineThreshold` (`3`) consecutive failures with an audit trail (`QuarantineAuditLog`) and recovery via `ReenableRule`. Time spent waiting on `MatchLog` is tracked separately (`RecordDependencyCall`) so database slowdowns never quarantine a rule.
+
 ## Escalation
 
 A frequency alert is a good candidate for an [escalation policy](../guides/escalation.md): the first channel may be a chat room that is easy to miss during a storm, and a later step can reach a pager. The policy replaces the monitor's flat fan-out, so include every channel you still want told in its steps.

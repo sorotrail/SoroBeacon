@@ -9,7 +9,11 @@ package rules
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
+	"sync"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -102,6 +106,11 @@ type Registry struct {
 	// telemetry is optional tracing; a nil Registry.telemetry (tests construct
 	// registries directly) just means no spans.
 	telemetry *telemetry.Provider
+
+	mu            sync.RWMutex
+	evalTimeout   time.Duration
+	isolator      *ruleIsolator
+	panicObserver func()
 }
 
 // WithTelemetry attaches tracing to every evaluation this registry runs.
@@ -113,11 +122,91 @@ func (r *Registry) WithTelemetry(t *telemetry.Provider) *Registry {
 	return r
 }
 
+// WithEvalTimeout sets the per-rule evaluation timeout budget. A non-positive
+// duration restores DefaultRuleEvalTimeout.
+func (r *Registry) WithEvalTimeout(d time.Duration) *Registry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if d <= 0 {
+		r.evalTimeout = DefaultRuleEvalTimeout
+	} else {
+		r.evalTimeout = d
+	}
+	return r
+}
+
+// EvalTimeout returns the active per-rule evaluation timeout budget.
+func (r *Registry) EvalTimeout() time.Duration {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.evalTimeout <= 0 {
+		return DefaultRuleEvalTimeout
+	}
+	return r.evalTimeout
+}
+
+// WithQuarantineThreshold configures how many consecutive rule-attributed
+// timeouts or panics trigger quarantine for a rule.
+func (r *Registry) WithQuarantineThreshold(threshold int) *Registry {
+	r.isolator.mu.Lock()
+	defer r.isolator.mu.Unlock()
+	if threshold <= 0 {
+		r.isolator.threshold = DefaultQuarantineThreshold
+	} else {
+		r.isolator.threshold = threshold
+	}
+	return r
+}
+
+// WithLogger attaches a structured logger so quarantine transitions are logged
+// with the offending rule's identifiers and failure reason.
+func (r *Registry) WithLogger(log *slog.Logger) *Registry {
+	r.isolator.mu.Lock()
+	defer r.isolator.mu.Unlock()
+	r.isolator.log = log
+	return r
+}
+
+// WithPanicObserver registers a callback invoked whenever a rule panic is
+// recovered during evaluation (used to increment sorobeacon_poll_panics_total).
+func (r *Registry) WithPanicObserver(fn func()) *Registry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.panicObserver = fn
+	return r
+}
+
+// QuarantineState returns the current failure and quarantine status for ruleID.
+func (r *Registry) QuarantineState(ruleID int64) (RuleQuarantineState, bool) {
+	return r.isolator.state(ruleID)
+}
+
+// QuarantinedRules returns the snapshot of all currently quarantined rules,
+// ordered by RuleID.
+func (r *Registry) QuarantinedRules() []RuleQuarantineState {
+	return r.isolator.quarantinedList()
+}
+
+// QuarantineAuditLog returns the chronological audit trail of rule quarantine
+// and re-enable actions.
+func (r *Registry) QuarantineAuditLog() []QuarantineAuditEntry {
+	return r.isolator.auditLog()
+}
+
+// ReenableRule clears a rule's quarantine and resets its consecutive failure
+// count so a fixed rule resumes evaluation. It returns true when the rule was
+// quarantined and has been re-enabled.
+func (r *Registry) ReenableRule(ruleID int64) bool {
+	return r.isolator.reenable(ruleID)
+}
+
 // NewRegistry returns a Registry with the built-in rule types registered.
 func NewRegistry() *Registry {
 	r := &Registry{
-		evaluators: map[string]RuleEvaluator{},
-		absences:   map[string]AbsenceEvaluator{},
+		evaluators:  map[string]RuleEvaluator{},
+		absences:    map[string]AbsenceEvaluator{},
+		evalTimeout: DefaultRuleEvalTimeout,
+		isolator:    newRuleIsolator(),
 	}
 	r.Register(TypeEventEmitted, EventEmitted{})
 	r.Register(TypeValueThreshold, ValueThreshold{})
@@ -172,16 +261,148 @@ func (r *Registry) Types() []string {
 	return out
 }
 
-// Evaluate runs the evaluator registered for ruleType.
+// Evaluate runs the evaluator registered for ruleType inside the per-rule
+// isolation boundary: quarantined rules are rejected immediately, panics are
+// recovered and attributed to the rule, and evaluation time is bounded by
+// EvalTimeout.
 func (r *Registry) Evaluate(ctx context.Context, ruleType string, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error) {
+	// Nested child evaluations inside a composite rule already run inside the
+	// outer rule's isolated timeout and panic recovery boundary.
+	if inIsolatedEval(ctx) {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		return r.evaluate(ctx, ruleType, ev, params)
+	}
+
 	ctx, span := r.startEvalSpan(ctx, ruleType, ev)
-	matched, err := r.evaluate(ctx, ruleType, ev, params)
+	matched, err := r.evaluateIsolated(ctx, ruleType, ev, params)
 	if err != nil {
 		telemetry.RecordError(span, err)
 	}
 	telemetry.SetAttrs(span, "matched", matched)
 	span.End()
 	return matched, err
+}
+
+type isolatedResult struct {
+	matched  bool
+	err      error
+	panicErr *RulePanicError
+}
+
+func (r *Registry) notifyPanic() {
+	r.mu.RLock()
+	fn := r.panicObserver
+	r.mu.RUnlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+func (r *Registry) evaluateIsolated(ctx context.Context, ruleType string, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error) {
+	ruleID := RuleID(ctx)
+	monitorID := MonitorID(ctx)
+
+	if st, quarantined := r.isolator.checkQuarantined(ruleID); quarantined {
+		return false, &QuarantinedRuleError{
+			RuleID:        ruleID,
+			MonitorID:     st.MonitorID,
+			RuleType:      ruleType,
+			Reason:        st.Reason,
+			LastError:     st.LastError,
+			QuarantinedAt: st.QuarantinedAt,
+		}
+	}
+
+	timeout := r.EvalTimeout()
+	evalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+	evalCtx = context.WithValue(evalCtx, isolatedEvalKey{}, true)
+	evalCtx, tracker := withDependencyTracker(evalCtx)
+
+	start := time.Now()
+	done := make(chan isolatedResult, 1)
+	go func() {
+		var res isolatedResult
+		defer func() {
+			if rec := recover(); rec != nil {
+				res.panicErr = recoverRulePanic(ruleID, monitorID, ruleType, rec)
+			}
+			done <- res
+		}()
+		res.matched, res.err = r.evaluate(evalCtx, ruleType, ev, params)
+	}()
+
+	select {
+	case res := <-done:
+		return r.handleIsolatedResult(ruleID, monitorID, ruleType, timeout, start, tracker, res)
+	case <-evalCtx.Done():
+		// If the goroutine finished at the same instant the deadline fired,
+		// prefer its concrete outcome (such as a recovered panic).
+		select {
+		case res := <-done:
+			return r.handleIsolatedResult(ruleID, monitorID, ruleType, timeout, start, tracker, res)
+		default:
+		}
+		return false, r.recordTimeout(ruleID, monitorID, ruleType, timeout, start, tracker)
+	}
+}
+
+func (r *Registry) handleIsolatedResult(
+	ruleID, monitorID int64,
+	ruleType string,
+	timeout time.Duration,
+	start time.Time,
+	tracker *dependencyTracker,
+	res isolatedResult,
+) (bool, error) {
+	if res.panicErr != nil {
+		r.isolator.recordStrike(ruleID, monitorID, ruleType, QuarantineReasonPanic, res.panicErr.Error())
+		r.notifyPanic()
+		return false, res.panicErr
+	}
+	elapsed := time.Since(start)
+	if res.err != nil {
+		if errors.Is(res.err, context.DeadlineExceeded) {
+			return false, r.recordTimeout(ruleID, monitorID, ruleType, timeout, start, tracker)
+		}
+		return false, res.err
+	}
+	if elapsed >= timeout {
+		return false, r.recordTimeout(ruleID, monitorID, ruleType, timeout, start, tracker)
+	}
+	r.isolator.recordSuccess(ruleID)
+	return res.matched, nil
+}
+
+func (r *Registry) recordTimeout(
+	ruleID, monitorID int64,
+	ruleType string,
+	timeout time.Duration,
+	start time.Time,
+	tracker *dependencyTracker,
+) error {
+	now := time.Now()
+	elapsed := now.Sub(start)
+	depElapsed, depErr := tracker.snapshot(now)
+	// When the backing store (e.g. MatchLog) consumed the evaluation budget or
+	// failed, the timeout is attributed to the dependency rather than the rule
+	// so database slowdowns never quarantine rules.
+	depAttributed := depErr != nil || (depElapsed > 0 && (elapsed-depElapsed) < timeout/2)
+	te := &RuleTimeoutError{
+		RuleID:               ruleID,
+		MonitorID:            monitorID,
+		RuleType:             ruleType,
+		Budget:               timeout,
+		Elapsed:              elapsed,
+		DependencyElapsed:    depElapsed,
+		DependencyAttributed: depAttributed,
+	}
+	if !depAttributed {
+		r.isolator.recordStrike(ruleID, monitorID, ruleType, QuarantineReasonTimeout, te.Error())
+	}
+	return te
 }
 
 // startEvalSpan opens the rules.evaluate span with the identifiers an

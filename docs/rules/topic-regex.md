@@ -40,7 +40,11 @@ whose topic conventions SoroBeacon cannot know in advance.
   the single-key wrappers (`{"symbol": "transfer"}`,
   `{"address": "G..."}`) the RPC's `xdrFormat: "json"` path produces.
 * The pattern is evaluated with Go's `regexp` (RE2). Lookarounds and
-  backreferences are not supported; alternation (`swap_|pool_`) is.
+  backreferences are not supported; alternation (`swap_|pool_`) is. Every
+  pattern path in `internal/rules` (`topic_regex` via `regexp.Compile` and
+  `event_name_glob` via `path.Match`) runs in linear time with respect to the
+  input topic and never reaches a backtracking engine, so attacker-controlled
+  contract event payloads cannot trigger catastrophic backtracking.
 
 ## Validation
 
