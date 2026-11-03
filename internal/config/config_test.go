@@ -728,6 +728,7 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"graphql_playground_enabled",
 		"graphql_max_depth",
 		"graphql_max_complexity",
+		"graphql_allowlist_only",
 		"channel_disable_after_failures",
 	}, keys)
 }
@@ -1393,4 +1394,30 @@ func TestLoadRejectsBadSecretsConfig(t *testing.T) {
 	for _, a := range cfg.LogAttrs() {
 		assert.NotEqual(t, "hvs.super-secret", a.Value.String())
 	}
+}
+
+func TestGraphQLAllowlistOnlyConfig(t *testing.T) {
+	for _, k := range []string{"SOROBAN_RPC_URL", "DATABASE_URL"} {
+		t.Setenv(k, "postgres://user:pass@localhost:5432/db")
+	}
+
+	t.Run("default false", func(t *testing.T) {
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.False(t, cfg.GraphQL.AllowlistOnly)
+	})
+
+	t.Run("enabled via true", func(t *testing.T) {
+		t.Setenv("GRAPHQL_ALLOWLIST_ONLY", "true")
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.True(t, cfg.GraphQL.AllowlistOnly)
+	})
+
+	t.Run("invalid value", func(t *testing.T) {
+		t.Setenv("GRAPHQL_ALLOWLIST_ONLY", "not-a-bool")
+		_, err := Load()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "GRAPHQL_ALLOWLIST_ONLY")
+	})
 }

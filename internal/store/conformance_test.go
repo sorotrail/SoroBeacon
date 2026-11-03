@@ -116,6 +116,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	// local rule, and both backends have to store it that way.
 	t.Run("FederatedAlerts", func(t *testing.T) { testFederatedAlerts(t, newStore) })
 	t.Run("FederatedAlertsFollowTheDeliveringWorkspace", func(t *testing.T) { testFederatedAlertFollowsTheDeliveringWorkspace(t, newStore) })
+	t.Run("PersistedOperations", func(t *testing.T) { testPersistedOperations(t, newStore) })
 }
 
 // testChannelDigest pins the digest settings round trip and the pending

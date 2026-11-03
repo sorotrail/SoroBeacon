@@ -321,6 +321,8 @@ type GraphQLConfig struct {
 	MaxDepth int
 	// MaxComplexity limits the maximum query complexity. Default 1000.
 	MaxComplexity int
+	// AllowlistOnly requires all executed queries to match registered persisted operations. Default false.
+	AllowlistOnly bool
 }
 
 // PlaygroundEnabled reports whether the interactive playground is served.
@@ -852,6 +854,17 @@ func LoadProblems() (Config, []Problem) {
 			cfg.GraphQL.MaxComplexity = n
 		}
 	}
+	cfg.GraphQL.AllowlistOnly = false
+	if v := lookupConfigValue("GRAPHQL_ALLOWLIST_ONLY", fileValues); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			cfg.GraphQL.AllowlistOnly = true
+		case "0", "false", "no", "off":
+			cfg.GraphQL.AllowlistOnly = false
+		default:
+			ps.add("GRAPHQL_ALLOWLIST_ONLY", fmt.Errorf("invalid GRAPHQL_ALLOWLIST_ONLY %q (want true|false)", v))
+		}
+	}
 
 	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_SLACK_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
@@ -1036,6 +1049,7 @@ func (c Config) LogAttrs() []slog.Attr {
 		slog.Bool("graphql_playground_enabled", c.GraphQL.EnablePlayground),
 		slog.Int("graphql_max_depth", c.GraphQL.MaxDepth),
 		slog.Int("graphql_max_complexity", c.GraphQL.MaxComplexity),
+		slog.Bool("graphql_allowlist_only", c.GraphQL.AllowlistOnly),
 		slog.Int("channel_disable_after_failures", c.ChannelDisableAfterFailures),
 	}
 }

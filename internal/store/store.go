@@ -1771,6 +1771,22 @@ type APITokens interface {
 	AbandonAPITokenRotation(ctx context.Context, id int64) error
 }
 
+// PersistedOperation represents a vetted, stored GraphQL query document.
+type PersistedOperation struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Document  string    `json:"document"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// PersistedOperations persists vetted GraphQL operations by SHA-256 hash.
+type PersistedOperations interface {
+	RegisterPersistedOperation(ctx context.Context, op PersistedOperation) error
+	GetPersistedOperation(ctx context.Context, id string) (*PersistedOperation, error)
+	ListPersistedOperations(ctx context.Context) ([]PersistedOperation, error)
+	DeletePersistedOperation(ctx context.Context, id string) error
+}
+
 // Store is everything the application needs from persistence.
 //
 // Tenancy: every method below is scoped to the workspace carried by ctx
@@ -1803,6 +1819,7 @@ type Store interface {
 	Workspaces
 	APITokens
 	Escalations
+	PersistedOperations
 	GetStats(ctx context.Context) (Stats, error)
 	// GetMonitorStats returns one monitor's alert, delivery and per-rule
 	// counts, or ErrNotFound when the monitor does not exist. It exists

@@ -4197,3 +4197,70 @@ func (s *SQLite) DeleteMonitorTemplate(ctx context.Context, id int64) error {
 func (s *SQLite) ListAlertsStream(ctx context.Context, f AlertFilter, fn func(Alert) error) error {
 	return streamAlerts(ctx, f, s.ListAlerts, fn)
 }
+
+func (s *SQLite) RegisterPersistedOperation(ctx context.Context, op PersistedOperation) error {
+	now := time.Now().UTC()
+	if op.CreatedAt.IsZero() {
+		op.CreatedAt = now
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO persisted_operations (id, name, document, created_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET
+			name = excluded.name,
+			document = excluded.document`,
+		op.ID, op.Name, op.Document, op.CreatedAt)
+	return mapSQLiteErr(err)
+}
+
+func (s *SQLite) GetPersistedOperation(ctx context.Context, id string) (*PersistedOperation, error) {
+	var op PersistedOperation
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, name, document, created_at
+		FROM persisted_operations
+		WHERE id = ?`, id).Scan(&op.ID, &op.Name, &op.Document, &op.CreatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, mapSQLiteErr(err)
+	}
+	return &op, nil
+}
+
+func (s *SQLite) ListPersistedOperations(ctx context.Context) ([]PersistedOperation, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, name, document, created_at
+		FROM persisted_operations
+		ORDER BY created_at DESC, id ASC`)
+	if err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var ops []PersistedOperation
+	for rows.Next() {
+		var op PersistedOperation
+		if err := rows.Scan(&op.ID, &op.Name, &op.Document, &op.CreatedAt); err != nil {
+			return nil, mapSQLiteErr(err)
+		}
+		ops = append(ops, op)
+	}
+	return ops, rows.Err()
+}
+
+func (s *SQLite) DeletePersistedOperation(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM persisted_operations WHERE id = ?`, id)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+

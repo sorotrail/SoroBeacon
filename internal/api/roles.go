@@ -119,6 +119,12 @@ var routeRoles = auth.NewRouteTable(map[string]auth.Role{
 	"POST /tokens/{id}/revoke": auth.RoleAdmin,
 	"GET /audit":               auth.RoleAdmin,
 
+	// Persisted GraphQL operations: viewing is a viewer's job, registration/deletion is an admin's.
+	"GET /graphql/operations":        auth.RoleViewer,
+	"GET /graphql/operations/{id}":   auth.RoleViewer,
+	"POST /graphql/operations":       auth.RoleAdmin,
+	"DELETE /graphql/operations/{id}": auth.RoleAdmin,
+
 	// Instance facts: the version, the poller's position and the rule
 	// vocabulary are not a tenant's data.
 	"GET /version":    auth.RoleViewer,

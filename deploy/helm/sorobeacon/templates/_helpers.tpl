@@ -109,6 +109,7 @@ HORIZON_URL: {{ .Values.config.horizonUrl | quote }}
 GRAPHQL_PLAYGROUND: {{ .Values.config.graphqlPlayground | toString | quote }}
 GRAPHQL_MAX_DEPTH: {{ .Values.config.graphqlMaxDepth | quote }}
 GRAPHQL_MAX_COMPLEXITY: {{ .Values.config.graphqlMaxComplexity | quote }}
+GRAPHQL_ALLOWLIST_ONLY: {{ .Values.config.graphqlAllowlistOnly | toString | quote }}
 INSTANCE_NAME: {{ .Values.config.instanceName | quote }}
 HTTP_ADDR: {{ .Values.config.httpAddr | quote }}
 HTTP_MAX_BODY_BYTES: {{ .Values.config.httpMaxBodyBytes | int64 | quote }}

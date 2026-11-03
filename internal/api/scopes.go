@@ -89,6 +89,12 @@ var routeScopes = auth.NewRouteTable(map[string][]auth.Scope{
 	"POST /tokens/{id}/abandon": {auth.ScopeTokensWrite},
 	"POST /tokens/{id}/revoke": {auth.ScopeTokensWrite},
 
+	// Persisted GraphQL operations:
+	"GET /graphql/operations":        {auth.ScopeNone},
+	"GET /graphql/operations/{id}":   {auth.ScopeNone},
+	"POST /graphql/operations":       {auth.ScopeMonitorsWrite},
+	"DELETE /graphql/operations/{id}": {auth.ScopeMonitorsWrite},
+
 	// Routes main added after the scope table was first written. Each one is
 	// mapped to the resource it reads or writes, never to a new scope: the
 	// vocabulary an operator grants from stays the short, reviewable list.

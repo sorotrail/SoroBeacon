@@ -467,3 +467,13 @@ attach itself to them.
 * `422` — the payload cannot be stored here: it violates a database
   constraint. It is a client error, and the sender must not retry it.
 * `500` — the receiver's own fault. The sender may retry.
+
+## GraphQL Persisted Operations
+
+| Method & path | Description | Scope |
+| --- | --- | --- |
+| `POST /graphql/operations` | Register or update a persisted GraphQL operation document (id is sha256 hex). | `monitors:write` |
+| `GET /graphql/operations` | List all registered persisted GraphQL operations. | `none` |
+| `GET /graphql/operations/{id}` | Retrieve a single registered persisted GraphQL operation by ID. | `none` |
+| `DELETE /graphql/operations/{id}` | Delete a registered persisted GraphQL operation by ID. | `monitors:write` |
+

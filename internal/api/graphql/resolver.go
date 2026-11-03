@@ -10,10 +10,13 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/99designs/gqlgen/graphql/playground"
+	"github.com/vektah/gqlparser/v2/ast"
 	"github.com/vektah/gqlparser/v2/gqlerror"
+	"github.com/vektah/gqlparser/v2/parser"
 
 	"github.com/sorotrail/sorobeacon/internal/apierr"
 	"github.com/sorotrail/sorobeacon/internal/store"
@@ -327,6 +330,7 @@ type ServerConfig struct {
 	EnablePlayground bool
 	MaxDepth         int
 	MaxComplexity    int
+	AllowlistOnly    bool
 }
 
 // DefaultServerConfig returns sensible defaults.
@@ -335,16 +339,189 @@ func DefaultServerConfig() ServerConfig {
 		EnablePlayground: false,
 		MaxDepth:         10,
 		MaxComplexity:    1000,
+		AllowlistOnly:    false,
 	}
+}
+
+type graphQLRequestBody struct {
+	Query         string         `json:"query"`
+	OperationName string         `json:"operationName"`
+	Variables     map[string]any `json:"variables"`
+	ID            string         `json:"id"`
+	OperationID   string         `json:"operationId"`
+	Extensions    *struct {
+		PersistedQuery *struct {
+			Version    int    `json:"version"`
+			Sha256Hash string `json:"sha256Hash"`
+		} `json:"persistedQuery"`
+	} `json:"extensions"`
 }
 
 // NewHandler creates the GraphQL HTTP handler with middleware.
 func NewHandler(resolver *Resolver, config ServerConfig) http.Handler {
-	// Simple GraphQL endpoint that returns a basic response
-	// The actual GraphQL execution is handled by a custom executor
 	mux := http.NewServeMux()
 	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+
+		bodyBytes, _ := io.ReadAll(r.Body)
+		var req graphQLRequestBody
+		if len(bodyBytes) > 0 {
+			_ = json.Unmarshal(bodyBytes, &req)
+		}
+
+		opID := req.ID
+		if opID == "" {
+			opID = req.OperationID
+		}
+		if opID == "" && req.Extensions != nil && req.Extensions.PersistedQuery != nil {
+			opID = req.Extensions.PersistedQuery.Sha256Hash
+		}
+
+		var queryDoc string
+		switch {
+		case opID != "":
+			// Look up persisted operation
+			if resolver != nil && resolver.store != nil {
+				op, err := resolver.store.GetPersistedOperation(r.Context(), opID)
+				if err != nil {
+					w.WriteHeader(http.StatusOK)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"errors": []map[string]any{
+							{
+								"message": "PersistedQueryNotFound",
+								"extensions": map[string]any{
+									"code": CodePersistedQueryNotFound,
+								},
+							},
+						},
+					})
+					return
+				}
+				queryDoc = op.Document
+			} else {
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"errors": []map[string]any{
+						{
+							"message": "PersistedQueryNotFound",
+							"extensions": map[string]any{
+								"code": CodePersistedQueryNotFound,
+							},
+						},
+					},
+				})
+				return
+			}
+
+		case strings.TrimSpace(req.Query) != "":
+			if config.AllowlistOnly {
+				norm, err := NormalizeDocument(req.Query)
+				if err != nil {
+					w.WriteHeader(http.StatusOK)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"errors": []map[string]any{
+							{
+								"message": fmt.Sprintf("invalid query: %v", err),
+								"extensions": map[string]any{
+									"code": CodePersistedQueryNotAllowed,
+								},
+							},
+						},
+					})
+					return
+				}
+				hash := HashDocument(norm)
+				if resolver != nil && resolver.store != nil {
+					op, err := resolver.store.GetPersistedOperation(r.Context(), hash)
+					if err != nil {
+						w.WriteHeader(http.StatusOK)
+						_ = json.NewEncoder(w).Encode(map[string]any{
+							"errors": []map[string]any{
+								{
+									"message": "persisted operations only: ad-hoc queries are not permitted in allowlist mode",
+									"extensions": map[string]any{
+										"code": CodePersistedQueryNotAllowed,
+									},
+								},
+							},
+						})
+						return
+					}
+					queryDoc = op.Document
+				} else {
+					w.WriteHeader(http.StatusOK)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"errors": []map[string]any{
+							{
+								"message": "persisted operations only: ad-hoc queries are not permitted in allowlist mode",
+								"extensions": map[string]any{
+									"code": CodePersistedQueryNotAllowed,
+								},
+							},
+						},
+					})
+					return
+				}
+			} else {
+				queryDoc = req.Query
+			}
+
+		case config.AllowlistOnly:
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"errors": []map[string]any{
+					{
+						"message": "persisted operations only: operation identifier required",
+						"extensions": map[string]any{
+							"code": CodePersistedQueryNotAllowed,
+						},
+					},
+				},
+			})
+			return
+		}
+
+		// When a persisted query or allowlist query is evaluated, enforce depth and complexity limits
+		if queryDoc != "" && (opID != "" || config.AllowlistOnly) {
+			parsedDoc, err := parser.ParseQuery(&ast.Source{Input: queryDoc})
+			if err == nil {
+				if config.MaxDepth > 0 {
+					depth := CalculateQueryDepth(parsedDoc)
+					if depth > config.MaxDepth {
+						w.WriteHeader(http.StatusOK)
+						_ = json.NewEncoder(w).Encode(map[string]any{
+							"errors": []map[string]any{
+								{
+									"message": fmt.Sprintf("query depth %d exceeds maximum allowed depth %d", depth, config.MaxDepth),
+									"extensions": map[string]any{
+										"code": CodeQueryDepthExceeded,
+									},
+								},
+							},
+						})
+						return
+					}
+				}
+				if config.MaxComplexity > 0 {
+					complexity := CalculateQueryComplexity(parsedDoc, req.Variables)
+					if complexity > config.MaxComplexity {
+						w.WriteHeader(http.StatusOK)
+						_ = json.NewEncoder(w).Encode(map[string]any{
+							"errors": []map[string]any{
+								{
+									"message": fmt.Sprintf("query complexity %d exceeds maximum allowed complexity %d", complexity, config.MaxComplexity),
+									"extensions": map[string]any{
+										"code": CodeQueryComplexityExceeded,
+									},
+								},
+							},
+						})
+						return
+					}
+				}
+			}
+		}
+
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"data": map[string]any{

@@ -617,6 +617,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	graphqlConfig.EnablePlayground = cfg.GraphQL.EnablePlayground
 	graphqlConfig.MaxDepth = cfg.GraphQL.MaxDepth
 	graphqlConfig.MaxComplexity = cfg.GraphQL.MaxComplexity
+	graphqlConfig.AllowlistOnly = cfg.GraphQL.AllowlistOnly
 	root.Handle("/graphql", graphql.NewHandler(graphqlResolver, graphqlConfig))
 	if cfg.GraphQL.EnablePlayground {
 		root.Handle("/graphql/playground", graphql.PlaygroundHandler("/graphql"))

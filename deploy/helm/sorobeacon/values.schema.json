@@ -280,6 +280,10 @@
           "type": "string",
           "description": "GraphQL query complexity ceiling (1-10000). Empty uses the application default."
         },
+        "graphqlAllowlistOnly": {
+          "type": "boolean",
+          "description": "Require all executed GraphQL queries to match registered persisted operations."
+        },
         "rpcUrls": {
           "type": "string",
           "description": "Comma-separated RPC endpoints to fail over between. Empty uses rpcUrl alone."

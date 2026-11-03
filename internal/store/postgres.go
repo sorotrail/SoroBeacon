@@ -4134,3 +4134,66 @@ func mapErr(err error) error {
 func (p *Postgres) ListAlertsStream(ctx context.Context, f AlertFilter, fn func(Alert) error) error {
 	return streamAlerts(ctx, f, p.ListAlerts, fn)
 }
+
+func (p *Postgres) RegisterPersistedOperation(ctx context.Context, op PersistedOperation) error {
+	now := time.Now().UTC()
+	if op.CreatedAt.IsZero() {
+		op.CreatedAt = now
+	}
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO persisted_operations (id, name, document, created_at)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (id) DO UPDATE SET
+			name = EXCLUDED.name,
+			document = EXCLUDED.document`,
+		op.ID, op.Name, op.Document, op.CreatedAt)
+	return mapErr(err)
+}
+
+func (p *Postgres) GetPersistedOperation(ctx context.Context, id string) (*PersistedOperation, error) {
+	var op PersistedOperation
+	err := p.pool.QueryRow(ctx, `
+		SELECT id, name, document, created_at
+		FROM persisted_operations
+		WHERE id = $1`, id).Scan(&op.ID, &op.Name, &op.Document, &op.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, mapErr(err)
+	}
+	return &op, nil
+}
+
+func (p *Postgres) ListPersistedOperations(ctx context.Context) ([]PersistedOperation, error) {
+	rows, err := p.pool.Query(ctx, `
+		SELECT id, name, document, created_at
+		FROM persisted_operations
+		ORDER BY created_at DESC, id ASC`)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	var ops []PersistedOperation
+	for rows.Next() {
+		var op PersistedOperation
+		if err := rows.Scan(&op.ID, &op.Name, &op.Document, &op.CreatedAt); err != nil {
+			return nil, mapErr(err)
+		}
+		ops = append(ops, op)
+	}
+	return ops, rows.Err()
+}
+
+func (p *Postgres) DeletePersistedOperation(ctx context.Context, id string) error {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM persisted_operations WHERE id = $1`, id)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
