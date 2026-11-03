@@ -82,6 +82,15 @@ func (emptyStore) CreateAuditEntry(context.Context, *store.AuditEntry) error    
 func (emptyStore) ListAuditEntries(context.Context, store.AuditFilter) ([]store.AuditEntry, error) {
 	return nil, nil
 }
+func (emptyStore) ListDeadLetters(context.Context, store.DeadLetterFilter) ([]store.DeadLetter, error) {
+	return nil, nil
+}
+func (emptyStore) ListDeadLetterGroups(context.Context, store.DeadLetterFilter) ([]store.DeadLetterGroup, error) {
+	return nil, nil
+}
+func (emptyStore) BulkDeleteDeadLetters(context.Context, store.DeadLetterFilter) (int64, error) {
+	return 0, nil
+}
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()

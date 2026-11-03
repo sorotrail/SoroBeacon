@@ -197,6 +197,22 @@ func auditRoute(method, pattern string) (auditSpec, bool) {
 		if method == http.MethodPost {
 			return auditSpec{store.AuditActionDelete, "token"}, true
 		}
+	case "/dead-letters/{id}/redrive":
+		if method == http.MethodPost {
+			return auditSpec{store.AuditActionRedrive, "dead_letter"}, true
+		}
+	case "/dead-letters/{id}/discard":
+		if method == http.MethodPost {
+			return auditSpec{store.AuditActionDiscard, "dead_letter"}, true
+		}
+	case "/dead-letters/bulk/redrive":
+		if method == http.MethodPost {
+			return auditSpec{store.AuditActionRedrive, "dead_letter"}, true
+		}
+	case "/dead-letters/bulk/discard":
+		if method == http.MethodPost {
+			return auditSpec{store.AuditActionDiscard, "dead_letter"}, true
+		}
 	}
 	return auditSpec{}, false
 }

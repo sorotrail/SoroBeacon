@@ -19,6 +19,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/store"
 	"github.com/sorotrail/sorobeacon/internal/telemetry"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 // Retry gate errors. The HTTP layer maps these onto status codes; the
@@ -722,7 +723,8 @@ func (d *Dispatcher) deadLetter(ctx context.Context, a Alert, ch store.Channel, 
 	if errStore := d.store.CreateDeadLetter(ctx, dl); errStore != nil {
 		d.log.Error("create dead letter", "alert_id", a.ID, "channel_id", ch.ID, "err", errStore)
 	} else if d.metrics != nil {
-		d.metrics.RecordDeadLetter()
+		ws, _ := workspace.From(ctx)
+		d.metrics.RecordDeadLetterFor(string(ws), ch.Name)
 	}
 }
 
@@ -843,15 +845,16 @@ func (d *Dispatcher) RedriveDeadLetter(ctx context.Context, deadLetterID int64, 
 	err = notifier.Send(attemptCtx, alertObj)
 	if err != nil {
 		safeErr := sanitizeDeliveryError(redactURLError(err))
-		d.record(ctx, alert.ID, ch.ID, "failed", safeErr.Error())
+		d.record(ctx, alert.ID, ch.ID, "failed", "redrive: "+safeErr.Error())
 		return safeErr
 	}
 
-	d.record(ctx, alert.ID, ch.ID, "success", "")
+	d.record(ctx, alert.ID, ch.ID, "success", "redrive: success")
 	if err := d.store.DeleteDeadLetter(ctx, deadLetterID); err != nil {
 		d.log.Error("delete dead letter after successful redrive", "dead_letter_id", deadLetterID, "err", err)
 	} else if d.metrics != nil {
-		d.metrics.ClearDeadLetter()
+		ws, _ := workspace.From(ctx)
+		d.metrics.ClearDeadLetterFor(string(ws), ch.Name)
 	}
 	return nil
 }

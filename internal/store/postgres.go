@@ -2108,11 +2108,12 @@ func (p *Postgres) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, er
 	if err != nil {
 		return nil, mapErr(err)
 	}
+	d.Cause = ClassifyCause(d.LastStatus, d.LastError)
 	return &d, nil
 }
 
 // ListDeadLetters returns dead-letter records in id order, applying the
-// optional channel, alert, and pagination filters. A tenant sees only records
+// optional channel, alert, age, cause and pagination filters. A tenant sees only records
 // whose alert belongs to it; the dispatcher's system context sees every row.
 func (p *Postgres) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error) {
 	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
@@ -2136,17 +2137,66 @@ func (p *Postgres) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]D
 	if f.AfterID != 0 {
 		q += ` AND id > ` + arg(f.AfterID)
 	}
+	if !f.CreatedBefore.IsZero() {
+		q += ` AND created_at < ` + arg(f.CreatedBefore)
+	}
+	if f.OlderThan > 0 {
+		cutoff := time.Now().UTC().Add(-f.OlderThan)
+		q += ` AND created_at < ` + arg(cutoff)
+	}
+	if !f.CreatedAfter.IsZero() {
+		q += ` AND created_at >= ` + arg(f.CreatedAfter)
+	}
+	if len(f.IDs) > 0 {
+		q += ` AND id = ANY(` + arg(f.IDs) + `)`
+	}
 	q += ` ORDER BY id ASC LIMIT ` + arg(pageLimit(f.Limit))
 
 	rows, err := p.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (DeadLetter, error) {
+	letters, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (DeadLetter, error) {
 		var d DeadLetter
 		err := row.Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &d.CreatedAt)
+		if err == nil {
+			d.Cause = ClassifyCause(d.LastStatus, d.LastError)
+		}
 		return d, err
 	})
+	if err != nil {
+		return nil, err
+	}
+	if f.Cause != "" {
+		filtered := make([]DeadLetter, 0, len(letters))
+		for _, dl := range letters {
+			if dl.Cause == f.Cause {
+				filtered = append(filtered, dl)
+			}
+		}
+		return filtered, nil
+	}
+	return letters, nil
+}
+
+// ListDeadLetterGroups aggregates dead letters by channel and cause.
+func (p *Postgres) ListDeadLetterGroups(ctx context.Context, f DeadLetterFilter) ([]DeadLetterGroup, error) {
+	gf := f
+	gf.Limit = 10000
+	gf.AfterID = 0
+	letters, err := p.ListDeadLetters(ctx, gf)
+	if err != nil {
+		return nil, err
+	}
+	channels, err := p.ListChannels(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	chMap := make(map[int64]Channel, len(channels))
+	for _, ch := range channels {
+		chMap[ch.ID] = ch
+	}
+	return GroupDeadLetters(letters, chMap, f.Cause), nil
 }
 
 // DeleteDeadLetter removes one record, which is what a successful redrive does.
@@ -2168,6 +2218,63 @@ func (p *Postgres) DeleteDeadLetter(ctx context.Context, id int64) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// BulkDeleteDeadLetters removes dead letters matching the filter within the context's workspace.
+func (p *Postgres) BulkDeleteDeadLetters(ctx context.Context, f DeadLetterFilter) (int64, error) {
+	gf := f
+	if gf.Limit <= 0 || gf.Limit > 10000 {
+		gf.Limit = 10000
+	}
+	letters, err := p.ListDeadLetters(ctx, gf)
+	if err != nil {
+		return 0, err
+	}
+	if len(letters) == 0 {
+		return 0, nil
+	}
+	ids := make([]int64, len(letters))
+	for i, dl := range letters {
+		ids[i] = dl.ID
+	}
+
+	q := `DELETE FROM dead_letters WHERE id = ANY($1)`
+	args := []any{ids}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = $2)`
+		args = append(args, ws)
+	}
+	tag, err := p.pool.Exec(ctx, q, args...)
+	if err != nil {
+		return 0, mapErr(err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// DeleteExpiredDeadLetters removes up to limit dead letters created strictly before cutoff.
+func (p *Postgres) DeleteExpiredDeadLetters(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = DefaultPruneBatch
+	}
+	var deleted int64
+	err := p.pool.QueryRow(ctx, `
+		WITH expired AS (
+			SELECT id FROM dead_letters
+			WHERE created_at < $1
+			ORDER BY created_at ASC, id ASC
+			LIMIT $2
+		),
+		deleted_rows AS (
+			DELETE FROM dead_letters dl
+			USING expired e
+			WHERE dl.id = e.id
+			RETURNING dl.id
+		)
+		SELECT count(*) FROM deleted_rows`, cutoff, limit).Scan(&deleted)
+	if err != nil {
+		return 0, mapErr(err)
+	}
+	return deleted, nil
 }
 
 // buildAlertQuery builds the ListAlerts statement and its arguments. Both

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -99,6 +100,28 @@ func callDeadLetter(t *testing.T, srv *httptest.Server, method, path, token stri
 	req, err := http.NewRequest(method, srv.URL+path, nil)
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer "+token)
+	res, err := srv.Client().Do(req)
+	require.NoError(t, err)
+	raw, err := io.ReadAll(res.Body)
+	require.NoError(t, err)
+	require.NoError(t, res.Body.Close())
+	return res, raw
+}
+
+func callDeadLetterBody(t *testing.T, srv *httptest.Server, method, path, token string, body any) (*http.Response, []byte) {
+	t.Helper()
+	var r io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		require.NoError(t, err)
+		r = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, srv.URL+path, r)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	res, err := srv.Client().Do(req)
 	require.NoError(t, err)
 	raw, err := io.ReadAll(res.Body)
@@ -351,19 +374,232 @@ func TestErrorsIsNotFoundRecognisesWrappedNotFound(t *testing.T) {
 }
 
 func TestDeadLetterRoutesRequireTheExpectedRoleAndScope(t *testing.T) {
-	role, ok := routeRoles.Lookup(http.MethodGet, "/dead-letters")
-	require.True(t, ok)
-	assert.Equal(t, auth.RoleViewer, role)
+	for _, tc := range []struct {
+		method string
+		path   string
+		role   auth.Role
+		scopes []auth.Scope
+	}{
+		{http.MethodGet, "/dead-letters", auth.RoleViewer, []auth.Scope{auth.ScopeAlertsRead}},
+		{http.MethodGet, "/dead-letters/groups", auth.RoleViewer, []auth.Scope{auth.ScopeAlertsRead}},
+		{http.MethodPost, "/dead-letters/{id}/redrive", auth.RoleEditor, []auth.Scope{auth.ScopeAlertsWrite}},
+		{http.MethodPost, "/dead-letters/{id}/discard", auth.RoleEditor, []auth.Scope{auth.ScopeAlertsWrite}},
+		{http.MethodPost, "/dead-letters/bulk/redrive", auth.RoleEditor, []auth.Scope{auth.ScopeAlertsWrite}},
+		{http.MethodPost, "/dead-letters/bulk/discard", auth.RoleEditor, []auth.Scope{auth.ScopeAlertsWrite}},
+	} {
+		role, ok := routeRoles.Lookup(tc.method, tc.path)
+		require.True(t, ok, "%s %s", tc.method, tc.path)
+		assert.Equal(t, tc.role, role, "%s %s", tc.method, tc.path)
 
-	role, ok = routeRoles.Lookup(http.MethodPost, "/dead-letters/{id}/redrive")
-	require.True(t, ok)
-	assert.Equal(t, auth.RoleEditor, role, "redrive sends a notification, so a viewer must not reach it")
+		scopes, ok := routeScopes.Lookup(tc.method, tc.path)
+		require.True(t, ok, "%s %s", tc.method, tc.path)
+		assert.Equal(t, tc.scopes, scopes, "%s %s", tc.method, tc.path)
+	}
+}
 
-	scopes, ok := routeScopes.Lookup(http.MethodGet, "/dead-letters")
-	require.True(t, ok)
-	assert.Equal(t, []auth.Scope{auth.ScopeAlertsRead}, scopes)
+func TestListDeadLetterGroupsShapeAndNoConfigLeak(t *testing.T) {
+	st := newTenantStore(t)
+	f := seedDeadLetter(t, st)
+	ctx := workspace.With(context.Background(), workspace.ID("acme"))
 
-	scopes, ok = routeScopes.Lookup(http.MethodPost, "/dead-letters/{id}/redrive")
-	require.True(t, ok)
-	assert.Equal(t, []auth.Scope{auth.ScopeAlertsWrite}, scopes)
+	second := &store.DeadLetter{
+		AlertID:      f.alert.ID,
+		ChannelID:    f.channel.ID,
+		LastError:    "too many requests",
+		AttemptCount: 3,
+		LastStatus:   429,
+	}
+	require.NoError(t, st.CreateDeadLetter(ctx, second))
+
+	srv := deadLetterServer(t, st, &deadLetterNotifier{})
+
+	res, raw := callDeadLetter(t, srv, http.MethodGet, "/dead-letters/groups", acmeToken)
+	require.Equal(t, http.StatusOK, res.StatusCode, string(raw))
+	assert.NotContains(t, string(raw), "SUPER-SECRET-TOKEN", "group listing must never leak channel secrets")
+
+	var groups []store.DeadLetterGroup
+	require.NoError(t, json.Unmarshal(raw, &groups))
+	require.Len(t, groups, 2)
+
+	// Filter by cause
+	res, raw = callDeadLetter(t, srv, http.MethodGet, "/dead-letters/groups?cause=rate_limit", acmeToken)
+	require.Equal(t, http.StatusOK, res.StatusCode, string(raw))
+	var filtered []store.DeadLetterGroup
+	require.NoError(t, json.Unmarshal(raw, &filtered))
+	require.Len(t, filtered, 1)
+	assert.Equal(t, store.DeadLetterCauseRateLimit, filtered[0].Cause)
+}
+
+func TestDiscardDeadLetterRemovesRecordAndAudits(t *testing.T) {
+	st := newTenantStore(t)
+	f := seedDeadLetter(t, st)
+	srv := deadLetterServer(t, st, &deadLetterNotifier{})
+	ctx := workspace.With(context.Background(), workspace.ID("acme"))
+
+	path := fmt.Sprintf("/dead-letters/%d/discard", f.deadLetter.ID)
+	res, raw := callDeadLetter(t, srv, http.MethodPost, path, acmeToken)
+	require.Equal(t, http.StatusNoContent, res.StatusCode, string(raw))
+
+	_, err := st.GetDeadLetter(ctx, f.deadLetter.ID)
+	assert.ErrorIs(t, err, store.ErrNotFound)
+
+	entries, err := st.ListAuditEntries(ctx, store.AuditFilter{TargetType: "dead_letter"})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, store.AuditActionDiscard, entries[0].Action)
+	assert.Equal(t, f.deadLetter.ID, entries[0].TargetID)
+}
+
+func TestBulkDiscardDeadLettersScopingAndAudit(t *testing.T) {
+	st := newTenantStore(t)
+	fAcme := seedDeadLetter(t, st)
+	ctxAcme := workspace.With(context.Background(), workspace.ID("acme"))
+
+	second := &store.DeadLetter{
+		AlertID:      fAcme.alert.ID,
+		ChannelID:    fAcme.channel.ID,
+		LastError:    "timeout",
+		AttemptCount: 3,
+		LastStatus:   0,
+	}
+	require.NoError(t, st.CreateDeadLetter(ctxAcme, second))
+
+	// Create one in beta
+	ctxBeta := workspace.With(context.Background(), workspace.ID("beta"))
+	monitorsBeta, err := st.ListMonitors(ctxBeta, false)
+	require.NoError(t, err)
+	ruleBeta := &store.Rule{MonitorID: monitorsBeta[0].ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctxBeta, ruleBeta))
+	chBeta := &store.Channel{Name: "beta-ops", Type: "mock", Config: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateChannel(ctxBeta, chBeta))
+	alertBeta := &store.Alert{MonitorID: monitorsBeta[0].ID, RuleID: ruleBeta.ID, EventID: "ev-beta"}
+	_, err = st.CreateAlert(ctxBeta, alertBeta)
+	require.NoError(t, err)
+	dlBeta := &store.DeadLetter{AlertID: alertBeta.ID, ChannelID: chBeta.ID, LastError: "error", AttemptCount: 3}
+	require.NoError(t, st.CreateDeadLetter(ctxBeta, dlBeta))
+
+	srv := deadLetterServer(t, st, &deadLetterNotifier{})
+
+	// Acme bulk discards by channel
+	res, raw := callDeadLetterBody(t, srv, http.MethodPost, "/dead-letters/bulk/discard", acmeToken, map[string]any{
+		"channel_id": fAcme.channel.ID,
+	})
+	require.Equal(t, http.StatusOK, res.StatusCode, string(raw))
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(raw, &resp))
+	assert.Equal(t, float64(2), resp["discarded"])
+
+	// Acme dead letters are gone
+	acmeLetters, err := st.ListDeadLetters(ctxAcme, store.DeadLetterFilter{})
+	require.NoError(t, err)
+	assert.Empty(t, acmeLetters)
+
+	// Beta dead letter is untouched
+	betaLetters, err := st.ListDeadLetters(ctxBeta, store.DeadLetterFilter{})
+	require.NoError(t, err)
+	assert.Len(t, betaLetters, 1)
+
+	// Audit entry exists for acme
+	entries, err := st.ListAuditEntries(ctxAcme, store.AuditFilter{TargetType: "dead_letter"})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, store.AuditActionDiscard, entries[0].Action)
+}
+
+func TestBulkRedriveDeadLettersPacingAndDelivery(t *testing.T) {
+	st := newTenantStore(t)
+	f := seedDeadLetter(t, st)
+	ctx := workspace.With(context.Background(), workspace.ID("acme"))
+
+	secondAlert := &store.Alert{
+		MonitorID: f.alert.MonitorID,
+		RuleID:    f.alert.RuleID,
+		EventID:   "ev-2",
+		Payload:   json.RawMessage(`{}`),
+	}
+	_, err := st.CreateAlert(ctx, secondAlert)
+	require.NoError(t, err)
+
+	second := &store.DeadLetter{
+		AlertID:      secondAlert.ID,
+		ChannelID:    f.channel.ID,
+		LastError:    "error 2",
+		AttemptCount: 3,
+		LastStatus:   500,
+	}
+	require.NoError(t, st.CreateDeadLetter(ctx, second))
+
+	n := &deadLetterNotifier{}
+	srv := deadLetterServer(t, st, n)
+
+	res, raw := callDeadLetterBody(t, srv, http.MethodPost, "/dead-letters/bulk/redrive", acmeToken, map[string]any{
+		"channel_id": f.channel.ID,
+	})
+	require.Equal(t, http.StatusOK, res.StatusCode, string(raw))
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(raw, &resp))
+	assert.Equal(t, float64(2), resp["total"])
+	assert.Equal(t, float64(2), resp["succeeded"])
+	assert.Equal(t, float64(0), resp["failed"])
+	assert.Equal(t, float64(0), resp["skipped"])
+	assert.Equal(t, 2, n.calls)
+
+	// Dead letters are cleared
+	letters, err := st.ListDeadLetters(ctx, store.DeadLetterFilter{})
+	require.NoError(t, err)
+	assert.Empty(t, letters)
+
+	// Attempts were recorded with redrive snippet
+	attempts, err := st.ListDeliveryAttempts(ctx, f.alert.ID, "")
+	require.NoError(t, err)
+	require.Len(t, attempts, 1)
+	assert.Equal(t, store.DeliveryStatusSuccess, attempts[0].Status)
+	assert.Contains(t, attempts[0].ResponseSnippet, "redrive: ok")
+
+	attempts2, err := st.ListDeliveryAttempts(ctx, secondAlert.ID, "")
+	require.NoError(t, err)
+	require.Len(t, attempts2, 1)
+	assert.Equal(t, store.DeliveryStatusSuccess, attempts2[0].Status)
+	assert.Contains(t, attempts2[0].ResponseSnippet, "redrive: ok")
+
+	// Audit entry exists
+	entries, err := st.ListAuditEntries(ctx, store.AuditFilter{TargetType: "dead_letter"})
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, store.AuditActionRedrive, entries[0].Action)
+}
+
+func TestBulkRedriveDeadLettersDuplicationGuard(t *testing.T) {
+	st := newTenantStore(t)
+	f := seedDeadLetter(t, st)
+	ctx := workspace.With(context.Background(), workspace.ID("acme"))
+
+	// Pre-record successful delivery attempt
+	require.NoError(t, st.RecordDeliveryAttempt(ctx, &store.DeliveryAttempt{
+		AlertID:         f.alert.ID,
+		ChannelID:       f.channel.ID,
+		Status:          store.DeliveryStatusSuccess,
+		ResponseSnippet: "ok",
+	}))
+
+	n := &deadLetterNotifier{}
+	srv := deadLetterServer(t, st, n)
+
+	res, raw := callDeadLetterBody(t, srv, http.MethodPost, "/dead-letters/bulk/redrive", acmeToken, map[string]any{
+		"channel_id": f.channel.ID,
+	})
+	require.Equal(t, http.StatusOK, res.StatusCode, string(raw))
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(raw, &resp))
+	assert.Equal(t, float64(1), resp["total"])
+	assert.Equal(t, float64(0), resp["succeeded"])
+	assert.Equal(t, float64(1), resp["skipped"])
+	assert.Zero(t, n.calls, "duplication guard must prevent re-sending already delivered alerts")
+
+	// Stale dead letter is cleared
+	letters, err := st.ListDeadLetters(ctx, store.DeadLetterFilter{})
+	require.NoError(t, err)
+	assert.Empty(t, letters)
 }

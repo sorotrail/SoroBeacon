@@ -131,7 +131,11 @@ var routeScopes = auth.NewRouteTable(map[string][]auth.Scope{
 	// queue reads alerts, and redriving one sends a notification: that is an
 	// alert write, not a channel edit.
 	"GET /dead-letters":               {auth.ScopeAlertsRead},
+	"GET /dead-letters/groups":        {auth.ScopeAlertsRead},
 	"POST /dead-letters/{id}/redrive": {auth.ScopeAlertsWrite},
+	"POST /dead-letters/{id}/discard": {auth.ScopeAlertsWrite},
+	"POST /dead-letters/bulk/redrive": {auth.ScopeAlertsWrite},
+	"POST /dead-letters/bulk/discard": {auth.ScopeAlertsWrite},
 })
 
 // requiredScopes resolves the permissions a request needs. ok false means the

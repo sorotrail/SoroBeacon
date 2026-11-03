@@ -1651,6 +1651,46 @@
         }
       }
     },
+    "/dead-letters/groups": {
+      "get": {
+        "summary": "Roll up dead letters into groups by channel and cause",
+        "responses": {
+          "200": {
+            "description": "Dead letter groups",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dead-letters/bulk/redrive": {
+      "post": {
+        "summary": "Re-drive a batch of dead letters matching filter or IDs",
+        "responses": {
+          "200": {
+            "description": "Bulk redrive results"
+          }
+        }
+      }
+    },
+    "/dead-letters/bulk/discard": {
+      "post": {
+        "summary": "Discard a batch of dead letters matching filter or IDs",
+        "responses": {
+          "200": {
+            "description": "Bulk discard results"
+          }
+        }
+      }
+    },
     "/dead-letters/{id}/redrive": {
       "parameters": [
         {
@@ -1662,6 +1702,24 @@
         "responses": {
           "200": {
             "description": "Re-driven successfully"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/dead-letters/{id}/discard": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "post": {
+        "summary": "Discard one dead letter from the backlog",
+        "responses": {
+          "204": {
+            "description": "Discarded successfully"
           },
           "404": {
             "$ref": "#/components/responses/Error"
