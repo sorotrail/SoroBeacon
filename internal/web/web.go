@@ -25,6 +25,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/sorotrail/sorobeacon/internal/api"
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/buildinfo"
 	"github.com/sorotrail/sorobeacon/internal/lease"
@@ -84,7 +85,8 @@ type Server struct {
 	auth *auth.Authenticator
 	// tokenMgr mints and lists scoped API tokens for the dashboard's token
 	// page. Nil disables the page rather than showing one that cannot mint.
-	tokenMgr *auth.Manager
+	tokenMgr     *auth.Manager
+	maxBodyBytes int64
 }
 
 // monitorListRow is a monitor plus the last-matched cue rendered on the
@@ -306,6 +308,14 @@ func (s *Server) WithSilentAfter(d time.Duration) *Server {
 	return s
 }
 
+// WithMaxBodyBytes sets the maximum form body size for web dashboard write actions.
+func (s *Server) WithMaxBodyBytes(n int64) *Server {
+	if n > 0 {
+		s.maxBodyBytes = n
+	}
+	return s
+}
+
 // SilentAfter returns the configured silent-after duration. Exposed for tests.
 func (s *Server) SilentAfter() time.Duration {
 	return s.silentAfter
@@ -335,6 +345,11 @@ func (s *Server) monitorRows(monitors []store.Monitor, tz string, now time.Time)
 // Routes returns the dashboard router, mounted at / by cmd/sorobeacon.
 func (s *Server) Routes() chi.Router {
 	mux := chi.NewRouter()
+	limit := s.maxBodyBytes
+	if limit <= 0 {
+		limit = api.DefaultMaxBodyBytes
+	}
+	mux.Use(api.MaxBodyMiddleware(limit))
 	// Registered before any route, so the gate covers everything below it.
 	// With no token configured it is the identity function.
 	mux.Use(s.authMiddleware())

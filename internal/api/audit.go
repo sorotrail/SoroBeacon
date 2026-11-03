@@ -286,7 +286,7 @@ func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	if v := q.Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 {
+		if err != nil || n < 1 || n > 500 {
 			writeErr(w, r, http.StatusBadRequest, "invalid limit")
 			return
 		}

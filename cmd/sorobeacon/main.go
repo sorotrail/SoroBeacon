@@ -583,6 +583,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 			TrustForwarded: cfg.RateLimitTrustForwarded,
 		}).
 		WithMaxBodyBytes(cfg.HTTPMaxBodyBytes).
+		WithMetrics(m).
 		WithBroadcaster(liveAlerts).
 		WithAuth(authn)
 	webSrv, err := web.New(st, registry, factory, log)
@@ -590,7 +591,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 		return nil, err
 	}
 	webSrv.WithPoller(p).WithLeadership(leader).WithSilentAfter(cfg.MonitorSilentAfter).WithAuth(authn).
-		WithNetworks(config.NetworkNames(cfg.Networks)).WithTokens(tokens)
+		WithNetworks(config.NetworkNames(cfg.Networks)).WithTokens(tokens).WithMaxBodyBytes(cfg.HTTPMaxBodyBytes)
 	root := chi.NewRouter()
 	// RequestLog must sit outside Recoverer so a panic still emits the
 	// access line after chi writes 500. reqid first so the line can

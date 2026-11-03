@@ -19,6 +19,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/buildinfo"
 	"github.com/sorotrail/sorobeacon/internal/lease"
+	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
 	"github.com/sorotrail/sorobeacon/internal/reqid"
@@ -59,6 +60,15 @@ type LeaderReader interface {
 // Used when New is not followed by WithMaxBodyBytes.
 const DefaultMaxBodyBytes int64 = 1 << 20
 
+// DefaultBulkMaxBodyBytes is 10 MiB, allowed for bulk writes.
+const DefaultBulkMaxBodyBytes int64 = 10 << 20
+
+// MaxChannelConfigBytes is the upper bound on a channel's config payload (64 KiB).
+const MaxChannelConfigBytes int = 64 << 10
+
+// MaxTemplateBytes is the upper bound on a notification template or template body (32 KiB).
+const MaxTemplateBytes int = 32 << 10
+
 type Server struct {
 	store        store.Store
 	registry     *rules.Registry
@@ -77,6 +87,9 @@ type Server struct {
 	readyzLagThreshold uint32
 	rateLimit          RateLimitConfig
 	maxBodyBytes       int64
+	bulkMaxBodyBytes   int64
+	endpointBodyLimits map[string]int64
+	metrics            *metrics.Metrics
 	// broadcaster fans newly created alerts out to live SSE subscribers on
 	// GET /alerts/stream. main hands it the same instance the poller
 	// publishes into; the New default is an empty one so the endpoint works
@@ -99,9 +112,11 @@ type Server struct {
 func New(st store.Store, reg *rules.Registry, f *notify.Factory, rpc HealthChecker, log *slog.Logger) *Server {
 	return &Server{
 		store: st, registry: reg, factory: f, rpc: rpc, log: log,
-		maxBodyBytes:    DefaultMaxBodyBytes,
-		broadcaster:     broadcast.New(broadcast.DefaultBuffer),
-		streamHeartbeat: defaultStreamHeartbeat,
+		maxBodyBytes:       DefaultMaxBodyBytes,
+		bulkMaxBodyBytes:   DefaultBulkMaxBodyBytes,
+		endpointBodyLimits: make(map[string]int64),
+		broadcaster:        broadcast.New(broadcast.DefaultBuffer),
+		streamHeartbeat:    defaultStreamHeartbeat,
 	}
 }
 
@@ -112,6 +127,32 @@ func (s *Server) WithMaxBodyBytes(n int64) *Server {
 	if n > 0 {
 		s.maxBodyBytes = n
 	}
+	return s
+}
+
+// WithBulkMaxBodyBytes sets the body limit for bulk write endpoints
+// (such as /monitors/bulk or /alerts/import).
+func (s *Server) WithBulkMaxBodyBytes(n int64) *Server {
+	if n > 0 {
+		s.bulkMaxBodyBytes = n
+	}
+	return s
+}
+
+// WithEndpointMaxBodyBytes sets a custom body limit override for a specific endpoint path.
+func (s *Server) WithEndpointMaxBodyBytes(path string, n int64) *Server {
+	if s.endpointBodyLimits == nil {
+		s.endpointBodyLimits = make(map[string]int64)
+	}
+	if n > 0 {
+		s.endpointBodyLimits[path] = n
+	}
+	return s
+}
+
+// WithMetrics attaches Prometheus instrumentation so request body rejections are tracked.
+func (s *Server) WithMetrics(m *metrics.Metrics) *Server {
+	s.metrics = m
 	return s
 }
 
@@ -221,7 +262,9 @@ func (s *Server) WithTokens(m *auth.Manager) *Server {
 // served (authenticated and authorised) traffic.
 func (s *Server) Routes() chi.Router {
 	mux := chi.NewRouter()
-	mux.Use(middleware.Recoverer, MaxBodyMiddleware(s.maxBodyBytes))
+	mux.Use(middleware.Recoverer)
+	mux.Use(s.metricsContextMiddleware)
+	mux.Use(MaxBodyMiddlewareWithResolver(s.limitForRequest, s.metrics))
 	mux.Use(AuthMiddleware(s.auth, s.log))
 	mux.Use(auth.RoleCheck{
 		Authenticator: s.auth,
@@ -590,11 +633,58 @@ func constraintMessage(err error) string {
 	}
 }
 
+type metricsCtxKey struct{}
+
+func (s *Server) metricsContextMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.metrics != nil {
+			r = r.WithContext(context.WithValue(r.Context(), metricsCtxKey{}, s.metrics))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) limitForRequest(r *http.Request) int64 {
+	path := r.URL.Path
+	trimmed := strings.TrimPrefix(path, "/api/v1")
+	if s.endpointBodyLimits != nil {
+		if limit, ok := s.endpointBodyLimits[trimmed]; ok && limit > 0 {
+			return limit
+		}
+		if limit, ok := s.endpointBodyLimits[path]; ok && limit > 0 {
+			return limit
+		}
+	}
+	if strings.HasSuffix(trimmed, "/bulk") || strings.HasSuffix(trimmed, "/import") {
+		if s.bulkMaxBodyBytes > 0 {
+			return s.bulkMaxBodyBytes
+		}
+		return DefaultBulkMaxBodyBytes
+	}
+	if s.maxBodyBytes > 0 {
+		return s.maxBodyBytes
+	}
+	return DefaultMaxBodyBytes
+}
+
+func metricsFrom(ctx context.Context) *metrics.Metrics {
+	if ctx == nil {
+		return nil
+	}
+	if m, ok := ctx.Value(metricsCtxKey{}).(*metrics.Metrics); ok {
+		return m
+	}
+	return nil
+}
+
 func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
+			if m := metricsFrom(r.Context()); m != nil {
+				m.RecordBodyRejection(rejectionLimitType(r))
+			}
 			writeErr(w, r, http.StatusRequestEntityTooLarge, "request body too large")
 			return false
 		}
