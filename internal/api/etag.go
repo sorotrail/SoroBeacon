@@ -66,10 +66,6 @@ func ETagMatches(header, etag string) bool {
 	return false
 }
 
-func etagMatches(header, etag string) bool {
-	return ETagMatches(header, etag)
-}
-
 // FormatETag formats a strong entity tag for a query. The tag incorporates every
 // parameter that changes the answer: tenant workspace, route path, sorted query parameters,
 // and the underlying backend change detector key.
