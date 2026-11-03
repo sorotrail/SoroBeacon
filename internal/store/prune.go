@@ -108,30 +108,41 @@ func RunAlertPruner(ctx context.Context, st AlertPruner, retention, interval tim
 	)
 
 	pruneOnce := func() {
-		cutoff := time.Now().UTC().Add(-retention)
+		now := time.Now().UTC()
+		cutoff := now.Add(-retention)
+		var deleted int64
 		// Keep the upcoming partition window open before anything is written
-		// into it; on a partitioned backend this is what stops rows landing in
-		// the default partition.
-		if pe, ok := st.(PartitionEnsurer); ok {
-			if err := pe.EnsureAlertPartitions(ctx, time.Now().UTC(), 3); err != nil {
-				log.Error("ensure alert partitions failed", "error", err)
+		// into it, and drop whole expired partitions when archiving is off.
+		if mgr, ok := st.(PartitionLifecycleManager); ok {
+			plan, err := mgr.MaintainAlertPartitions(ctx, PartitionLifecycleOptions{
+				Now:       now,
+				Retention: retention,
+				Archiver:  arch,
+				Log:       log,
+			})
+			if err != nil {
+				log.Error("alert partition maintenance failed", "error", err, "cutoff", cutoff)
 				return
 			}
-		}
-
-		var deleted int64
-		// A partitioned backend drops whole expired partitions first, which is
-		// effectively free. It is skipped when archiving is on: a DROP cannot
-		// archive, so those rows must go through the batched archive-then-delete
-		// path above instead.
-		if arch == nil {
-			if pp, ok := st.(PartitionPruner); ok {
-				n, err := pp.DropExpiredPartitions(ctx, cutoff)
-				if err != nil {
-					log.Error("drop expired alert partitions failed", "error", err, "cutoff", cutoff)
+			if plan != nil {
+				deleted += plan.AlertsDropped
+			}
+		} else {
+			if pe, ok := st.(PartitionEnsurer); ok {
+				if err := pe.EnsureAlertPartitions(ctx, now, DefaultPartitionRunwayMonths); err != nil {
+					log.Error("ensure alert partitions failed", "error", err)
 					return
 				}
-				deleted += n
+			}
+			if arch == nil {
+				if pp, ok := st.(PartitionPruner); ok {
+					n, err := pp.DropExpiredPartitions(ctx, cutoff)
+					if err != nil {
+						log.Error("drop expired alert partitions failed", "error", err, "cutoff", cutoff)
+						return
+					}
+					deleted += n
+				}
 			}
 		}
 		for {

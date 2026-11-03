@@ -71,6 +71,10 @@ func TestExportedMetricNamesMatchesRegistryForAlerts(t *testing.T) {
 	m.RecordWorkspaceNotification("default", "slack", "ok", 1)
 	m.RecordWorkspaceAPIRequest("default", 1)
 	m.SetWorkspaceStoredRows("default", "monitors", 1)
+	m.SetAlertPartitionRunway(3)
+	m.RecordAlertPartitionError("ensure")
+	m.RecordAlertPartitionsCreated(1)
+	m.RecordAlertPartitionsDropped(1)
 	m.httpDuration.WithLabelValues("/health", "GET", "200").Observe(0.01)
 
 	families, err := m.registry.Gather()

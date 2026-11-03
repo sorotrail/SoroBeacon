@@ -162,3 +162,21 @@ An alerting system that crashes or loses network connectivity stops emitting met
   3. Send a test alert using the **Send test** button on the Channels dashboard to verify reachability.
   4. Review alert routing and escalation policies to confirm the right team is notified.
   5. *Note on limits*: Unacknowledged does not prove unseen; operators may have acted without clicking acknowledge. Never automatically disable the channel; raise with channel owners to confirm visibility.
+
+### `SoroBeaconAlertPartitionRunwayLow` {#sorobeaconalertpartitionrunwaylow}
+
+- **Severity**: `ticket`
+- **Meaning**: `sorobeacon_alert_partition_runway_months < 2` for at least 15 minutes. Fewer than two consecutive future monthly `alerts_YYYY_MM` partitions exist beyond the current UTC month.
+- **Triage Steps**:
+  1. Inspect logs for `msg="alert partition maintenance failed"` and check `sorobeacon_alert_partition_errors_total` by `operation`.
+  2. Verify the leader replica holds the PostgreSQL advisory lease (`GET /api/v1/health` -> `"leader": true`) and has DDL privileges on the `alerts` table.
+  3. See [Alert Partition Lifecycle](partition-lifecycle.md) for manual inspection and dry-run verification.
+
+### `SoroBeaconAlertPartitionMaintenanceFailed` {#sorobeaconalertpartitionmaintenancefailed}
+
+- **Severity**: `ticket`
+- **Meaning**: `increase(sorobeacon_alert_partition_errors_total[15m]) > 0`. An automated partition `ensure`, `inspect`, or `drop` pass failed.
+- **Triage Steps**:
+  1. Check structured error logs for `alert partition maintenance failed` or `drop expired alert partitions failed`.
+  2. If `operation="ensure"` failed due to lock contention, the lifecycle loop will retry on the next tick; if it failed due to schema or permission issues, resolve the database role permissions before `sorobeacon_alert_partition_runway_months` drops to `0`.
+  3. See [Alert Partition Lifecycle](partition-lifecycle.md) for recovery procedures.
