@@ -63,13 +63,23 @@ func (c Config) Workspaces() []workspace.ID {
 			ids = append(ids, wt.Workspace)
 		}
 	}
-	// A single sign-on mapping names a tenant too: with OIDC_WORKSPACE set to a
-	// team that has no static token, that workspace is still one this instance
-	// serves, and startup should record it rather than let the first signed-in
-	// user be the first to discover it is absent from the table.
-	if c.OIDC.Enabled() && !seen[c.OIDC.Workspace] {
-		seen[c.OIDC.Workspace] = true
-		ids = append(ids, c.OIDC.Workspace)
+	// A single sign-on mapping names a tenant too: with OIDC_WORKSPACE or
+	// OIDC_GROUP_MAPPINGS set to a team that has no static token, that
+	// workspace is still one this instance serves, and startup should record it
+	// rather than let the first signed-in user be the first to discover it is
+	// absent from the table.
+	if c.OIDC.Enabled() {
+		if len(c.OIDC.GroupMappings) > 0 {
+			for _, gm := range c.OIDC.GroupMappings {
+				if !seen[gm.Workspace] {
+					seen[gm.Workspace] = true
+					ids = append(ids, gm.Workspace)
+				}
+			}
+		} else if !seen[c.OIDC.Workspace] {
+			seen[c.OIDC.Workspace] = true
+			ids = append(ids, c.OIDC.Workspace)
+		}
 	}
 	return ids
 }

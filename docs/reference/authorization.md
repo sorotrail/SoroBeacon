@@ -150,9 +150,42 @@ The suffix is **stripped when the token table is built**: an entry
 `secret`, not `secret:viewer`. The suffix selects the role; it is not part of
 the secret the client sends.
 
-An OIDC deployment maps roles with `OIDC_ROLE_CLAIM`, naming a claim in the
-verified ID token whose value is `viewer`, `editor` or `admin`. A claim the
-token lacks, or one naming no known role, leaves the identity an admin.
+An OIDC deployment maps roles either with `OIDC_ROLE_CLAIM` (naming a claim in
+the verified ID token whose value is `viewer`, `editor` or `admin`; a claim the
+token lacks, or one naming no known role, leaves the identity an admin) or with
+declarative group mappings (`OIDC_GROUP_CLAIM` and `OIDC_GROUP_MAPPINGS`).
+
+#### Declarative OIDC group mapping
+
+Enterprise identity providers emit group memberships (typically in the `groups`
+claim), and `OIDC_GROUP_MAPPINGS` maps each group name to a `(workspace, role)`
+pair without issuing per-user tokens:
+
+```sh
+OIDC_GROUP_CLAIM=groups
+OIDC_GROUP_MAPPINGS=sre-prod=prod:admin,devs-prod=prod:editor,auditors=prod:viewer,devs-staging=staging:editor
+OIDC_GROUP_CACHE_TTL=5m
+```
+
+* **Fail-closed:** When `OIDC_GROUP_MAPPINGS` is configured, a token whose
+  group claim is missing, empty, or matches no configured rule is denied
+  (`403 Forbidden` on `/api/v1` and rejected on `/login/oidc/callback`). It is
+  **never** defaulted to `OIDC_WORKSPACE` or `admin`.
+* **Multi-group precedence:** When a token carries multiple groups, every
+  matching rule is evaluated. Within a single workspace, the highest role wins
+  (`admin > editor > viewer`). Across multiple workspaces, the primary
+  `(workspace, role)` is the grant with the highest role, with ties broken by
+  the earliest matching rule in `OIDC_GROUP_MAPPINGS` declaration order; all
+  matched `(workspace, role)` grants remain recorded on the resolved
+  `Identity`/`Principal`.
+* **Live reload and bounded revocation (`OIDC_GROUP_CACHE_TTL`):** Group
+  mappings can be updated at runtime via `OIDCProvider.SetGroupMappings`
+  without restarting the process, immediately invalidating cached group
+  resolutions and re-evaluating active OIDC sessions. When a group is removed
+  at the identity provider, cached bearer and session grants expire or
+  re-validate within `OIDC_GROUP_CACHE_TTL` (default `5m`).
+* **No claim or token leakage:** Neither raw claim values nor tokens are ever
+  logged, returned in error responses, or echoed in startup errors.
 
 ### What each role may do
 

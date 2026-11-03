@@ -27,8 +27,16 @@ func AuthMiddleware(a *auth.Authenticator, log *slog.Logger) func(http.Handler) 
 			// One resolution serves both questions: whether the request is
 			// authenticated at all, and which tenant and scopes it carries.
 			// Asking twice would let the two answers disagree.
-			principal, ok := a.Principal(r)
-			if !ok {
+			principal, status := a.AuthenticateRequest(r)
+			if status == auth.AuthForbidden {
+				log.Warn("oidc claim mapping denied",
+					"request_id", reqid.From(r),
+					"method", r.Method,
+					"path", routePath(r))
+				writeErr(w, r, http.StatusForbidden, "forbidden")
+				return
+			}
+			if status != auth.AuthOK || principal == nil {
 				w.Header().Set("WWW-Authenticate", `Bearer realm="sorobeacon"`)
 				writeErr(w, r, http.StatusUnauthorized, "unauthorized")
 				return

@@ -14,10 +14,12 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -59,12 +61,31 @@ type tokenEntry struct {
 	workspace workspace.ID
 }
 
+// AuthStatus describes the outcome of authenticating an HTTP request.
+type AuthStatus int
+
+const (
+	// AuthUnauthenticated means no valid credential was presented (401).
+	AuthUnauthenticated AuthStatus = iota
+	// AuthOK means the credential was verified and mapped to a workspace/role.
+	AuthOK
+	// AuthForbidden means the credential was verified (e.g. a valid OIDC ID
+	// token or session), but its claims did not match any configured group or
+	// domain mapping (403).
+	AuthForbidden
+)
+
 type sessionInfo struct {
 	expires time.Time
 	role    Role
 	// workspace is inherited from the token that signed in. After sign-in
 	// there is nothing else that could say which tenant a request is for.
-	workspace workspace.ID
+	workspace      workspace.ID
+	grants         []WorkspaceGrant
+	oidcSubject    string
+	oidcGroups     []string
+	groupCheckedAt time.Time
+	mappingVersion uint64
 }
 
 type Authenticator struct {
@@ -314,17 +335,8 @@ func (a *Authenticator) HasSession(id string) bool {
 }
 
 func (a *Authenticator) getSessionRole(id string) (Role, bool) {
-	if a == nil || id == "" {
-		return RoleUnknown, false
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	info, ok := a.sessions[id]
-	if !ok {
-		return RoleUnknown, false
-	}
-	if !a.now().Before(info.expires) {
-		delete(a.sessions, id)
+	info, status := a.getSessionStatus(context.Background(), id)
+	if status != AuthOK {
 		return RoleUnknown, false
 	}
 	return info.role, true
@@ -365,20 +377,43 @@ func SessionID(r *http.Request) string {
 // getSession returns a live session's record. It is getSessionRole plus the
 // workspace, which Principal needs and HasSession does not.
 func (a *Authenticator) getSession(id string) (sessionInfo, bool) {
+	info, status := a.getSessionStatus(context.Background(), id)
+	return info, status == AuthOK
+}
+
+func (a *Authenticator) getSessionStatus(ctx context.Context, id string) (sessionInfo, AuthStatus) {
 	if a == nil || id == "" {
-		return sessionInfo{}, false
+		return sessionInfo{}, AuthUnauthenticated
 	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	info, ok := a.sessions[id]
 	if !ok {
-		return sessionInfo{}, false
+		a.mu.Unlock()
+		return sessionInfo{}, AuthUnauthenticated
 	}
 	if !a.now().Before(info.expires) {
 		delete(a.sessions, id)
-		return sessionInfo{}, false
+		a.mu.Unlock()
+		return sessionInfo{}, AuthUnauthenticated
 	}
-	return info, true
+	oidcProvider := a.oidc
+	a.mu.Unlock()
+
+	if info.oidcSubject != "" && oidcProvider.Enabled() {
+		updated, status := oidcProvider.revalidateSession(ctx, info)
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if _, stillThere := a.sessions[id]; !stillThere {
+			return sessionInfo{}, AuthUnauthenticated
+		}
+		if status != AuthOK {
+			delete(a.sessions, id)
+			return sessionInfo{}, status
+		}
+		a.sessions[id] = updated
+		return updated, AuthOK
+	}
+	return info, AuthOK
 }
 
 // WithTokens attaches the database-backed token manager, which is what makes
@@ -451,12 +486,119 @@ func (a *Authenticator) LoginOIDC(id *Identity) string {
 		return ""
 	}
 	role := id.Role
+	ws := id.Workspace
+	var mappingVersion uint64
+	var checkedAt time.Time
+	if a.oidc.Enabled() {
+		a.oidc.mu.Lock()
+		hasMappings := len(a.oidc.groupMappings) > 0
+		mappingVersion = a.oidc.mappingVersion
+		checkedAt = a.oidc.now()
+		a.oidc.mu.Unlock()
+		if hasMappings {
+			// Fail closed when group mappings are configured: never default an
+			// unmapped identity to RoleAdmin or the default workspace.
+			if role == RoleUnknown || ws == "" {
+				return ""
+			}
+		}
+	}
 	if role == RoleUnknown {
 		// An identity with no role is an operator: the provider vouched for
 		// it, and the alternative is a session that can do nothing.
 		role = RoleAdmin
 	}
-	return a.newSessionFor(role, id.Workspace)
+	if ws == "" {
+		ws = workspace.Default
+	}
+	buf := make([]byte, sessionIDBytes)
+	if _, err := rand.Read(buf); err != nil {
+		return ""
+	}
+	sid := base64.RawURLEncoding.EncodeToString(buf)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := a.now()
+	if checkedAt.IsZero() {
+		checkedAt = now
+	}
+	a.sweepLocked(now)
+	a.sessions[sid] = sessionInfo{
+		expires:        now.Add(a.tt),
+		role:           role,
+		workspace:      ws,
+		grants:         cloneGrants(id.Grants),
+		oidcSubject:    id.Subject,
+		oidcGroups:     append([]string(nil), id.Groups...),
+		groupCheckedAt: checkedAt,
+		mappingVersion: mappingVersion,
+	}
+	return sid
+}
+
+// AuthenticateRequest resolves a request to its Principal and AuthStatus.
+// Unlike Principal, it distinguishes an unauthenticated request (401) from a
+// verified OIDC credential whose claims do not match any configured group or
+// domain mapping (403 AuthForbidden).
+func (a *Authenticator) AuthenticateRequest(r *http.Request) (*Principal, AuthStatus) {
+	if r == nil {
+		return nil, AuthUnauthenticated
+	}
+	if !a.Enabled() {
+		return &Principal{Workspace: workspace.Default, Role: RoleAdmin}, AuthOK
+	}
+	if raw, ok := Bearer(r.Header.Get("Authorization")); ok {
+		if strings.HasPrefix(raw, TokenPrefix) {
+			if a.scoped == nil {
+				return nil, AuthUnauthenticated
+			}
+			p, err := a.scoped.Authenticate(r.Context(), raw)
+			if err != nil {
+				return nil, AuthUnauthenticated
+			}
+			p.Role = RoleForScopes(p.Scopes())
+			return p, AuthOK
+		}
+		if entry, ok := a.lookupStatic(raw); ok {
+			return &Principal{Workspace: entry.workspace, Role: entry.role}, AuthOK
+		}
+		if a.oidc.Enabled() && strings.Count(raw, ".") == 2 {
+			id, err := a.oidc.VerifyBearer(r.Context(), raw)
+			if err != nil {
+				if errors.Is(err, ErrOIDCAccount) {
+					return nil, AuthForbidden
+				}
+				return nil, AuthUnauthenticated
+			}
+			p := &Principal{
+				Workspace: id.Workspace,
+				Role:      id.Role,
+				Grants:    cloneGrants(id.Grants),
+			}
+			if len(id.Scopes) > 0 {
+				p.restricted = true
+				p.scopes = append([]Scope(nil), id.Scopes...)
+			}
+			return p, AuthOK
+		}
+		// A bearer header that named a credential we do not know is a failed
+		// attempt, not an anonymous request: falling through to the cookie
+		// would let a stale token ride a live browser session.
+		return nil, AuthUnauthenticated
+	}
+	sid := SessionID(r)
+	if sid == "" {
+		return nil, AuthUnauthenticated
+	}
+	info, status := a.getSessionStatus(r.Context(), sid)
+	if status != AuthOK {
+		return nil, status
+	}
+	return &Principal{
+		Workspace: info.workspace,
+		Role:      info.role,
+		Grants:    cloneGrants(info.grants),
+	}, AuthOK
 }
 
 // Principal resolves a request to its caller. It is the one place that turns a
@@ -464,53 +606,23 @@ func (a *Authenticator) LoginOIDC(id *Identity) string {
 // not a query parameter, not the host — because a client that could name its
 // own workspace could read someone else's.
 //
-// The three credentials, in the order they are tried:
+// The credentials, in the order they are tried:
 //
 //   - A bearer token carrying TokenPrefix is a database-backed token: the
 //     manager resolves it to a restricted principal whose scopes are the whole
 //     grant. It is never compared against the static table, so revoking the row
 //     revokes the credential.
-//   - Any other bearer token is matched against the configured static tokens,
-//     and yields an unrestricted principal in that token's workspace.
+//   - Any other bearer token is matched against the configured static tokens
+//     (or verified as an OIDC ID token when OIDC is enabled), yielding a
+//     principal in the mapped workspace and role.
 //   - Failing both, a live dashboard session cookie yields an unrestricted
-//     principal in the workspace of the token that signed in. The dashboard's
-//     own same-origin requests (the CSV export link, for one) cannot attach a
-//     header, which is why the cookie is a credential here at all.
+//     principal in the workspace of the token or OIDC identity that signed in.
 //
 // With no tokens configured the service is open, as it has always been, and
 // every request acts on the default workspace.
 func (a *Authenticator) Principal(r *http.Request) (*Principal, bool) {
-	if r == nil {
-		return nil, false
-	}
-	// A nil authenticator is a server built without WithAuth, which is the
-	// same "nothing configured" case as an empty token list.
-	if !a.Enabled() {
-		return &Principal{Workspace: workspace.Default}, true
-	}
-	if raw, ok := Bearer(r.Header.Get("Authorization")); ok {
-		if strings.HasPrefix(raw, TokenPrefix) {
-			if a.scoped == nil {
-				return nil, false
-			}
-			p, err := a.scoped.Authenticate(r.Context(), raw)
-			if err != nil {
-				return nil, false
-			}
-			return p, true
-		}
-		if entry, ok := a.lookupStatic(raw); ok {
-			return &Principal{Workspace: entry.workspace}, true
-		}
-		// A bearer header that named a credential we do not know is a failed
-		// attempt, not an anonymous request: falling through to the cookie
-		// would let a stale token ride a live browser session.
-		return nil, false
-	}
-	if info, ok := a.getSession(SessionID(r)); ok {
-		return &Principal{Workspace: info.workspace}, true
-	}
-	return nil, false
+	p, status := a.AuthenticateRequest(r)
+	return p, status == AuthOK
 }
 
 // Workspace resolves the workspace a request's credential belongs to. It is
@@ -541,11 +653,12 @@ func (a *Authenticator) Authenticated(r *http.Request) bool {
 
 // RoleForRequest determines the effective Role for an HTTP request.
 //
-// The three credentials answer it differently. A static token carries its
-// role in its suffix, and a dashboard session carries the role of the
-// credential that signed in. A database-backed token carries no role of its
-// own: its scopes are the grant, and the role is the coarsest one those
-// scopes allow (RoleForScopes).
+// The credentials answer it differently. A static token carries its role in
+// its suffix, an OIDC bearer token carries the role resolved from its group or
+// role claims, and a dashboard session carries the role of the credential that
+// signed in. A database-backed token carries no role of its own: its scopes
+// are the grant, and the role is the coarsest one those scopes allow
+// (RoleForScopes).
 //
 // With no credential configured the request is an admin one: an unconfigured
 // instance is open, and an open instance is an admin instance.
@@ -556,27 +669,11 @@ func (a *Authenticator) RoleForRequest(r *http.Request) (Role, bool) {
 	if !a.Enabled() {
 		return RoleAdmin, true
 	}
-	if token, ok := Bearer(r.Header.Get("Authorization")); ok {
-		if strings.HasPrefix(token, TokenPrefix) {
-			// A database-backed token. The manager resolves it to its row,
-			// and the scopes on that row are the whole grant.
-			if a.scoped == nil {
-				return RoleUnknown, false
-			}
-			p, err := a.scoped.Authenticate(r.Context(), token)
-			if err != nil {
-				return RoleUnknown, false
-			}
-			return RoleForScopes(p.Scopes()), true
-		}
-		if role, ok := a.verifyToken(token); ok {
-			return role, true
-		}
+	p, status := a.AuthenticateRequest(r)
+	if status != AuthOK || p == nil {
+		return RoleUnknown, false
 	}
-	if role, ok := a.getSessionRole(SessionID(r)); ok {
-		return role, true
-	}
-	return RoleUnknown, false
+	return a.RoleForPrincipal(r, p), true
 }
 
 // RoleForPrincipal is the role of an already-resolved caller.
@@ -585,13 +682,20 @@ func (a *Authenticator) RoleForRequest(r *http.Request) (Role, bool) {
 // row is read from the database, and reading it a second time for the role
 // would double that cost on every API call; here the role comes from the
 // scopes the principal already carries. An unrestricted credential — a static
-// token or a session — is resolved from the in-memory tables either way.
+// token, an OIDC bearer token, or a session — carries its resolved Role on p.
 func (a *Authenticator) RoleForPrincipal(r *http.Request, p *Principal) Role {
 	if p == nil {
 		return RoleUnknown
 	}
 	if p.Restricted() {
-		return RoleForScopes(p.Scopes())
+		scopeRole := RoleForScopes(p.Scopes())
+		if p.Role != RoleUnknown && !p.Role.AtLeast(scopeRole) {
+			return p.Role
+		}
+		return scopeRole
+	}
+	if p.Role != RoleUnknown {
+		return p.Role
 	}
 	role, _ := a.RoleForRequest(r)
 	return role
