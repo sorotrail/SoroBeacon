@@ -1949,7 +1949,7 @@ func (s *SQLite) ReconcileChannelAcknowledgements(ctx context.Context, cfg AckRe
 	if err != nil {
 		return nil, mapSQLiteErr(err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var reconciliations []ChannelAckReconciliation
 	for rows.Next() {
@@ -2062,7 +2062,7 @@ func (s *SQLite) ListChannelAckReconciliations(ctx context.Context) (map[int64]C
 	if err != nil {
 		return nil, mapSQLiteErr(err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make(map[int64]ChannelAckReconciliation)
 	for rows.Next() {
