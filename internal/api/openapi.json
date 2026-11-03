@@ -1980,6 +1980,56 @@
         }
       }
     },
+    "/usage": {
+      "get": {
+        "summary": "Per-workspace usage metering summary",
+        "description": "Returns durable per-period usage rollups (alerts raised, rule evaluations, notifications by channel type and outcome, API requests) and live stored row counts. Scoped to the caller's workspace for workspace-bound credentials, or available across workspaces to an unrestricted operator.",
+        "parameters": [
+          {
+            "name": "workspace",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workspace usage summary and per-period rollups",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/stats/alerts-daily": {
       "get": {
         "summary": "Daily alert counts for the last 30 UTC days",

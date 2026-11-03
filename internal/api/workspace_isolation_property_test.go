@@ -876,6 +876,19 @@ func buildRESTIsolationChecks(fx *isolationFixture) map[string]func(t *testing.T
 			}
 			assert.Equal(t, int64(1), total, "alerts-daily must count only alpha's alerts, never beta's")
 		},
+		"GET /usage": func(t *testing.T) {
+			code, raw := fx.doREST(t, fx.alphaToken, http.MethodGet, "/usage", "")
+			require.Equal(t, http.StatusOK, code)
+			var resp UsageResponse
+			require.NoError(t, json.Unmarshal(raw, &resp))
+			assert.Equal(t, "alpha", resp.WorkspaceID)
+			assert.Equal(t, int64(1), resp.StoredRows.Alerts, "usage stored_rows.alerts must count only alpha's alerts")
+			require.Len(t, resp.Workspaces, 1)
+			assert.Equal(t, "alpha", resp.Workspaces[0].WorkspaceID)
+
+			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodGet, "/usage?workspace=beta", "")
+			assert.Equal(t, http.StatusForbidden, crossCode)
+		},
 	}
 }
 

@@ -364,24 +364,26 @@ func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
 	if err := lockContractCursorRefs(ctx, tx); err != nil {
 		return err
 	}
+	ws := workspaceID(ctx)
 	if err := tx.QueryRow(ctx,
 		`INSERT INTO monitors (name, contract_ids, tags, enabled, priority, workspace_id, network, created_at, runbook_url, response_guidance)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, now()), $9, $10)
 		 RETURNING id, created_at`,
-		m.Name, ids, m.Tags, m.Enabled, m.Priority.Normalized(), workspaceID(ctx), m.Network, pgCreatedAt(m.CreatedAt), m.RunbookURL, m.ResponseGuidance,
+		m.Name, ids, m.Tags, m.Enabled, m.Priority.Normalized(), ws, m.Network, pgCreatedAt(m.CreatedAt), m.RunbookURL, m.ResponseGuidance,
 	).Scan(&m.ID, &m.CreatedAt); err != nil {
 		// A name already taken in this workspace violates the unique index, and
 		// that is the request's fault rather than the server's: mapErr turns
 		// it into the typed constraint error the API answers 422 with.
 		return mapErr(err)
 	}
+	m.WorkspaceID = string(ws)
 	return tx.Commit(ctx)
 }
 
 func (p *Postgres) GetMonitor(ctx context.Context, id int64) (*Monitor, error) {
 	ws := workspaceID(ctx)
 	m, err := scanMonitor(p.pool.QueryRow(ctx,
-		`SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
+		`SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
 	if err != nil {
 		return nil, err
 	}
@@ -408,7 +410,7 @@ func (p *Postgres) monitorChannelIDs(ctx context.Context, monitorID int64) ([]in
 func (p *Postgres) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monitor, error) {
 	var out []Monitor
 	err := p.read(ctx, func(ctx context.Context) error {
-		q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance FROM monitors WHERE deleted_at IS NULL`
+		q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE deleted_at IS NULL`
 		args := []any{}
 		ws, scoped := tenantWorkspace(ctx)
 		if scoped {
@@ -445,7 +447,7 @@ func (p *Postgres) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monito
 }
 
 func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance FROM monitors WHERE workspace_id = $1 AND deleted_at IS NULL`
+	q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE workspace_id = $1 AND deleted_at IS NULL`
 	args := []any{workspaceID(ctx)}
 	n := 1
 	arg := func(v any) string {
@@ -669,7 +671,7 @@ func (p *Postgres) RestoreMonitor(ctx context.Context, id int64) error {
 
 // ListDeletedMonitors returns soft-deleted monitors (the "trash").
 func (p *Postgres) ListDeletedMonitors(ctx context.Context, f ListFilter) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance FROM monitors WHERE workspace_id = $1 AND deleted_at IS NOT NULL`
+	q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE workspace_id = $1 AND deleted_at IS NOT NULL`
 	args := []any{workspaceID(ctx)}
 	n := 1
 	arg := func(v any) string {
@@ -765,7 +767,7 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 	}
 
 	src, err := scanMonitor(tx.QueryRow(ctx,
-		`SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
+		`SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
 	if err != nil {
 		return nil, err
 	}
@@ -858,6 +860,7 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 		return nil, err
 	}
 	copy.ChannelIDs = src.ChannelIDs
+	copy.WorkspaceID = string(ws)
 	return &copy, nil
 }
 
@@ -895,6 +898,7 @@ func (p *Postgres) CreateMonitorWithRules(ctx context.Context, m *Monitor, rules
 	).Scan(&m.ID, &m.CreatedAt); err != nil {
 		return err
 	}
+	m.WorkspaceID = string(ws)
 	for _, r := range rules {
 		r.MonitorID = m.ID
 		if err := tx.QueryRow(ctx,
@@ -972,7 +976,7 @@ func scanMonitor(r rowScanner) (*Monitor, error) {
 	var tags []string
 	var priority string
 	var deletedAt *time.Time
-	if err := r.Scan(&m.ID, &m.Name, &ids, &tags, &m.Enabled, &m.CreatedAt, &m.LastMatchedAt, &priority, &m.Network, &deletedAt, &m.RunbookURL, &m.ResponseGuidance); err != nil {
+	if err := r.Scan(&m.ID, &m.Name, &ids, &tags, &m.Enabled, &m.CreatedAt, &m.LastMatchedAt, &priority, &m.Network, &deletedAt, &m.RunbookURL, &m.ResponseGuidance, &m.WorkspaceID); err != nil {
 		return nil, mapErr(err)
 	}
 	m.Priority = Priority(priority).Normalized()
@@ -1250,12 +1254,17 @@ func (p *Postgres) CreateChannel(ctx context.Context, c *Channel) error {
 	if err != nil {
 		return err
 	}
-	return p.pool.QueryRow(ctx,
+	ws := workspaceID(ctx)
+	if err := p.pool.QueryRow(ctx,
 		`INSERT INTO channels (name, type, config, enabled, digest_mode, digest_window_seconds, timeout, workspace_id, created_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, now()))
 		 RETURNING id, created_at`,
-		c.Name, c.Type, config, c.Enabled, c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(), workspaceID(ctx), pgCreatedAt(c.CreatedAt),
-	).Scan(&c.ID, &c.CreatedAt)
+		c.Name, c.Type, config, c.Enabled, c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(), ws, pgCreatedAt(c.CreatedAt),
+	).Scan(&c.ID, &c.CreatedAt); err != nil {
+		return err
+	}
+	c.WorkspaceID = string(ws)
+	return nil
 }
 
 func (p *Postgres) GetChannel(ctx context.Context, id int64) (*Channel, error) {
@@ -1264,11 +1273,11 @@ func (p *Postgres) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 	err := p.pool.QueryRow(ctx,
 		`SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout,
 		        consecutive_failures, consecutive_permanent_failures, last_error,
-		        last_error_at, last_success_at, disabled_at
+		        last_error_at, last_success_at, disabled_at, workspace_id
 		 FROM channels WHERE id = $1 AND workspace_id = $2`, id, workspaceID(ctx),
 	).Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.Enabled, &c.CreatedAt, &c.DigestMode, &c.DigestWindowSeconds, &timeoutSec,
 		&c.ConsecutiveFailures, &c.ConsecutivePermanentFailures, &c.LastError,
-		&c.LastErrorAt, &c.LastSuccessAt, &c.DisabledAt)
+		&c.LastErrorAt, &c.LastSuccessAt, &c.DisabledAt, &c.WorkspaceID)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -1284,7 +1293,7 @@ func (p *Postgres) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 func (p *Postgres) ListChannels(ctx context.Context, enabledOnly bool) ([]Channel, error) {
 	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout,
 		        consecutive_failures, consecutive_permanent_failures, last_error,
-		        last_error_at, last_success_at, disabled_at FROM channels WHERE TRUE`
+		        last_error_at, last_success_at, disabled_at, workspace_id FROM channels WHERE TRUE`
 	args := []any{}
 	if ws, scoped := tenantWorkspace(ctx); scoped {
 		args = append(args, ws)
@@ -1304,7 +1313,7 @@ func (p *Postgres) ListChannels(ctx context.Context, enabledOnly bool) ([]Channe
 func (p *Postgres) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel, error) {
 	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout,
 		        consecutive_failures, consecutive_permanent_failures, last_error,
-		        last_error_at, last_success_at, disabled_at FROM channels WHERE TRUE`
+		        last_error_at, last_success_at, disabled_at, workspace_id FROM channels WHERE TRUE`
 	args := []any{}
 	n := 0
 	arg := func(v any) string {
@@ -1473,7 +1482,7 @@ func (p *Postgres) DeleteChannel(ctx context.Context, id int64) error {
 
 func (p *Postgres) ListMonitorsForChannel(ctx context.Context, channelID int64) ([]Monitor, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT m.id, m.name, m.contract_ids, m.tags, m.enabled, m.created_at, m.last_matched_at, m.priority, m.network, m.deleted_at, m.runbook_url, m.response_guidance
+		`SELECT m.id, m.name, m.contract_ids, m.tags, m.enabled, m.created_at, m.last_matched_at, m.priority, m.network, m.deleted_at, m.runbook_url, m.response_guidance, m.workspace_id
 		 FROM monitors m
 		 JOIN monitor_channels mc ON mc.monitor_id = m.id
 		 WHERE mc.channel_id = $1 AND m.workspace_id = $2
@@ -1511,7 +1520,7 @@ func (p *Postgres) ListChannelsForMonitor(ctx context.Context, monitorID int64) 
 	rows, err := p.pool.Query(ctx,
 		`SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at, c.digest_mode, c.digest_window_seconds, c.timeout,
 		        c.consecutive_failures, c.consecutive_permanent_failures, c.last_error,
-		        c.last_error_at, c.last_success_at, c.disabled_at
+		        c.last_error_at, c.last_success_at, c.disabled_at, c.workspace_id
 		 FROM channels c
 		 JOIN monitor_channels mc ON mc.channel_id = c.id
 		 JOIN monitors m ON m.id = mc.monitor_id
@@ -1534,7 +1543,7 @@ func (p *Postgres) ListChannelsByIDs(ctx context.Context, ids []int64) ([]Channe
 	rows, err := p.pool.Query(ctx,
 		`SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout,
 		        consecutive_failures, consecutive_permanent_failures, last_error,
-		        last_error_at, last_success_at, disabled_at FROM channels
+		        last_error_at, last_success_at, disabled_at, workspace_id FROM channels
 		  WHERE id = ANY($1) AND enabled ORDER BY id`, uniqueIDs(ids))
 	if err != nil {
 		return nil, err
@@ -1549,7 +1558,7 @@ func (p *Postgres) scanChannel(row pgx.CollectableRow) (Channel, error) {
 	var timeoutSec int
 	if err := row.Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.Enabled, &c.CreatedAt, &c.DigestMode, &c.DigestWindowSeconds, &timeoutSec,
 		&c.ConsecutiveFailures, &c.ConsecutivePermanentFailures, &c.LastError,
-		&c.LastErrorAt, &c.LastSuccessAt, &c.DisabledAt); err != nil {
+		&c.LastErrorAt, &c.LastSuccessAt, &c.DisabledAt, &c.WorkspaceID); err != nil {
 		return c, err
 	}
 	c.Timeout = time.Duration(timeoutSec) * time.Second
@@ -2189,7 +2198,7 @@ func (p *Postgres) createAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 		// deployed to, so the monitor owns the answer and an alert cannot be
 		// filed against a chain its monitor does not watch.
 		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, backfilled, ledger, network, workspace_id, rule_version, runbook_url, response_guidance)
-			 VALUES ($1, $2, $3, $4, $5, COALESCE(NULLIF($9, ''), (SELECT severity FROM rules WHERE id = $2), 'warning'), $6, $7, (SELECT network FROM monitors WHERE id = $1), $8, COALESCE(NULLIF($10, 0), (SELECT version FROM rules WHERE id = $2), 1), $11, $12)
+			 VALUES ($1, $2, $3, $4, $5, COALESCE(NULLIF($9, ''), (SELECT severity FROM rules WHERE id = $2), 'warning'), $6, $7, (SELECT network FROM monitors WHERE id = $1), COALESCE((SELECT workspace_id FROM monitors WHERE id = $1), $8), COALESCE(NULLIF($10, 0), (SELECT version FROM rules WHERE id = $2), 1), $11, $12)
 			 RETURNING id, created_at, network, severity, rule_version, runbook_url, response_guidance`,
 		a.MonitorID, a.RuleID, a.EventID, jsonOrEmpty(a.Payload), nullableJSON(a.Enrichment), a.Backfilled, int64(a.Ledger),
 		ws, string(a.Severity), a.RuleVersion, a.RunbookURL, a.ResponseGuidance,

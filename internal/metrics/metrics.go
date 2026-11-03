@@ -85,6 +85,13 @@ type Metrics struct {
 
 	databaseDegraded         prometheus.Gauge
 	databaseUnavailableTotal prometheus.Counter
+
+	workspaceTracker         *workspaceLabelTracker
+	workspaceAlertsRaised    *prometheus.CounterVec
+	workspaceRuleEvaluations *prometheus.CounterVec
+	workspaceNotifications   *prometheus.CounterVec
+	workspaceAPIRequests     *prometheus.CounterVec
+	workspaceStoredRows      *prometheus.GaugeVec
 }
 
 // networkLabel is the Prometheus label every ingest metric carries.
@@ -279,6 +286,33 @@ func New() *Metrics {
 			Name: "sorobeacon_channel_unacknowledged_delivery_rate",
 			Help: "Share of delivered alerts that were never acknowledged within the SLA window [0.0 - 1.0].",
 		}, []string{"channel_id", "channel_type"}),
+
+		workspaceTracker: newWorkspaceLabelTracker(MaxTrackedWorkspaces),
+
+		workspaceAlertsRaised: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_workspace_alerts_raised_total",
+			Help: "Alerts raised per workspace (opaque hashed workspace label, bounded with overflow).",
+		}, []string{"workspace"}),
+
+		workspaceRuleEvaluations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_workspace_rule_evaluations_total",
+			Help: "Rule evaluations executed per workspace (opaque hashed workspace label, bounded with overflow).",
+		}, []string{"workspace"}),
+
+		workspaceNotifications: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_workspace_notifications_total",
+			Help: "Notification attempts per workspace by channel_type and outcome (ok|error|throttled).",
+		}, []string{"workspace", "channel_type", "outcome"}),
+
+		workspaceAPIRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_workspace_api_requests_total",
+			Help: "Authenticated HTTP API requests served per workspace.",
+		}, []string{"workspace"}),
+
+		workspaceStoredRows: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_workspace_stored_rows",
+			Help: "Exact stored row count per workspace and resource kind (monitors|rules|channels|alerts|dead_letters).",
+		}, []string{"workspace", "resource"}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
 		m.upstreamLagLedger, m.upstreamFailures,
@@ -287,7 +321,8 @@ func New() *Metrics {
 		m.reorgsTotal, m.lastReorgLedger, m.breakerStates, m.pollPanics,
 		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.deadLetters, m.deadLettersByChannel, m.heartbeatLastSuccess,
 		m.ruleEvalsTotal, m.ruleMatchesTotal, m.ruleErrorsTotal, m.ruleDuration, m.requestBodyRejectionsTotal,
-		m.databaseDegraded, m.databaseUnavailableTotal, m.channelUnackFlagged, m.channelUnackRate)
+		m.databaseDegraded, m.databaseUnavailableTotal, m.channelUnackFlagged, m.channelUnackRate,
+		m.workspaceAlertsRaised, m.workspaceRuleEvaluations, m.workspaceNotifications, m.workspaceAPIRequests, m.workspaceStoredRows)
 	return m
 }
 
@@ -784,5 +819,10 @@ func ExportedMetricNames() []string {
 		"sorobeacon_database_unavailable_total",
 		"sorobeacon_channel_unacknowledged_flagged",
 		"sorobeacon_channel_unacknowledged_delivery_rate",
+		"sorobeacon_workspace_alerts_raised_total",
+		"sorobeacon_workspace_rule_evaluations_total",
+		"sorobeacon_workspace_notifications_total",
+		"sorobeacon_workspace_api_requests_total",
+		"sorobeacon_workspace_stored_rows",
 	}
 }

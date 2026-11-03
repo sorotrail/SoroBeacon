@@ -177,6 +177,10 @@ type Monitor struct {
 	// ResponseGuidance is an optional short markdown/text note describing what
 	// an on-call responder should do when an alert fires on this monitor.
 	ResponseGuidance string `json:"response_guidance,omitempty"`
+	// WorkspaceID is the tenant workspace this monitor belongs to. It is populated
+	// by store reads and writes so cross-tenant background workers (poller, ingestor)
+	// can attribute rule evaluations and alerts to the owning workspace.
+	WorkspaceID string `json:"-"`
 }
 
 // MaxMonitorTags bounds how many tags one monitor may carry, and MaxTagLen
@@ -541,6 +545,10 @@ type Channel struct {
 	// then. It is what makes the dashboard say "auto-disabled" rather than
 	// "disabled", and it is cleared by an explicit re-enable.
 	DisabledAt *time.Time `json:"disabled_at,omitempty"`
+	// WorkspaceID is the tenant workspace this channel belongs to, populated
+	// by store reads and writes so delivery workers can attribute notifications
+	// to the owning workspace.
+	WorkspaceID string `json:"-"`
 }
 
 // TimeoutDuration returns the channel's timeout, falling back to
@@ -2056,6 +2064,92 @@ type PersistedOperations interface {
 	DeletePersistedOperation(ctx context.Context, id string) error
 }
 
+// WorkspaceNotificationUsage records notification volume for a single channel
+// type and delivery outcome within a usage period or summary.
+type WorkspaceNotificationUsage struct {
+	ChannelType string `json:"channel_type"`
+	Outcome     string `json:"outcome"`
+	Count       int64  `json:"count"`
+}
+
+// WorkspaceStorageCounts holds exact stored row counts per workspace across
+// tenant-owned tables. Rules and dead letters carry no workspace_id column of
+// their own and are counted via their parent monitor and alert respectively.
+type WorkspaceStorageCounts struct {
+	Monitors         int64 `json:"monitors"`
+	Rules            int64 `json:"rules"`
+	Channels         int64 `json:"channels"`
+	Alerts           int64 `json:"alerts"`
+	DeliveryAttempts int64 `json:"delivery_attempts"`
+	DeadLetters      int64 `json:"dead_letters"`
+}
+
+// Total returns the total stored rows across all tracked tenant tables.
+func (c WorkspaceStorageCounts) Total() int64 {
+	return c.Monitors + c.Rules + c.Channels + c.Alerts + c.DeliveryAttempts + c.DeadLetters
+}
+
+// WorkspaceUsagePeriod is one durable aggregated usage rollup for a workspace
+// over [PeriodStart, PeriodEnd), suitable for reporting or invoicing.
+type WorkspaceUsagePeriod struct {
+	WorkspaceID     string                       `json:"workspace_id"`
+	PeriodStart     time.Time                    `json:"period_start"`
+	PeriodEnd       time.Time                    `json:"period_end"`
+	AlertsRaised    int64                        `json:"alerts_raised"`
+	RuleEvaluations int64                        `json:"rule_evaluations"`
+	APIRequests     int64                        `json:"api_requests"`
+	Notifications   []WorkspaceNotificationUsage `json:"notifications"`
+	UpdatedAt       time.Time                    `json:"updated_at"`
+}
+
+// WorkspaceUsageDelta is an incremental batch update flushed from in-memory
+// usage counters into the durable store rollups.
+type WorkspaceUsageDelta struct {
+	WorkspaceID     string
+	PeriodStart     time.Time
+	PeriodEnd       time.Time
+	AlertsRaised    int64
+	RuleEvaluations int64
+	APIRequests     int64
+	Notifications   []WorkspaceNotificationUsage
+}
+
+// WorkspaceUsageFilter constrains ListWorkspaceUsage by workspace and period
+// bounds. When called under a tenant-scoped context, the store enforces the
+// context's workspace regardless of WorkspaceID.
+type WorkspaceUsageFilter struct {
+	WorkspaceID string
+	From        time.Time
+	To          time.Time
+}
+
+// WorkspaceUsageSummary is the aggregated usage report for one workspace across
+// the requested window, including per-period rollups and current stored rows.
+type WorkspaceUsageSummary struct {
+	WorkspaceID     string                       `json:"workspace_id"`
+	From            *time.Time                   `json:"from,omitempty"`
+	To              *time.Time                   `json:"to,omitempty"`
+	AlertsRaised    int64                        `json:"alerts_raised"`
+	RuleEvaluations int64                        `json:"rule_evaluations"`
+	APIRequests     int64                        `json:"api_requests"`
+	Notifications   []WorkspaceNotificationUsage `json:"notifications"`
+	StoredRows      WorkspaceStorageCounts       `json:"stored_rows"`
+	Periods         []WorkspaceUsagePeriod       `json:"periods"`
+}
+
+// Usage persists and queries per-workspace usage rollups and storage counts.
+type Usage interface {
+	// RecordWorkspaceUsageBatch atomically adds the given deltas into the durable
+	// per-workspace, per-period usage rollup tables.
+	RecordWorkspaceUsageBatch(ctx context.Context, deltas []WorkspaceUsageDelta) error
+	// ListWorkspaceUsage returns aggregated usage summaries and period rollups.
+	// A tenant-scoped context sees only its own workspace; a system context
+	// sees all workspaces (or filters to f.WorkspaceID when non-empty).
+	ListWorkspaceUsage(ctx context.Context, f WorkspaceUsageFilter) ([]WorkspaceUsageSummary, error)
+	// GetWorkspaceStorageCounts returns exact stored row counts for workspaceID.
+	GetWorkspaceStorageCounts(ctx context.Context, workspaceID string) (WorkspaceStorageCounts, error)
+}
+
 // Store is everything the application needs from persistence.
 //
 // Tenancy: every method below is scoped to the workspace carried by ctx
@@ -2089,6 +2183,7 @@ type Store interface {
 	APITokens
 	Escalations
 	PersistedOperations
+	Usage
 	GetStats(ctx context.Context) (Stats, error)
 	// GetMonitorStats returns one monitor's alert, delivery and per-rule
 	// counts, or ErrNotFound when the monitor does not exist. It exists

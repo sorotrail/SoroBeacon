@@ -27,6 +27,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/usage"
 )
 
 // Server holds the API's dependencies.
@@ -108,6 +109,9 @@ type Server struct {
 	tokens *auth.Manager
 	// breaker fast-fails requests when the database is unavailable.
 	breaker *store.StoreBreaker
+	// usageMeter buffers per-workspace API request counts in memory and
+	// flushes them to durable rollups.
+	usageMeter *usage.Meter
 }
 
 // New wires an API server. Rate limiting stays off until WithRateLimit, and
@@ -128,6 +132,7 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, rpc HealthCheck
 		broadcaster:        broadcast.New(broadcast.DefaultBuffer),
 		streamHeartbeat:    defaultStreamHeartbeat,
 		breaker:            b,
+		usageMeter:         usage.NewMeter(st, nil, log),
 	}
 }
 
@@ -170,7 +175,26 @@ func (s *Server) WithEndpointMaxBodyBytes(path string, n int64) *Server {
 // WithMetrics attaches Prometheus instrumentation so request body rejections are tracked.
 func (s *Server) WithMetrics(m *metrics.Metrics) *Server {
 	s.metrics = m
+	if s.usageMeter != nil {
+		s.usageMeter.WithMetrics(m)
+	}
 	return s
+}
+
+// WithUsageMeter attaches a shared workspace usage meter.
+func (s *Server) WithUsageMeter(um *usage.Meter) *Server {
+	if um != nil {
+		if s.metrics != nil {
+			um.WithMetrics(s.metrics)
+		}
+		s.usageMeter = um
+	}
+	return s
+}
+
+// UsageMeter returns the server's workspace usage meter.
+func (s *Server) UsageMeter() *usage.Meter {
+	return s.usageMeter
 }
 
 // WithPoller attaches the ingest-position source used by /health and /readyz.
@@ -296,6 +320,7 @@ func (s *Server) Routes() chi.Router {
 		Deny: s.denyRole,
 	}.Middleware())
 	mux.Use(RateLimitMiddleware(s.rateLimit))
+	mux.Use(s.usageMiddleware)
 	// Innermost, so only authenticated, rate-limited requests are audited
 	// and an audit failure never blocks the request.
 	mux.Use(AuditMiddleware(s.store, s.log))
@@ -420,6 +445,7 @@ func (s *Server) Routes() chi.Router {
 	mux.Get("/rule-types", s.listRuleTypes)
 	mux.Get("/stats", s.stats)
 	mux.Get("/stats/alerts-daily", s.withConditionalETag(s.alertsDailyChangeKey, s.alertsDaily))
+	mux.Get("/usage", s.usage)
 	mux.Get("/audit", s.listAudit)
 
 	return mux

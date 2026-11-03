@@ -66,6 +66,11 @@ func TestExportedMetricNamesMatchesRegistryForAlerts(t *testing.T) {
 	m.SetDeadLetters(0)
 	m.SetDeadLettersFor("default", "slack", 0)
 	m.RecordBodyRejection("max_body")
+	m.RecordWorkspaceAlertRaised("default", 1)
+	m.RecordWorkspaceRuleEvaluations("default", 1)
+	m.RecordWorkspaceNotification("default", "slack", "ok", 1)
+	m.RecordWorkspaceAPIRequest("default", 1)
+	m.SetWorkspaceStoredRows("default", "monitors", 1)
 	m.httpDuration.WithLabelValues("/health", "GET", "200").Observe(0.01)
 
 	families, err := m.registry.Gather()
