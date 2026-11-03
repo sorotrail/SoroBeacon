@@ -2493,6 +2493,98 @@
         }
       }
     },
+    "/tokens/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "get": {
+        "summary": "Get an API token by ID",
+        "description": "Returns token metadata including last_used_at and rotation relationships. Never returns the token secret.",
+        "responses": {
+          "200": {
+            "description": "Token details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIToken"
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/TokenManagementDisabled"
+          }
+        }
+      }
+    },
+    "/tokens/{id}/rotate": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "post": {
+        "summary": "Rotate an API token with overlap",
+        "description": "Initiates an overlapping token rotation, issuing a successor token while predecessor remains valid until its new expiry. The plaintext secret of the successor is returned exactly once.",
+        "responses": {
+          "201": {
+            "description": "Successor token minted. Plaintext secret returned once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedAPIToken"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/TokenManagementDisabled"
+          }
+        }
+      }
+    },
+    "/tokens/{id}/abandon": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "post": {
+        "summary": "Abandon an in-progress token rotation",
+        "description": "Cancels an in-progress rotation, revoking the successor token and restoring the predecessor token's pre-rotation state without inconsistent state.",
+        "responses": {
+          "200": {
+            "description": "Rotation abandoned"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/TokenManagementDisabled"
+          }
+        }
+      }
+    },
     "/monitors/trash": {
       "get": {
         "summary": "List deleted monitors (trash)",

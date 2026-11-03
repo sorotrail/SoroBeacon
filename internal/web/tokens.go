@@ -37,6 +37,9 @@ type tokenRow struct {
 	State        string
 	Revoked      bool
 	NeverExpires bool
+	IsRotating   bool
+	SuccessorID  int64
+	RotatedFrom  int64
 }
 
 func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
@@ -138,6 +141,13 @@ func (s *Server) tokenPageData(r *http.Request, list []auth.Token, newToken stri
 	now := time.Now()
 	rows := make([]tokenRow, 0, len(list))
 	for _, t := range list {
+		var succID, rotFrom int64
+		if t.SuccessorID != nil {
+			succID = *t.SuccessorID
+		}
+		if t.RotatedFromID != nil {
+			rotFrom = *t.RotatedFromID
+		}
 		rows = append(rows, tokenRow{
 			ID:           t.ID,
 			Name:         t.Name,
@@ -149,6 +159,9 @@ func (s *Server) tokenPageData(r *http.Request, list []auth.Token, newToken stri
 			State:        tokenState(t, now),
 			Revoked:      !t.RevokedAt.IsZero(),
 			NeverExpires: t.ExpiresAt.IsZero(),
+			IsRotating:   t.SuccessorID != nil,
+			SuccessorID:  succID,
+			RotatedFrom:  rotFrom,
 		})
 	}
 	return map[string]any{
@@ -199,10 +212,12 @@ func tokenState(t auth.Token, now time.Time) string {
 	switch {
 	case !t.RevokedAt.IsZero():
 		return "revoked"
+	case !t.ExpiresAt.IsZero() && !now.Before(t.ExpiresAt):
+		return "expired"
+	case t.SuccessorID != nil:
+		return "rotating"
 	case t.ExpiresAt.IsZero():
 		return "no expiry"
-	case !now.Before(t.ExpiresAt):
-		return "expired"
 	default:
 		return "active"
 	}

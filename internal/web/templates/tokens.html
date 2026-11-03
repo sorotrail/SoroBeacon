@@ -30,6 +30,7 @@
     <td>
       {{if .Revoked}}<span class="pill off">revoked</span>
       {{else if eq .State "active"}}<span class="pill on">active</span>
+      {{else if eq .State "rotating"}}<span class="pill on">rotating</span>
       {{else if eq .State "expired"}}<span class="pill off">expired</span>
       {{else}}{{.State}}{{end}}
     </td>

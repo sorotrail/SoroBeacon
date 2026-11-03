@@ -3,6 +3,8 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -93,6 +95,93 @@ func (f *fakeTokens) TouchAPIToken(_ context.Context, id int64, at time.Time) er
 		if t.ID == id {
 			t.LastUsedAt = at
 			return nil
+		}
+	}
+	return nil
+}
+
+func (f *fakeTokens) GetAPIToken(ctx context.Context, id int64) (*Token, error) {
+	ws := wsOf(ctx)
+	for _, t := range f.byHash {
+		if t.ID == id && t.Workspace == ws {
+			copied := *t
+			return &copied, nil
+		}
+	}
+	return nil, errors.New("not found")
+}
+
+func (f *fakeTokens) RotateAPIToken(ctx context.Context, predecessorID int64, successor *Token, predecessorExpiry time.Time) error {
+	ws := wsOf(ctx)
+	var pred *Token
+	for _, t := range f.byHash {
+		if t.ID == predecessorID && t.Workspace == ws {
+			pred = t
+			break
+		}
+	}
+	if pred == nil {
+		return errors.New("not found")
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	if !pred.RevokedAt.IsZero() {
+		return errors.New("cannot rotate a revoked token")
+	}
+	if !pred.ExpiresAt.IsZero() && now.After(pred.ExpiresAt) {
+		return errors.New("cannot rotate an expired token")
+	}
+
+	f.next++
+	successor.ID = f.next
+	successor.Workspace = ws
+	successor.CreatedAt = now
+	successor.RotatedAt = now
+	successor.RotatedFromID = &pred.ID
+	storedSucc := *successor
+	f.byHash[storedSucc.Hash] = &storedSucc
+
+	pred.SuccessorID = &successor.ID
+	pred.RotatedAt = now
+	pred.PreRotationExpiresAt = pred.ExpiresAt
+	pred.ExpiresAt = predecessorExpiry
+	return nil
+}
+
+func (f *fakeTokens) AbandonAPITokenRotation(ctx context.Context, id int64) error {
+	ws := wsOf(ctx)
+	var target *Token
+	for _, t := range f.byHash {
+		if t.ID == id && t.Workspace == ws {
+			target = t
+			break
+		}
+	}
+	if target == nil {
+		return errors.New("not found")
+	}
+
+	var predID, succID int64
+	if target.SuccessorID != nil {
+		predID = target.ID
+		succID = *target.SuccessorID
+	} else if target.RotatedFromID != nil {
+		succID = target.ID
+		predID = *target.RotatedFromID
+	} else {
+		return fmt.Errorf("no rotation in progress for token %d", id)
+	}
+
+	for _, t := range f.byHash {
+		if t.ID == succID && t.Workspace == ws {
+			if t.RevokedAt.IsZero() {
+				t.RevokedAt = time.Now().UTC().Truncate(time.Second)
+			}
+		}
+		if t.ID == predID && t.Workspace == ws {
+			t.SuccessorID = nil
+			t.RotatedAt = time.Time{}
+			t.ExpiresAt = t.PreRotationExpiresAt
+			t.PreRotationExpiresAt = time.Time{}
 		}
 	}
 	return nil
@@ -615,5 +704,198 @@ func TestPrincipalContext(t *testing.T) {
 	// A nil principal in the context is "no caller", never "unrestricted".
 	if _, ok := PrincipalFromContext(WithPrincipal(ctx, nil)); ok {
 		t.Error("a nil principal must not read as a caller")
+	}
+}
+
+func TestTokenRotationLifecycleAndOverlap(t *testing.T) {
+	st := newFakeTokens()
+	now := testNow
+	m := NewManager(st, nil).withNow(func() time.Time { return now })
+	ctx := workspace.With(context.Background(), "acme")
+
+	// 1. Mint predecessor
+	predRaw, predTok, err := m.Mint(ctx, "ci-runner", []Scope{ScopeMonitorsRead, ScopeMonitorsWrite}, time.Time{})
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	// 2. Rotate with 48h overlap
+	overlap := 48 * time.Hour
+	succRaw, succTok, err := m.Rotate(ctx, predTok.ID, "", nil, overlap, time.Time{})
+	if err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	if succRaw == "" || succRaw == predRaw {
+		t.Fatal("successor secret must be distinct and non-empty")
+	}
+	if succTok.ID == predTok.ID {
+		t.Fatal("successor must have a distinct ID")
+	}
+	if len(succTok.Scopes) != 2 || succTok.Scopes[0] != ScopeMonitorsRead || succTok.Scopes[1] != ScopeMonitorsWrite {
+		t.Fatalf("successor scopes must default to predecessor scopes, got %v", succTok.Scopes)
+	}
+	if succTok.RotatedFromID == nil || *succTok.RotatedFromID != predTok.ID {
+		t.Fatalf("successor rotated_from_id must point to predecessor, got %v", succTok.RotatedFromID)
+	}
+
+	// Verify predecessor was updated with successor ID and expiry
+	predUpdated, err := m.Get(ctx, predTok.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if predUpdated.SuccessorID == nil || *predUpdated.SuccessorID != succTok.ID {
+		t.Fatalf("predecessor successor_id must point to successor, got %v", predUpdated.SuccessorID)
+	}
+	if predUpdated.ExpiresAt.IsZero() || predUpdated.ExpiresAt != now.Add(overlap).UTC().Truncate(time.Second) {
+		t.Fatalf("predecessor must have expiry set to now+overlap, got %v", predUpdated.ExpiresAt)
+	}
+
+	// 3. Both tokens valid during overlap
+	p1, err := m.Authenticate(ctx, predRaw)
+	if err != nil {
+		t.Fatalf("predecessor should authenticate during overlap: %v", err)
+	}
+	if p1.TokenID() != predTok.ID {
+		t.Errorf("predecessor principal ID = %d, want %d", p1.TokenID(), predTok.ID)
+	}
+
+	p2, err := m.Authenticate(ctx, succRaw)
+	if err != nil {
+		t.Fatalf("successor should authenticate: %v", err)
+	}
+	if p2.TokenID() != succTok.ID {
+		t.Errorf("successor principal ID = %d, want %d", p2.TokenID(), succTok.ID)
+	}
+}
+
+func TestTokenRotationExpiryTakingEffect(t *testing.T) {
+	st := newFakeTokens()
+	currTime := testNow
+	m := NewManager(st, nil).withNow(func() time.Time { return currTime })
+	ctx := workspace.With(context.Background(), "acme")
+
+	predRaw, predTok, err := m.Mint(ctx, "ci-runner", []Scope{ScopeMonitorsRead}, time.Time{})
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	overlap := 2 * time.Hour
+	succRaw, _, err := m.Rotate(ctx, predTok.ID, "", nil, overlap, time.Time{})
+	if err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	// Advance time past overlap
+	currTime = currTime.Add(3 * time.Hour)
+
+	// Predecessor must be expired
+	if _, err := m.Authenticate(ctx, predRaw); err != ErrInvalidToken {
+		t.Fatalf("predecessor after overlap expiry must fail with ErrInvalidToken, got %v", err)
+	}
+
+	// Successor must still be live
+	if _, err := m.Authenticate(ctx, succRaw); err != nil {
+		t.Fatalf("successor must still authenticate after predecessor expiry: %v", err)
+	}
+}
+
+func TestTokenRotationImmediateRevocation(t *testing.T) {
+	st := newFakeTokens()
+	now := testNow
+	m := NewManager(st, nil).withNow(func() time.Time { return now })
+	ctx := workspace.With(context.Background(), "acme")
+
+	predRaw, predTok, _ := m.Mint(ctx, "ci-runner", []Scope{ScopeMonitorsRead}, time.Time{})
+	succRaw, succTok, _ := m.Rotate(ctx, predTok.ID, "", nil, 24*time.Hour, time.Time{})
+
+	// Immediate revocation of predecessor
+	if err := m.Revoke(ctx, predTok.ID); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	if _, err := m.Authenticate(ctx, predRaw); err != ErrInvalidToken {
+		t.Fatalf("revoked predecessor must fail immediately, got %v", err)
+	}
+	if _, err := m.Authenticate(ctx, succRaw); err != nil {
+		t.Fatalf("successor should still be valid after predecessor revocation: %v", err)
+	}
+
+	// Immediate revocation of successor
+	if err := m.Revoke(ctx, succTok.ID); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	if _, err := m.Authenticate(ctx, succRaw); err != ErrInvalidToken {
+		t.Fatalf("revoked successor must fail immediately, got %v", err)
+	}
+}
+
+func TestTokenRotationAbandon(t *testing.T) {
+	st := newFakeTokens()
+	now := testNow
+	m := NewManager(st, nil).withNow(func() time.Time { return now })
+	ctx := workspace.With(context.Background(), "acme")
+
+	// Predecessor originally had no expiry
+	predRaw, predTok, _ := m.Mint(ctx, "ci-runner", []Scope{ScopeMonitorsRead}, time.Time{})
+	succRaw, _, _ := m.Rotate(ctx, predTok.ID, "", nil, 24*time.Hour, time.Time{})
+
+	// Abandon the rotation
+	if err := m.AbandonRotation(ctx, predTok.ID); err != nil {
+		t.Fatalf("AbandonRotation: %v", err)
+	}
+
+	// Successor must be revoked
+	if _, err := m.Authenticate(ctx, succRaw); err != ErrInvalidToken {
+		t.Fatalf("successor after abandon must be invalid, got %v", err)
+	}
+
+	// Predecessor must be restored to its original state (no expiry, not rotating)
+	p, err := m.Authenticate(ctx, predRaw)
+	if err != nil {
+		t.Fatalf("predecessor after abandon must authenticate: %v", err)
+	}
+	if p.TokenID() != predTok.ID {
+		t.Fatalf("predecessor ID mismatch: got %d, want %d", p.TokenID(), predTok.ID)
+	}
+
+	predRestored, err := m.Get(ctx, predTok.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if predRestored.SuccessorID != nil {
+		t.Errorf("predecessor successor_id must be cleared after abandon, got %v", predRestored.SuccessorID)
+	}
+	if !predRestored.ExpiresAt.IsZero() {
+		t.Errorf("predecessor expiry should be restored to zero, got %v", predRestored.ExpiresAt)
+	}
+
+	// Can also abandon by passing the successor ID
+	_, succTok2, _ := m.Rotate(ctx, predTok.ID, "", nil, 24*time.Hour, time.Time{})
+	if err := m.AbandonRotation(ctx, succTok2.ID); err != nil {
+		t.Fatalf("AbandonRotation on successor: %v", err)
+	}
+}
+
+func TestTokenExpiringSoonWarning(t *testing.T) {
+	st := newFakeTokens()
+	now := testNow
+	var logs strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	m := NewManager(st, logger).withNow(func() time.Time { return now })
+	ctx := workspace.With(context.Background(), "acme")
+
+	// Token expiring in 2 hours (less than ExpiringSoonThreshold = 24h)
+	raw, _, err := m.Mint(ctx, "expiring-soon", []Scope{ScopeMonitorsRead}, now.Add(2*time.Hour))
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+
+	if _, err := m.Authenticate(ctx, raw); err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	output := logs.String()
+	if !strings.Contains(output, "api token in use close to expiry") {
+		t.Errorf("expected warning log for token close to expiry, got:\n%s", output)
 	}
 }

@@ -3457,7 +3457,8 @@ func (p *Postgres) CreateAPIToken(ctx context.Context, t *auth.Token) error {
 // then gets — never anything the caller supplied.
 func (p *Postgres) TokenByHash(ctx context.Context, hash string) (*auth.Token, bool, error) {
 	t, err := scanAPIToken(p.pool.QueryRow(ctx,
-		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
+		        rotated_from_id, successor_id, rotated_at, pre_rotation_expires_at
 		   FROM api_tokens WHERE token_hash = $1`, hash))
 	if errors.Is(err, ErrNotFound) {
 		return nil, false, nil
@@ -3470,7 +3471,8 @@ func (p *Postgres) TokenByHash(ctx context.Context, hash string) (*auth.Token, b
 
 func (p *Postgres) ListAPITokens(ctx context.Context) ([]auth.Token, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
+		        rotated_from_id, successor_id, rotated_at, pre_rotation_expires_at
 		   FROM api_tokens WHERE workspace_id = $1 ORDER BY id DESC`,
 		workspaceID(ctx))
 	if err != nil {
@@ -3486,6 +3488,145 @@ func (p *Postgres) ListAPITokens(ctx context.Context) ([]auth.Token, error) {
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// GetAPIToken returns one token by id in the caller's workspace.
+func (p *Postgres) GetAPIToken(ctx context.Context, id int64) (*auth.Token, error) {
+	t, err := scanAPIToken(p.pool.QueryRow(ctx,
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
+		        rotated_from_id, successor_id, rotated_at, pre_rotation_expires_at
+		   FROM api_tokens WHERE id = $1 AND workspace_id = $2`,
+		id, workspaceID(ctx)))
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// RotateAPIToken atomically creates a successor token and updates the predecessor
+// with the successor's id, rotation timestamp, and new expiry.
+func (p *Postgres) RotateAPIToken(ctx context.Context, predecessorID int64, successor *auth.Token, predecessorExpiry time.Time) error {
+	ws := workspaceID(ctx)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	pred, err := scanAPIToken(tx.QueryRow(ctx,
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
+		        rotated_from_id, successor_id, rotated_at, pre_rotation_expires_at
+		   FROM api_tokens WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+		predecessorID, ws))
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	if !pred.RevokedAt.IsZero() {
+		return fmt.Errorf("cannot rotate a revoked token")
+	}
+	if !pred.ExpiresAt.IsZero() && now.After(pred.ExpiresAt) {
+		return fmt.Errorf("cannot rotate an expired token")
+	}
+
+	var succExpires any
+	if !successor.ExpiresAt.IsZero() {
+		succExpires = successor.ExpiresAt
+	}
+
+	var succCreated, succRotated time.Time
+	err = tx.QueryRow(ctx,
+		`INSERT INTO api_tokens (workspace_id, name, token_hash, prefix, scopes, expires_at, rotated_from_id, rotated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, created_at, rotated_at`,
+		ws, successor.Name, successor.Hash, successor.Prefix, auth.JoinScopes(successor.Scopes),
+		succExpires, predecessorID, now).Scan(&successor.ID, &succCreated, &succRotated)
+	if err != nil {
+		return mapErr(err)
+	}
+	successor.Workspace = ws
+	successor.CreatedAt = succCreated
+	successor.RotatedAt = succRotated
+	successor.RotatedFromID = &predecessorID
+
+	var predExpiry any
+	if !predecessorExpiry.IsZero() {
+		predExpiry = predecessorExpiry
+	}
+	var origPredExpires any
+	if !pred.ExpiresAt.IsZero() {
+		origPredExpires = pred.ExpiresAt
+	}
+
+	_, err = tx.Exec(ctx,
+		`UPDATE api_tokens
+		    SET successor_id = $1, rotated_at = $2, pre_rotation_expires_at = $3, expires_at = $4
+		  WHERE id = $5 AND workspace_id = $6`,
+		successor.ID, now, origPredExpires, predExpiry, predecessorID, ws)
+	if err != nil {
+		return mapErr(err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+// AbandonAPITokenRotation revokes the successor and restores predecessor's pre-rotation expiry.
+func (p *Postgres) AbandonAPITokenRotation(ctx context.Context, id int64) error {
+	ws := workspaceID(ctx)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	tok, err := scanAPIToken(tx.QueryRow(ctx,
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
+		        rotated_from_id, successor_id, rotated_at, pre_rotation_expires_at
+		   FROM api_tokens WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+		id, ws))
+	if err != nil {
+		return err
+	}
+
+	var predID, succID int64
+	if tok.SuccessorID != nil {
+		predID = tok.ID
+		succID = *tok.SuccessorID
+	} else if tok.RotatedFromID != nil {
+		succID = tok.ID
+		predID = *tok.RotatedFromID
+	} else {
+		return fmt.Errorf("no rotation in progress for token %d", id)
+	}
+
+	var preRotExpires *time.Time
+	err = tx.QueryRow(ctx,
+		`SELECT pre_rotation_expires_at FROM api_tokens WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+		predID, ws).Scan(&preRotExpires)
+	if err != nil {
+		return mapErr(err)
+	}
+
+	_, err = tx.Exec(ctx,
+		`UPDATE api_tokens SET revoked_at = COALESCE(revoked_at, now()) WHERE id = $1 AND workspace_id = $2`,
+		succID, ws)
+	if err != nil {
+		return mapErr(err)
+	}
+
+	var restoredExpiry any
+	if preRotExpires != nil {
+		restoredExpiry = *preRotExpires
+	}
+	_, err = tx.Exec(ctx,
+		`UPDATE api_tokens
+		    SET successor_id = NULL, rotated_at = NULL, pre_rotation_expires_at = NULL, expires_at = $1
+		  WHERE id = $2 AND workspace_id = $3`,
+		restoredExpiry, predID, ws)
+	if err != nil {
+		return mapErr(err)
+	}
+
+	return tx.Commit(ctx)
 }
 
 // RevokeAPIToken retires one of the caller's tokens. COALESCE keeps the first
@@ -3524,9 +3665,11 @@ func (p *Postgres) TouchAPIToken(ctx context.Context, id int64, at time.Time) er
 func scanAPIToken(row rowScanner) (auth.Token, error) {
 	var t auth.Token
 	var scopes string
-	var expiresAt, lastUsedAt, revokedAt *time.Time
+	var expiresAt, lastUsedAt, revokedAt, rotatedAt, preRotExpires *time.Time
+	var rotatedFromID, successorID *int64
 	err := row.Scan(&t.ID, &t.Workspace, &t.Name, &t.Hash, &t.Prefix, &scopes,
-		&expiresAt, &lastUsedAt, &revokedAt, &t.CreatedAt)
+		&expiresAt, &lastUsedAt, &revokedAt, &t.CreatedAt,
+		&rotatedFromID, &successorID, &rotatedAt, &preRotExpires)
 	if err != nil {
 		return t, mapErr(err)
 	}
@@ -3539,6 +3682,14 @@ func scanAPIToken(row rowScanner) (auth.Token, error) {
 	}
 	if revokedAt != nil {
 		t.RevokedAt = *revokedAt
+	}
+	t.RotatedFromID = rotatedFromID
+	t.SuccessorID = successorID
+	if rotatedAt != nil {
+		t.RotatedAt = *rotatedAt
+	}
+	if preRotExpires != nil {
+		t.PreRotationExpiresAt = *preRotExpires
 	}
 	return t, nil
 }

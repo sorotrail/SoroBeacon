@@ -104,6 +104,72 @@ func (s *tokenStore) TouchAPIToken(ctx context.Context, id int64, at time.Time) 
 	return nil
 }
 
+func (s *tokenStore) GetAPIToken(ctx context.Context, id int64) (*auth.Token, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.rows[id]
+	if !ok || t.Workspace != wsOf(ctx) {
+		return nil, store.ErrNotFound
+	}
+	copied := *t
+	return &copied, nil
+}
+
+func (s *tokenStore) RotateAPIToken(ctx context.Context, predecessorID int64, successor *auth.Token, predecessorExpiry time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pred, ok := s.rows[predecessorID]
+	if !ok || pred.Workspace != wsOf(ctx) {
+		return store.ErrNotFound
+	}
+	now := s.nowFn()
+	s.next++
+	successor.ID = s.next
+	successor.Workspace = wsOf(ctx)
+	successor.CreatedAt = now
+	successor.RotatedAt = now
+	successor.RotatedFromID = &pred.ID
+	storedSucc := *successor
+	s.rows[storedSucc.ID] = &storedSucc
+
+	pred.SuccessorID = &successor.ID
+	pred.RotatedAt = now
+	pred.PreRotationExpiresAt = pred.ExpiresAt
+	pred.ExpiresAt = predecessorExpiry
+	return nil
+}
+
+func (s *tokenStore) AbandonAPITokenRotation(ctx context.Context, id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.rows[id]
+	if !ok || t.Workspace != wsOf(ctx) {
+		return store.ErrNotFound
+	}
+	var predID, succID int64
+	if t.SuccessorID != nil {
+		predID = t.ID
+		succID = *t.SuccessorID
+	} else if t.RotatedFromID != nil {
+		succID = t.ID
+		predID = *t.RotatedFromID
+	} else {
+		return store.ErrNotFound
+	}
+	if succ, ok := s.rows[succID]; ok && succ.Workspace == wsOf(ctx) {
+		if succ.RevokedAt.IsZero() {
+			succ.RevokedAt = s.nowFn()
+		}
+	}
+	if pred, ok := s.rows[predID]; ok && pred.Workspace == wsOf(ctx) {
+		pred.SuccessorID = nil
+		pred.RotatedAt = time.Time{}
+		pred.ExpiresAt = pred.PreRotationExpiresAt
+		pred.PreRotationExpiresAt = time.Time{}
+	}
+	return nil
+}
+
 // seed stores one token directly, so a test can start from a row that already
 // exists instead of from a mint it is also auditing.
 func (s *tokenStore) seed(ws workspace.ID, name, secret string, scopes ...auth.Scope) *auth.Token {

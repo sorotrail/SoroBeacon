@@ -367,6 +367,9 @@ func (s *Server) Routes() chi.Router {
 	mux.Route("/tokens", func(r chi.Router) {
 		r.Post("/", s.createToken)
 		r.Get("/", s.listTokens)
+		r.Get("/{id}", s.getToken)
+		r.Post("/{id}/rotate", s.rotateToken)
+		r.Post("/{id}/abandon", s.abandonTokenRotation)
 		r.Post("/{id}/revoke", s.revokeToken)
 	})
 

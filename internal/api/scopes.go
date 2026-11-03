@@ -84,6 +84,9 @@ var routeScopes = auth.NewRouteTable(map[string][]auth.Scope{
 
 	"POST /tokens":             {auth.ScopeTokensWrite},
 	"GET /tokens":              {auth.ScopeTokensRead},
+	"GET /tokens/{id}":         {auth.ScopeTokensRead},
+	"POST /tokens/{id}/rotate":  {auth.ScopeTokensWrite},
+	"POST /tokens/{id}/abandon": {auth.ScopeTokensWrite},
 	"POST /tokens/{id}/revoke": {auth.ScopeTokensWrite},
 
 	// Routes main added after the scope table was first written. Each one is

@@ -362,7 +362,10 @@ monitor without being able to delete every channel.
 | Method & path | Description | Scope |
 | --- | --- | --- |
 | `POST /tokens` | Mint. Body: `scopes` (required, at least one), optional `name`, optional `expires_in` (a Go duration, `72h`). Returns `201` with the token fields **and `token`** — the raw secret, which appears in no other response ever. | `tokens:write` |
-| `GET /tokens` | List this workspace's tokens: `id`, `name`, `prefix` (`sb_` plus eight characters), `scopes`, `created_at`, `expires_at`, `last_used_at`, `revoked_at`. Never the secret, and never the stored digest. | `tokens:read` |
+| `GET /tokens` | List this workspace's tokens: `id`, `name`, `prefix` (`sb_` plus eight characters), `scopes`, `created_at`, `expires_at`, `last_used_at`, `revoked_at`, `rotated_from_id`, `successor_id`, `rotated_at`. Never the secret, and never the stored digest. | `tokens:read` |
+| `GET /tokens/{id}` | Get one token by ID: metadata, `last_used_at`, and rotation relationship. Secret is never returned. | `tokens:read` |
+| `POST /tokens/{id}/rotate` | Rotate with overlap. Body: optional `name`, optional `scopes` (defaults to predecessor's scopes), optional `overlap` (Go duration, e.g. `48h`, default `168h`), optional `expires_in` (for successor). Sets predecessor expiry to `now + overlap` and mints successor token. Returns `201` with successor fields and `token` secret once. | `tokens:write` |
+| `POST /tokens/{id}/abandon` | Abandon in-progress rotation. Revokes the successor token and restores the predecessor token to its pre-rotation expiry. `200 {"status":"abandoned"}`. | `tokens:write` |
 | `POST /tokens/{id}/revoke` | Revoke now. `204`; the row survives with `revoked_at` set, so the audit trail outlives the credential. Revoking twice keeps the first timestamp. Another workspace's id gets the same `404` as a nonexistent one. | `tokens:write` |
 
 ```sh
@@ -395,6 +398,9 @@ Three behaviours worth knowing before you script against this:
   from the database or the dashboard — mint another and revoke the first.
   `last_used_at` is written at most once a minute per token; treat it as
   "recently used", not as an exact audit timestamp.
+* **Immediate revocation & cache timing**: Token authentication reads directly from the database (one indexed read per request) with no caching layer in front of the lookup. Therefore, revocation and rotation take effect immediately across all replicas without invalidation delay.
+* **Rotation vs. Identity-based tokens (OIDC)**: Use overlapping token rotation for static service credentials (such as CI/CD service tokens, Terraform providers, or automated workers) where an overlap period is required to roll out the new credential without downtime. When OIDC is configured, prefer ephemeral identity-based tokens (e.g. GitHub Actions Workload Identity) rather than long-lived static tokens.
+* **Expiring token warning**: When a live token with an expiry is used close to its expiration (within 24 hours), SoroBeacon emits a structured log warning (`level=WARN msg="api token in use close to expiry"`) to alert operators before unexpected expiration causes service disruption.
 
 ## Operational
 

@@ -1597,8 +1597,11 @@ type APITokens interface {
 	CreateAPIToken(ctx context.Context, t *auth.Token) error
 	TokenByHash(ctx context.Context, hash string) (token *auth.Token, found bool, err error)
 	ListAPITokens(ctx context.Context) ([]auth.Token, error)
+	GetAPIToken(ctx context.Context, id int64) (*auth.Token, error)
 	RevokeAPIToken(ctx context.Context, id int64) error
 	TouchAPIToken(ctx context.Context, id int64, at time.Time) error
+	RotateAPIToken(ctx context.Context, predecessorID int64, successor *auth.Token, predecessorExpiry time.Time) error
+	AbandonAPITokenRotation(ctx context.Context, id int64) error
 }
 
 // Store is everything the application needs from persistence.

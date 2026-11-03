@@ -181,6 +181,22 @@ func auditRoute(method, pattern string) (auditSpec, bool) {
 		if method == http.MethodPost {
 			return auditSpec{store.AuditActionUpdate, "channel"}, true
 		}
+	case "/tokens":
+		if method == http.MethodPost {
+			return auditSpec{store.AuditActionCreate, "token"}, true
+		}
+	case "/tokens/{id}/rotate":
+		if method == http.MethodPost {
+			return auditSpec{store.AuditActionUpdate, "token"}, true
+		}
+	case "/tokens/{id}/abandon":
+		if method == http.MethodPost {
+			return auditSpec{store.AuditActionUpdate, "token"}, true
+		}
+	case "/tokens/{id}/revoke":
+		if method == http.MethodPost {
+			return auditSpec{store.AuditActionDelete, "token"}, true
+		}
 	}
 	return auditSpec{}, false
 }
