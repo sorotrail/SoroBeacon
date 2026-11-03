@@ -867,8 +867,11 @@ func buildSource(ctx context.Context, log *slog.Logger, cfg config.Config) (poll
 	switch cfg.SourceMode {
 	case "sorotrail":
 		stc := sorotrail.NewClient(cfg.SoroTrailURL, nil)
-		log.Info("upstream mode: reading events from SoroTrail", "url", cfg.SoroTrailURL)
-		return sorotrail.NewSource(stc), stc, nil
+		if err := verifySoroTrailEndpoint(ctx, log, stc, cfg.SoroTrailURL, cfg.Network.Passphrase); err != nil {
+			return nil, nil, err
+		}
+		log.Info("upstream mode: reading events from SoroTrail", "url", cfg.SoroTrailURL, "network", cfg.Network.Name)
+		return sorotrail.NewSource(stc).WithExpectedPassphrase(cfg.Network.Passphrase), stc, nil
 	case "horizon":
 		hc := horizon.NewClient(cfg.HorizonURL, nil)
 		log.Info("horizon mode: reading events from Horizon", "url", cfg.HorizonURL)
@@ -1082,6 +1085,25 @@ func verifyNetworkEndpoints(ctx context.Context, log *slog.Logger, client *stell
 		}
 	}
 	return errors.Join(mismatches...)
+}
+
+// verifySoroTrailEndpoint checks at startup that the configured SoroTrail
+// endpoint speaks the SoroTrail API and serves the configured Stellar network.
+// A transient transport failure at boot logs a warning rather than crashing
+// the process so the poller can back off and verify on the first reachable
+// cycle; a wrong network passphrase or incompatible endpoint fails startup
+// immediately.
+func verifySoroTrailEndpoint(ctx context.Context, log *slog.Logger, client *sorotrail.Client, endpointURL, configured string) error {
+	ctx, cancel := context.WithTimeout(ctx, startupNetworkTimeout)
+	defer cancel()
+	if err := client.VerifyUpstream(ctx, configured); err != nil {
+		if errors.Is(err, sorotrail.ErrUpstreamUnreachable) {
+			log.Warn("could not verify upstream SoroTrail endpoint at startup", "sorotrail_url", endpointURL, "error", err)
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // startupHealthTimeout bounds the one-off health check logged at startup,

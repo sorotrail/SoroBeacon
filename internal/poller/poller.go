@@ -5,6 +5,7 @@ package poller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -352,6 +353,7 @@ func (p *Poller) recordCycle(ok bool, took time.Duration) {
 	p.metrics.RecordPoll(ok, took)
 	p.metrics.RecordEvents(p.scanned, p.matched)
 	p.metrics.RecordRuleEvaluations(p.evaluations)
+	p.recordUpstreamMetrics()
 }
 
 // Poll runs one ingest cycle as a single trace. The root span
@@ -620,6 +622,10 @@ func (p *Poller) Poll(ctx context.Context) error {
 		groupCheckpoint := uint32(0)
 		failedLedger := make(map[string]uint32)
 		cursor := ""
+		if len(starts) == 1 && state.LastCursor != "" {
+			cursor = state.LastCursor
+		}
+		reanchoredCursor := false
 		for {
 			fetchCtx := ctx
 			fetchSpan := telemetry.NoopSpan()
@@ -635,15 +641,39 @@ func (p *Poller) Poll(ctx context.Context) error {
 			if err != nil {
 				telemetry.RecordError(fetchSpan, err)
 				fetchSpan.End()
+				if cursor != "" && !reanchoredCursor && errors.Is(err, ErrInvalidCursor) {
+					reanchoredCursor = true
+					p.log.Warn("upstream rejected cursor; re-anchoring from checkpoint",
+						"cursor", cursor, "start_ledger", groupStart, "err", err)
+					cursor = ""
+					if state.LastCursor != "" {
+						state.LastCursor = ""
+						_ = p.store.SetIngestState(ctx, p.network, state)
+					}
+					continue
+				}
+				p.recordUpstreamMetrics()
 				return err
 			}
 			fetchSpan.End()
 
+			if err := p.reconcileUpstreamRetractions(ctx, &state, monitors); err != nil {
+				p.log.Warn("upstream retraction reconciliation failed", "err", err)
+			}
+
 			if page.LatestLedger > 0 && (groupCheckpoint == 0 || page.LatestLedger < groupCheckpoint) {
 				groupCheckpoint = page.LatestLedger
 			}
+			if page.NextCursor == "" && page.LatestLedger > groupCheckpoint {
+				if _, isUpstream := p.source.(UpstreamStatusSource); isUpstream {
+					groupCheckpoint = page.LatestLedger
+				}
+			}
 			if page.LatestLedger > 0 && (checkpoint == 0 || page.LatestLedger < checkpoint) {
 				checkpoint = page.LatestLedger
+			}
+			if page.NextCursor == "" && len(starts) == 1 && groupCheckpoint > checkpoint {
+				checkpoint = groupCheckpoint
 			}
 			if page.LatestLedger > tip {
 				tip = page.LatestLedger
@@ -692,6 +722,11 @@ func (p *Poller) Poll(ctx context.Context) error {
 	if confirmActive && checkpoint > confirmedThrough {
 		checkpoint = confirmedThrough
 	}
+	chainHead := p.recordUpstreamMetrics()
+	chainTip := tip
+	if chainHead > chainTip {
+		chainTip = chainHead
+	}
 	p.metrics.SetPollLag(int64(tip) - int64(checkpoint))
 	for _, pr := range prioritiesInServiceOrder {
 		if tierCounts[pr] == 0 {
@@ -714,7 +749,7 @@ func (p *Poller) Poll(ctx context.Context) error {
 	if processed == 0 {
 		processed = state.LastLedger
 	}
-	p.recordPosition(processed, tip, time.Now())
+	p.recordPosition(processed, chainTip, time.Now())
 	return nil
 }
 

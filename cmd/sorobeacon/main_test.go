@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sorotrail/sorobeacon/internal/sorotrail"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 )
 
@@ -157,4 +158,73 @@ func TestLogStartupHealth_Unreachable(t *testing.T) {
 	if !strings.Contains(out, "connection refused") {
 		t.Fatalf("expected the underlying error in the log line, got: %s", out)
 	}
+}
+
+func TestVerifySoroTrailEndpoint(t *testing.T) {
+	t.Run("matching network succeeds", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"first_ledger":1,"last_ledger":10,"network_passphrase":"` + stellar.PassphraseTestnet + `"}`))
+		}))
+		defer srv.Close()
+
+		var buf bytes.Buffer
+		log := slog.New(slog.NewTextHandler(&buf, nil))
+		err := verifySoroTrailEndpoint(context.Background(), log, sorotrail.NewClient(srv.URL, nil), srv.URL, stellar.PassphraseTestnet)
+		if err != nil {
+			t.Fatalf("expected matching network to pass, got %v", err)
+		}
+	})
+
+	t.Run("wrong network fails startup naming both networks", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"first_ledger":1,"last_ledger":10,"network_passphrase":"` + stellar.PassphraseMainnet + `"}`))
+		}))
+		defer srv.Close()
+
+		var buf bytes.Buffer
+		log := slog.New(slog.NewTextHandler(&buf, nil))
+		err := verifySoroTrailEndpoint(context.Background(), log, sorotrail.NewClient(srv.URL, nil), srv.URL, stellar.PassphraseTestnet)
+		if err == nil {
+			t.Fatal("expected wrong network to fail startup")
+		}
+		for _, want := range []string{"network mismatch", "mainnet", "testnet"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("error %q should name %q", err.Error(), want)
+			}
+		}
+	})
+
+	t.Run("incompatible endpoint fails startup", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<html>not sorotrail</html>`))
+		}))
+		defer srv.Close()
+
+		var buf bytes.Buffer
+		log := slog.New(slog.NewTextHandler(&buf, nil))
+		err := verifySoroTrailEndpoint(context.Background(), log, sorotrail.NewClient(srv.URL, nil), srv.URL, stellar.PassphraseTestnet)
+		if !errors.Is(err, sorotrail.ErrIncompatibleUpstream) {
+			t.Fatalf("expected ErrIncompatibleUpstream, got %v", err)
+		}
+	})
+
+	t.Run("unreachable endpoint at boot warns and does not crash", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		closedURL := srv.URL
+		srv.Close()
+
+		var buf bytes.Buffer
+		log := slog.New(slog.NewTextHandler(&buf, nil))
+		client := sorotrail.NewClient(closedURL, nil).WithRetry(1, 0)
+		err := verifySoroTrailEndpoint(context.Background(), log, client, closedURL, stellar.PassphraseTestnet)
+		if err != nil {
+			t.Fatalf("unreachable endpoint at startup must warn rather than fail, got %v", err)
+		}
+		if !strings.Contains(buf.String(), "could not verify upstream SoroTrail endpoint") {
+			t.Fatalf("expected startup warning, got: %s", buf.String())
+		}
+	})
 }
