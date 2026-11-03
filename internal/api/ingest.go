@@ -70,6 +70,17 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	runbookURL, err := store.ValidateRunbookURL(fa.Alert.RunbookURL)
+	if err != nil {
+		writeErr(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+	responseGuidance, err := store.ValidateResponseGuidance(fa.Alert.ResponseGuidance)
+	if err != nil {
+		writeErr(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	alert := &store.Alert{
 		// The payload's monitor and rule ids belong to the sending
 		// instance's database. They are kept as the source ids and never
@@ -83,6 +94,8 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		EventID:          fa.Alert.EventID,
 		Payload:          json.RawMessage(stampedPayload),
 		Severity:         severity,
+		RunbookURL:       runbookURL,
+		ResponseGuidance: responseGuidance,
 	}
 
 	outcome, err := s.store.CreateAlert(r.Context(), alert)

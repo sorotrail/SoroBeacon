@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
@@ -23,10 +24,12 @@ func ruleParamDetails(err error) []FieldError {
 }
 
 type ruleRequest struct {
-	Type     *string          `json:"type"`
-	Params   *json.RawMessage `json:"params"`
-	Enabled  *bool            `json:"enabled"`
-	Severity *string          `json:"severity"`
+	Type             *string          `json:"type"`
+	Params           *json.RawMessage `json:"params"`
+	Enabled          *bool            `json:"enabled"`
+	Severity         *string          `json:"severity"`
+	RunbookURL       *string          `json:"runbook_url"`
+	ResponseGuidance *string          `json:"response_guidance"`
 }
 
 func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
@@ -138,15 +141,44 @@ func (s *Server) ruleFromRequest(monitorID int64, req ruleRequest) (store.Rule, 
 			severity = parsed
 		}
 	}
+	var runbookURL string
+	if req.RunbookURL != nil {
+		u, err := store.ValidateRunbookURL(*req.RunbookURL)
+		if err != nil {
+			details = append(details, FieldError{Field: "runbook_url", Reason: err.Error()})
+		} else {
+			runbookURL = u
+		}
+	}
+	var responseGuidance string
+	if req.ResponseGuidance != nil {
+		g, err := store.ValidateResponseGuidance(*req.ResponseGuidance)
+		if err != nil {
+			details = append(details, FieldError{Field: "response_guidance", Reason: err.Error()})
+		} else {
+			responseGuidance = g
+		}
+	}
 	if len(details) > 0 {
 		return store.Rule{}, details
 	}
+	if runbookURL == "" || responseGuidance == "" {
+		pURL, pGuidance, _ := rules.ParseGuidance(params)
+		if req.RunbookURL == nil && runbookURL == "" {
+			runbookURL = pURL
+		}
+		if req.ResponseGuidance == nil && responseGuidance == "" {
+			responseGuidance = pGuidance
+		}
+	}
 	return store.Rule{
-		MonitorID: monitorID,
-		Type:      *req.Type,
-		Params:    params,
-		Enabled:   req.Enabled == nil || *req.Enabled,
-		Severity:  severity,
+		MonitorID:        monitorID,
+		Type:             *req.Type,
+		Params:           params,
+		Enabled:          req.Enabled == nil || *req.Enabled,
+		Severity:         severity,
+		RunbookURL:       runbookURL,
+		ResponseGuidance: responseGuidance,
 	}, nil
 }
 
@@ -203,6 +235,35 @@ func (s *Server) updateRule(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.registry.Validate(rule.Type, rule.Params); err != nil {
 		writeValidation(w, r, ruleParamDetails(err))
+		return
+	}
+	var details []FieldError
+	if req.RunbookURL != nil {
+		u, err := store.ValidateRunbookURL(*req.RunbookURL)
+		if err != nil {
+			details = append(details, FieldError{Field: "runbook_url", Reason: err.Error()})
+		} else {
+			rule.RunbookURL = u
+		}
+	} else if req.Params != nil {
+		if u, err := rules.ParseRunbookURL(rule.Params); err == nil && u != "" {
+			rule.RunbookURL = u
+		}
+	}
+	if req.ResponseGuidance != nil {
+		g, err := store.ValidateResponseGuidance(*req.ResponseGuidance)
+		if err != nil {
+			details = append(details, FieldError{Field: "response_guidance", Reason: err.Error()})
+		} else {
+			rule.ResponseGuidance = g
+		}
+	} else if req.Params != nil {
+		if g, err := rules.ParseResponseGuidance(rule.Params); err == nil && g != "" {
+			rule.ResponseGuidance = g
+		}
+	}
+	if len(details) > 0 {
+		writeValidation(w, r, details)
 		return
 	}
 	if err := s.store.UpdateRule(r.Context(), rule); err != nil {

@@ -423,23 +423,46 @@ func notifyAlertFromStore(ctx context.Context, st store.Store, a store.Alert) no
 		// the rule need the instance it came from to tell two peers' alerts
 		// apart.
 		FederationOrigin: a.FederationOrigin,
+		RunbookURL:       a.RunbookURL,
+		ResponseGuidance: a.ResponseGuidance,
 	}
 	var p struct {
-		ContractID string `json:"contract_id"`
-		EventName  string `json:"event_name"`
-		Ledger     uint32 `json:"ledger"`
-		TxHash     string `json:"tx_hash"`
+		ContractID       string `json:"contract_id"`
+		EventName        string `json:"event_name"`
+		Ledger           uint32 `json:"ledger"`
+		TxHash           string `json:"tx_hash"`
+		RunbookURL       string `json:"runbook_url"`
+		ResponseGuidance string `json:"response_guidance"`
 	}
 	_ = json.Unmarshal(a.Payload, &p)
 	na.ContractID = p.ContractID
 	na.EventName = p.EventName
 	na.Ledger = p.Ledger
 	na.TxHash = p.TxHash
+	if na.RunbookURL == "" {
+		na.RunbookURL = p.RunbookURL
+	}
+	if na.ResponseGuidance == "" {
+		na.ResponseGuidance = p.ResponseGuidance
+	}
+	var mon *store.Monitor
 	if m, err := st.GetMonitor(ctx, a.MonitorID); err == nil && m != nil {
 		na.MonitorName = m.Name
+		mon = m
 	}
+	var rl *store.Rule
 	if rule, err := st.GetRule(ctx, a.RuleID); err == nil && rule != nil {
 		na.RuleType = rule.Type
+		rl = rule
+	}
+	if na.RunbookURL == "" || na.ResponseGuidance == "" {
+		rURL, rGuidance := store.ResolveAlertGuidance(rl, mon, "", "")
+		if na.RunbookURL == "" {
+			na.RunbookURL = rURL
+		}
+		if na.ResponseGuidance == "" {
+			na.ResponseGuidance = rGuidance
+		}
 	}
 	return na
 }

@@ -48,6 +48,8 @@ the exported `notify.Alert` fields.
 | `.TxHash` | string | Transaction hash. |
 | `.Payload` | string | The stored alert payload as raw JSON. |
 | `.Enrichment` | string | The [enrichment](../guides/alert-enrichment.md) object fetched from `ALERT_ENRICHMENT_URL`, as raw JSON; empty when enrichment is off or its fetch failed. |
+| `.RunbookURL` | string | Resolved runbook URL (`rule -> monitor -> workspace`); empty when none is configured. |
+| `.ResponseGuidance` | string | Resolved response guidance (`rule -> monitor -> workspace`); empty when none is configured. |
 | `.CreatedAt` | time | When the alert was created (`time.Time`; use `.CreatedAt.UTC.Format "2006-01-02 15:04:05"` for a timestamp). |
 
 Standard Go `text/template` syntax and built-in functions (`printf`, `index`,
@@ -58,10 +60,22 @@ strings into one.
 ## Escaping
 
 Templates are parsed with `text/template`, **not** `html/template`, so values
-are inserted verbatim with no automatic escaping. **You own escaping for your
-destination.** For example, Slack `mrkdwn` and Discord markdown use different
-metacharacters; wrap a value in `printf` or your destination's escape syntax if
-it can contain characters that matter there.
+are inserted verbatim unless escaped. Built-in escaping helpers are registered in
+every channel and JSON payload template so free-form fields such as
+`.ResponseGuidance`, `.MonitorName`, or `.EventName` can be safely embedded:
+
+| Function | Purpose |
+| --- | --- |
+| `slackEscape` | Escapes `&`, `<`, and `>` as `&amp;`, `&lt;`, and `&gt;` so Slack `mrkdwn` cannot inject `<!here>`, `<!channel>`, or forged links. |
+| `htmlEscape` | Escapes HTML metacharacters (`&`, `<`, `>`, `"`, `'`) for HTML email or Telegram HTML-mode templates. |
+| `jsonEscape` | Escapes a string for safe embedding inside a JSON string literal (without outer quotes). |
+| `markdownEscape` | Escapes Markdown formatting characters (`\`, `` ` ``, `*`, `_`, `[`, `]`, `<`, `>`). |
+
+Example using `slackEscape`:
+
+```json
+{"template": "*{{slackEscape .MonitorName}}*: {{slackEscape .ResponseGuidance}}\nRunbook: {{.RunbookURL}}"}
+```
 
 ## Validation and fallback
 

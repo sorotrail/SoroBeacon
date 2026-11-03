@@ -72,7 +72,27 @@ More precisely:
   `event_emitted` (first topic only) nor `topic_regex` (fuzzy, unanchored)
   asks directly. See its [reference page](../rules/topic-position.md).
 
-Any rule type can carry a `cooldown` — see [rule cooldown](../rules/cooldown.md).
+Any rule type can carry a `cooldown` — see [rule cooldown](../rules/cooldown.md) — as well as `runbook_url` and `response_guidance` (see [Runbook links and response guidance](#runbook-links-and-response-guidance) below).
+
+## Runbook links and response guidance
+
+Rules, monitors, and workspaces accept two optional response-context fields so an
+on-call responder receives actionable steps directly inside the alert:
+
+* **`runbook_url`**: an absolute `http://` or `https://` URL (up to 2,048 characters) pointing to the operational runbook for the condition. Schemes such as `javascript:` or `data:`, relative URLs, and control characters are rejected with `400 Bad Request`.
+* **`response_guidance`**: short plain-text or markdown instructions (up to 4,096 characters) describing immediate triage or mitigation steps.
+
+Both fields can be set at the top level of a rule or monitor (`POST`/`PATCH /api/v1/monitors` and `POST`/`PATCH /api/v1/monitors/{id}/rules`) or inside a rule's `params` object.
+
+### Inheritance (`rule -> monitor -> workspace`)
+
+`runbook_url` and `response_guidance` resolve independently from most specific to least specific:
+
+1. **Rule** (`rule.runbook_url` / `rule.response_guidance`, or `params.runbook_url` / `params.response_guidance`)
+2. **Monitor** (`monitor.runbook_url` / `monitor.response_guidance`)
+3. **Workspace default** (when configured for the workspace)
+
+For example, if a monitor sets `runbook_url` and a rule on that monitor sets only `response_guidance`, alerts fired by that rule inherit the monitor's `runbook_url` alongside the rule's `response_guidance`. The resolved values are snapshotted onto the stored alert (`alert.runbook_url`, `alert.response_guidance`, and the alert's `payload` JSON) when the alert fires, rendered on the dashboard alert detail page, and passed to every notification channel (`{{.RunbookURL}}` and `{{.ResponseGuidance}}`).
 
 ## How multiple rules on one monitor combine
 

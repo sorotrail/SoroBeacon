@@ -96,8 +96,14 @@ func (p *PagerDuty) Send(ctx context.Context, a Alert) error {
 			}
 		}
 	}
+	if a.RunbookURL != "" {
+		details["runbook_url"] = a.RunbookURL
+	}
+	if a.ResponseGuidance != "" {
+		details["response_guidance"] = a.ResponseGuidance
+	}
 
-	body, err := json.Marshal(map[string]any{
+	reqBody := map[string]any{
 		"routing_key":  p.cfg.RoutingKey,
 		"event_action": "trigger",
 		"dedup_key":    dedupKey(a),
@@ -107,7 +113,14 @@ func (p *PagerDuty) Send(ctx context.Context, a Alert) error {
 			"severity":       p.cfg.Severity,
 			"custom_details": details,
 		},
-	})
+	}
+	if a.RunbookURL != "" {
+		reqBody["links"] = []map[string]string{
+			{"href": a.RunbookURL, "text": "Runbook"},
+		}
+	}
+
+	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return err
 	}

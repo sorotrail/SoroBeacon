@@ -840,6 +840,8 @@ func (d *Dispatcher) RedriveDeadLetter(ctx context.Context, deadLetterID int64, 
 		// the rule need the instance it came from to tell two peers' alerts
 		// apart.
 		FederationOrigin: alert.FederationOrigin,
+		RunbookURL:       alert.RunbookURL,
+		ResponseGuidance: alert.ResponseGuidance,
 	}
 
 	err = notifier.Send(attemptCtx, alertObj)

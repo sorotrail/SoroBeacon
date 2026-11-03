@@ -4,6 +4,8 @@
 </h1>
 <p class="muted">Contracts: {{range .Monitor.ContractIDs}}{{template "copyID" .}} {{end}}</p>
 {{with .Monitor.Network}}<p class="muted">Network: {{.}} — a monitor cannot be moved to another chain; delete and recreate it to switch.</p>{{end}}
+{{with .Monitor.RunbookURL}}<p class="muted">Runbook: <a href="{{.}}" rel="noopener noreferrer">{{.}}</a></p>{{end}}
+{{with .Monitor.ResponseGuidance}}<p class="muted">Response guidance: {{.}}</p>{{end}}
 <p>Last matched:
   {{if eq .Monitor.Cue "never"}}<span class="pill never">never</span>
   {{else}}{{.Monitor.MatchedHTML}}{{if eq .Monitor.Cue "silent"}} <span class="pill silent">silent</span>{{end}}
@@ -74,7 +76,7 @@
     <td>{{.ID}}</td>
     <td>{{.Type}}</td>
     <td>{{if .Severity}}<span class="pill {{severityClass .Severity}}">{{.Severity}}</span>{{else}}<span class="pill warning">warning</span>{{end}}</td>
-    <td><code>{{printf "%s" .Params}}</code></td>
+    <td><code>{{printf "%s" .Params}}</code>{{if .RunbookURL}}<br><span class="muted">Runbook: <a href="{{.RunbookURL}}" rel="noopener noreferrer">{{.RunbookURL}}</a></span>{{end}}{{if .ResponseGuidance}}<br><span class="muted">Guidance: {{.ResponseGuidance}}</span>{{end}}</td>
     <td>{{if .Enabled}}<span class="pill on">enabled</span>{{else}}<span class="pill off">disabled</span>{{end}}</td>
     <td>
       <form class="inline" method="post" action="/monitors/{{$.Monitor.ID}}/rules/{{.ID}}/toggle"><button>{{if .Enabled}}Disable{{else}}Enable{{end}}</button></form>
@@ -119,6 +121,10 @@
       <option value="warning" selected>Warning</option>
       <option value="critical">Critical</option>
     </select>
+    <label for="runbook_url">Runbook URL (optional)</label>
+    <input type="url" id="runbook_url" name="runbook_url" placeholder="https://runbooks.example.com/..." value="{{.BuilderRunbookURL}}">
+    <label for="response_guidance">Response guidance (optional)</label>
+    <textarea id="response_guidance" name="response_guidance" rows="2" placeholder="Immediate steps for the on-call responder">{{.BuilderResponseGuidance}}</textarea>
     <div id="params-preview" class="muted" style="margin:.5rem 0"></div>
     <p><button>Add rule</button></p>
   </form>
