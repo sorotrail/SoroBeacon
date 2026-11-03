@@ -433,7 +433,21 @@ func TestDeadLetterPanicAndNetworkAreNilSafe(t *testing.T) {
 		m.RecordDeadLetter()
 		m.ClearDeadLetter()
 		m.RecordHeartbeatSuccess()
+		m.RecordBodyRejection("max_body")
 	})
+}
+
+func TestRecordBodyRejection(t *testing.T) {
+	m := New()
+	m.RecordBodyRejection("max_body")
+	m.RecordBodyRejection("max_body")
+	m.RecordBodyRejection("template_size")
+
+	gotMax := m.sampleValue(t, "sorobeacon_request_body_rejections_total", map[string]string{"limit": "max_body"})
+	assert.Equal(t, float64(2), gotMax)
+
+	gotTmpl := m.sampleValue(t, "sorobeacon_request_body_rejections_total", map[string]string{"limit": "template_size"})
+	assert.Equal(t, float64(1), gotTmpl)
 }
 
 // The heartbeat metric is the inside-the-instance record that the external

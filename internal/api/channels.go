@@ -79,6 +79,35 @@ func validateMinSeverity(minSeverity string) []FieldError {
 	return nil
 }
 
+// validateConfigLimits bounds channel configuration and template size specifically.
+func validateConfigLimits(r *http.Request, config json.RawMessage) []FieldError {
+	var details []FieldError
+	if len(config) > MaxChannelConfigBytes {
+		details = append(details, FieldError{
+			Field:  "config",
+			Reason: fmt.Sprintf("channel config exceeds maximum size of %d bytes", MaxChannelConfigBytes),
+		})
+		if m := metricsFrom(r.Context()); m != nil {
+			m.RecordBodyRejection("channel_config_size")
+		}
+	}
+	var cfgMap map[string]any
+	if err := json.Unmarshal(config, &cfgMap); err == nil {
+		if tmpl, ok := cfgMap["template"].(string); ok {
+			if len(tmpl) > MaxTemplateBytes {
+				details = append(details, FieldError{
+					Field:  "config.template",
+					Reason: fmt.Sprintf("template exceeds maximum size of %d bytes", MaxTemplateBytes),
+				})
+				if m := metricsFrom(r.Context()); m != nil {
+					m.RecordBodyRejection("template_size")
+				}
+			}
+		}
+	}
+	return details
+}
+
 func timeoutDetail(raw *json.RawMessage) (time.Duration, *FieldError) {
 	if raw == nil {
 		return 0, nil
@@ -115,6 +144,7 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 	if req.Config != nil {
 		config = *req.Config
 	}
+	details = append(details, validateConfigLimits(r, config)...)
 	// Building the notifier validates the config up front. Config holds
 	// secrets; the constructors already return messages that name fields
 	// without echoing values.
@@ -241,6 +271,7 @@ func (s *Server) updateChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Config != nil {
 		ch.Config = *req.Config
+		details = append(details, validateConfigLimits(r, *req.Config)...)
 	}
 	if req.Enabled != nil {
 		ch.Enabled = *req.Enabled

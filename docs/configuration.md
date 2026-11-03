@@ -424,6 +424,7 @@ strands its alert history outside every filter.
 | Variable | Type | Default | Required | What it does |
 | --- | --- | --- | --- | --- |
 | `HTTP_ADDR` | listen address | `:8080` | optional | Bind address for the API and dashboard (and `/metrics`). |
+| `HTTP_MAX_BODY_BYTES` | integer (bytes) | `1048576` (1 MiB) | optional | Maximum accepted request body size for write endpoints (`POST`/`PATCH`/`PUT`). Bulk endpoints default to 10 MiB. Decompression (`gzip`/`deflate`) is bounded by decompressed size. |
 | `CORS_ALLOWED_ORIGINS` | comma-separated origins | empty (CORS disabled) | optional | Browser Origins allowed to call the API cross-origin. Empty disables CORS. The dashboard is same-origin and never needs this. Do not allow origins you do not control: whatever credential their users hold can act through their browser. |
 | `GRPC_ADDR` | listen address | empty (gRPC disabled) | optional | Bind address for the [gRPC API](reference/grpc.md). Empty binds nothing, so an existing deployment opens no new port until it opts in. Cleartext HTTP/2 only — there is no TLS option — so anything that can reach the port reads the traffic in the clear; terminate TLS in front of it. |
 

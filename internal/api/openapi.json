@@ -2521,6 +2521,16 @@
       }
     },
     "responses": {
+      "PayloadTooLarge": {
+        "description": "Request body exceeded the allowed size limit (default 1 MiB, bulk endpoints 10 MiB, channel config 64 KiB, templates 32 KiB). Supports gzip/deflate Content-Encoding with decompressed size bounds.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
       "TokenManagementDisabled": {
         "description": "Token management is not configured on this instance: it needs a database-backed store, so an unset deployment answers this way rather than pretending to mint.",
         "content": {

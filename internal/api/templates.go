@@ -59,6 +59,15 @@ func (s *Server) createTemplate(w http.ResponseWriter, r *http.Request) {
 	if in.Name == "" {
 		problems = append(problems, FieldError{Field: "name", Reason: "required"})
 	}
+	if len(in.Description) > MaxTemplateBytes {
+		problems = append(problems, FieldError{
+			Field:  "description",
+			Reason: fmt.Sprintf("description exceeds maximum size of %d bytes", MaxTemplateBytes),
+		})
+		if m := metricsFrom(r.Context()); m != nil {
+			m.RecordBodyRejection("template_size")
+		}
+	}
 	problems = append(problems, s.validateTemplateRules(in.Rules)...)
 	if len(problems) > 0 {
 		writeValidation(w, r, problems)
@@ -156,6 +165,15 @@ func (s *Server) updateTemplate(w http.ResponseWriter, r *http.Request) {
 		existing.Parameters = in.Parameters
 	}
 	problems := s.validateTemplateRules(existing.Rules)
+	if len(existing.Description) > MaxTemplateBytes {
+		problems = append(problems, FieldError{
+			Field:  "description",
+			Reason: fmt.Sprintf("description exceeds maximum size of %d bytes", MaxTemplateBytes),
+		})
+		if m := metricsFrom(r.Context()); m != nil {
+			m.RecordBodyRejection("template_size")
+		}
+	}
 	if len(problems) > 0 {
 		writeValidation(w, r, problems)
 		return

@@ -30,7 +30,7 @@ func (s *Server) listDeadLetters(w http.ResponseWriter, r *http.Request) {
 			filter.Limit = limit
 		}
 	}
-	if filter.Limit <= 0 {
+	if filter.Limit <= 0 || filter.Limit > 500 {
 		filter.Limit = 50
 	}
 	if q := r.URL.Query().Get("after_id"); q != "" {

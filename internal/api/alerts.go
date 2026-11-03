@@ -346,6 +346,9 @@ func (s *Server) listDeliveries(w http.ResponseWriter, r *http.Request) {
 	if list == nil {
 		list = []store.DeliveryAttempt{}
 	}
+	if len(list) > 500 {
+		list = list[:500]
+	}
 	writeJSON(w, http.StatusOK, list)
 }
 

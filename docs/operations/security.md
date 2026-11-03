@@ -281,7 +281,7 @@ here or accept a cookie that is not marked `Secure`.
 Two protections are built in, both off-or-defaulted so existing deployments
 are unaffected until an operator opts in:
 
-* **Request body limit.** Write endpoints (`POST`/`PATCH`/`PUT`) wrap the
+* **Request body and payload limits.** Write endpoints (`POST`/`PATCH`/`PUT`) wrap the
   body in `http.MaxBytesReader` and reject larger requests with `413` before
   reading them; `GET`/`HEAD`/`OPTIONS` are untouched
   (`internal/api/maxbody.go`). The default is 1 MiB
@@ -289,6 +289,20 @@ are unaffected until an operator opts in:
   `HTTP_MAX_BODY_BYTES` (parsed in `internal/config/config.go`; zero or
   negative values are rejected and a non-positive wiring cannot disable the
   cap).
+  * **Decompression bounds:** Requests carrying `Content-Encoding: gzip` or `deflate`
+    are decompressed on the fly, with limits enforced on the *decompressed* byte count
+    to prevent compression bombs.
+  * **Endpoint overrides:** Bulk operations (such as `/monitors/bulk` and `/alerts/import`)
+    receive a higher default limit of 10 MiB (`DefaultBulkMaxBodyBytes`).
+  * **Field-specific bounds:** Channel configuration JSON is capped at 64 KiB
+    (`MaxChannelConfigBytes`), and message/monitor templates are capped at 32 KiB
+    (`MaxTemplateBytes`) to prevent excessive memory and template render costs.
+  * **Response bounds:** Listing endpoints cap page size to at most 500 records; large
+    exports (`/alerts.csv`, `/alerts/export`) and live feeds (`/alerts/stream`) stream
+    incrementally to avoid buffering unbounded payloads.
+  * **Rejection metrics:** Rejections are tracked by Prometheus counter
+    `sorobeacon_request_body_rejections_total` partitioned by the `limit` label
+    (`max_body`, `bulk_max_body`, `template_size`, `channel_config_size`).
 * **Per-client rate limiting.** A token-bucket limiter keyed by client
   address, opt-in via `RATE_LIMIT_RPS` (burst defaults to
   ⌈RPS⌉, `RATE_LIMIT_BURST` overrides). Excess requests get `429` with

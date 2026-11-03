@@ -70,6 +70,8 @@ type Metrics struct {
 	// since the process started, which is the signal a dashboard alert can
 	// be built on.
 	heartbeatLastSuccess prometheus.Gauge
+
+	requestBodyRejectionsTotal *prometheus.CounterVec
 }
 
 // networkLabel is the Prometheus label every ingest metric carries.
@@ -219,13 +221,18 @@ func New() *Metrics {
 			Name: "sorobeacon_heartbeat_last_success_timestamp_seconds",
 			Help: "Unix time of the last heartbeat ping sent while ingest was healthy; 0 when none has succeeded this run.",
 		}),
+
+		requestBodyRejectionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_request_body_rejections_total",
+			Help: "Requests rejected for exceeding body or field size limits, partitioned by limit type.",
+		}, []string{"limit"}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
 		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired, m.deliveries, m.throttles,
 		m.httpDuration, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
 		m.reorgsTotal, m.lastReorgLedger, m.breakerStates, m.pollPanics,
 		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.deadLetters, m.heartbeatLastSuccess,
-		m.ruleEvalsTotal, m.ruleMatchesTotal, m.ruleErrorsTotal, m.ruleDuration)
+		m.ruleEvalsTotal, m.ruleMatchesTotal, m.ruleErrorsTotal, m.ruleDuration, m.requestBodyRejectionsTotal)
 	return m
 }
 
@@ -537,6 +544,14 @@ func (m *Metrics) Middleware(next http.Handler) http.Handler {
 // package does not import chi; the wire-up lives in cmd/sorobeacon.
 var RoutePattern func(*http.Request) string
 
+// RecordBodyRejection increments the counter for a rejected request body or field limit.
+func (m *Metrics) RecordBodyRejection(limit string) {
+	if m == nil || m.requestBodyRejectionsTotal == nil {
+		return
+	}
+	m.requestBodyRejectionsTotal.WithLabelValues(limit).Inc()
+}
+
 // ExportedMetricNames returns the canonical list of base Prometheus metric
 // names exported by SoroBeacon. Histogram metrics also emit _bucket, _sum,
 // and _count suffixes when scraped.
@@ -568,6 +583,7 @@ func ExportedMetricNames() []string {
 		"sorobeacon_store_replica_enabled",
 		"sorobeacon_dead_letters_total",
 		"sorobeacon_alerts_stream_dropped_total",
+		"sorobeacon_request_body_rejections_total",
 	}
 }
 
