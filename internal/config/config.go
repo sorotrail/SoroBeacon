@@ -1007,21 +1007,29 @@ func BuildResolver(cfg Config) *secrets.Resolver {
 		return nil
 	}
 	r := secrets.NewResolver()
+	registered := 0
 	for _, rawP := range strings.Split(cfg.SecretsProvider, ",") {
 		switch strings.TrimSpace(rawP) {
 		case "env":
 			r.Register(secrets.NewEnvProvider())
+			registered++
 		case "file":
 			r.Register(secrets.NewFileProvider())
+			registered++
 		case "vault":
 			r.Register(secrets.NewVaultProvider(cfg.VaultAddr, cfg.VaultToken, cfg.VaultNamespace))
+			registered++
 		case "all":
 			r.Register(secrets.NewEnvProvider())
 			r.Register(secrets.NewFileProvider())
 			if cfg.VaultAddr != "" {
 				r.Register(secrets.NewVaultProvider(cfg.VaultAddr, cfg.VaultToken, cfg.VaultNamespace))
 			}
+			registered++
 		}
+	}
+	if registered == 0 {
+		return nil
 	}
 	return r.WithTTL(cfg.SecretsCacheTTL)
 }
