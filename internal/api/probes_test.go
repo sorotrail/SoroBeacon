@@ -55,6 +55,9 @@ func (f *fakeStore) DeleteMonitorTemplate(context.Context, int64) error         
 func (f *fakeStore) ListMonitors(context.Context, bool) ([]store.Monitor, error) {
 	return nil, nil
 }
+func (f *fakeStore) GetMonitor(_ context.Context, id int64) (*store.Monitor, error) {
+	return &store.Monitor{ID: id}, nil
+}
 
 // fakeRPC implements stellar.Client; the probes use GetHealth only.
 type fakeRPC struct {

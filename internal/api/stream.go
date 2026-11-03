@@ -54,8 +54,12 @@ func (s *Server) streamAlerts(w http.ResponseWriter, r *http.Request) {
 	var monitorID int64
 	if v := r.URL.Query().Get("monitor_id"); v != "" {
 		id, err := strconv.ParseInt(v, 10, 64)
-		if err != nil {
+		if err != nil || id <= 0 {
 			writeErr(w, r, http.StatusBadRequest, "invalid monitor_id")
+			return
+		}
+		if _, err := s.store.GetMonitor(r.Context(), id); err != nil {
+			s.fail(w, r, err)
 			return
 		}
 		monitorID = id
@@ -106,6 +110,11 @@ func (s *Server) streamAlerts(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-beat.C:
+			if s.auth != nil && s.auth.Enabled() {
+				if _, ok := s.auth.Principal(r); !ok {
+					return
+				}
+			}
 			// A comment line is a valid SSE event with no data: it keeps
 			// the connection warm without reaching the client's handler.
 			if _, err := io.WriteString(w, ": keep-alive\n\n"); err != nil {
@@ -113,6 +122,16 @@ func (s *Server) streamAlerts(w http.ResponseWriter, r *http.Request) {
 			}
 			flusher.Flush()
 		case a := <-sub.C:
+			if s.auth != nil && s.auth.Enabled() {
+				if _, ok := s.auth.Principal(r); !ok {
+					return
+				}
+			}
+			if a.MonitorID > 0 {
+				if _, err := s.store.GetMonitor(r.Context(), a.MonitorID); err != nil {
+					continue
+				}
+			}
 			data, err := json.Marshal(a)
 			if err != nil {
 				// A payload that will not marshal is a bug in what was

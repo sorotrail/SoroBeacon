@@ -1457,7 +1457,11 @@ func (p *Postgres) RecordChannelHealth(ctx context.Context, channelID int64, u C
 func (p *Postgres) DeleteChannel(ctx context.Context, id int64) error {
 	var inUse bool
 	if err := p.pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM escalation_step_channels WHERE channel_id = $1)`, id,
+		`SELECT EXISTS (
+			SELECT 1 FROM escalation_step_channels esc
+			JOIN channels c ON c.id = esc.channel_id
+			WHERE esc.channel_id = $1 AND c.workspace_id = $2
+		)`, id, workspaceID(ctx),
 	).Scan(&inUse); err != nil {
 		return err
 	}

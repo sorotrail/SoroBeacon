@@ -38,6 +38,10 @@ func (s *Server) triggerHandler(w http.ResponseWriter, r *http.Request) {
 		writeValidation(w, r, []FieldError{{Field: "monitor_id", Reason: "monitor_id is required"}})
 		return
 	}
+	if _, err := s.store.GetMonitor(r.Context(), req.MonitorID); err != nil {
+		s.fail(w, r, err)
+		return
+	}
 
 	// TODO: add rule evaluation here
 	// For now, just create a minimal alert and return

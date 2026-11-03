@@ -62,6 +62,10 @@ func (s *Server) getMonitorEscalation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, r, http.StatusBadRequest, "invalid id")
 		return
 	}
+	if _, err := s.store.GetMonitor(r.Context(), id); err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	pol, err := s.store.GetEscalationPolicyForMonitor(r.Context(), id)
 	if err != nil {
 		s.fail(w, r, err)
@@ -157,6 +161,10 @@ func (s *Server) deleteMonitorEscalation(w http.ResponseWriter, r *http.Request)
 	id, err := pathID(r, "id")
 	if err != nil {
 		writeErr(w, r, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if _, err := s.store.GetMonitor(r.Context(), id); err != nil {
+		s.fail(w, r, err)
 		return
 	}
 	if err := s.store.DeleteEscalationPolicy(r.Context(), id); err != nil {
