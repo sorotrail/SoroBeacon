@@ -197,6 +197,14 @@ func Classify(err error) Classified {
 			GRPCCode: codes.FailedPrecondition,
 		}
 	}
+	if errors.Is(err, store.ErrUnavailable) {
+		return Classified{
+			Status:   http.StatusServiceUnavailable,
+			Code:     CodeServiceUnavailable,
+			Message:  "database unavailable",
+			GRPCCode: codes.Unavailable,
+		}
+	}
 
 	// Fallback for unclassified / internal errors: generic code, safe message.
 	return Classified{

@@ -83,6 +83,8 @@ type Postgres struct {
 	health *DatabaseHealth
 	// retry is the policy used for reads that failed transiently.
 	retry RetryPolicy
+	// breaker protects against database stampedes when unavailable.
+	breaker *StoreBreaker
 }
 
 // WithTelemetry attaches tracing to the store's write paths. Only ids go
@@ -132,7 +134,13 @@ func NewPostgres(ctx context.Context, databaseURL string, settings PoolSettings)
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	p := &Postgres{pool: pool, metrics: settings.Metrics, health: health, retry: ReadPolicy()}
+	p := &Postgres{
+		pool:    pool,
+		metrics: settings.Metrics,
+		health:  health,
+		retry:   ReadPolicy(),
+		breaker: NewStoreBreaker(3, 5*time.Second),
+	}
 	if err := p.connectReplica(ctx, settings); err != nil {
 		pool.Close()
 		return nil, err
@@ -206,7 +214,20 @@ func (p *Postgres) Ping(ctx context.Context) error {
 // lose its database (the SQLite file) has nothing to report, and adding the
 // method to the interface would force every fake store in the tests to
 // answer for a condition that does not apply to them.
-func (p *Postgres) Degraded() bool { return p.health != nil && p.health.Degraded() }
+func (p *Postgres) Degraded() bool {
+	if p.health != nil && p.health.Degraded() {
+		return true
+	}
+	if p.breaker != nil && p.breaker.Degraded() {
+		return true
+	}
+	return false
+}
+
+// Breaker returns the underlying circuit breaker protecting Postgres operations.
+func (p *Postgres) Breaker() *StoreBreaker {
+	return p.breaker
+}
 
 // DegradedSince reports when the database became unreachable, and whether it
 // is unreachable now.
@@ -225,6 +246,9 @@ func (p *Postgres) DegradedSince() (time.Time, bool) {
 // the alert write carries its own dedup guard, but the general rule is that
 // the caller decides what a repeated write means.
 func (p *Postgres) read(ctx context.Context, fn func(context.Context) error) error {
+	if p.breaker != nil && !p.breaker.Allow() {
+		return ErrUnavailable
+	}
 	return p.retry.Do(ctx, func(ctx context.Context) error {
 		err := fn(ctx)
 		// Every attempt is observed, so a database that goes away mid-read
@@ -238,10 +262,16 @@ func (p *Postgres) read(ctx context.Context, fn func(context.Context) error) err
 // A store built without one — the tests that exercise routing — has no
 // database state to report.
 func (p *Postgres) observe(err error) {
-	if p.health == nil {
-		return
+	if p.health != nil {
+		p.health.Observe(err)
 	}
-	p.health.Observe(err)
+	if p.breaker != nil {
+		if err == nil {
+			p.breaker.RecordSuccess()
+		} else {
+			p.breaker.RecordFailure(err)
+		}
+	}
 }
 
 // Close releases both pools. The replica goes first so a query cannot be

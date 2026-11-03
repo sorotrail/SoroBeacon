@@ -72,6 +72,9 @@ type Metrics struct {
 	heartbeatLastSuccess prometheus.Gauge
 
 	requestBodyRejectionsTotal *prometheus.CounterVec
+
+	databaseDegraded         prometheus.Gauge
+	databaseUnavailableTotal prometheus.Counter
 }
 
 // networkLabel is the Prometheus label every ingest metric carries.
@@ -226,13 +229,24 @@ func New() *Metrics {
 			Name: "sorobeacon_request_body_rejections_total",
 			Help: "Requests rejected for exceeding body or field size limits, partitioned by limit type.",
 		}, []string{"limit"}),
+
+		databaseDegraded: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_database_degraded",
+			Help: "1 if the database is unreachable or operating in degraded mode, 0 otherwise.",
+		}),
+
+		databaseUnavailableTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_database_unavailable_total",
+			Help: "Count of database unavailable failures encountered across the service.",
+		}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
 		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired, m.deliveries, m.throttles,
 		m.httpDuration, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
 		m.reorgsTotal, m.lastReorgLedger, m.breakerStates, m.pollPanics,
 		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.deadLetters, m.heartbeatLastSuccess,
-		m.ruleEvalsTotal, m.ruleMatchesTotal, m.ruleErrorsTotal, m.ruleDuration, m.requestBodyRejectionsTotal)
+		m.ruleEvalsTotal, m.ruleMatchesTotal, m.ruleErrorsTotal, m.ruleDuration, m.requestBodyRejectionsTotal,
+		m.databaseDegraded, m.databaseUnavailableTotal)
 	return m
 }
 
@@ -552,6 +566,26 @@ func (m *Metrics) RecordBodyRejection(limit string) {
 	m.requestBodyRejectionsTotal.WithLabelValues(limit).Inc()
 }
 
+// SetDatabaseDegraded updates the gauge indicating whether the service is in degraded mode.
+func (m *Metrics) SetDatabaseDegraded(degraded bool) {
+	if m == nil || m.databaseDegraded == nil {
+		return
+	}
+	if degraded {
+		m.databaseDegraded.Set(1)
+	} else {
+		m.databaseDegraded.Set(0)
+	}
+}
+
+// RecordDatabaseUnavailable increments the count of database unavailable events.
+func (m *Metrics) RecordDatabaseUnavailable() {
+	if m == nil || m.databaseUnavailableTotal == nil {
+		return
+	}
+	m.databaseUnavailableTotal.Inc()
+}
+
 // ExportedMetricNames returns the canonical list of base Prometheus metric
 // names exported by SoroBeacon. Histogram metrics also emit _bucket, _sum,
 // and _count suffixes when scraped.
@@ -584,6 +618,8 @@ func ExportedMetricNames() []string {
 		"sorobeacon_dead_letters_total",
 		"sorobeacon_alerts_stream_dropped_total",
 		"sorobeacon_request_body_rejections_total",
+		"sorobeacon_database_degraded",
+		"sorobeacon_database_unavailable_total",
 	}
 }
 
