@@ -75,6 +75,26 @@ the token bucket and does not send `Retry-After`; clients should treat
 
 Probes (`/health`, `/livez`, `/readyz`) are exempt from rate limiting.
 
+## Conditional requests
+
+Read endpoints across the dominant polling surfaces — alert listings (`GET /alerts`), daily alert statistics (`GET /stats/alerts-daily`), per-channel delivery summaries (`GET /channels/{id}/stats`), and monitor/channel lists — set a strong entity tag (`ETag`) and respond to conditional requests (`If-None-Match`) with `304 Not Modified` and no body.
+
+Responses set `Cache-Control: private, no-cache` so clients revalidate before each reuse while proxies do not store responses shared across tenants.
+
+### Change detection design
+
+Rather than hashing serialised JSON responses — which still pays the full database query and serialisation penalty — entity tags are derived directly from lightweight backend change detectors:
+* **Alert surface** (`GET /alerts` and `GET /stats/alerts-daily`): A composite key of the workspace's monotonic maximum alert identifier plus total alert count. New alerts advance the monotonic identifier; retention sweeps and partition drops decrement the count. Daily alert statistics also incorporate the current UTC calendar day to invalidate the tag at day boundaries.
+* **Channel delivery summaries** (`GET /channels/{id}/stats`): A composite key of the channel ID, maximum delivery attempt identifier, and total delivery attempt count.
+
+The strong entity tag incorporates every input that influences the answer:
+* Authenticated tenant workspace (preventing cross-workspace cache collisions or information disclosure)
+* Exact URL path
+* Full sorted query string (filters, limit, cursor, and time window parameters)
+* Underlying backend change detector key
+
+When `If-None-Match` matches, the endpoint fails fast with `304 Not Modified` without running the primary database scan or allocating result buffers. Not-modified responses are tracked by the metric `sorobeacon_http_not_modified_total`.
+
 ## Monitors
 
 The **Scope** column lists the scope a scoped token needs; the full

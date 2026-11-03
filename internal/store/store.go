@@ -1177,6 +1177,10 @@ type Channels interface {
 	// channel with no attempts in the window returns explicit zero counts and
 	// nil timestamps (see ChannelDeliveryStats).
 	GetChannelDeliveryStats(ctx context.Context, channelID int64, since time.Time) (ChannelDeliveryStats, error)
+	// ChannelDeliveryChangeKey returns (maxDeliveryAttemptID, attemptCount, error) for the
+	// given channel in the context's workspace. Returns ErrNotFound if the channel does not
+	// exist in the workspace.
+	ChannelDeliveryChangeKey(ctx context.Context, channelID int64) (maxID int64, count int64, err error)
 
 	// Channel signing keys methods for multi-key overlap, rotation, retirement and emergency revocation.
 	CreateChannelSigningKey(ctx context.Context, k *ChannelSigningKey) error
@@ -1202,6 +1206,9 @@ type Alerts interface {
 	CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error)
 	GetAlert(ctx context.Context, id int64) (*Alert, error)
 	ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
+	// AlertChangeKey returns (maxAlertID, alertCount, error) for the context's workspace.
+	// It serves as a monotonic, deletion-aware change detector for conditional requests.
+	AlertChangeKey(ctx context.Context) (maxID int64, count int64, err error)
 	// ListAlertsStream walks the same filter as ListAlerts, calling fn per
 	// row. f.Limit caps the total rows, not the page size, so an export
 	// streams with bounded memory. See streamAlerts for the guarantees.

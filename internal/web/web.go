@@ -34,6 +34,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 // PositionReader is the poller's race-free snapshot of ingest progress.
@@ -1801,6 +1802,35 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, target, http.StatusSeeOther)
 		return
 	}
+
+	var maxID, count int64
+	var changeKeyErr error
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				changeKeyErr = fmt.Errorf("panic in AlertChangeKey: %v", rec)
+			}
+		}()
+		if s.store != nil {
+			maxID, count, changeKeyErr = s.store.AlertChangeKey(r.Context())
+		} else {
+			changeKeyErr = errors.New("no store")
+		}
+	}()
+	if changeKeyErr == nil {
+		ws := ""
+		if wID, ok := workspace.From(r.Context()); ok {
+			ws = string(wID)
+		}
+		changeKey := fmt.Sprintf("alerts:%d:%d", maxID, count)
+		etag := api.FormatETag(ws, r.URL.Path, r.URL.Query().Encode(), changeKey)
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Cache-Control", "private, no-cache")
+		if api.ETagMatches(r.Header.Get("If-None-Match"), etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
 	q := r.URL.Query()
 	f := store.AlertFilter{Limit: 50}
 	var selected int64
@@ -2078,6 +2108,25 @@ func (s *Server) writeDeliveriesFragment(w http.ResponseWriter, r *http.Request,
 	attempts, err := s.store.ListDeliveryAttempts(r.Context(), alertID, "")
 	if err != nil {
 		s.fail(w, err)
+		return
+	}
+
+	var maxAttemptID int64
+	for _, a := range attempts {
+		if a.ID > maxAttemptID {
+			maxAttemptID = a.ID
+		}
+	}
+	ws := ""
+	if wID, ok := workspace.From(r.Context()); ok {
+		ws = string(wID)
+	}
+	changeKey := fmt.Sprintf("alert_deliv:%d:%d:%d:%s", alertID, maxAttemptID, len(attempts), note)
+	etag := api.FormatETag(ws, r.URL.Path, r.URL.Query().Encode(), changeKey)
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "private, no-cache")
+	if api.ETagMatches(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	channels, err := s.store.ListChannels(r.Context(), false)

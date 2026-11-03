@@ -339,7 +339,7 @@ func (s *Server) Routes() chi.Router {
 		r.Get("/{id}", s.getChannel)
 		// Registered under the channel's own id rather than under /stats:
 		// the statistics are one channel's, not the instance's.
-		r.Get("/{id}/stats", s.channelStats)
+		r.Get("/{id}/stats", s.withConditionalETag(s.channelStatsChangeKey, s.channelStats))
 		r.Patch("/{id}", s.updateChannel)
 		r.Delete("/{id}", s.deleteChannel)
 		r.Post("/{id}/test", s.testChannel)
@@ -390,7 +390,7 @@ func (s *Server) Routes() chi.Router {
 		r.Post("/{id}/revoke", s.revokeToken)
 	})
 
-	mux.Get("/alerts", s.listAlerts)
+	mux.Get("/alerts", s.withConditionalETag(s.alertChangeKey, s.listAlerts))
 	// Registered before /alerts.csv and the /alerts/{id}/... routes for
 	// readability; chi matches the static segment either way.
 	mux.Get("/alerts/stream", s.streamAlerts)
@@ -408,7 +408,7 @@ func (s *Server) Routes() chi.Router {
 	mux.Get("/version", s.version)
 	mux.Get("/rule-types", s.listRuleTypes)
 	mux.Get("/stats", s.stats)
-	mux.Get("/stats/alerts-daily", s.alertsDaily)
+	mux.Get("/stats/alerts-daily", s.withConditionalETag(s.alertsDailyChangeKey, s.alertsDaily))
 	mux.Get("/audit", s.listAudit)
 
 	return mux

@@ -1437,6 +1437,27 @@ func (s *SQLite) GetChannelDeliveryStats(ctx context.Context, channelID int64, s
 	return cs, nil
 }
 
+// ChannelDeliveryChangeKey returns the max delivery attempt ID and count for channelID in the caller's workspace.
+func (s *SQLite) ChannelDeliveryChangeKey(ctx context.Context, channelID int64) (maxID int64, count int64, err error) {
+	ws := workspaceID(ctx)
+	var exists bool
+	err = s.db.QueryRowContext(ctx, `
+		SELECT
+			(SELECT count(*) FROM channels WHERE id = ? AND workspace_id = ?) > 0,
+			COALESCE(max(da.id), 0),
+			count(*)
+		FROM delivery_attempts da
+		WHERE da.channel_id = ?`, channelID, ws, channelID).
+		Scan(&exists, &maxID, &count)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !exists {
+		return 0, 0, ErrNotFound
+	}
+	return maxID, count, nil
+}
+
 // UpdateChannel mirrors the Postgres implementation, including the health
 // reset. Turning a channel back on clears the state auto-disable left behind,
 // in the same statement, so a channel cannot re-disable on its next failure
@@ -2322,6 +2343,15 @@ func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// AlertChangeKey returns the max alert ID and count for the caller's workspace.
+func (s *SQLite) AlertChangeKey(ctx context.Context) (maxID int64, count int64, err error) {
+	ws := workspaceID(ctx)
+	err = s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(max(id), 0), count(*) FROM alerts WHERE workspace_id = ?`, ws).
+		Scan(&maxID, &count)
+	return maxID, count, err
 }
 
 // ListAlertsStream streams alerts matching the filter to the callback.
