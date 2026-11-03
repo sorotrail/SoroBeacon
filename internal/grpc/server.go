@@ -19,7 +19,6 @@ package grpc
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -31,6 +30,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"github.com/sorotrail/sorobeacon/internal/apierr"
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/store"
 	"github.com/sorotrail/sorobeacon/internal/workspace"
@@ -301,10 +301,8 @@ func streamAlertsHandler(srv any, stream grpc.ServerStream) error {
 func (s *Server) GetMonitor(ctx context.Context, req *GetMonitorRequest) (*MonitorProto, error) {
 	m, err := s.store.GetMonitor(ctx, req.ID)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, status.Error(codes.NotFound, "monitor not found")
-		}
-		return nil, status.Error(codes.Internal, "internal error")
+		c := apierr.Classify(err)
+		return nil, status.Error(c.GRPCCode, c.Message)
 	}
 	return monitorToProto(m), nil
 }
@@ -320,7 +318,8 @@ func (s *Server) ListMonitors(ctx context.Context, req *ListMonitorsRequest) (*L
 		AfterID:     req.Cursor,
 	})
 	if err != nil {
-		return nil, status.Error(codes.Internal, "internal error")
+		c := apierr.Classify(err)
+		return nil, status.Error(c.GRPCCode, c.Message)
 	}
 	resp := &ListMonitorsResponse{Monitors: make([]*MonitorProto, 0, len(monitors))}
 	for i := range monitors {
@@ -341,7 +340,8 @@ func (s *Server) ListAlerts(ctx context.Context, req *ListAlertsRequest) (*ListA
 		AfterID:   req.Cursor,
 	})
 	if err != nil {
-		return nil, status.Error(codes.Internal, "internal error")
+		c := apierr.Classify(err)
+		return nil, status.Error(c.GRPCCode, c.Message)
 	}
 	resp := &ListAlertsResponse{Alerts: make([]*AlertProto, 0, len(alerts))}
 	for _, a := range alerts {

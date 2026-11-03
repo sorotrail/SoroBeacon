@@ -2646,7 +2646,22 @@
           },
           "code": {
             "type": "string",
-            "description": "Stable status token, e.g. Not Found"
+            "description": "Stable machine-readable error code",
+            "enum": [
+              "NOT_FOUND",
+              "ALREADY_EXISTS",
+              "INVALID_ARGUMENT",
+              "CONFLICT",
+              "UNAUTHENTICATED",
+              "PERMISSION_DENIED",
+              "RATE_LIMITED",
+              "QUOTA_EXCEEDED",
+              "PAYLOAD_TOO_LARGE",
+              "METHOD_NOT_ALLOWED",
+              "NOT_IMPLEMENTED",
+              "SERVICE_UNAVAILABLE",
+              "INTERNAL_ERROR"
+            ]
           },
           "request_id": {
             "type": "string",

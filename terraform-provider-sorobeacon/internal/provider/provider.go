@@ -28,9 +28,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -154,16 +156,102 @@ func (c *apiClient) do(ctx context.Context, method, path string, body any) ([]by
 	return data, resp.StatusCode, nil
 }
 
+// Stable machine-readable error codes matching the server API contract.
+const (
+	CodeNotFound        = "NOT_FOUND"
+	CodeAlreadyExists   = "ALREADY_EXISTS"
+	CodeInvalidArgument = "INVALID_ARGUMENT"
+	CodeConflict        = "CONFLICT"
+	CodeRateLimited     = "RATE_LIMITED"
+	CodeInternalError   = "INTERNAL_ERROR"
+)
+
+// APIError represents a structured error returned from the SoroBeacon API.
+type APIError struct {
+	Status    int
+	Code      string
+	Message   string
+	RequestID string
+	Details   []struct {
+		Field  string `json:"field"`
+		Reason string `json:"reason"`
+	}
+}
+
+func (e *APIError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return fmt.Sprintf("API error %d (%s)", e.Status, e.Code)
+}
+
+// IsNotFound reports whether err indicates the target resource does not exist.
+func IsNotFound(err error) bool {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Code == CodeNotFound || apiErr.Status == http.StatusNotFound
+	}
+	return err != nil && (strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "404"))
+}
+
+// IsAlreadyExists reports whether err indicates a resource conflict or unique constraint failure.
+func IsAlreadyExists(err error) bool {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Code == CodeAlreadyExists || apiErr.Code == "DUPLICATE" || apiErr.Status == http.StatusConflict
+	}
+	return false
+}
+
+// IsInvalidArgument reports whether err represents invalid input or a validation rejection.
+func IsInvalidArgument(err error) bool {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.Code == CodeAlreadyExists || apiErr.Code == "DUPLICATE" {
+			return false
+		}
+		return apiErr.Code == CodeInvalidArgument || apiErr.Status == http.StatusBadRequest
+	}
+	return false
+}
+
+func decodeAPIError(status int, data []byte) error {
+	apiErr := &APIError{
+		Status:  status,
+		Code:    http.StatusText(status),
+		Message: http.StatusText(status),
+	}
+	var env struct {
+		Error     string `json:"error"`
+		Code      string `json:"code"`
+		RequestID string `json:"request_id"`
+		Details   []struct {
+			Field  string `json:"field"`
+			Reason string `json:"reason"`
+		} `json:"details"`
+	}
+	if err := json.Unmarshal(data, &env); err == nil {
+		if env.Error != "" {
+			apiErr.Message = env.Error
+		}
+		if env.Code != "" {
+			apiErr.Code = env.Code
+		}
+		apiErr.RequestID = env.RequestID
+		apiErr.Details = env.Details
+	} else if len(data) > 0 {
+		apiErr.Message = string(data)
+	}
+	return apiErr
+}
+
 func (c *apiClient) get(ctx context.Context, path string, result any) error {
 	data, status, err := c.do(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return err
 	}
-	if status == http.StatusNotFound {
-		return fmt.Errorf("not found")
-	}
 	if status < 200 || status > 299 {
-		return fmt.Errorf("API error %d: %s", status, string(data))
+		return decodeAPIError(status, data)
 	}
 	return json.Unmarshal(data, result)
 }
@@ -174,7 +262,7 @@ func (c *apiClient) create(ctx context.Context, path string, body any, result an
 		return err
 	}
 	if status < 200 || status > 299 {
-		return fmt.Errorf("API error %d: %s", status, string(data))
+		return decodeAPIError(status, data)
 	}
 	return json.Unmarshal(data, result)
 }
@@ -185,18 +273,18 @@ func (c *apiClient) update(ctx context.Context, path string, body any, result an
 		return err
 	}
 	if status < 200 || status > 299 {
-		return fmt.Errorf("API error %d: %s", status, string(data))
+		return decodeAPIError(status, data)
 	}
 	return json.Unmarshal(data, result)
 }
 
 func (c *apiClient) delete(ctx context.Context, path string) error {
-	_, status, err := c.do(ctx, http.MethodDelete, path, nil)
+	data, status, err := c.do(ctx, http.MethodDelete, path, nil)
 	if err != nil {
 		return err
 	}
 	if status != http.StatusNoContent && status != http.StatusOK {
-		return fmt.Errorf("API error %d on delete", status)
+		return decodeAPIError(status, data)
 	}
 	return nil
 }

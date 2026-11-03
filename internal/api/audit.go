@@ -93,10 +93,17 @@ func AuditMiddleware(st store.Store, log *slog.Logger) func(http.Handler) http.H
 				TargetID:   targetID,
 				Diff:       diff,
 			}
-			if err := st.CreateAuditEntry(r.Context(), entry); err != nil {
-				log.Error("write audit entry",
-					"action", spec.action, "target_type", spec.targetType, "target_id", targetID, "err", err)
-			}
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						log.Error("audit write panicked", "panic", rec)
+					}
+				}()
+				if err := st.CreateAuditEntry(r.Context(), entry); err != nil {
+					log.Error("write audit entry",
+						"action", spec.action, "target_type", spec.targetType, "target_id", targetID, "err", err)
+				}
+			}()
 		})
 	}
 }

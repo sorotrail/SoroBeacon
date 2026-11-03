@@ -15,8 +15,18 @@ import (
 	"github.com/99designs/gqlgen/graphql/playground"
 	"github.com/vektah/gqlparser/v2/gqlerror"
 
+	"github.com/sorotrail/sorobeacon/internal/apierr"
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
+
+func gqlErrorf(code string, format string, args ...any) *gqlerror.Error {
+	return &gqlerror.Error{
+		Message: fmt.Sprintf(format, args...),
+		Extensions: map[string]any{
+			"code": code,
+		},
+	}
+}
 
 // Resolver holds the dependencies for GraphQL resolvers.
 type Resolver struct {
@@ -60,14 +70,14 @@ type queryResolver struct{ *Resolver }
 func (r *queryResolver) Monitor(ctx context.Context, id string) (*Monitor, error) {
 	monitorID, err := strconv.ParseInt(id, 10, 64)
 	if err != nil {
-		return nil, gqlerror.Errorf("invalid monitor ID: %v", err)
+		return nil, gqlErrorf(apierr.CodeInvalidArgument, "invalid monitor ID: %v", err)
 	}
 	m, err := r.store.GetMonitor(ctx, monitorID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, nil
 		}
-		return nil, gqlerror.Errorf("monitor not found: %v", err)
+		return nil, gqlErrorf(apierr.CodeNotFound, "monitor not found: %v", err)
 	}
 	return toMonitor(m), nil
 }
@@ -105,7 +115,7 @@ func (r *queryResolver) Monitors(ctx context.Context, enabled *bool, limit *int,
 
 	monitors, err := r.store.ListMonitorsPage(ctx, f)
 	if err != nil {
-		return nil, gqlerror.Errorf("failed to list monitors: %v", err)
+		return nil, gqlErrorf(apierr.CodeInternalError, "failed to list monitors: %v", err)
 	}
 
 	edges := make([]MonitorEdge, len(monitors))
@@ -136,14 +146,14 @@ func (r *queryResolver) Monitors(ctx context.Context, enabled *bool, limit *int,
 func (r *queryResolver) Alert(ctx context.Context, id string) (*Alert, error) {
 	alertID, err := strconv.ParseInt(id, 10, 64)
 	if err != nil {
-		return nil, gqlerror.Errorf("invalid alert ID: %v", err)
+		return nil, gqlErrorf(apierr.CodeInvalidArgument, "invalid alert ID: %v", err)
 	}
 	a, err := r.store.GetAlert(ctx, alertID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, nil
 		}
-		return nil, gqlerror.Errorf("alert not found: %v", err)
+		return nil, gqlErrorf(apierr.CodeNotFound, "alert not found: %v", err)
 	}
 	return toAlert(a), nil
 }
@@ -194,7 +204,7 @@ func (r *queryResolver) Alerts(ctx context.Context, monitorID *string, ruleID *s
 
 	alerts, err := r.store.ListAlerts(ctx, f)
 	if err != nil {
-		return nil, gqlerror.Errorf("failed to list alerts: %v", err)
+		return nil, gqlErrorf(apierr.CodeInternalError, "failed to list alerts: %v", err)
 	}
 
 	edges := make([]AlertEdge, len(alerts))
@@ -225,7 +235,7 @@ func (r *queryResolver) Alerts(ctx context.Context, monitorID *string, ruleID *s
 func (r *queryResolver) Stats(ctx context.Context) (*Stats, error) {
 	s, err := r.store.GetStats(ctx)
 	if err != nil {
-		return nil, gqlerror.Errorf("failed to get stats: %v", err)
+		return nil, gqlErrorf(apierr.CodeInternalError, "failed to get stats: %v", err)
 	}
 	return toStats(s), nil
 }
@@ -241,7 +251,7 @@ func (r *queryResolver) AlertSeries(ctx context.Context, days *int) ([]AlertDayC
 	}
 	counts, err := r.store.AlertCountsByDay(ctx, d)
 	if err != nil {
-		return nil, gqlerror.Errorf("failed to get alert series: %v", err)
+		return nil, gqlErrorf(apierr.CodeInternalError, "failed to get alert series: %v", err)
 	}
 	result := make([]AlertDayCount, len(counts))
 	for i, c := range counts {
@@ -256,11 +266,11 @@ type monitorResolver struct{ *Resolver }
 func (r *monitorResolver) Rules(ctx context.Context, obj *Monitor) ([]Rule, error) {
 	monitorID, err := strconv.ParseInt(obj.ID, 10, 64)
 	if err != nil {
-		return nil, gqlerror.Errorf("invalid monitor ID: %v", err)
+		return nil, gqlErrorf(apierr.CodeInvalidArgument, "invalid monitor ID: %v", err)
 	}
 	rules, err := r.store.ListRules(ctx, monitorID, false)
 	if err != nil {
-		return nil, gqlerror.Errorf("failed to list rules: %v", err)
+		return nil, gqlErrorf(apierr.CodeInternalError, "failed to list rules: %v", err)
 	}
 	result := make([]Rule, len(rules))
 	for i := range rules {
@@ -272,11 +282,11 @@ func (r *monitorResolver) Rules(ctx context.Context, obj *Monitor) ([]Rule, erro
 func (r *monitorResolver) Channels(ctx context.Context, obj *Monitor) ([]Channel, error) {
 	monitorID, err := strconv.ParseInt(obj.ID, 10, 64)
 	if err != nil {
-		return nil, gqlerror.Errorf("invalid monitor ID: %v", err)
+		return nil, gqlErrorf(apierr.CodeInvalidArgument, "invalid monitor ID: %v", err)
 	}
 	channels, err := r.store.ListChannelsForMonitor(ctx, monitorID)
 	if err != nil {
-		return nil, gqlerror.Errorf("failed to list channels: %v", err)
+		return nil, gqlErrorf(apierr.CodeInternalError, "failed to list channels: %v", err)
 	}
 	result := make([]Channel, len(channels))
 	for i := range channels {
@@ -294,14 +304,14 @@ func (r *alertResolver) InhibitedByRule(ctx context.Context, obj *Alert) (*Rule,
 	}
 	ruleID, err := strconv.ParseInt(*obj.InhibitedByRuleID, 10, 64)
 	if err != nil {
-		return nil, gqlerror.Errorf("invalid inhibited rule ID: %v", err)
+		return nil, gqlErrorf(apierr.CodeInvalidArgument, "invalid inhibited rule ID: %v", err)
 	}
 	rule, err := r.store.GetRule(ctx, ruleID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, nil
 		}
-		return nil, gqlerror.Errorf("failed to get inhibited rule: %v", err)
+		return nil, gqlErrorf(apierr.CodeInternalError, "failed to get inhibited rule: %v", err)
 	}
 	return toRule(rule), nil
 }

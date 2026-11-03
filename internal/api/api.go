@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/sorotrail/sorobeacon/internal/apierr"
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/buildinfo"
@@ -473,18 +474,19 @@ func writeNoContent(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// writeErr emits the structured error envelope. The top-level "error"
-// string is kept for clients written against the original shape; the
-// "request_id" field lets a quoted error be mapped to one request in the
-// logs, and "code" gives clients a stable token to branch on.
-//
-// details is purely additive: omitted when empty so existing clients keep
-// working. When present, every validation problem in the request is listed
-// rather than only the first.
+// writeErr emits the structured error envelope using the default taxonomy code for the status.
 func writeErr(w http.ResponseWriter, r *http.Request, status int, msg string, details ...FieldError) {
+	writeErrCode(w, r, status, apierr.CodeFromStatus(status), msg, details...)
+}
+
+// writeErrCode emits the structured error envelope with an explicit machine-readable taxonomy code.
+func writeErrCode(w http.ResponseWriter, r *http.Request, status int, code string, msg string, details ...FieldError) {
+	if code == "" {
+		code = apierr.CodeFromStatus(status)
+	}
 	body := map[string]any{
 		"error":      msg,
-		"code":       http.StatusText(status),
+		"code":       code,
 		"request_id": reqid.From(r),
 	}
 	if len(details) > 0 {
@@ -505,7 +507,7 @@ func writeValidation(w http.ResponseWriter, r *http.Request, details []FieldErro
 	if len(details) > 1 {
 		msg = "validation failed"
 	}
-	writeErr(w, r, http.StatusBadRequest, msg, details...)
+	writeErrCode(w, r, http.StatusBadRequest, apierr.CodeInvalidArgument, msg, details...)
 }
 
 // writeUnprocessable reports problems that make a well-formed request
@@ -517,7 +519,7 @@ func writeUnprocessable(w http.ResponseWriter, r *http.Request, details []FieldE
 	if len(details) == 0 {
 		return
 	}
-	writeErr(w, r, http.StatusUnprocessableEntity, "validation failed", details...)
+	writeErrCode(w, r, http.StatusUnprocessableEntity, apierr.CodeInvalidArgument, "validation failed", details...)
 }
 
 // detailsFromErr turns a Validate / constructor error into envelope
@@ -555,7 +557,7 @@ func joinPath(prefix, field string) string {
 }
 
 func (s *Server) notFound(w http.ResponseWriter, r *http.Request) {
-	writeErr(w, r, http.StatusNotFound, "not found")
+	writeErrCode(w, r, http.StatusNotFound, apierr.CodeNotFound, "not found")
 }
 
 func (s *Server) methodNotAllowed(w http.ResponseWriter, r *http.Request) {
@@ -565,7 +567,7 @@ func (s *Server) methodNotAllowed(w http.ResponseWriter, r *http.Request) {
 	if allow := allowHeader(r); allow != "" {
 		w.Header().Set("Allow", allow)
 	}
-	writeErr(w, r, http.StatusMethodNotAllowed, "method not allowed")
+	writeErrCode(w, r, http.StatusMethodNotAllowed, apierr.CodeMethodNotAllowed, "method not allowed")
 }
 
 func allowHeader(r *http.Request) string {
@@ -594,23 +596,13 @@ func allowHeader(r *http.Request) string {
 	return strings.Join(allow, ", ")
 }
 
-// fail maps store errors to HTTP responses.
+// fail maps store errors to HTTP responses using the error taxonomy.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
-	// A constraint violation is the request's fault, not the server's: it
-	// named a record that does not exist, or a value the database refuses.
-	// Answering 500 would tell the sender the failure is transient, and a
-	// federated sender retries a request that cannot succeed — three times,
-	// and then into the dead-letter queue.
-	if errors.Is(err, store.ErrConstraint) {
-		writeErr(w, r, http.StatusUnprocessableEntity, constraintMessage(err))
-		return
+	c := apierr.Classify(err)
+	if c.Code == apierr.CodeInternalError {
+		s.log.Error("api error", "request_id", reqid.From(r), "err", err)
 	}
-	if errors.Is(err, store.ErrNotFound) {
-		writeErr(w, r, http.StatusNotFound, "not found")
-		return
-	}
-	s.log.Error("api error", "request_id", reqid.From(r), "err", err)
-	writeErr(w, r, http.StatusInternalServerError, "internal error")
+	writeErrCode(w, r, c.Status, c.Code, c.Message)
 }
 
 // constraintMessage describes a constraint violation in the caller's terms.
