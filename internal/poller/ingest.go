@@ -13,6 +13,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/usage"
 )
 
 // IngestStore is the slice of persistence the Ingestor needs. It is a subset
@@ -37,8 +38,9 @@ type Ingestor struct {
 	// live is the optional SSE fan-out. When set, every alert this Ingestor
 	// creates for a live event is published to it; nil (the NewIngestor
 	// default) disables live alerts entirely.
-	live     *broadcast.Broadcaster
-	enricher *alerts.Enricher
+	live       *broadcast.Broadcaster
+	enricher   *alerts.Enricher
+	usageMeter *usage.Meter
 }
 
 // NewIngestor wires an Ingestor. d receives every alert unless the caller
@@ -50,6 +52,12 @@ func NewIngestor(st IngestStore, reg *rules.Registry, d Dispatcher, log *slog.Lo
 // WithMetrics attaches Prometheus instrumentation to alert evaluation.
 func (in *Ingestor) WithMetrics(m *metrics.Metrics) *Ingestor {
 	in.metrics = m
+	return in
+}
+
+// WithUsageMeter attaches per-workspace usage metering to alert evaluation.
+func (in *Ingestor) WithUsageMeter(um *usage.Meter) *Ingestor {
+	in.usageMeter = um
 	return in
 }
 
@@ -98,11 +106,13 @@ func (in *Ingestor) Handle(ctx context.Context, decoded *stellar.DecodedEvent, m
 			in.log.Error("list rules", "monitor_id", m.ID, "err", err)
 			continue
 		}
+		var evals int64
 		for _, rule := range ruleList {
 			// The rule id rides in the context so a stateful evaluator (the
 			// frequency rule) can key its per-rule state.
 			ruleCtx := rules.WithRuleVersion(rules.WithRuleID(ctx, rule.ID), rule.Version)
 			matched, err := in.registry.Evaluate(ruleCtx, rule.Type, decoded, rule.Params)
+			evals++
 			if err != nil {
 				in.log.Warn("rule evaluation failed", "rule_id", rule.ID, "event_id", decoded.ID, "err", err)
 				continue
@@ -125,6 +135,9 @@ func (in *Ingestor) Handle(ctx context.Context, decoded *stellar.DecodedEvent, m
 			if dispatched {
 				res.Dispatched++
 			}
+		}
+		if evals > 0 {
+			in.recordWorkspaceRuleEvaluations(ctx, m.WorkspaceID, evals)
 		}
 	}
 	return res
@@ -192,6 +205,7 @@ func (in *Ingestor) fireAlert(ctx context.Context, m store.Monitor, rule store.R
 			"rule_id", rule.ID, "event_id", ev.ID, "cooldown", alert.Cooldown)
 		return false, false
 	}
+	in.recordWorkspaceAlertRaised(ctx, m.WorkspaceID)
 	logAttrs := []any{"alert_id", alert.ID, "monitor", m.Name, "rule_id", rule.ID, "event_id", ev.ID}
 	if alert.SuppressedSinceLast > 0 {
 		logAttrs = append(logAttrs, "suppressed_since_last", alert.SuppressedSinceLast)
@@ -255,4 +269,37 @@ func ruleCooldown(rule store.Rule) time.Duration {
 		return 0
 	}
 	return d
+}
+
+func (in *Ingestor) recordWorkspaceRuleEvaluations(ctx context.Context, workspaceID string, n int64) {
+	if n <= 0 {
+		return
+	}
+	if in.usageMeter != nil {
+		in.usageMeter.RecordRuleEvaluations(workspaceID, n)
+		return
+	}
+	if in.metrics != nil {
+		in.metrics.RecordWorkspaceRuleEvaluations(workspaceID, n)
+	}
+	if uStore, ok := in.store.(store.Usage); ok {
+		_ = store.SafeRecordWorkspaceUsageBatch(ctx, uStore, []store.WorkspaceUsageDelta{
+			{WorkspaceID: workspaceID, RuleEvaluations: n},
+		})
+	}
+}
+
+func (in *Ingestor) recordWorkspaceAlertRaised(ctx context.Context, workspaceID string) {
+	if in.usageMeter != nil {
+		in.usageMeter.RecordAlertRaised(workspaceID, 1)
+		return
+	}
+	if in.metrics != nil {
+		in.metrics.RecordWorkspaceAlertRaised(workspaceID, 1)
+	}
+	if uStore, ok := in.store.(store.Usage); ok {
+		_ = store.SafeRecordWorkspaceUsageBatch(ctx, uStore, []store.WorkspaceUsageDelta{
+			{WorkspaceID: workspaceID, AlertsRaised: 1},
+		})
+	}
 }

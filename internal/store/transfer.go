@@ -89,6 +89,8 @@ var transferTables = []transferTable{
 	{name: "audit_log", key: []string{"id"}},
 	{name: "api_tokens", key: []string{"id"}},
 	{name: "persisted_operations", key: []string{"id"}},
+	{name: "workspace_usage_rollups", key: []string{"workspace_id", "period_start"}},
+	{name: "workspace_notification_usage_rollups", key: []string{"workspace_id", "period_start", "channel_type", "outcome"}},
 }
 
 // transferDerived marks plan tables that only one backend physically has,

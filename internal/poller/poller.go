@@ -26,6 +26,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
 	"github.com/sorotrail/sorobeacon/internal/telemetry"
+	"github.com/sorotrail/sorobeacon/internal/usage"
 )
 
 // Position is a race-free snapshot of how far the poller has got relative
@@ -160,6 +161,7 @@ type Poller struct {
 	// slowRuleThreshold is the duration after which a rule evaluation is
 	// considered slow and logged. Zero disables slow rule logging.
 	slowRuleThreshold time.Duration
+	usageMeter        *usage.Meter
 }
 
 // Position returns the last successful poll snapshot. Safe to call from
@@ -226,6 +228,14 @@ func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval 
 func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
 	p.metrics = m
 	p.ing = p.ing.WithMetrics(m)
+	return p
+}
+
+// WithUsageMeter attaches per-workspace usage metering to the poller and its
+// shared Ingestor.
+func (p *Poller) WithUsageMeter(um *usage.Meter) *Poller {
+	p.usageMeter = um
+	p.ing = p.ing.WithUsageMeter(um)
 	return p
 }
 
@@ -826,6 +836,7 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 			processed = false
 			continue
 		}
+		var evals int64
 		for _, rule := range ruleList {
 			// An absence rule is re-armed by a matching event and fired by
 			// the sweep; evaluating it here would be asking the wrong
@@ -839,6 +850,7 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 			// The rule id rides in the context so a stateful evaluator (the
 			// frequency rule) can key its per-rule state.
 			p.evaluations++
+			evals++
 			ruleCtx := rules.WithRuleVersion(rules.WithRuleID(ctx, rule.ID), rule.Version)
 			start := time.Now()
 			matched, err := p.registry.Evaluate(ruleCtx, rule.Type, decoded, rule.Params)
@@ -864,6 +876,9 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 					processed = false
 				}
 			}
+		}
+		if evals > 0 {
+			p.recordWorkspaceRuleEvaluations(ctx, m.WorkspaceID, evals)
 		}
 	}
 	return processed
@@ -942,6 +957,7 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 			"rule_id", rule.ID, "event_id", ev.ID, "cooldown", alert.Cooldown)
 		return true
 	}
+	p.recordWorkspaceAlertRaised(ctx, m.WorkspaceID)
 	logAttrs := []any{"alert_id", alert.ID, "monitor", m.Name, "rule_id", rule.ID, "event_id", ev.ID}
 	if alert.SuppressedSinceLast > 0 {
 		logAttrs = append(logAttrs, "suppressed_since_last", alert.SuppressedSinceLast)
@@ -1150,6 +1166,7 @@ func (p *Poller) fireAbsence(ctx context.Context, m store.Monitor, rule store.Ru
 		return
 	}
 	p.metrics.RecordAlert()
+	p.recordWorkspaceAlertRaised(ctx, m.WorkspaceID)
 	p.log.Info("absence alert created",
 		"alert_id", alert.ID, "monitor", m.Name, "rule_id", rule.ID,
 		"event_name", spec.EventName, "silent_for", silent)
@@ -1182,4 +1199,37 @@ func (p *Poller) fireAbsence(ctx context.Context, m store.Monitor, rule store.Ru
 // built from lives in the database.
 func AbsenceEventID(lastSeen time.Time) string {
 	return "absence-" + strconv.FormatInt(lastSeen.UTC().UnixNano(), 10)
+}
+
+func (p *Poller) recordWorkspaceRuleEvaluations(ctx context.Context, workspaceID string, n int64) {
+	if n <= 0 {
+		return
+	}
+	if p.usageMeter != nil {
+		p.usageMeter.RecordRuleEvaluations(workspaceID, n)
+		return
+	}
+	if p.metrics != nil {
+		p.metrics.RecordWorkspaceRuleEvaluations(workspaceID, n)
+	}
+	if uStore, ok := p.store.(store.Usage); ok {
+		_ = store.SafeRecordWorkspaceUsageBatch(ctx, uStore, []store.WorkspaceUsageDelta{
+			{WorkspaceID: workspaceID, RuleEvaluations: n},
+		})
+	}
+}
+
+func (p *Poller) recordWorkspaceAlertRaised(ctx context.Context, workspaceID string) {
+	if p.usageMeter != nil {
+		p.usageMeter.RecordAlertRaised(workspaceID, 1)
+		return
+	}
+	if p.metrics != nil {
+		p.metrics.RecordWorkspaceAlertRaised(workspaceID, 1)
+	}
+	if uStore, ok := p.store.(store.Usage); ok {
+		_ = store.SafeRecordWorkspaceUsageBatch(ctx, uStore, []store.WorkspaceUsageDelta{
+			{WorkspaceID: workspaceID, AlertsRaised: 1},
+		})
+	}
 }

@@ -190,6 +190,7 @@ var knownRouteBindings = []routeBinding{
 	{"GET", "/rule-types", "listRuleTypes"},
 	{"GET", "/stats", "getStats"},
 	{"GET", "/stats/alerts-daily", "getDailyAlertCounts"},
+	{"GET", "/usage", "getUsage"},
 	{"GET", "/audit", "listAuditLogs"},
 	{"GET", "/templates", "listTemplates"},
 	{"POST", "/templates", "createTemplate"},
@@ -2016,6 +2017,16 @@ export class SoroBeaconClient {
     options?: RequestOptions,
   ): Promise<DailyAlertCountsResponse> {
     return this.request<DailyAlertCountsResponse>("GET", "/stats/alerts-daily", {
+      requestOptions: options,
+    });
+  }
+
+  async getUsage(
+    params?: { from?: string; to?: string; workspace?: string },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>("GET", "/usage", {
+      query: params as Record<string, unknown>,
       requestOptions: options,
     });
   }

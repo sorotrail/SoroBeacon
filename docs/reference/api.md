@@ -438,6 +438,7 @@ Three behaviours worth knowing before you script against this:
 | `GET /rule-types` | Machine-readable vocabulary of rule types: `200 {"rule_types": [{"type", "parameters": [{"name", "type", …}]}, …]}`, sorted by type — the schema `POST /monitors/{id}/rules` validates against. | `none` |
 | `GET /stats` | Counts (monitors, rules, channels, alerts, alerts last 24h), last ingested ledger, last poll time. | `stats:read` |
 | `GET /stats/alerts-daily` | Daily alert counts for the last 30 UTC calendar days. Quiet days are explicit zeroes. `{"timezone":"UTC","days":[{"day":"2026-09-01","count":0}, ...]}`. | `alerts:read` |
+| `GET /usage` | Per-workspace usage metering summary (`rule_evaluations`, `alerts_raised`, `notifications_by_type`, `storage`, and daily series). Query: `from`, `to` (`YYYY-MM-DD`, default last 30 UTC days), and optional `workspace` (`all` or workspace ID, admin-only). | `stats:read` |
 | `GET /audit` | Append-only log of monitor, rule and channel changes, newest first. Query: `target_type` (`monitor`\|`rule`\|`channel`), `target_id`, `from`/`to` (RFC 3339), `limit` (≤500, default 50). Each entry has `actor` (the request ID), `action` (`create`\|`update`\|`delete`), `target_type`, `target_id`, `diff` and `created_at`. `diff` records the *names* of the fields that were sent, never their values — a channel's config holds webhook URLs and tokens and is never stored. There is no endpoint to update or delete entries. | `monitors:read` |
 
 ## Federation

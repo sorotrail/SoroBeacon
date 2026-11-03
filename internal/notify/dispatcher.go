@@ -19,6 +19,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/store"
 	"github.com/sorotrail/sorobeacon/internal/telemetry"
+	"github.com/sorotrail/sorobeacon/internal/usage"
 	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
@@ -121,6 +122,7 @@ type Dispatcher struct {
 	now           func() time.Time
 	flapping      alerts.FlappingConfig
 	monitorBudget *MonitorBudgetTracker
+	usageMeter    *usage.Meter
 }
 
 // NewDispatcher wires a Dispatcher with default retry settings.
@@ -225,6 +227,12 @@ func (d *Dispatcher) DisableAfterFailures() int {
 // WithMetrics attaches delivery instrumentation.
 func (d *Dispatcher) WithMetrics(m *metrics.Metrics) *Dispatcher {
 	d.metrics = m
+	return d
+}
+
+// WithUsageMeter attaches per-workspace usage metering to notification delivery.
+func (d *Dispatcher) WithUsageMeter(um *usage.Meter) *Dispatcher {
+	d.usageMeter = um
 	return d
 }
 
@@ -517,6 +525,7 @@ func (d *Dispatcher) flushDigest(ctx context.Context, ch store.Channel, pending 
 		if d.metrics != nil {
 			d.metrics.RecordDelivery(ch.Type, false)
 		}
+		d.recordWorkspaceNotification(ctx, ch, "error")
 		d.log.Warn("digest delivery failed; keeping the window for the next flush",
 			"channel_id", ch.ID, "count", len(alerts), "err", err)
 		return
@@ -524,6 +533,7 @@ func (d *Dispatcher) flushDigest(ctx context.Context, ch store.Channel, pending 
 	if d.metrics != nil {
 		d.metrics.RecordDelivery(ch.Type, true)
 	}
+	d.recordWorkspaceNotification(ctx, ch, "ok")
 	d.log.Info("digest delivered", "channel_id", ch.ID, "count", len(alerts))
 	d.clearDigest(ctx, ch.ID, ids)
 }
@@ -582,6 +592,7 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 			if d.metrics != nil {
 				d.metrics.RecordThrottle(ch.Type)
 			}
+			d.recordWorkspaceNotification(ctx, ch, "throttled")
 			d.log.Warn("channel rate limit wait failed", "channel_id", ch.ID, "channel_type", ch.Type, "err", err)
 		}
 	}
@@ -608,6 +619,7 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 		safeErr := sanitizeDeliveryError(err)
 		d.record(ctx, a.ID, ch.ID, "failed", safeErr.Error())
 		d.recordHealth(ctx, ch.ID, store.ChannelHealthUpdate{Error: safeErr.Error(), Permanent: true})
+		d.recordWorkspaceNotification(ctx, ch, "error")
 		d.log.Error("build notifier", "channel_id", ch.ID, "channel_type", ch.Type, "err", safeErr)
 		telemetry.RecordError(span, safeErr)
 		cb.RecordFailure()
@@ -633,6 +645,7 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 			if d.metrics != nil {
 				d.metrics.RecordDelivery(ch.Type, true)
 			}
+			d.recordWorkspaceNotification(ctx, ch, "ok")
 			d.record(ctx, a.ID, ch.ID, "success", "")
 			d.recordHealth(ctx, ch.ID, store.ChannelHealthUpdate{Success: true})
 			d.log.Info("alert delivered", "alert_id", a.ID, "channel_id", ch.ID, "attempt", attempt)
@@ -666,11 +679,14 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 		permanent = permanent || IsPermanent(err)
 
 		// Honor Retry-After if present in error message or headers
+		outcome := "error"
 		if errStr := err.Error(); strings.Contains(errStr, "Retry-After") || strings.Contains(errStr, "429") {
+			outcome = "throttled"
 			if d.metrics != nil {
 				d.metrics.RecordThrottle(ch.Type)
 			}
 		}
+		d.recordWorkspaceNotification(ctx, ch, outcome)
 
 		// A receiver that rejected the request itself (a 4xx that is not a
 		// "come back later" answer) will reject it again, so the delivery is
@@ -847,10 +863,12 @@ func (d *Dispatcher) RedriveDeadLetter(ctx context.Context, deadLetterID int64, 
 	err = notifier.Send(attemptCtx, alertObj)
 	if err != nil {
 		safeErr := sanitizeDeliveryError(redactURLError(err))
+		d.recordWorkspaceNotification(ctx, *ch, "error")
 		d.record(ctx, alert.ID, ch.ID, "failed", "redrive: "+safeErr.Error())
 		return safeErr
 	}
 
+	d.recordWorkspaceNotification(ctx, *ch, "ok")
 	d.record(ctx, alert.ID, ch.ID, "success", "redrive: success")
 	if err := d.store.DeleteDeadLetter(ctx, deadLetterID); err != nil {
 		d.log.Error("delete dead letter after successful redrive", "dead_letter_id", deadLetterID, "err", err)
@@ -918,12 +936,14 @@ func (d *Dispatcher) Retry(ctx context.Context, a Alert, ch store.Channel) *stor
 			if d.metrics != nil {
 				d.metrics.RecordThrottle(ch.Type)
 			}
+			d.recordWorkspaceNotification(ctx, ch, "throttled")
 		}
 	}
 	notifier, err := d.factory.New(ch.Type, ch.Config)
 	if err != nil {
 		d.log.Error("build notifier", "channel_id", ch.ID, "channel_type", ch.Type, "err", err)
 		d.recordHealth(ctx, ch.ID, store.ChannelHealthUpdate{Error: err.Error(), Permanent: true})
+		d.recordWorkspaceNotification(ctx, ch, "error")
 		return d.record(ctx, a.ID, ch.ID, "failed", err.Error())
 	}
 	timeout := ch.TimeoutDuration()
@@ -934,6 +954,7 @@ func (d *Dispatcher) Retry(ctx context.Context, a Alert, ch store.Channel) *stor
 		if d.metrics != nil {
 			d.metrics.RecordDelivery(ch.Type, true)
 		}
+		d.recordWorkspaceNotification(ctx, ch, "ok")
 		d.recordHealth(ctx, ch.ID, store.ChannelHealthUpdate{Success: true})
 		d.log.Info("alert delivered", "alert_id", a.ID, "channel_id", ch.ID, "attempt", "retry")
 		return d.record(ctx, a.ID, ch.ID, "success", "")
@@ -941,6 +962,7 @@ func (d *Dispatcher) Retry(ctx context.Context, a Alert, ch store.Channel) *stor
 	if d.metrics != nil {
 		d.metrics.RecordDelivery(ch.Type, false)
 	}
+	d.recordWorkspaceNotification(ctx, ch, "error")
 	d.log.Warn("alert delivery failed", "alert_id", a.ID, "channel_id", ch.ID, "attempt", "retry", "err", err)
 	// A manual retry is a real delivery outcome, so it counts: an operator who
 	// fixes a channel and re-sends the alert should see the channel recover,
@@ -962,4 +984,30 @@ func (d *Dispatcher) Shutdown(ctx context.Context, gracePeriod time.Duration) er
 	// know to stop marking permanent failures and instead just return.
 	d.log.Info("shutting down dispatcher", "grace_period", gracePeriod)
 	return nil
+}
+
+func (d *Dispatcher) recordWorkspaceNotification(ctx context.Context, ch store.Channel, outcome string) {
+	wsID := ch.WorkspaceID
+	if wsID == "" {
+		if ws, ok := workspace.From(ctx); ok && !workspace.System(ctx) {
+			wsID = string(ws)
+		}
+	}
+	if d.usageMeter != nil {
+		d.usageMeter.RecordNotification(wsID, ch.Type, outcome, 1)
+		return
+	}
+	if d.metrics != nil {
+		d.metrics.RecordWorkspaceNotification(wsID, ch.Type, outcome, 1)
+	}
+	if uStore, ok := d.store.(store.Usage); ok {
+		_ = store.SafeRecordWorkspaceUsageBatch(ctx, uStore, []store.WorkspaceUsageDelta{
+			{
+				WorkspaceID: wsID,
+				Notifications: []store.WorkspaceNotificationUsage{
+					{ChannelType: ch.Type, Outcome: outcome, Count: 1},
+				},
+			},
+		})
+	}
 }

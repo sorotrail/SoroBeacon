@@ -192,6 +192,7 @@ var knownRouteBindings = []routeBinding{
 	{"GET", "/rule-types", "list_rule_types"},
 	{"GET", "/stats", "get_stats"},
 	{"GET", "/stats/alerts-daily", "get_daily_alert_counts"},
+	{"GET", "/usage", "get_usage"},
 	{"GET", "/audit", "list_audit_logs"},
 	{"GET", "/templates", "list_templates"},
 	{"POST", "/templates", "create_template"},
@@ -2170,6 +2171,14 @@ func writeClientClass(b *bytes.Buffer) {
         headers: Mapping[str, str] | None = None,
     ) -> DailyAlertCountsResponse:
         return self._request("GET", "/stats/alerts-daily", headers=headers)
+
+    def get_usage(
+        self,
+        params: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        return self._request("GET", "/usage", query=params, headers=headers)
 
     def list_audit_logs(
         self,

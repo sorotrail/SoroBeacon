@@ -108,6 +108,7 @@ var routeRoles = auth.NewRouteTable(map[string]auth.Role{
 	// Statistics are a view of the instance, not a change to it.
 	"GET /stats":              auth.RoleViewer,
 	"GET /stats/alerts-daily": auth.RoleViewer,
+	"GET /usage":              auth.RoleViewer,
 
 	// Credentials are administrative: minting one is minting authority, and
 	// the audit log is the instance's record of who has been doing what.

@@ -970,6 +970,7 @@ OPENAPI_OPERATIONS: tuple[dict[str, str], ...] = (
     {"method": "GET", "path": "/rule-types", "client_method": "list_rule_types", "summary": "List rule types and parameter schemas"},
     {"method": "GET", "path": "/stats", "client_method": "get_stats", "summary": "Service statistics"},
     {"method": "GET", "path": "/stats/alerts-daily", "client_method": "get_daily_alert_counts", "summary": "Daily alert counts for the last 30 UTC days"},
+    {"method": "GET", "path": "/usage", "client_method": "get_usage", "summary": "Per-workspace usage metering summary"},
     {"method": "GET", "path": "/audit", "client_method": "list_audit_logs", "summary": "Audit log of configuration changes"},
     {"method": "GET", "path": "/templates", "client_method": "list_templates", "summary": "List monitor templates"},
     {"method": "POST", "path": "/templates", "client_method": "create_template", "summary": "Create a monitor template"},
@@ -2025,6 +2026,14 @@ class SoroBeaconClient:
         headers: Mapping[str, str] | None = None,
     ) -> DailyAlertCountsResponse:
         return self._request("GET", "/stats/alerts-daily", headers=headers)
+
+    def get_usage(
+        self,
+        params: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        return self._request("GET", "/usage", query=params, headers=headers)
 
     def list_audit_logs(
         self,
