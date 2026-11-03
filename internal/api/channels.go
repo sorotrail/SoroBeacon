@@ -318,10 +318,6 @@ func (s *Server) deleteChannel(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, r, http.StatusBadRequest, "invalid id")
 		return
 	}
-	if _, err := s.store.GetChannel(r.Context(), id); err != nil {
-		s.fail(w, r, err)
-		return
-	}
 	if err := s.store.DeleteChannel(r.Context(), id); err != nil {
 		// A channel referenced by an escalation step must be detached first;
 		// a 409 says so instead of leaving a dangling reference behind.
