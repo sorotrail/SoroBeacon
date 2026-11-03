@@ -210,7 +210,7 @@ Compute the HMAC over the raw bytes you received — re-serializing the JSON fir
 
 SoroBeacon supports overlapping keys so a channel's signing secret can be rotated without downtime or dropped deliveries:
 
-1. **Rotate the key**: Call `POST /api/v1/channels/{id}/keys/rotate` (or `POST /api/v1/channels/{id}/rotate-signing-key`).
+1. **Rotate the key**: Call `POST /api/v1/channels/{id}/keys/rotate`.
    The API generates a new key ID (`key_id`) and secret, marks the new key as `is_current: true`, and returns the secret **once**:
    ```json
    {

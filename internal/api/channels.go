@@ -579,7 +579,7 @@ type rotateSigningKeyRequest struct {
 	Secret string `json:"secret"`
 }
 
-// rotateChannelSigningKey serves POST /channels/{id}/keys/rotate and POST /channels/{id}/rotate-signing-key.
+// rotateChannelSigningKey serves POST /channels/{id}/keys/rotate.
 // It generates a new signing key (or accepts one), promotes it to current, and retains the previous key
 // in the active set for overlap verification. The secret is returned only once in this response.
 func (s *Server) rotateChannelSigningKey(w http.ResponseWriter, r *http.Request) {

@@ -56,7 +56,6 @@ var routeScopes = auth.NewRouteTable(map[string][]auth.Scope{
 	"POST /channels/{id}/duplicate": {auth.ScopeChannelsWrite},
 	"GET /channels/{id}/keys":                 {auth.ScopeChannelsRead},
 	"POST /channels/{id}/keys/rotate":         {auth.ScopeChannelsWrite},
-	"POST /channels/{id}/rotate-signing-key": {auth.ScopeChannelsWrite},
 	"POST /channels/{id}/keys/{keyID}/retire": {auth.ScopeChannelsWrite},
 	"POST /channels/{id}/keys/{keyID}/revoke": {auth.ScopeChannelsWrite},
 

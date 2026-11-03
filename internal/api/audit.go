@@ -169,7 +169,7 @@ func auditRoute(method, pattern string) (auditSpec, bool) {
 		case http.MethodDelete:
 			return auditSpec{store.AuditActionDelete, "channel"}, true
 		}
-	case "/channels/{id}/keys/rotate", "/channels/{id}/rotate-signing-key":
+	case "/channels/{id}/keys/rotate":
 		if method == http.MethodPost {
 			return auditSpec{store.AuditActionUpdate, "channel"}, true
 		}

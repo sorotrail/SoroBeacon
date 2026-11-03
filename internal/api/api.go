@@ -328,7 +328,6 @@ func (s *Server) Routes() chi.Router {
 		r.Post("/{id}/test", s.testChannel)
 		r.Get("/{id}/keys", s.listChannelSigningKeys)
 		r.Post("/{id}/keys/rotate", s.rotateChannelSigningKey)
-		r.Post("/{id}/rotate-signing-key", s.rotateChannelSigningKey)
 		r.Post("/{id}/keys/{keyID}/retire", s.retireChannelSigningKey)
 		r.Post("/{id}/keys/{keyID}/revoke", s.revokeChannelSigningKey)
 	})

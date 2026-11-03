@@ -84,7 +84,7 @@ func TestAPI_ChannelSigningKeyRotationLifecycle(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, wRetireCurr.Code)
 
 	// 5. Rotate again to generate a new key
-	reqRot2 := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/channels/%d/rotate-signing-key", ch.ID), bytes.NewReader([]byte(`{}`)))
+	reqRot2 := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/channels/%d/keys/rotate", ch.ID), bytes.NewReader([]byte(`{}`)))
 	wRot2 := httptest.NewRecorder()
 	mux.ServeHTTP(wRot2, reqRot2)
 	require.Equal(t, http.StatusCreated, wRot2.Code)

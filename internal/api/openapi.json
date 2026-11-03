@@ -837,6 +837,100 @@
         }
       }
     },
+    "/channels/{id}/keys": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "get": {
+        "summary": "List signing keys for a channel",
+        "responses": {
+          "200": {
+            "description": "List of signing keys without secrets"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/channels/{id}/keys/rotate": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "post": {
+        "summary": "Rotate channel signing key with overlap",
+        "responses": {
+          "201": {
+            "description": "Key rotated; secret returned once"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/channels/{id}/keys/{keyID}/retire": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        },
+        {
+          "name": "keyID",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Retire a channel signing key",
+        "responses": {
+          "200": {
+            "description": "Key retired"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/channels/{id}/keys/{keyID}/revoke": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        },
+        {
+          "name": "keyID",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Revoke a channel signing key immediately",
+        "responses": {
+          "200": {
+            "description": "Key revoked"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/maintenance-windows": {
       "post": {
         "summary": "Create a maintenance window",

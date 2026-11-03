@@ -204,6 +204,10 @@ curl -s -X POST localhost:8080/api/v1/templates/1/instantiate -d '{
 | `POST /channels/{id}/test` | Send a synthetic alert through the channel right now. `200 {"status":"sent"}` or `502 {"status":"failed","error":"..."}`. | `channels:write` |
 | `POST /channels/bulk` | Enable or disable up to 100 channels in one call. Body: `ids` (1–100), `enabled` (required). **Partial**, with the same contract as `POST /monitors/bulk`: unknown ids are reported in `200 {"updated", "unknown_ids", "enabled"}` and do not stop the known ones. Disabling only flips the flag — queued and in-flight deliveries are not touched. | `channels:write` |
 | `POST /channels/{id}/duplicate` | Copy a channel under a unique name, credentials in `config` included (that is the point: re-typing a webhook URL to change only the room is the toil this removes). The copy is **always created disabled** — a new destination is reviewed before it receives anything — and has no monitor attachments. `201` with the new channel; the config is decrypted and re-encrypted through the store's own paths and never reaches a log. | `channels:write` |
+| `GET /channels/{id}/keys` | List signing keys for a channel. Key secret is never returned. | `channels:read` |
+| `POST /channels/{id}/keys/rotate` | Rotate channel signing key, generating a successor while maintaining overlap. Returns new secret once. | `channels:write` |
+| `POST /channels/{id}/keys/{keyID}/retire` | Retire a signing key so it is no longer used for new signing but accepted during overlap. | `channels:write` |
+| `POST /channels/{id}/keys/{keyID}/revoke` | Revoke a signing key immediately. | `channels:write` |
 
 Config shapes per type: [Discord](../channels/discord.md) · [Slack](../channels/slack.md) · [Telegram](../channels/telegram.md) · [ntfy](../channels/ntfy.md) · [Email](../channels/email.md) · [Webhook](../channels/webhook.md)
 

@@ -66,7 +66,6 @@ var routeRoles = auth.NewRouteTable(map[string]auth.Role{
 	"POST /channels/{id}/test":      auth.RoleEditor,
 	"GET /channels/{id}/keys":       auth.RoleViewer,
 	"POST /channels/{id}/keys/rotate": auth.RoleEditor,
-	"POST /channels/{id}/rotate-signing-key": auth.RoleEditor,
 	"POST /channels/{id}/keys/{keyID}/retire": auth.RoleEditor,
 	"POST /channels/{id}/keys/{keyID}/revoke": auth.RoleEditor,
 
