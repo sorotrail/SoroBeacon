@@ -64,6 +64,10 @@ var routeRoles = auth.NewRouteTable(map[string]auth.Role{
 	"POST /channels/bulk":           auth.RoleEditor,
 	"POST /channels/{id}/duplicate": auth.RoleEditor,
 	"POST /channels/{id}/test":      auth.RoleEditor,
+	"GET /channels/{id}/keys":       auth.RoleViewer,
+	"POST /channels/{id}/keys/rotate": auth.RoleEditor,
+	"POST /channels/{id}/keys/{keyID}/retire": auth.RoleEditor,
+	"POST /channels/{id}/keys/{keyID}/revoke": auth.RoleEditor,
 
 	// Templates hold monitors and rules, so instantiating one is an editor's
 	// decision too.

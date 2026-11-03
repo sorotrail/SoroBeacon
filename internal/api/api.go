@@ -326,6 +326,10 @@ func (s *Server) Routes() chi.Router {
 		r.Patch("/{id}", s.updateChannel)
 		r.Delete("/{id}", s.deleteChannel)
 		r.Post("/{id}/test", s.testChannel)
+		r.Get("/{id}/keys", s.listChannelSigningKeys)
+		r.Post("/{id}/keys/rotate", s.rotateChannelSigningKey)
+		r.Post("/{id}/keys/{keyID}/retire", s.retireChannelSigningKey)
+		r.Post("/{id}/keys/{keyID}/revoke", s.revokeChannelSigningKey)
 	})
 
 	mux.Route("/maintenance-windows", func(r chi.Router) {

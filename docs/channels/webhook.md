@@ -30,29 +30,39 @@ If SoroBeacon's API requires authentication, add `-H 'Authorization: Bearer <api
 
 ## Headers
 
-Every request carries three headers:
+Every request carries headers that authenticate and identify the delivery:
 
 | Header | Example | Description |
 | --- | --- | --- |
 | `X-SoroBeacon-Timestamp` | `1700000000` | Decimal Unix seconds the signature covers. |
-| `X-SoroBeacon-Signature` | `b7ae34…` | Hex HMAC-SHA256 over the canonical string under `secret`. |
-| `X-SoroBeacon-Signature-Previous` | `d88c5d…` | Same signature under `previous_secret`. Sent only when `previous_secret` is set. |
+| `X-SoroBeacon-Signature` | `b7ae34…` | Hex HMAC-SHA256 over the canonical string under the current signing key. |
+| `X-SoroBeacon-Signature-Previous` | `d88c5d…` | Same signature under the rotating-out key. Sent during rotation overlap. |
+| `X-SoroBeacon-Key-ID` | `csk_8f1b3c9e` | Key identifier that signed this delivery so consumers select the right secret directly. |
+| `X-SoroBeacon-Idempotency-Key` | `0000015985-001` | Stable event identifier (`event_id`) so receivers can deduplicate retries. |
 
 ## The canonical string
 
-The signature covers the timestamp **and** the body, separated by a single `.`:
+The signature covers the key identifier, timestamp, idempotency key, and body, separated by `.`:
+
+```
+<X-SoroBeacon-Key-ID>.<X-SoroBeacon-Timestamp>.<X-SoroBeacon-Idempotency-Key>.<raw request body>
+```
+
+When no key ID or idempotency key is configured (legacy single-secret mode), it matches the historical format:
 
 ```
 <X-SoroBeacon-Timestamp>.<raw request body>
 ```
 
-For example, a delivery at `1700000000` with body `{"event_id":"e1"}` is signed over exactly these bytes:
+For example, a delivery with key ID `csk_v2`, timestamp `1700000000`, idempotency key `e1`, and body `{"event_id":"e1"}` is signed over exactly these bytes:
 
 ```
-1700000000.{"event_id":"e1"}
+csk_v2.1700000000.e1.{"event_id":"e1"}
 ```
 
-The digest is `HMAC-SHA256(secret, canonicalString)`, hex encoded. `internal/notify.Sign(secret, timestamp, body)` computes it.
+**Security rationale**: Incorporating `X-SoroBeacon-Key-ID` and idempotency into the signed canonical string ensures that nothing security-relevant sits outside the HMAC envelope. An attacker modifying the key identifier header in flight cannot steer the verification to a weaker or retired key.
+
+The digest is `HMAC-SHA256(secret, canonicalString)`, hex encoded. `internal/notify.SignCanonical` computes it.
 
 The generic webhook sends structured JSON rather than the plain-text summary,
 so it has no [`template`](templates.md) option. Transform the payload in your
@@ -128,58 +138,106 @@ verify the signature and timestamp before trusting or acting on a delivery.
 Recompute the HMAC over the **raw bytes you received** — re-serializing the JSON first changes key order and whitespace and breaks verification. Also reject stale timestamps: the timestamp is in the signed string precisely so a captured request cannot be replayed later.
 
 ```go
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
+	"net/http"
+	"strconv"
+	"time"
+)
+
 const maxSkew = 5 * time.Minute
 
 // verify reports whether r is an authentic, fresh SoroBeacon delivery.
+// keys is a map of key_id -> secret bytes known to your receiver.
 // Call it with the raw request body before unmarshalling the JSON.
-func verify(r *http.Request, body []byte, secret, previousSecret string) bool {
-	ts, err := strconv.ParseInt(r.Header.Get("X-SoroBeacon-Timestamp"), 10, 64)
+func verify(r *http.Request, body []byte, keys map[string][]byte) bool {
+	tsStr := r.Header.Get("X-SoroBeacon-Timestamp")
+	ts, err := strconv.ParseInt(tsStr, 10, 64)
 	if err != nil {
 		return false // missing or malformed timestamp
 	}
-	// Replay check: the timestamp is part of the signed string, so an old
-	// signature cannot be reused with a fresh timestamp.
+	// Replay protection: reject requests older than maxSkew.
 	if time.Since(time.Unix(ts, 0)).Abs() > maxSkew {
 		return false
 	}
 
-	canonical := strconv.FormatInt(ts, 10) + "." + string(body)
+	keyID := r.Header.Get("X-SoroBeacon-Key-ID")
+	idemKey := r.Header.Get("X-SoroBeacon-Idempotency-Key")
+	sig := r.Header.Get("X-SoroBeacon-Signature")
 
-	// Accept either the current or the rotating-out secret. Check all
-	// candidates before returning so the comparison time doesn't reveal
-	// which key matched.
-	ok := false
-	for _, key := range []string{secret, previousSecret} {
-		if key == "" {
-			continue
+	// 1. If key identifier header is present, select that key directly.
+	if keyID != "" {
+		key, ok := keys[keyID]
+		if !ok {
+			return false // unknown key ID
 		}
-		mac := hmac.New(sha256.New, []byte(key))
-		mac.Write([]byte(canonical))
+		// The signature covers: <key_id>.<timestamp>.<idempotency_key>.<body>
+		var canonical []byte
+		if idemKey != "" {
+			canonical = []byte(keyID + "." + tsStr + "." + idemKey + "." + string(body))
+		} else {
+			canonical = []byte(keyID + "." + tsStr + "." + string(body))
+		}
+		mac := hmac.New(sha256.New, key)
+		mac.Write(canonical)
 		expected := hex.EncodeToString(mac.Sum(nil))
-		for _, header := range []string{
-			"X-SoroBeacon-Signature",
-			"X-SoroBeacon-Signature-Previous",
-		} {
-			if hmac.Equal([]byte(expected), []byte(r.Header.Get(header))) {
-				ok = true
-			}
+		return subtle.ConstantTimeCompare([]byte(expected), []byte(sig)) == 1
+	}
+
+	// 2. Legacy delivery without key ID: check candidate keys in constant time.
+	canonical := []byte(tsStr + "." + string(body))
+	valid := false
+	for _, key := range keys {
+		mac := hmac.New(sha256.New, key)
+		mac.Write(canonical)
+		expected := hex.EncodeToString(mac.Sum(nil))
+		if subtle.ConstantTimeCompare([]byte(expected), []byte(sig)) == 1 {
+			valid = true
 		}
 	}
-	return ok
+	return valid
 }
 ```
 
 {% hint style="warning" %}
-Compute the HMAC over the raw bytes you received — re-serializing the JSON first will change key order/whitespace and break verification.
+Compute the HMAC over the raw bytes you received — re-serializing the JSON first will change key order/whitespace and break verification. Always use `subtle.ConstantTimeCompare` or `hmac.Equal` to prevent timing attacks.
 {% endhint %}
 
-### Rotating the secret
+### Rotating signing keys without downtime
 
-To rotate without dropping deliveries:
+SoroBeacon supports overlapping keys so a channel's signing secret can be rotated without downtime or dropped deliveries:
 
-1. Put the **current** secret in `previous_secret` and the **new** secret in `secret`. SoroBeacon now sends both signatures.
-2. Update your receiver to verify against the new key (accepting either, as above).
-3. Once you are satisfied, clear `previous_secret`. Only `X-SoroBeacon-Signature` is sent from then on.
+1. **Rotate the key**: Call `POST /api/v1/channels/{id}/keys/rotate`.
+   The API generates a new key ID (`key_id`) and secret, marks the new key as `is_current: true`, and returns the secret **once**:
+   ```json
+   {
+     "key_id": "csk_a4f102c9",
+     "secret": "9a38f…",
+     "is_current": true,
+     "status": "active",
+     "created_at": "2026-11-03T01:00:00Z"
+   }
+   ```
+2. **Overlap period**: Add the new key to your receiver's keyring (`keys["csk_a4f102c9"] = ...`). The receiver continues to accept both the old key and the new key based on `X-SoroBeacon-Key-ID`. SoroBeacon signs new deliveries with the current key.
+3. **Visibility**: Inspect key status with `GET /api/v1/channels/{id}/keys`. The API lists all configured keys, their lifecycle `status`, and `last_used_at` timestamps without exposing secrets.
+4. **Retire the old key**: Once all traffic has migrated to the new key, deliberately retire the previous key:
+   ```sh
+   curl -X POST http://localhost:8080/api/v1/channels/1/keys/csk_old_key/retire -H 'Authorization: Bearer <token>'
+   ```
+   Retiring the current key is prevented by the API (`400 Bad Request`).
+
+### Emergency revocation
+
+If a key is disclosed or compromised, revoke it immediately via the emergency path:
+
+```sh
+curl -X POST http://localhost:8080/api/v1/channels/1/keys/csk_compromised/revoke -H 'Authorization: Bearer <token>'
+```
+
+Revoked keys are permanently invalidated immediately. Deliveries under revoked keys are rejected by receivers.
 
 ## Run a local receiver
 

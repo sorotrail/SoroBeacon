@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
@@ -548,4 +549,235 @@ func (s *Server) channelStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, channelStatsResponse{ChannelDeliveryStats: stats, Window: windowLabel})
+}
+
+// listChannelSigningKeys serves GET /channels/{id}/keys.
+// It lists all signing keys for a webhook channel, omitting secret key material.
+func (s *Server) listChannelSigningKeys(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if _, err := s.store.GetChannel(r.Context(), id); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	keys, err := s.store.ListChannelSigningKeys(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if keys == nil {
+		keys = []store.ChannelSigningKey{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
+}
+
+type rotateSigningKeyRequest struct {
+	KeyID  string `json:"key_id"`
+	Secret string `json:"secret"`
+}
+
+// rotateChannelSigningKey serves POST /channels/{id}/keys/rotate.
+// It generates a new signing key (or accepts one), promotes it to current, and retains the previous key
+// in the active set for overlap verification. The secret is returned only once in this response.
+func (s *Server) rotateChannelSigningKey(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
+		return
+	}
+	ch, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	var req rotateSigningKeyRequest
+	if r.Body != nil && r.ContentLength > 0 {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	keyID := strings.TrimSpace(req.KeyID)
+	if keyID == "" {
+		keyID = notify.GenerateSigningKeyID()
+	}
+	secret := strings.TrimSpace(req.Secret)
+	if secret == "" {
+		secret = notify.GenerateSigningKeySecret()
+	}
+
+	existingKeys, _ := s.store.ListChannelSigningKeys(r.Context(), id)
+	if len(existingKeys) == 0 && len(ch.Config) > 0 {
+		var cfgMap map[string]any
+		if err := json.Unmarshal(ch.Config, &cfgMap); err == nil {
+			if oldSecret, ok := cfgMap["secret"].(string); ok && oldSecret != "" {
+				oldKeyID := "csk_legacy"
+				if kID, ok := cfgMap["key_id"].(string); ok && kID != "" {
+					oldKeyID = kID
+				}
+				_ = s.store.CreateChannelSigningKey(r.Context(), &store.ChannelSigningKey{
+					ChannelID: id,
+					KeyID:     oldKeyID,
+					Secret:    oldSecret,
+					IsCurrent: false,
+					Status:    store.SigningKeyStatusActive,
+				})
+			}
+		}
+	}
+
+	newKey := store.ChannelSigningKey{
+		ChannelID: id,
+		KeyID:     keyID,
+		Secret:    secret,
+	}
+	if err := s.store.RotateChannelSigningKey(r.Context(), id, &newKey); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	var cfgMap map[string]any
+	if err := json.Unmarshal(ch.Config, &cfgMap); err == nil {
+		if cfgMap == nil {
+			cfgMap = make(map[string]any)
+		}
+		var keysList []map[string]any
+		allKeys, _ := s.store.ListChannelSigningKeys(r.Context(), id)
+		for _, k := range allKeys {
+			km := map[string]any{
+				"id":         k.KeyID,
+				"is_current": k.IsCurrent,
+				"status":     k.Status,
+			}
+			if k.KeyID == keyID {
+				km["secret"] = secret
+			} else {
+				if fullKey, err := s.store.GetChannelSigningKey(r.Context(), id, k.KeyID); err == nil {
+					km["secret"] = fullKey.Secret
+				}
+			}
+			keysList = append(keysList, km)
+		}
+		cfgMap["keys"] = keysList
+		cfgMap["secret"] = secret
+		if updatedConfig, err := json.Marshal(cfgMap); err == nil {
+			ch.Config = updatedConfig
+			_ = s.store.UpdateChannel(r.Context(), ch)
+		}
+	}
+
+	s.factory.InvalidateSecretCache()
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"key_id":     newKey.KeyID,
+		"secret":     secret,
+		"is_current": true,
+		"status":     store.SigningKeyStatusActive,
+		"created_at": newKey.CreatedAt,
+	})
+}
+
+// retireChannelSigningKey serves POST /channels/{id}/keys/{keyID}/retire.
+// It marks an old, non-current signing key as retired after the overlap period has passed.
+func (s *Server) retireChannelSigningKey(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
+		return
+	}
+	keyID := chi.URLParam(r, "keyID")
+	if keyID == "" {
+		writeErr(w, r, http.StatusBadRequest, "key_id is required")
+		return
+	}
+
+	ch, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	if err := s.store.RetireChannelSigningKey(r.Context(), id, keyID); err != nil {
+		if strings.Contains(err.Error(), "cannot retire") {
+			writeErr(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.fail(w, r, err)
+		return
+	}
+
+	var cfgMap map[string]any
+	if err := json.Unmarshal(ch.Config, &cfgMap); err == nil {
+		if keysList, ok := cfgMap["keys"].([]any); ok {
+			for _, item := range keysList {
+				if km, ok := item.(map[string]any); ok {
+					if km["id"] == keyID {
+						km["status"] = store.SigningKeyStatusRetired
+					}
+				}
+			}
+			if updatedConfig, err := json.Marshal(cfgMap); err == nil {
+				ch.Config = updatedConfig
+				_ = s.store.UpdateChannel(r.Context(), ch)
+			}
+		}
+	}
+
+	s.factory.InvalidateSecretCache()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"key_id": keyID,
+		"status": store.SigningKeyStatusRetired,
+	})
+}
+
+// revokeChannelSigningKey serves POST /channels/{id}/keys/{keyID}/revoke.
+// It immediately revokes a compromised key (emergency path).
+func (s *Server) revokeChannelSigningKey(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
+		return
+	}
+	keyID := chi.URLParam(r, "keyID")
+	if keyID == "" {
+		writeErr(w, r, http.StatusBadRequest, "key_id is required")
+		return
+	}
+
+	ch, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	if err := s.store.RevokeChannelSigningKey(r.Context(), id, keyID); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	var cfgMap map[string]any
+	if err := json.Unmarshal(ch.Config, &cfgMap); err == nil {
+		if keysList, ok := cfgMap["keys"].([]any); ok {
+			for _, item := range keysList {
+				if km, ok := item.(map[string]any); ok {
+					if km["id"] == keyID {
+						km["status"] = store.SigningKeyStatusRevoked
+						km["is_current"] = false
+					}
+				}
+			}
+			if updatedConfig, err := json.Marshal(cfgMap); err == nil {
+				ch.Config = updatedConfig
+				_ = s.store.UpdateChannel(r.Context(), ch)
+			}
+		}
+	}
+
+	s.factory.InvalidateSecretCache()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"key_id": keyID,
+		"status": store.SigningKeyStatusRevoked,
+	})
 }

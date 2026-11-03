@@ -299,6 +299,31 @@ func (c Channel) TimeoutDuration() time.Duration {
 	return c.Timeout
 }
 
+// ChannelSigningKeyStatus represents the lifecycle state of a signing key.
+type ChannelSigningKeyStatus string
+
+const (
+	SigningKeyStatusActive  = "active"
+	SigningKeyStatusRetired = "retired"
+	SigningKeyStatusRevoked = "revoked"
+)
+
+// ChannelSigningKey represents a webhook channel signing key. Secret key material
+// is shown once at creation/rotation and never returned in listings or API responses.
+type ChannelSigningKey struct {
+	ID          int64      `json:"-" db:"id"`
+	ChannelID   int64      `json:"channel_id,omitempty" db:"channel_id"`
+	WorkspaceID string     `json:"-" db:"workspace_id"`
+	KeyID       string     `json:"key_id" db:"key_id"`
+	Secret      string     `json:"secret,omitempty" db:"secret"`
+	IsCurrent   bool       `json:"is_current" db:"is_current"`
+	Status      string     `json:"status" db:"status"`
+	CreatedAt   time.Time  `json:"created_at" db:"created_at"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty" db:"expires_at"`
+	LastUsedAt  *time.Time `json:"last_used_at,omitempty" db:"last_used_at"`
+	RevokedAt   *time.Time `json:"revoked_at,omitempty" db:"revoked_at"`
+}
+
 // TimeoutSeconds returns the channel's timeout as an integer number of seconds.
 func (c Channel) TimeoutSeconds() int {
 	return int(c.TimeoutDuration() / time.Second)
@@ -1149,6 +1174,16 @@ type Channels interface {
 	// channel with no attempts in the window returns explicit zero counts and
 	// nil timestamps (see ChannelDeliveryStats).
 	GetChannelDeliveryStats(ctx context.Context, channelID int64, since time.Time) (ChannelDeliveryStats, error)
+
+	// Channel signing keys methods for multi-key overlap, rotation, retirement and emergency revocation.
+	CreateChannelSigningKey(ctx context.Context, k *ChannelSigningKey) error
+	GetChannelSigningKey(ctx context.Context, channelID int64, keyID string) (*ChannelSigningKey, error)
+	ListChannelSigningKeys(ctx context.Context, channelID int64) ([]ChannelSigningKey, error)
+	GetCurrentChannelSigningKey(ctx context.Context, channelID int64) (*ChannelSigningKey, error)
+	RotateChannelSigningKey(ctx context.Context, channelID int64, newKey *ChannelSigningKey) error
+	RetireChannelSigningKey(ctx context.Context, channelID int64, keyID string) error
+	RevokeChannelSigningKey(ctx context.Context, channelID int64, keyID string) error
+	RecordChannelSigningKeyUsage(ctx context.Context, channelID int64, keyID string, usedAt time.Time) error
 }
 
 // Alerts persists alerts and delivery attempts.
