@@ -10,14 +10,17 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vektah/gqlparser/v2"
@@ -128,6 +131,8 @@ type isolationFixture struct {
 	betaRotatingTokenID  int64
 }
 
+var propSchemaSeq atomic.Int64
+
 func isolationStores(t *testing.T) []struct {
 	name string
 	open func(t *testing.T) store.Store
@@ -158,10 +163,33 @@ func isolationStores(t *testing.T) []struct {
 			name: "postgres",
 			open: func(t *testing.T) store.Store {
 				t.Helper()
-				require.NoError(t, store.Migrate(pgURL))
-				st, err := store.New(context.Background(), pgURL, store.PoolSettings{}, nil)
+				ctx := context.Background()
+				schema := fmt.Sprintf("api_workspace_isolation_%d", propSchemaSeq.Add(1))
+				admin, err := pgxpool.New(ctx, pgURL)
 				require.NoError(t, err)
-				t.Cleanup(st.Close)
+				_, err = admin.Exec(ctx, "DROP SCHEMA IF EXISTS "+schema+" CASCADE")
+				require.NoError(t, err)
+				_, err = admin.Exec(ctx, "CREATE SCHEMA "+schema)
+				require.NoError(t, err)
+				admin.Close()
+
+				u, err := url.Parse(pgURL)
+				require.NoError(t, err)
+				q := u.Query()
+				q.Set("options", "-csearch_path="+schema)
+				u.RawQuery = q.Encode()
+				isolated := u.String()
+
+				require.NoError(t, store.Migrate(isolated))
+				st, err := store.New(ctx, isolated, store.PoolSettings{}, nil)
+				require.NoError(t, err)
+				t.Cleanup(func() {
+					st.Close()
+					if adm, err := pgxpool.New(ctx, pgURL); err == nil {
+						_, _ = adm.Exec(ctx, "DROP SCHEMA IF EXISTS "+schema+" CASCADE")
+						adm.Close()
+					}
+				})
 				return st
 			},
 		})
