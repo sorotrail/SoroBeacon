@@ -108,7 +108,10 @@ var routeRoles = auth.NewRouteTable(map[string]auth.Role{
 	// Credentials are administrative: minting one is minting authority, and
 	// the audit log is the instance's record of who has been doing what.
 	"GET /tokens":              auth.RoleAdmin,
+	"GET /tokens/{id}":         auth.RoleAdmin,
 	"POST /tokens":             auth.RoleAdmin,
+	"POST /tokens/{id}/rotate":  auth.RoleAdmin,
+	"POST /tokens/{id}/abandon": auth.RoleAdmin,
 	"POST /tokens/{id}/revoke": auth.RoleAdmin,
 	"GET /audit":               auth.RoleAdmin,
 

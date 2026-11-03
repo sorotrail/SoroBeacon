@@ -191,20 +191,30 @@ func SplitScopes(s string) []Scope {
 // the plaintext exists only inside Mint's return value, so no code path here can
 // hand it to a log line or a response body by accident.
 type Token struct {
-	ID     int64
-	Name   string
-	Prefix string
+	ID                   int64
+	Name                 string
+	Prefix               string
 	// Hash is the hex SHA-256 of the secret. Never serialised.
 	Hash string `json:"-"`
 	// Workspace is the tenant the token belongs to, read from its row. The
 	// request that authenticates has no workspace yet — resolving it is this
 	// value's job — so the tenancy cannot come from the caller.
-	Workspace  workspace.ID `json:"-"`
-	Scopes     []Scope
-	ExpiresAt  time.Time
-	LastUsedAt time.Time
-	RevokedAt  time.Time
-	CreatedAt  time.Time
+	Workspace            workspace.ID `json:"-"`
+	Scopes               []Scope
+	ExpiresAt            time.Time
+	LastUsedAt           time.Time
+	RevokedAt            time.Time
+	CreatedAt            time.Time
+	RotatedFromID        *int64
+	SuccessorID          *int64
+	RotatedAt            time.Time
+	PreRotationExpiresAt time.Time
+}
+
+// IsRotating reports whether this token is currently in the process of being rotated
+// to a successor token.
+func (t *Token) IsRotating() bool {
+	return t != nil && t.SuccessorID != nil
 }
 
 // Live reports whether the token may authenticate right now. Revoked and
@@ -319,8 +329,11 @@ type TokenStore interface {
 	// database failed" without this package importing the store's errors.
 	TokenByHash(ctx context.Context, hash string) (token *Token, found bool, err error)
 	ListAPITokens(ctx context.Context) ([]Token, error)
+	GetAPIToken(ctx context.Context, id int64) (*Token, error)
 	RevokeAPIToken(ctx context.Context, id int64) error
 	TouchAPIToken(ctx context.Context, id int64, at time.Time) error
+	RotateAPIToken(ctx context.Context, predecessorID int64, successor *Token, predecessorExpiry time.Time) error
+	AbandonAPITokenRotation(ctx context.Context, id int64) error
 }
 
 // Manager mints, authenticates and retires database tokens.
@@ -403,6 +416,17 @@ func (m *Manager) Authenticate(ctx context.Context, raw string) (*Principal, err
 	if !t.Live(now) {
 		return nil, ErrInvalidToken
 	}
+	if !t.ExpiresAt.IsZero() {
+		rem := t.ExpiresAt.Sub(now)
+		if rem > 0 && rem <= ExpiringSoonThreshold {
+			m.log.Warn("api token in use close to expiry",
+				"token_id", t.ID,
+				"name", t.Name,
+				"prefix", t.Prefix,
+				"expires_at", t.ExpiresAt.Format(time.RFC3339),
+				"time_remaining", rem.Round(time.Second).String())
+		}
+	}
 	if !t.LastUsedAt.IsZero() && now.Sub(t.LastUsedAt) < touchInterval {
 		// A busy CI job would otherwise write one row per request. The stamp is
 		// for finding stale tokens, and "used within the last minute" answers
@@ -449,6 +473,90 @@ func (m *Manager) Revoke(ctx context.Context, id int64) error {
 		return ErrInvalidToken
 	}
 	return m.store.RevokeAPIToken(ctx, id)
+}
+
+// DefaultRotationOverlap is the fallback overlap duration during which both
+// predecessor and successor tokens remain valid simultaneously.
+const DefaultRotationOverlap = 7 * 24 * time.Hour
+
+// ExpiringSoonThreshold defines when an authenticated token triggers a warning
+// that it will expire soon.
+const ExpiringSoonThreshold = 24 * time.Hour
+
+// Get returns one token by ID in the caller's workspace.
+func (m *Manager) Get(ctx context.Context, id int64) (*Token, error) {
+	if m == nil || m.store == nil {
+		return nil, ErrInvalidToken
+	}
+	return m.store.GetAPIToken(ctx, id)
+}
+
+// Rotate issues a successor token while keeping the predecessor valid for the
+// overlap window. The plaintext secret of the successor is returned exactly once.
+func (m *Manager) Rotate(ctx context.Context, predecessorID int64, name string, scopes []Scope, overlap time.Duration, successorExpiresAt time.Time) (string, *Token, error) {
+	if m == nil || m.store == nil {
+		return "", nil, ErrInvalidToken
+	}
+	pred, err := m.store.GetAPIToken(ctx, predecessorID)
+	if err != nil {
+		return "", nil, err
+	}
+	now := m.now()
+	if !pred.Live(now) {
+		return "", nil, fmt.Errorf("cannot rotate inactive token")
+	}
+
+	secret, err := newTokenSecret()
+	if err != nil {
+		return "", nil, err
+	}
+
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = pred.Name
+	}
+	if len(name) > MaxTokenNameLen {
+		return "", nil, fmt.Errorf("name must be at most %d characters", MaxTokenNameLen)
+	}
+
+	// Successor's scopes default to predecessor's scopes
+	if len(scopes) == 0 {
+		scopes = append([]Scope{}, pred.Scopes...)
+	}
+
+	if overlap <= 0 {
+		overlap = DefaultRotationOverlap
+	}
+	newPredExpiry := now.Add(overlap).UTC().Truncate(time.Second)
+	// If predecessor already had an earlier expiry, keep the earlier one
+	if !pred.ExpiresAt.IsZero() && pred.ExpiresAt.Before(newPredExpiry) {
+		newPredExpiry = pred.ExpiresAt
+	}
+
+	succ := &Token{
+		Name:          name,
+		Prefix:        secret[:len(TokenPrefix)+tokenPrefixLen],
+		Hash:          HashToken(secret),
+		Scopes:        append([]Scope{}, scopes...),
+		ExpiresAt:     successorExpiresAt.UTC().Truncate(time.Second),
+		RotatedFromID: &pred.ID,
+		RotatedAt:     now.UTC().Truncate(time.Second),
+	}
+
+	if err := m.store.RotateAPIToken(ctx, predecessorID, succ, newPredExpiry); err != nil {
+		return "", nil, err
+	}
+
+	return secret, succ, nil
+}
+
+// AbandonRotation revokes the successor token and restores the predecessor token's
+// pre-rotation state without inconsistent state.
+func (m *Manager) AbandonRotation(ctx context.Context, id int64) error {
+	if m == nil || m.store == nil {
+		return ErrInvalidToken
+	}
+	return m.store.AbandonAPITokenRotation(ctx, id)
 }
 
 // HashToken is the credential digest: hex SHA-256 over the raw secret.

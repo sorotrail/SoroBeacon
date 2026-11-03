@@ -23,14 +23,17 @@ import (
 // apiToken is one token as the API describes it: enough to recognise and audit,
 // with nothing to steal.
 type apiToken struct {
-	ID         int64        `json:"id"`
-	Name       string       `json:"name"`
-	Prefix     string       `json:"prefix"`
-	Scopes     []auth.Scope `json:"scopes"`
-	CreatedAt  time.Time    `json:"created_at"`
-	ExpiresAt  *time.Time   `json:"expires_at"`
-	LastUsedAt *time.Time   `json:"last_used_at"`
-	RevokedAt  *time.Time   `json:"revoked_at"`
+	ID            int64        `json:"id"`
+	Name          string       `json:"name"`
+	Prefix        string       `json:"prefix"`
+	Scopes        []auth.Scope `json:"scopes"`
+	CreatedAt     time.Time    `json:"created_at"`
+	ExpiresAt     *time.Time   `json:"expires_at"`
+	LastUsedAt    *time.Time   `json:"last_used_at"`
+	RevokedAt     *time.Time   `json:"revoked_at"`
+	RotatedFromID *int64       `json:"rotated_from_id,omitempty"`
+	SuccessorID   *int64       `json:"successor_id,omitempty"`
+	RotatedAt     *time.Time   `json:"rotated_at,omitempty"`
 }
 
 // createdToken is the one response that carries a secret, which is why it is a
@@ -49,10 +52,20 @@ type createTokenRequest struct {
 	ExpiresIn string   `json:"expires_in"`
 }
 
+// rotateTokenRequest is POST /tokens/{id}/rotate's body.
+type rotateTokenRequest struct {
+	Name      string   `json:"name,omitempty"`
+	Scopes    []string `json:"scopes,omitempty"`
+	Overlap   string   `json:"overlap,omitempty"`
+	ExpiresIn string   `json:"expires_in,omitempty"`
+}
+
 func apiTokenOf(t *auth.Token) apiToken {
 	out := apiToken{
 		ID: t.ID, Name: t.Name, Prefix: t.Prefix,
 		Scopes: t.Scopes, CreatedAt: t.CreatedAt.UTC(),
+		RotatedFromID: t.RotatedFromID,
+		SuccessorID:   t.SuccessorID,
 	}
 	if out.Scopes == nil {
 		// A token with no scopes is a real state (it authenticates and can
@@ -63,7 +76,12 @@ func apiTokenOf(t *auth.Token) apiToken {
 	for _, src := range []struct {
 		dst **time.Time
 		val time.Time
-	}{{&out.ExpiresAt, t.ExpiresAt}, {&out.LastUsedAt, t.LastUsedAt}, {&out.RevokedAt, t.RevokedAt}} {
+	}{
+		{&out.ExpiresAt, t.ExpiresAt},
+		{&out.LastUsedAt, t.LastUsedAt},
+		{&out.RevokedAt, t.RevokedAt},
+		{&out.RotatedAt, t.RotatedAt},
+	} {
 		if !src.val.IsZero() {
 			v := src.val.UTC()
 			*src.dst = &v
@@ -158,6 +176,153 @@ func (s *Server) listTokens(w http.ResponseWriter, r *http.Request) {
 		out = append(out, apiTokenOf(&toks[i]))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"tokens": out})
+}
+
+// getToken returns a single token by ID in the caller's workspace.
+func (s *Server) getToken(w http.ResponseWriter, r *http.Request) {
+	if s.tokens == nil {
+		writeErr(w, r, http.StatusServiceUnavailable, "token management is not configured")
+		return
+	}
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, r, http.StatusNotFound, "not found")
+		return
+	}
+	tok, err := s.tokens.Get(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, r, http.StatusNotFound, "not found")
+			return
+		}
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, apiTokenOf(tok))
+}
+
+// rotateToken initiates an overlapping token rotation, issuing a successor token while
+// predecessor remains valid until its new expiry. The plaintext secret of the successor
+// is returned exactly once.
+func (s *Server) rotateToken(w http.ResponseWriter, r *http.Request) {
+	if s.tokens == nil {
+		writeErr(w, r, http.StatusServiceUnavailable, "token management is not configured")
+		return
+	}
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, r, http.StatusNotFound, "not found")
+		return
+	}
+
+	pred, err := s.tokens.Get(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, r, http.StatusNotFound, "not found")
+			return
+		}
+		s.fail(w, r, err)
+		return
+	}
+	if !pred.Live(time.Now()) {
+		writeErr(w, r, http.StatusBadRequest, "cannot rotate an inactive or expired token")
+		return
+	}
+
+	var in rotateTokenRequest
+	if r.ContentLength > 0 {
+		if !readJSON(w, r, &in) {
+			return
+		}
+	}
+
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		name = pred.Name
+	}
+	if len(name) > auth.MaxTokenNameLen {
+		writeValidation(w, r, []FieldError{{
+			Field:  "name",
+			Reason: "name must be at most " + strconv.Itoa(auth.MaxTokenNameLen) + " characters",
+		}})
+		return
+	}
+
+	var scopes []auth.Scope
+	if len(in.Scopes) > 0 {
+		var parseErr error
+		scopes, parseErr = auth.ParseScopes(in.Scopes)
+		if parseErr != nil {
+			writeValidation(w, r, []FieldError{{Field: "scopes", Reason: parseErr.Error()}})
+			return
+		}
+	} else {
+		// Defaults to predecessor's scopes
+		scopes = append([]auth.Scope{}, pred.Scopes...)
+	}
+
+	// The escalation guard: a scoped token must not mint a stronger one
+	if !callerMayGrant(r, scopes) {
+		writeErr(w, r, http.StatusForbidden, "a scoped token cannot mint a token with scopes it does not hold")
+		return
+	}
+
+	overlap := auth.DefaultRotationOverlap
+	if v := strings.TrimSpace(in.Overlap); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			writeValidation(w, r, []FieldError{{
+				Field:  "overlap",
+				Reason: "overlap is a positive Go duration (for example 48h or 168h)",
+			}})
+			return
+		}
+		overlap = d
+	}
+
+	var successorExpiresAt time.Time
+	if v := strings.TrimSpace(in.ExpiresIn); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			writeValidation(w, r, []FieldError{{
+				Field:  "expires_in",
+				Reason: "expires_in must be a positive Go duration",
+			}})
+			return
+		}
+		successorExpiresAt = time.Now().Add(d)
+	}
+
+	raw, succ, err := s.tokens.Rotate(r.Context(), id, name, scopes, overlap, successorExpiresAt)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, createdToken{apiToken: apiTokenOf(succ), Token: raw})
+}
+
+// abandonTokenRotation cancels an in-progress rotation, revoking the successor token
+// and restoring the predecessor token's pre-rotation state.
+func (s *Server) abandonTokenRotation(w http.ResponseWriter, r *http.Request) {
+	if s.tokens == nil {
+		writeErr(w, r, http.StatusServiceUnavailable, "token management is not configured")
+		return
+	}
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, r, http.StatusNotFound, "not found")
+		return
+	}
+	if err := s.tokens.AbandonRotation(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, r, http.StatusNotFound, "not found")
+			return
+		}
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "abandoned"})
 }
 
 // revokeToken retires one. The row survives so the audit trail (name, prefix,
