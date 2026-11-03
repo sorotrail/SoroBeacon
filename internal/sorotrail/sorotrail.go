@@ -27,6 +27,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/config"
 	"github.com/sorotrail/sorobeacon/internal/poller"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
+	"github.com/sorotrail/sorobeacon/internal/tlsutil"
 )
 
 var (
@@ -69,6 +70,19 @@ func NewClient(baseURL string, httpClient *http.Client) *Client {
 		retryAttempts:  2,
 		retryBaseDelay: 25 * time.Millisecond,
 	}
+}
+
+// NewClientWithTLS returns a SoroTrail client whose HTTP transport uses the
+// provided TLS/mTLS Reloader for server certificate verification and client
+// certificate authentication.
+func NewClientWithTLS(baseURL string, reloader *tlsutil.Reloader) *Client {
+	if reloader == nil {
+		return NewClient(baseURL, nil)
+	}
+	return NewClient(baseURL, &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: reloader.NewHTTPTransport(),
+	})
 }
 
 // WithRetry configures the bounded retry attempts and base backoff delay used

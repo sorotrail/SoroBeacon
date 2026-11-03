@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -41,6 +42,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
 	"github.com/sorotrail/sorobeacon/internal/telemetry"
+	"github.com/sorotrail/sorobeacon/internal/tlsutil"
 	"github.com/sorotrail/sorobeacon/internal/web"
 	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
@@ -131,7 +133,7 @@ func run() error {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGHUP)
 	defer signal.Stop(sigs)
-	go reloadLoop(ctx, sigs, config.NewReloader(cfg), &level, srv.poller, log)
+	go reloadLoop(ctx, sigs, config.NewReloader(cfg), &level, srv.poller, log, srv.tlsReloaders...)
 
 	return srv.run(ctx)
 }
@@ -140,13 +142,13 @@ func run() error {
 // loop rather than a one-shot handler so a burst of signals is drained one
 // reload at a time instead of being collapsed by the signal coalescing a
 // channel-based Notify performs.
-func reloadLoop(ctx context.Context, sigs <-chan os.Signal, reloader *config.Reloader, level *slog.LevelVar, p *poller.Poller, log *slog.Logger) {
+func reloadLoop(ctx context.Context, sigs <-chan os.Signal, reloader *config.Reloader, level *slog.LevelVar, p *poller.Poller, log *slog.Logger, tlsReloaders ...*tlsutil.Reloader) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-sigs:
-			applyReload(reloader, level, p, log)
+			applyReload(reloader, level, p, log, tlsReloaders...)
 		}
 	}
 }
@@ -156,7 +158,17 @@ func reloadLoop(ctx context.Context, sigs <-chan os.Signal, reloader *config.Rel
 // and log what changed, old value to new value. A rejected reload logs the
 // reasons and changes nothing — a bad reload must never leave the process
 // half-configured.
-func applyReload(reloader *config.Reloader, level *slog.LevelVar, p *poller.Poller, log *slog.Logger) {
+func applyReload(reloader *config.Reloader, level *slog.LevelVar, p *poller.Poller, log *slog.Logger, tlsReloaders ...*tlsutil.Reloader) {
+	for _, tr := range tlsReloaders {
+		if tr == nil {
+			continue
+		}
+		if err := tr.Reload(); err != nil {
+			log.Error("tls certificate reload failed", "err", err)
+		} else {
+			log.Info("tls certificates reloaded")
+		}
+	}
 	changed, err := reloader.Reload()
 	if err != nil {
 		log.Error("configuration reload rejected", "err", err)
@@ -251,6 +263,7 @@ type server struct {
 	grpcSrv      *sorogrpc.Server
 	httpListener net.Listener
 	grpcListener net.Listener
+	tlsReloaders []*tlsutil.Reloader
 
 	// Wiring decisions, set once here and used by run. Keeping them in one
 	// place means the branch that constructs a component and the loop that
@@ -295,6 +308,9 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 		return nil, err
 	}
 	authn := auth.NewBound(bindings, auth.DefaultSessionTTL)
+	if cfg.ServerMTLSEnabled() || len(cfg.MTLSBindings) > 0 {
+		authn.WithMTLS(cfg.ServerMTLSEnabled(), cfg.MTLSBindings)
+	}
 
 	// Single sign-on, when a provider is configured. Discovery happens here, at
 	// startup, rather than on the first visitor's click: a mistyped
@@ -345,6 +361,22 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	// database, and the store is opened before the lease, the source or any
 	// server gets a handle to it. A server wired against a database that has
 	// not been migrated would serve 500s until the operator noticed.
+	if cfg.DatabaseTLSEnabled() {
+		dbURL, err := store.ApplyDatabaseTLS(cfg.DatabaseURL, cfg.DatabaseSSLMode, cfg.DatabaseSSLCertFile, cfg.DatabaseSSLKeyFile, cfg.DatabaseSSLRootCertFile)
+		if err != nil {
+			shutdownTelemetry(log, tel)
+			return nil, err
+		}
+		cfg.DatabaseURL = dbURL
+		if cfg.ReplicaDatabaseURL != "" {
+			repURL, err := store.ApplyDatabaseTLS(cfg.ReplicaDatabaseURL, cfg.DatabaseSSLMode, cfg.DatabaseSSLCertFile, cfg.DatabaseSSLKeyFile, cfg.DatabaseSSLRootCertFile)
+			if err != nil {
+				shutdownTelemetry(log, tel)
+				return nil, err
+			}
+			cfg.ReplicaDatabaseURL = repURL
+		}
+	}
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		shutdownTelemetry(log, tel)
 		return nil, err
@@ -444,6 +476,11 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	// overwrites a name, and 'default' already exists from the migration.
 	for _, ws := range cfg.Workspaces() {
 		if err := st.EnsureWorkspace(ctx, ws); err != nil {
+			return nil, err
+		}
+	}
+	for _, b := range cfg.MTLSBindings {
+		if err := st.EnsureWorkspace(ctx, b.Workspace); err != nil {
 			return nil, err
 		}
 	}
@@ -664,10 +701,67 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	srv.prunerEnabled = cfg.AlertRetention > 0
 	srv.playground = cfg.GraphQL.EnablePlayground
 
+	var srvTLSReloader *tlsutil.Reloader
+	if cfg.ServerTLSEnabled() {
+		mode, err := tlsutil.ParseClientAuthMode(cfg.TLSClientAuth, cfg.TLSClientCAFile != "")
+		if err != nil {
+			return nil, err
+		}
+		srvTLSReloader, err = tlsutil.NewReloader(tlsutil.PeerConfig{
+			Component:  "server",
+			CertFile:   cfg.TLSCertFile,
+			KeyFile:    cfg.TLSKeyFile,
+			CAFile:     cfg.TLSClientCAFile,
+			ClientAuth: mode,
+			Logger:     log,
+		})
+		if err != nil {
+			return nil, err
+		}
+		srv.tlsReloaders = append(srv.tlsReloaders, srvTLSReloader)
+		m.RegisterTLSCertificateExpiry("server", srvTLSReloader.LeafNotAfterUnix)
+	}
+	if cfg.SoroTrailTLSCertFile != "" && cfg.SoroTrailTLSKeyFile != "" {
+		stReloader, err := tlsutil.NewReloader(tlsutil.PeerConfig{
+			Component:  "sorotrail_client",
+			CertFile:   cfg.SoroTrailTLSCertFile,
+			KeyFile:    cfg.SoroTrailTLSKeyFile,
+			CAFile:     cfg.SoroTrailTLSCAFile,
+			ServerName: cfg.SoroTrailTLSServerName,
+			Logger:     log,
+		})
+		if err != nil {
+			return nil, err
+		}
+		srv.tlsReloaders = append(srv.tlsReloaders, stReloader)
+		m.RegisterTLSCertificateExpiry("sorotrail_client", stReloader.LeafNotAfterUnix)
+	}
+	if cfg.DatabaseSSLCertFile != "" && cfg.DatabaseSSLKeyFile != "" {
+		dbReloader, err := tlsutil.NewReloader(tlsutil.PeerConfig{
+			Component: "database_client",
+			CertFile:  cfg.DatabaseSSLCertFile,
+			KeyFile:   cfg.DatabaseSSLKeyFile,
+			CAFile:    cfg.DatabaseSSLRootCertFile,
+			Logger:    log,
+		})
+		if err != nil {
+			return nil, err
+		}
+		srv.tlsReloaders = append(srv.tlsReloaders, dbReloader)
+		m.RegisterTLSCertificateExpiry("database_client", dbReloader.LeafNotAfterUnix)
+	}
+
 	// gRPC serves reads exactly as the HTTP API does, so every instance runs
 	// it regardless of leadership.
 	if cfg.GRPCAddr != "" {
 		srv.grpcSrv = sorogrpc.New(st, authn, log)
+		if srvTLSReloader != nil {
+			grpcTLS, err := srvTLSReloader.ServerTLSConfig()
+			if err != nil {
+				return nil, err
+			}
+			srv.grpcSrv.WithTLSConfig(grpcTLS)
+		}
 	}
 
 	// Bind last. A listener is the first thing a failed startup could leave
@@ -676,6 +770,14 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	httpLis, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
 		return nil, fmt.Errorf("http listen %s: %w", cfg.HTTPAddr, err)
+	}
+	if srvTLSReloader != nil {
+		httpTLS, err := srvTLSReloader.ServerTLSConfig()
+		if err != nil {
+			_ = httpLis.Close()
+			return nil, err
+		}
+		httpLis = tls.NewListener(httpLis, httpTLS)
 	}
 	srv.httpListener = httpLis
 	if srv.grpcSrv != nil {
@@ -866,7 +968,23 @@ func buildSecretResolver(cfg config.Config, log *slog.Logger) *secrets.Resolver 
 func buildSource(ctx context.Context, log *slog.Logger, cfg config.Config) (poller.EventSource, api.HealthChecker, error) {
 	switch cfg.SourceMode {
 	case "sorotrail":
-		stc := sorotrail.NewClient(cfg.SoroTrailURL, nil)
+		var stc *sorotrail.Client
+		if cfg.SoroTrailTLSEnabled() {
+			rel, err := tlsutil.NewReloader(tlsutil.PeerConfig{
+				Component:  "sorotrail_client",
+				CertFile:   cfg.SoroTrailTLSCertFile,
+				KeyFile:    cfg.SoroTrailTLSKeyFile,
+				CAFile:     cfg.SoroTrailTLSCAFile,
+				ServerName: cfg.SoroTrailTLSServerName,
+				Logger:     log,
+			})
+			if err != nil {
+				return nil, nil, err
+			}
+			stc = sorotrail.NewClientWithTLS(cfg.SoroTrailURL, rel)
+		} else {
+			stc = sorotrail.NewClient(cfg.SoroTrailURL, nil)
+		}
 		if err := verifySoroTrailEndpoint(ctx, log, stc, cfg.SoroTrailURL, cfg.Network.Passphrase); err != nil {
 			return nil, nil, err
 		}
@@ -967,6 +1085,13 @@ func runBackfill(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if cfg.DatabaseTLSEnabled() {
+		dbURL, err := store.ApplyDatabaseTLS(cfg.DatabaseURL, cfg.DatabaseSSLMode, cfg.DatabaseSSLCertFile, cfg.DatabaseSSLKeyFile, cfg.DatabaseSSLRootCertFile)
+		if err != nil {
+			return err
+		}
+		cfg.DatabaseURL = dbURL
+	}
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		return err
 	}
