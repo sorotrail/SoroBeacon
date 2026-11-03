@@ -62,10 +62,11 @@ type Metrics struct {
 	pollPanics       *prometheus.CounterVec
 	breakerStates    *prometheus.GaugeVec
 
-	storeReads     *prometheus.CounterVec
-	storeFallbacks prometheus.Counter
-	replicaEnabled prometheus.Gauge
-	deadLetters    prometheus.Gauge
+	storeReads           *prometheus.CounterVec
+	storeFallbacks       prometheus.Counter
+	replicaEnabled       prometheus.Gauge
+	deadLetters          prometheus.Gauge
+	deadLettersByChannel *prometheus.GaugeVec
 	// heartbeatLastSuccess is the unix time of the last heartbeat ping that
 	// confirmed ingest was healthy. Zero (unset) means none has succeeded
 	// since the process started, which is the signal a dashboard alert can
@@ -226,6 +227,11 @@ func New() *Metrics {
 			Help: "Current number of dead-lettered delivery attempts waiting for review or re-drive.",
 		}),
 
+		deadLettersByChannel: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_dead_letters",
+			Help: "Current number of dead-lettered delivery attempts by workspace and channel.",
+		}, []string{"workspace", "channel"}),
+
 		heartbeatLastSuccess: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "sorobeacon_heartbeat_last_success_timestamp_seconds",
 			Help: "Unix time of the last heartbeat ping sent while ingest was healthy; 0 when none has succeeded this run.",
@@ -250,7 +256,7 @@ func New() *Metrics {
 		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired, m.deliveries, m.throttles,
 		m.httpDuration, m.httpNotModifiedTotal, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
 		m.reorgsTotal, m.lastReorgLedger, m.breakerStates, m.pollPanics,
-		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.deadLetters, m.heartbeatLastSuccess,
+		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.deadLetters, m.deadLettersByChannel, m.heartbeatLastSuccess,
 		m.ruleEvalsTotal, m.ruleMatchesTotal, m.ruleErrorsTotal, m.ruleDuration, m.requestBodyRejectionsTotal,
 		m.databaseDegraded, m.databaseUnavailableTotal)
 	return m
@@ -475,12 +481,41 @@ func (m *Metrics) SetDeadLetters(count int) {
 	m.deadLetters.Set(float64(count))
 }
 
+// SetDeadLettersFor sets the dead letter gauge for a specific workspace and channel.
+func (m *Metrics) SetDeadLettersFor(workspace, channel string, count int) {
+	if m == nil {
+		return
+	}
+	if workspace == "" {
+		workspace = "default"
+	}
+	if channel == "" {
+		channel = "unknown"
+	}
+	m.deadLettersByChannel.WithLabelValues(workspace, channel).Set(float64(count))
+}
+
 // RecordDeadLetter increments the number of dead letters awaiting review.
 func (m *Metrics) RecordDeadLetter() {
 	if m == nil {
 		return
 	}
 	m.deadLetters.Inc()
+}
+
+// RecordDeadLetterFor increments the dead letter gauge for a specific workspace and channel.
+func (m *Metrics) RecordDeadLetterFor(workspace, channel string) {
+	if m == nil {
+		return
+	}
+	m.deadLetters.Inc()
+	if workspace == "" {
+		workspace = "default"
+	}
+	if channel == "" {
+		channel = "unknown"
+	}
+	m.deadLettersByChannel.WithLabelValues(workspace, channel).Inc()
 }
 
 // RecordHeartbeatSuccess stamps the last time a heartbeat ping confirmed
@@ -502,6 +537,21 @@ func (m *Metrics) ClearDeadLetter() {
 		return
 	}
 	m.deadLetters.Dec()
+}
+
+// ClearDeadLetterFor decrements the dead letter gauge for a specific workspace and channel.
+func (m *Metrics) ClearDeadLetterFor(workspace, channel string) {
+	if m == nil {
+		return
+	}
+	m.deadLetters.Dec()
+	if workspace == "" {
+		workspace = "default"
+	}
+	if channel == "" {
+		channel = "unknown"
+	}
+	m.deadLettersByChannel.WithLabelValues(workspace, channel).Dec()
 }
 
 // RecordThrottle counts one throttled delivery per channel type.
@@ -638,6 +688,7 @@ func ExportedMetricNames() []string {
 		"sorobeacon_store_replica_fallbacks_total",
 		"sorobeacon_store_replica_enabled",
 		"sorobeacon_dead_letters_total",
+		"sorobeacon_dead_letters",
 		"sorobeacon_alerts_stream_dropped_total",
 		"sorobeacon_request_body_rejections_total",
 		"sorobeacon_database_degraded",

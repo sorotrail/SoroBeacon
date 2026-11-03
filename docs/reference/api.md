@@ -355,8 +355,12 @@ retention rules and the difference between a retry and a redrive are in
 
 | Method & path | Description | Scope |
 | --- | --- | --- |
-| `GET /dead-letters` | List the queue in id order. Query: `channel_id`, `alert_id`, `limit` (default 50), `after_id` (keyset cursor). | `alerts:read` |
+| `GET /dead-letters` | List the queue in id order. Query: `channel_id`, `alert_id`, `cause`, `older_than`, `created_before`, `created_after`, `limit` (default 50), `after_id` (keyset cursor). | `alerts:read` |
+| `GET /dead-letters/groups` | Roll up dead letters into groups by channel and cause. Query: `channel_id`, `cause`, `older_than`. | `alerts:read` |
 | `POST /dead-letters/{id}/redrive` | Send the stored alert to the stored channel once. | `alerts:write` |
+| `POST /dead-letters/{id}/discard` | Discard one dead letter from the backlog without sending. | `alerts:write` |
+| `POST /dead-letters/bulk/redrive` | Re-drive a batch of dead letters matching filter or IDs. Rate-limited and pacing protected. | `alerts:write` |
+| `POST /dead-letters/bulk/discard` | Discard a batch of dead letters matching filter or IDs. | `alerts:write` |
 
 Each dead letter has `id`, `alert_id`, `channel_id`, `last_error` (sanitized),
 `attempt_count`, `last_status` (HTTP status, or `0` for a transport error) and

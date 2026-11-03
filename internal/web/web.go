@@ -430,6 +430,9 @@ func (s *Server) Routes() chi.Router {
 
 	mux.Get("/dead-letters", s.listDeadLetters)
 	mux.Post("/dead-letters/{id}/redrive", s.redriveDeadLetter)
+	mux.Post("/dead-letters/{id}/discard", s.discardDeadLetter)
+	mux.Post("/dead-letters/bulk/redrive", s.bulkRedriveDeadLetters)
+	mux.Post("/dead-letters/bulk/discard", s.bulkDiscardDeadLetters)
 
 	mux.Get("/maintenance", s.maintenance)
 	mux.Post("/maintenance", s.createMaintenance)

@@ -405,6 +405,7 @@ var unscopedStoreMethods = map[string]string{
 	"PruneLedgerHashes":                  "the reorg window is per network, not per tenant",
 	"RetractAlertsFromLedger":            "a reorg orphans every tenant's alerts on that ledger",
 	"DeleteExpiredAlerts":                "retention sweeps every workspace, and ExpiredAlerts selects the rows it deletes",
+	"DeleteExpiredDeadLetters":           "retention sweeps every workspace",
 	"EnsureWorkspace":                    "takes the workspace as an argument",
 	"AssignLegacyNetwork":                "the one-time startup upgrade labels rows the migration left unlabelled in every workspace; its predicate is the empty network, not a tenant",
 	"TokenByHash":                        "authenticating: the token's own row is where its workspace comes from, so the read cannot be scoped to a tenant the caller does not have yet",

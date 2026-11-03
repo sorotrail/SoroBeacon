@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1227,23 +1228,72 @@ type Alerts interface {
 	ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int) ([]Alert, error)
 }
 
+// Dead letter cause categories. Coarse groupings so triage doesn't fragment into one group per unique error string.
+const (
+	DeadLetterCauseRateLimit   = "rate_limit"
+	DeadLetterCauseAuthFailure = "auth_failure"
+	DeadLetterCauseClientError = "client_error"
+	DeadLetterCauseServerError = "server_error"
+	DeadLetterCauseTimeout     = "timeout"
+	DeadLetterCauseNetwork     = "network_error"
+	DeadLetterCauseOther       = "other"
+)
+
+// ClassifyCause derives a coarse cause from the last delivery HTTP status code and error message.
+func ClassifyCause(status int, errStr string) string {
+	lower := strings.ToLower(errStr)
+	switch {
+	case status == 429 || strings.Contains(lower, "429") || strings.Contains(lower, "rate limit") || strings.Contains(lower, "too many requests"):
+		return DeadLetterCauseRateLimit
+	case status == 401 || status == 403 || strings.Contains(lower, "401") || strings.Contains(lower, "403") || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "forbidden") || strings.Contains(lower, "token"):
+		return DeadLetterCauseAuthFailure
+	case status >= 400 && status < 500:
+		return DeadLetterCauseClientError
+	case status >= 500 && status < 600:
+		return DeadLetterCauseServerError
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded") || status == 408 || status == 504:
+		return DeadLetterCauseTimeout
+	case strings.Contains(lower, "connection refused") || strings.Contains(lower, "no such host") || strings.Contains(lower, "dial tcp") || strings.Contains(lower, "network"):
+		return DeadLetterCauseNetwork
+	default:
+		return DeadLetterCauseOther
+	}
+}
+
 // DeadLetter represents a permanently failed delivery attempt.
 type DeadLetter struct {
 	ID           int64     `json:"id"`
 	AlertID      int64     `json:"alert_id"`
 	ChannelID    int64     `json:"channel_id"`
+	Cause        string    `json:"cause,omitempty"`
 	LastError    string    `json:"last_error"`
 	AttemptCount int       `json:"attempt_count"`
 	LastStatus   int       `json:"last_status"`
 	CreatedAt    time.Time `json:"created_at"`
 }
 
-// DeadLetterFilter narrows ListDeadLetters.
+// DeadLetterGroup is a rollup of dead letters by channel and cause.
+type DeadLetterGroup struct {
+	ChannelID   int64     `json:"channel_id"`
+	ChannelName string    `json:"channel_name,omitempty"`
+	ChannelType string    `json:"channel_type,omitempty"`
+	Cause       string    `json:"cause"`
+	Count       int       `json:"count"`
+	OldestAt    time.Time `json:"oldest_at"`
+	NewestAt    time.Time `json:"newest_at"`
+}
+
+// DeadLetterFilter narrows ListDeadLetters and bulk operations.
 type DeadLetterFilter struct {
-	ChannelID int64
-	AlertID   int64
-	Limit     int
-	AfterID   int64
+	ChannelID     int64
+	AlertID       int64
+	Cause         string
+	OlderThan     time.Duration
+	CreatedBefore time.Time
+	CreatedAfter  time.Time
+	Limit         int
+	AfterID       int64
+	IDs           []int64
 }
 
 // DeadLetters persists permanently failed deliveries.
@@ -1251,7 +1301,64 @@ type DeadLetters interface {
 	CreateDeadLetter(ctx context.Context, d *DeadLetter) error
 	GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, error)
 	ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error)
+	ListDeadLetterGroups(ctx context.Context, f DeadLetterFilter) ([]DeadLetterGroup, error)
 	DeleteDeadLetter(ctx context.Context, id int64) error
+	BulkDeleteDeadLetters(ctx context.Context, f DeadLetterFilter) (int64, error)
+	DeleteExpiredDeadLetters(ctx context.Context, cutoff time.Time, limit int) (int64, error)
+}
+
+// GroupDeadLetters rolls up a slice of dead letters by (channel_id, cause).
+func GroupDeadLetters(letters []DeadLetter, chMap map[int64]Channel, causeFilter string) []DeadLetterGroup {
+	type key struct {
+		channelID int64
+		cause     string
+	}
+	groups := make(map[key]*DeadLetterGroup)
+	order := make([]key, 0)
+
+	for _, dl := range letters {
+		cause := dl.Cause
+		if cause == "" {
+			cause = ClassifyCause(dl.LastStatus, dl.LastError)
+		}
+		if causeFilter != "" && cause != causeFilter {
+			continue
+		}
+		k := key{channelID: dl.ChannelID, cause: cause}
+		g, exists := groups[k]
+		if !exists {
+			ch := chMap[dl.ChannelID]
+			g = &DeadLetterGroup{
+				ChannelID:   dl.ChannelID,
+				ChannelName: ch.Name,
+				ChannelType: ch.Type,
+				Cause:       cause,
+				OldestAt:    dl.CreatedAt,
+				NewestAt:    dl.CreatedAt,
+			}
+			groups[k] = g
+			order = append(order, k)
+		}
+		g.Count++
+		if dl.CreatedAt.Before(g.OldestAt) {
+			g.OldestAt = dl.CreatedAt
+		}
+		if dl.CreatedAt.After(g.NewestAt) {
+			g.NewestAt = dl.CreatedAt
+		}
+	}
+
+	result := make([]DeadLetterGroup, 0, len(order))
+	for _, k := range order {
+		result = append(result, *groups[k])
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Count != result[j].Count {
+			return result[i].Count > result[j].Count
+		}
+		return result[i].ChannelID < result[j].ChannelID
+	})
+	return result
 }
 
 // MaintenanceWindows persists alert-silencing windows and marks suppressed
@@ -1414,9 +1521,11 @@ type SavedSearches interface {
 // Audit actions persisted on audit_log.action. A small closed set so the
 // API can filter on it and clients can branch on a stable token.
 const (
-	AuditActionCreate = "create"
-	AuditActionUpdate = "update"
-	AuditActionDelete = "delete"
+	AuditActionCreate  = "create"
+	AuditActionUpdate  = "update"
+	AuditActionDelete  = "delete"
+	AuditActionRedrive = "redrive"
+	AuditActionDiscard = "discard"
 )
 
 // AuditEntry is one append-only record of a mutating operation on a monitor,

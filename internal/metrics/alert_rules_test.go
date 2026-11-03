@@ -61,6 +61,7 @@ func TestExportedMetricNamesMatchesRegistryForAlerts(t *testing.T) {
 	m.RecordReplicaFallback()
 	m.SetReplicaEnabled(true)
 	m.SetDeadLetters(0)
+	m.SetDeadLettersFor("default", "slack", 0)
 	m.RecordBodyRejection("max_body")
 	m.httpDuration.WithLabelValues("/health", "GET", "200").Observe(0.01)
 

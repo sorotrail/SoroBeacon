@@ -111,8 +111,8 @@ them.
 | `GET /channels/{id}/stats` | `stats:read` |
 | `GET /templates`, `GET /templates/{id}` | `templates:read` |
 | `POST /templates`, `PATCH`/`DELETE /templates/{id}`, `POST /templates/{id}/instantiate`, `POST /templates/{id}/instantiate/bulk` | `templates:write` (instantiate also `monitors:write`) |
-| `GET /alerts`, `GET /alerts.csv`, `GET /alerts/export`, `GET /alerts/stream`, `GET /alerts/{id}/deliveries`, `GET /dead-letters`, `GET /inhibitions`, `GET /maintenance-windows`, `GET /maintenance-windows/{id}` | `alerts:read` |
-| `POST /alerts/{id}/acknowledge`, `POST /alerts/{id}/deliveries/{channelID}/retry`, `POST /ingest`, `POST /dead-letters/{id}/redrive`, `POST /inhibitions`, `DELETE /inhibitions/{sourceID}/{targetID}`, `POST`/`PATCH`/`DELETE /maintenance-windows...` | `alerts:write` |
+| `GET /alerts`, `GET /alerts.csv`, `GET /alerts/export`, `GET /alerts/stream`, `GET /alerts/{id}/deliveries`, `GET /dead-letters`, `GET /dead-letters/groups`, `GET /inhibitions`, `GET /maintenance-windows`, `GET /maintenance-windows/{id}` | `alerts:read` |
+| `POST /alerts/{id}/acknowledge`, `POST /alerts/{id}/deliveries/{channelID}/retry`, `POST /ingest`, `POST /dead-letters/{id}/redrive`, `POST /dead-letters/{id}/discard`, `POST /dead-letters/bulk/redrive`, `POST /dead-letters/bulk/discard`, `POST /inhibitions`, `DELETE /inhibitions/{sourceID}/{targetID}`, `POST`/`PATCH`/`DELETE /maintenance-windows...` | `alerts:write` |
 | `GET /stats`, `GET /monitors/{id}/stats` | `stats:read` |
 | `GET /stats/alerts-daily` | `alerts:read` |
 | `POST /tokens`, `POST /tokens/{id}/revoke` | `tokens:write` |
@@ -175,7 +175,7 @@ disagree in either direction.
 | `GET /monitors`, `/monitors/{id}`, `/monitors/{id}/stats`, `/monitors/{id}/rules`, `/monitors/{id}/escalation`, `/monitors/trash` | viewer |
 | `GET /channels`, `/channels/{id}`, `/channels/{id}/stats` | viewer |
 | `GET /templates`, `/templates/{id}` | viewer |
-| `GET /alerts`, `/alerts.csv`, `/alerts/export`, `/alerts/stream`, `/alerts/{id}/deliveries`, `/dead-letters`, `/inhibitions`, `/maintenance-windows`, `/maintenance-windows/{id}` | viewer |
+| `GET /alerts`, `/alerts.csv`, `/alerts/export`, `/alerts/stream`, `/alerts/{id}/deliveries`, `/dead-letters`, `/dead-letters/groups`, `/inhibitions`, `/maintenance-windows`, `/maintenance-windows/{id}` | viewer |
 | `GET /stats`, `/stats/alerts-daily` | viewer |
 | `GET /version`, `/poller`, `/rule-types` | viewer |
 | `POST /monitors`, `/monitors/bulk`, `/monitors/import` | editor |
@@ -185,7 +185,7 @@ disagree in either direction.
 | `PUT`/`DELETE /monitors/{id}/escalation` | editor |
 | `POST /channels`, `PATCH`/`DELETE /channels/{id}`, `/channels/bulk`, `/channels/{id}/duplicate`, `/channels/{id}/test` | editor |
 | `POST /templates`, `PATCH`/`DELETE /templates/{id}`, `/templates/{id}/instantiate`, `/templates/{id}/instantiate/bulk` | editor |
-| `POST /alerts/{id}/acknowledge`, `/alerts/{id}/deliveries/{channelID}/retry`, `/ingest`, `/dead-letters/{id}/redrive`, `/inhibitions`, `DELETE /inhibitions/{sourceID}/{targetID}` | editor |
+| `POST /alerts/{id}/acknowledge`, `/alerts/{id}/deliveries/{channelID}/retry`, `/ingest`, `/dead-letters/{id}/redrive`, `/dead-letters/{id}/discard`, `/dead-letters/bulk/redrive`, `/dead-letters/bulk/discard`, `/inhibitions`, `DELETE /inhibitions/{sourceID}/{targetID}` | editor |
 | `POST`/`PATCH`/`DELETE /maintenance-windows...` | editor |
 | `GET`/`POST /tokens`, `POST /tokens/{id}/revoke` | admin |
 | `GET /audit` | admin |

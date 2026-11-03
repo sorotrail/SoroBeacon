@@ -38,6 +38,7 @@ host is shared.
 | `sorobeacon_alerts_fired_total` | counter | — | grows when alerts are created; can lag matched (dedup and cooldown suppress) |
 | `sorobeacon_alert_deliveries_total` | counter | `channel`, `outcome` (`ok`\|`error`) | `outcome="error"` stays a small share per channel type |
 | `sorobeacon_dead_letters_total` | gauge | - | `0`; a positive value means failed deliveries are waiting for a redrive |
+| `sorobeacon_dead_letters` | gauge | `workspace`, `channel` | failed deliveries waiting for review or redrive, labeled by workspace and channel |
 | `sorobeacon_heartbeat_last_success_timestamp_seconds` | gauge | — | a recent unix timestamp while `HEARTBEAT_URL` is configured; `0` means no ping has succeeded since this process started (the metric only moves when ingest is healthy) |
 | `sorobeacon_http_request_duration_seconds` | histogram | `route`, `method`, `status` | request times at millisecond scale |
 | `sorobeacon_http_not_modified_total` | counter | `route` | increments on HTTP 304 Not Modified responses served via conditional requests |

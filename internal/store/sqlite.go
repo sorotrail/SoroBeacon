@@ -2179,11 +2179,12 @@ func (s *SQLite) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, erro
 	if err != nil {
 		return nil, err
 	}
+	d.Cause = ClassifyCause(d.LastStatus, d.LastError)
 	return &d, nil
 }
 
 // ListDeadLetters returns dead-letter records in id order, applying the
-// optional channel, alert, and pagination filters. A tenant sees only records
+// optional channel, alert, age, cause and pagination filters. A tenant sees only records
 // whose alert belongs to it; the dispatcher's system context sees every row.
 func (s *SQLite) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error) {
 	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
@@ -2205,6 +2206,27 @@ func (s *SQLite) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]Dea
 		q += ` AND id > ?`
 		args = append(args, f.AfterID)
 	}
+	if !f.CreatedBefore.IsZero() {
+		q += ` AND created_at < ?`
+		args = append(args, sqliteTimeString(f.CreatedBefore.UTC()))
+	}
+	if f.OlderThan > 0 {
+		cutoff := time.Now().UTC().Add(-f.OlderThan)
+		q += ` AND created_at < ?`
+		args = append(args, sqliteTimeString(cutoff))
+	}
+	if !f.CreatedAfter.IsZero() {
+		q += ` AND created_at >= ?`
+		args = append(args, sqliteTimeString(f.CreatedAfter.UTC()))
+	}
+	if len(f.IDs) > 0 {
+		placeholders := make([]string, len(f.IDs))
+		for i, id := range f.IDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		q += ` AND id IN (` + strings.Join(placeholders, ",") + `)`
+	}
 	q += ` ORDER BY id ASC LIMIT ?`
 	args = append(args, pageLimit(f.Limit))
 
@@ -2224,9 +2246,33 @@ func (s *SQLite) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]Dea
 		if err != nil {
 			return nil, err
 		}
+		d.Cause = ClassifyCause(d.LastStatus, d.LastError)
+		if f.Cause != "" && d.Cause != f.Cause {
+			continue
+		}
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// ListDeadLetterGroups aggregates dead letters by channel and cause.
+func (s *SQLite) ListDeadLetterGroups(ctx context.Context, f DeadLetterFilter) ([]DeadLetterGroup, error) {
+	gf := f
+	gf.Limit = 10000
+	gf.AfterID = 0
+	letters, err := s.ListDeadLetters(ctx, gf)
+	if err != nil {
+		return nil, err
+	}
+	channels, err := s.ListChannels(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	chMap := make(map[int64]Channel, len(channels))
+	for _, ch := range channels {
+		chMap[ch.ID] = ch
+	}
+	return GroupDeadLetters(letters, chMap, f.Cause), nil
 }
 
 // DeleteDeadLetter removes a dead-letter record after a successful redrive.
@@ -2253,6 +2299,54 @@ func (s *SQLite) DeleteDeadLetter(ctx context.Context, id int64) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// BulkDeleteDeadLetters removes dead letters matching the filter within the context's workspace.
+func (s *SQLite) BulkDeleteDeadLetters(ctx context.Context, f DeadLetterFilter) (int64, error) {
+	gf := f
+	if gf.Limit <= 0 || gf.Limit > 10000 {
+		gf.Limit = 10000
+	}
+	letters, err := s.ListDeadLetters(ctx, gf)
+	if err != nil {
+		return 0, err
+	}
+	if len(letters) == 0 {
+		return 0, nil
+	}
+	placeholders := make([]string, len(letters))
+	args := make([]any, 0, len(letters)+1)
+	for i, dl := range letters {
+		placeholders[i] = "?"
+		args = append(args, dl.ID)
+	}
+
+	q := `DELETE FROM dead_letters WHERE id IN (` + strings.Join(placeholders, ",") + `)`
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = ?)`
+		args = append(args, ws)
+	}
+	res, err := s.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return 0, mapSQLiteErr(err)
+	}
+	return res.RowsAffected()
+}
+
+// DeleteExpiredDeadLetters removes up to limit dead letters created strictly before cutoff.
+func (s *SQLite) DeleteExpiredDeadLetters(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = DefaultPruneBatch
+	}
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM dead_letters WHERE id IN (
+			SELECT id FROM dead_letters WHERE created_at < ?
+			ORDER BY created_at ASC, id ASC LIMIT ?
+		)`, sqliteTimeString(cutoff.UTC()), limit)
+	if err != nil {
+		return 0, mapSQLiteErr(err)
+	}
+	return res.RowsAffected()
 }
 
 func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {

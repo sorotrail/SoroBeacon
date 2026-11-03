@@ -286,3 +286,57 @@ func RunEventArchivePruner(ctx context.Context, st EventArchive, retention, inte
 		}
 	}
 }
+
+// RunDeadLetterPruner removes dead letters older than retention in batches until
+// ctx is cancelled. Non-positive retention is a no-op.
+func RunDeadLetterPruner(ctx context.Context, st DeadLetters, retention, interval time.Duration, batch int, log *slog.Logger) {
+	if retention <= 0 {
+		return
+	}
+	if batch <= 0 {
+		batch = DefaultPruneBatch
+	}
+	if interval <= 0 {
+		interval = DefaultPruneInterval
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	log.Info("dead letter pruner started",
+		"retention", retention.String(),
+		"interval", interval.String(),
+		"batch", batch,
+	)
+
+	pruneOnce := func() {
+		cutoff := time.Now().UTC().Add(-retention)
+		var deleted int64
+		for {
+			n, err := st.DeleteExpiredDeadLetters(ctx, cutoff, batch)
+			if err != nil {
+				log.Error("dead letter prune failed", "error", err, "cutoff", cutoff)
+				return
+			}
+			deleted += n
+			if n < int64(batch) {
+				break
+			}
+		}
+		if deleted > 0 {
+			log.Info("dead letter prune", "deleted", deleted, "cutoff", cutoff)
+		}
+	}
+
+	pruneOnce()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("dead letter pruner stopped")
+			return
+		case <-t.C:
+			pruneOnce()
+		}
+	}
+}

@@ -40,6 +40,7 @@ const (
 	httpDurationName      = "sorobeacon_http_request_duration_seconds"
 	streamDroppedName     = "sorobeacon_alerts_stream_dropped_total"
 	deadLettersName       = "sorobeacon_dead_letters_total"
+	deadLettersChannelName = "sorobeacon_dead_letters"
 	pollPanicsName        = "sorobeacon_poll_panics_total"
 )
 
@@ -395,6 +396,25 @@ func TestDeadLetterGaugeHasNoLabels(t *testing.T) {
 		return
 	}
 	t.Fatalf("%s was not exported", deadLettersName)
+}
+
+func TestDeadLettersByWorkspaceAndChannel(t *testing.T) {
+	m := New()
+
+	m.RecordDeadLetterFor("acme", "slack")
+	m.RecordDeadLetterFor("acme", "slack")
+	m.RecordDeadLetterFor("beta", "pagerduty")
+
+	assert.Equal(t, float64(2), m.sampleValue(t, deadLettersChannelName, map[string]string{"workspace": "acme", "channel": "slack"}))
+	assert.Equal(t, float64(1), m.sampleValue(t, deadLettersChannelName, map[string]string{"workspace": "beta", "channel": "pagerduty"}))
+	assert.Equal(t, float64(3), m.sampleValue(t, deadLettersName, nil), "global unlabelled count also increments")
+
+	m.ClearDeadLetterFor("acme", "slack")
+	assert.Equal(t, float64(1), m.sampleValue(t, deadLettersChannelName, map[string]string{"workspace": "acme", "channel": "slack"}))
+	assert.Equal(t, float64(2), m.sampleValue(t, deadLettersName, nil))
+
+	m.SetDeadLettersFor("acme", "slack", 10)
+	assert.Equal(t, float64(10), m.sampleValue(t, deadLettersChannelName, map[string]string{"workspace": "acme", "channel": "slack"}))
 }
 
 func TestRecordPanicCountsPerNetwork(t *testing.T) {
