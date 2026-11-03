@@ -261,6 +261,7 @@ func configEnvVars(t *testing.T) []string {
 		// scan — without this pattern the loop below would find nothing and
 		// pass vacuously, which is what the guard on the caller catches.
 		regexp.MustCompile(`lookupConfigValue\("([A-Z0-9_]+)"`),
+		regexp.MustCompile(`lookupSecret\("([A-Z0-9_]+)"\)`),
 		regexp.MustCompile(`valueOrFallback\("([A-Z0-9_]+)"`),
 		regexp.MustCompile(`parseInt32EnvWithFile\("([A-Z0-9_]+)"`),
 		regexp.MustCompile(`parseDurationEnvWithFile\("([A-Z0-9_]+)"`),

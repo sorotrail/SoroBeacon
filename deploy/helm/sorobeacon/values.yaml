@@ -288,7 +288,7 @@ auth:
 # encrypted database column; "vault" fetches them from HashiCorp Vault at
 # delivery time instead.
 secrets:
-  # env (default) or vault.
+  # env, vault, or file.
   provider: ""
   # How long a resolved secret is cached before it is fetched again.
   cacheTtl: ""

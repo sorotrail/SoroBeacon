@@ -495,8 +495,8 @@
       "properties": {
         "provider": {
           "type": "string",
-          "enum": ["", "env", "vault"],
-          "description": "env (default) reads the encrypted database column; vault fetches from HashiCorp Vault."
+          "enum": ["", "env", "vault", "file"],
+          "description": "env (default) reads the encrypted database column; vault fetches from HashiCorp Vault; file reads from mounted files."
         },
         "cacheTtl": {
           "type": "string",

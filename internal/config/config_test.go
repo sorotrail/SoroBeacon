@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/base64"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1421,3 +1423,68 @@ func TestGraphQLAllowlistOnlyConfig(t *testing.T) {
 		assert.ErrorContains(t, err, "GRAPHQL_ALLOWLIST_ONLY")
 	})
 }
+
+func TestSecretResolutionConfig(t *testing.T) {
+	for _, k := range []string{"SOROBAN_RPC_URL", "DATABASE_URL"} {
+		t.Setenv(k, "postgres://user:pass@localhost:5432/db")
+	}
+
+	t.Run("resolves database url from file", func(t *testing.T) {
+		dir := t.TempDir()
+		dbFile := filepath.Join(dir, "db.txt")
+		require.NoError(t, os.WriteFile(dbFile, []byte("postgres://secretuser:secretpass@dbhost:5432/secretdb\n"), 0o600))
+
+		t.Setenv("SECRETS_PROVIDER", "file")
+		t.Setenv("DATABASE_URL", "${secret:file:"+dbFile+"}")
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Equal(t, "postgres://secretuser:secretpass@dbhost:5432/secretdb", cfg.DatabaseURL)
+	})
+
+	t.Run("resolves api token and encryption key from file", func(t *testing.T) {
+		dir := t.TempDir()
+		credsFile := filepath.Join(dir, "creds.json")
+		require.NoError(t, os.WriteFile(credsFile, []byte(`{"token":"sb_admin_token","enc":"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="}`), 0o600))
+
+		t.Setenv("SECRETS_PROVIDER", "file")
+		t.Setenv("API_TOKEN", "${secret:file:"+credsFile+"#token}")
+		t.Setenv("CONFIG_ENCRYPTION_KEY", "${secret:file:"+credsFile+"#enc}")
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Contains(t, cfg.APITokens, "sb_admin_token")
+		assert.Len(t, cfg.ConfigEncryptionKey, 32)
+	})
+
+	t.Run("fails startup on missing secret file without leaking", func(t *testing.T) {
+		t.Setenv("SECRETS_PROVIDER", "file")
+		t.Setenv("DATABASE_URL", "${secret:file:/nonexistent/db.txt}")
+
+		_, err := Load()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "DATABASE_URL")
+		assert.ErrorContains(t, err, "${secret:file:/nonexistent/db.txt}")
+	})
+
+	t.Run("fails when secrets provider is unset but reference provided", func(t *testing.T) {
+		t.Setenv("SECRETS_PROVIDER", "")
+		t.Setenv("DATABASE_URL", "${secret:file:/some/path}")
+
+		_, err := Load()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "DATABASE_URL")
+		assert.ErrorContains(t, err, "SECRETS_PROVIDER is not configured")
+	})
+
+	t.Run("supports comma-separated secrets providers", func(t *testing.T) {
+		t.Setenv("SECRETS_PROVIDER", "file,env")
+		t.Setenv("MY_ENV_DB", "postgres://envuser:envpass@envhost:5432/envdb")
+		t.Setenv("DATABASE_URL", "${secret:env:MY_ENV_DB}")
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Equal(t, "postgres://envuser:envpass@envhost:5432/envdb", cfg.DatabaseURL)
+	})
+}
+
