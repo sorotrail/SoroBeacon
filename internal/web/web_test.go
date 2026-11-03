@@ -64,6 +64,10 @@ func (emptyStore) GetChannelDeliveryStats(context.Context, int64, time.Time) (st
 func (emptyStore) ListChannelAckReconciliations(context.Context) (map[int64]store.ChannelAckReconciliation, error) {
 	return nil, nil
 }
+func (emptyStore) RegisterPersistedOperation(context.Context, store.PersistedOperation) error { return nil }
+func (emptyStore) GetPersistedOperation(context.Context, string) (*store.PersistedOperation, error) { return nil, store.ErrNotFound }
+func (emptyStore) ListPersistedOperations(context.Context) ([]store.PersistedOperation, error) { return nil, nil }
+func (emptyStore) DeletePersistedOperation(context.Context, string) error { return nil }
 func (emptyStore) ListSavedSearches(context.Context) ([]store.SavedSearch, error) { return nil, nil }
 func (emptyStore) CreateSavedSearch(context.Context, *store.SavedSearch) error    { return nil }
 func (emptyStore) GetSavedSearch(context.Context, int64) (*store.SavedSearch, error) {

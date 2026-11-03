@@ -323,3 +323,70 @@ Reported as issues rather than documented around:
    default workspace on a multi-workspace instance.
 5. **The resolver package has no tests at all**, so every behaviour documented
    above as intended is currently unverified by anything but this reading.
+
+## Persisted Operations and Allowlist Mode
+
+For multi-tenant defense and performance, SoroBeacon supports persisted GraphQL operations. Rather than accepting arbitrary caller-composed documents, clients register query documents and invoke them by identifier (SHA-256 hash).
+
+### How Invocation Works
+
+A client invokes an operation by sending its SHA-256 hash in the JSON body:
+
+```json
+{
+  "id": "a591a6d40bf420404a011733cfb7b190d62c65bf0bcda32b57b277d9ad9f146e",
+  "variables": { "limit": 20 }
+}
+```
+
+Or via standard Apollo Automatic Persisted Query (APQ) extensions:
+
+```json
+{
+  "extensions": {
+    "persistedQuery": {
+      "version": 1,
+      "sha256Hash": "a591a6d40bf420404a011733cfb7b190d62c65bf0bcda32b57b277d9ad9f146e"
+    }
+  },
+  "variables": { "limit": 20 }
+}
+```
+
+If an identifier is unknown, the server responds distinguishably:
+
+```json
+{
+  "errors": [
+    {
+      "message": "PersistedQueryNotFound",
+      "extensions": {
+        "code": "PERSISTED_QUERY_NOT_FOUND"
+      }
+    }
+  ]
+}
+```
+
+### Allowlist-Only Mode (`GRAPHQL_ALLOWLIST_ONLY=true`)
+
+By default (`GRAPHQL_ALLOWLIST_ONLY=false`), open queries are accepted. When allowlist mode is enabled (`GRAPHQL_ALLOWLIST_ONLY=true`), arbitrary ad-hoc queries are rejected with `PERSISTED_QUERY_NOT_ALLOWED` unless the document text matches a registered persisted operation's canonical hash.
+
+### Privileged Registration API
+
+Persisted operations are stored in the database (`persisted_operations` table) across PostgreSQL and SQLite, surviving process restarts and synchronizing across replicas.
+
+Registration is an authenticated, administrative operation under `/api/v1/graphql/operations` requiring `API_TOKEN` or `WORKSPACE_TOKENS` with `tokens:write` / admin privilege. Automatic client registration on cache miss is intentionally prohibited to prevent bypasses:
+
+* `POST /api/v1/graphql/operations`: Register an operation. Requires JSON `{"name": "...", "document": "..."}`. Normalizes document whitespace and verifies the SHA-256 hash. Returns `201 Created`.
+* `GET /api/v1/graphql/operations`: List registered operations (reviewable audit surface).
+* `GET /api/v1/graphql/operations/{id}`: Inspect a registered operation.
+* `DELETE /api/v1/graphql/operations/{id}`: Delete an operation from the allowlist.
+
+### Cost and Complexity Limits on Persisted Queries
+
+A registered query is vetted, not exempt. `GRAPHQL_MAX_DEPTH` (depth ceiling) and `GRAPHQL_MAX_COMPLEXITY` (complexity ceiling) are strictly enforced against persisted operations. Variable arguments (such as large `limit` inputs) multiply complexity scores and will trigger `QUERY_COMPLEXITY_EXCEEDED` or `QUERY_DEPTH_EXCEEDED` rejections when exceeded.
+
+### Global vs Per-Workspace Operation Tenancy
+
+The GraphQL schema defines shared structural types (monitors, alerts, rules, channels, stats). Multi-tenant isolation is enforced at execution time against the requesting caller's authenticated workspace context, not by partitioning query syntax. Operation shapes are therefore registered globally in `persisted_operations`, allowing first-party dashboard queries and multi-tenant clients to share vetted shapes without per-workspace duplicate registration.

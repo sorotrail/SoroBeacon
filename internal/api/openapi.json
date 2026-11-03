@@ -2643,6 +2643,71 @@
         }
       }
     },
+    "/graphql/operations": {
+      "get": {
+        "summary": "List registered persisted GraphQL operations",
+        "description": "Required role: viewer",
+        "responses": {
+          "200": {
+            "description": "List of registered operations"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "summary": "Register a persisted GraphQL operation",
+        "description": "Required role: admin",
+        "responses": {
+          "201": {
+            "description": "Operation registered"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/graphql/operations/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "Get a registered persisted GraphQL operation",
+        "description": "Required role: viewer",
+        "responses": {
+          "200": {
+            "description": "Operation details"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a registered persisted GraphQL operation",
+        "description": "Required role: admin",
+        "responses": {
+          "204": {
+            "description": "Operation deleted"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/monitors/trash": {
       "get": {
         "summary": "List deleted monitors (trash)",

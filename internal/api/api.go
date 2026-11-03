@@ -390,6 +390,13 @@ func (s *Server) Routes() chi.Router {
 		r.Post("/{id}/revoke", s.revokeToken)
 	})
 
+	mux.Route("/graphql/operations", func(r chi.Router) {
+		r.Post("/", s.registerPersistedOperation)
+		r.Get("/", s.listPersistedOperations)
+		r.Get("/{id}", s.getPersistedOperation)
+		r.Delete("/{id}", s.deletePersistedOperation)
+	})
+
 	mux.Get("/alerts", s.withConditionalETag(s.alertChangeKey, s.listAlerts))
 	// Registered before /alerts.csv and the /alerts/{id}/... routes for
 	// readability; chi matches the static segment either way.

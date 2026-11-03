@@ -113,6 +113,7 @@ config:
   # the application's defaults.
   graphqlMaxDepth: ""
   graphqlMaxComplexity: ""
+  graphqlAllowlistOnly: false
   # Stable identity for this deployment, stamped as the origin on federated
   # alerts. Must be unique across instances that federate with each other.
   # Empty is fine for a standalone instance, but creating a federation channel
