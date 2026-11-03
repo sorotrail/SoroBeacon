@@ -489,7 +489,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 			}
 			records := make([]rules.MatchRecord, 0, len(alerts))
 			for _, a := range alerts {
-				records = append(records, rules.MatchRecord{At: a.CreatedAt, EventID: a.EventID})
+				records = append(records, rules.MatchRecord{At: a.CreatedAt, EventID: a.EventID, RuleVersion: a.RuleVersion})
 			}
 			return records, nil
 		})))

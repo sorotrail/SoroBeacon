@@ -76,6 +76,29 @@ func RuleID(ctx context.Context) int64 {
 	return id
 }
 
+// ruleVersionKey carries the rule revision under evaluation in the context.
+type ruleVersionKey struct{}
+
+// WithRuleVersion returns a context carrying the revision of the rule under
+// evaluation, so stateful evaluators can detect rule changes and reset any
+// cached state from a previous version.
+func WithRuleVersion(ctx context.Context, version int) context.Context {
+	return context.WithValue(ctx, ruleVersionKey{}, version)
+}
+
+// RuleVersion returns the rule version carried by ctx, or 0 when none is set.
+func RuleVersion(ctx context.Context) int {
+	v, _ := ctx.Value(ruleVersionKey{}).(int)
+	return v
+}
+
+// StatefulRuleEvaluator is implemented by evaluators that maintain in-memory
+// state keyed by rule ID, so the registry can clear that state when a rule is
+// updated, disabled, or deleted.
+type StatefulRuleEvaluator interface {
+	ResetRule(ruleID int64)
+}
+
 // EventNamer is implemented by evaluators that can name the events they
 // match. The poller uses it to compile server-side getEvents topic filters,
 // which is purely a bandwidth optimisation: client-side evaluation stays the
@@ -348,4 +371,17 @@ func (r *Registry) DryRun(ctx context.Context, ruleType string, events []*stella
 		}
 	}
 	return matches, nil
+}
+
+// ResetRuleState clears any in-memory state held by stateful evaluators for
+// ruleID. Safe to call on a nil receiver.
+func (r *Registry) ResetRuleState(ruleID int64) {
+	if r == nil || ruleID == 0 {
+		return
+	}
+	for _, e := range r.evaluators {
+		if sr, ok := e.(StatefulRuleEvaluator); ok {
+			sr.ResetRule(ruleID)
+		}
+	}
 }

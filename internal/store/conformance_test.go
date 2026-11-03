@@ -117,6 +117,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("FederatedAlerts", func(t *testing.T) { testFederatedAlerts(t, newStore) })
 	t.Run("FederatedAlertsFollowTheDeliveringWorkspace", func(t *testing.T) { testFederatedAlertFollowsTheDeliveringWorkspace(t, newStore) })
 	t.Run("PersistedOperations", func(t *testing.T) { testPersistedOperations(t, newStore) })
+	t.Run("RuleChangeSafety", func(t *testing.T) { testRuleChangeSafety(t, newStore) })
 }
 
 // testChannelDigest pins the digest settings round trip and the pending
@@ -2265,4 +2266,138 @@ func testDeadLetters(t *testing.T, newStore conformanceFactory) {
 	// otherwise point at nothing and never be cleaned up by the cascade.
 	orphan := &DeadLetter{AlertID: 999999, ChannelID: chA.ID, AttemptCount: 1}
 	assert.Error(t, st.CreateDeadLetter(ctx, orphan))
+}
+
+func testRuleChangeSafety(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	m := &Monitor{Name: "m-rule-safety", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+
+	r := &Rule{
+		MonitorID: m.ID,
+		Type:      "absence_of_event",
+		Params:    json.RawMessage(`{"event_name":"heartbeat","window":"5m","cooldown":"10m"}`),
+		Enabled:   true,
+	}
+	require.NoError(t, st.CreateRule(ctx, r))
+	assert.Equal(t, 1, r.Version, "newly created rule starts at version 1")
+
+	gotRule, err := st.GetRule(ctx, r.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, gotRule.Version)
+
+	// Record an absence clock and fire an alert under v1 with a long cooldown.
+	now := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "heartbeat", now))
+
+	alertV1 := &Alert{
+		MonitorID: m.ID,
+		RuleID:    r.ID,
+		EventID:   "ev-v1",
+		Payload:   json.RawMessage(`{"event_name":"heartbeat"}`),
+		Cooldown:  10 * time.Minute,
+	}
+	outcome, err := st.CreateAlert(ctx, alertV1)
+	require.NoError(t, err)
+	require.Equal(t, AlertCreated, outcome)
+	assert.Equal(t, 1, alertV1.RuleVersion, "CreateAlert stamps the current rule version")
+
+	// A second alert inside the cooldown window is suppressed and increments suppressed_since_last.
+	suppressed := &Alert{
+		MonitorID: m.ID,
+		RuleID:    r.ID,
+		EventID:   "ev-v1-suppressed",
+		Payload:   json.RawMessage(`{"event_name":"heartbeat"}`),
+		Cooldown:  10 * time.Minute,
+	}
+	outcome, err = st.CreateAlert(ctx, suppressed)
+	require.NoError(t, err)
+	require.Equal(t, AlertSuppressed, outcome)
+
+	// Attach an in-flight escalation to the v1 alert.
+	ch := &Channel{Name: "pager", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateChannel(ctx, ch))
+	pol, err := st.SetEscalationPolicy(ctx, m.ID, []EscalationStep{{DelaySeconds: 60, ChannelIDs: []int64{ch.ID}}})
+	require.NoError(t, err)
+	require.NoError(t, st.ScheduleEscalation(ctx, alertV1.ID, pol.ID, json.RawMessage(`{}`), 0, now.Add(-time.Minute)))
+
+	due, err := st.DueEscalations(ctx, now, 10)
+	require.NoError(t, err)
+	require.Len(t, due, 1, "escalation is due before the rule is edited")
+
+	// Editing the rule's condition increments version to 2, clears absence state,
+	// completes in-flight escalations, and resets the cooldown window while
+	// keeping the v1 alert row intact.
+	r.Params = json.RawMessage(`{"event_name":"heartbeat","window":"15m","cooldown":"10m"}`)
+	require.NoError(t, st.UpdateRule(ctx, r))
+	assert.Equal(t, 2, r.Version)
+
+	gotRule, err = st.GetRule(ctx, r.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 2, gotRule.Version)
+
+	states, err := st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, states, "changing rule params must clear stored absence state")
+
+	due, err = st.DueEscalations(ctx, now, 10)
+	require.NoError(t, err)
+	assert.Empty(t, due, "changing rule params must stop in-flight escalations")
+
+	// Because cooldown was reset on condition change, a new match under v2 fires
+	// immediately and carries SuppressedSinceLast == 0 and RuleVersion == 2.
+	alertV2 := &Alert{
+		MonitorID: m.ID,
+		RuleID:    r.ID,
+		EventID:   "ev-v2",
+		Payload:   json.RawMessage(`{"event_name":"heartbeat"}`),
+		Cooldown:  10 * time.Minute,
+	}
+	outcome, err = st.CreateAlert(ctx, alertV2)
+	require.NoError(t, err)
+	require.Equal(t, AlertCreated, outcome, "cooldown from v1 must not suppress v2")
+	assert.Equal(t, 2, alertV2.RuleVersion)
+	assert.Zero(t, alertV2.SuppressedSinceLast, "suppressed count from v1 must not carry into v2")
+
+	// Disabling the rule also increments version, clears absence state, and stops escalations.
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "heartbeat", now))
+	require.NoError(t, st.ScheduleEscalation(ctx, alertV2.ID, pol.ID, json.RawMessage(`{}`), 0, now.Add(-time.Minute)))
+	r.Enabled = false
+	require.NoError(t, st.UpdateRule(ctx, r))
+	assert.Equal(t, 3, r.Version)
+
+	states, err = st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, states, "disabling a rule must clear stored absence state")
+
+	due, err = st.DueEscalations(ctx, now, 10)
+	require.NoError(t, err)
+	assert.Empty(t, due, "disabling a rule must stop in-flight escalations")
+
+	// Historical alerts from v1 and v2 remain intact with their respective rule versions.
+	listed, err := st.ListAlerts(ctx, AlertFilter{RuleID: r.ID, Sort: "created_at_asc"})
+	require.NoError(t, err)
+	require.Len(t, listed, 2)
+	assert.Equal(t, 1, listed[0].RuleVersion)
+	assert.Equal(t, 2, listed[1].RuleVersion)
+
+	gotV1, err := st.GetAlert(ctx, alertV1.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, gotV1.RuleVersion)
+	gotV2, err := st.GetAlert(ctx, alertV2.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 2, gotV2.RuleVersion)
+
+	// Direct DeleteAbsenceStateForRule removes only the target rule's clocks.
+	r2 := &Rule{MonitorID: m.ID, Type: "absence_of_event", Params: json.RawMessage(`{"event_name":"ping","window":"5m"}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, r2))
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "heartbeat", now))
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r2.ID, "ping", now))
+	require.NoError(t, st.DeleteAbsenceStateForRule(ctx, r.ID))
+	states, err = st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	require.Len(t, states, 1)
+	assert.Equal(t, r2.ID, states[0].RuleID)
 }
