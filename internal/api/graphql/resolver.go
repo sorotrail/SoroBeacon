@@ -378,7 +378,8 @@ func NewHandler(resolver *Resolver, config ServerConfig) http.Handler {
 		}
 
 		var queryDoc string
-		if opID != "" {
+		switch {
+		case opID != "":
 			// Look up persisted operation
 			if resolver != nil && resolver.store != nil {
 				op, err := resolver.store.GetPersistedOperation(r.Context(), opID)
@@ -411,7 +412,8 @@ func NewHandler(resolver *Resolver, config ServerConfig) http.Handler {
 				})
 				return
 			}
-		} else if strings.TrimSpace(req.Query) != "" {
+
+		case strings.TrimSpace(req.Query) != "":
 			if config.AllowlistOnly {
 				norm, err := NormalizeDocument(req.Query)
 				if err != nil {
@@ -463,7 +465,8 @@ func NewHandler(resolver *Resolver, config ServerConfig) http.Handler {
 			} else {
 				queryDoc = req.Query
 			}
-		} else if config.AllowlistOnly {
+
+		case config.AllowlistOnly:
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"errors": []map[string]any{
