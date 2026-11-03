@@ -949,6 +949,7 @@ export const OPENAPI_OPERATIONS = [
   { method: "GET", path: "/rule-types", clientMethod: "listRuleTypes", summary: "List rule types and parameter schemas" },
   { method: "GET", path: "/stats", clientMethod: "getStats", summary: "Service statistics" },
   { method: "GET", path: "/stats/alerts-daily", clientMethod: "getDailyAlertCounts", summary: "Daily alert counts for the last 30 UTC days" },
+  { method: "GET", path: "/usage", clientMethod: "getUsage", summary: "Per-workspace usage metering summary" },
   { method: "GET", path: "/audit", clientMethod: "listAuditLogs", summary: "Audit log of configuration changes" },
   { method: "GET", path: "/templates", clientMethod: "listTemplates", summary: "List monitor templates" },
   { method: "POST", path: "/templates", clientMethod: "createTemplate", summary: "Create a monitor template" },
@@ -1931,6 +1932,16 @@ export class SoroBeaconClient {
     options?: RequestOptions,
   ): Promise<DailyAlertCountsResponse> {
     return this.request<DailyAlertCountsResponse>("GET", "/stats/alerts-daily", {
+      requestOptions: options,
+    });
+  }
+
+  async getUsage(
+    params?: { from?: string; to?: string; workspace?: string },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>("GET", "/usage", {
+      query: params as Record<string, unknown>,
       requestOptions: options,
     });
   }
