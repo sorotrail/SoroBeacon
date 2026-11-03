@@ -147,13 +147,14 @@ func (s *tokenStore) AbandonAPITokenRotation(ctx context.Context, id int64) erro
 		return store.ErrNotFound
 	}
 	var predID, succID int64
-	if t.SuccessorID != nil {
+	switch {
+	case t.SuccessorID != nil:
 		predID = t.ID
 		succID = *t.SuccessorID
-	} else if t.RotatedFromID != nil {
+	case t.RotatedFromID != nil:
 		succID = t.ID
 		predID = *t.RotatedFromID
-	} else {
+	default:
 		return store.ErrNotFound
 	}
 	if succ, ok := s.rows[succID]; ok && succ.Workspace == wsOf(ctx) {

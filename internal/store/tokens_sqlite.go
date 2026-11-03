@@ -185,13 +185,14 @@ func (s *SQLite) AbandonAPITokenRotation(ctx context.Context, id int64) error {
 	}
 
 	var predID, succID int64
-	if tok.SuccessorID != nil {
+	switch {
+	case tok.SuccessorID != nil:
 		predID = tok.ID
 		succID = *tok.SuccessorID
-	} else if tok.RotatedFromID != nil {
+	case tok.RotatedFromID != nil:
 		succID = tok.ID
 		predID = *tok.RotatedFromID
-	} else {
+	default:
 		return fmt.Errorf("no rotation in progress for token %d", id)
 	}
 

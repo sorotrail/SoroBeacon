@@ -3511,7 +3511,7 @@ func (p *Postgres) RotateAPIToken(ctx context.Context, predecessorID int64, succ
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	pred, err := scanAPIToken(tx.QueryRow(ctx,
 		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
@@ -3576,7 +3576,7 @@ func (p *Postgres) AbandonAPITokenRotation(ctx context.Context, id int64) error 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	tok, err := scanAPIToken(tx.QueryRow(ctx,
 		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
@@ -3588,13 +3588,14 @@ func (p *Postgres) AbandonAPITokenRotation(ctx context.Context, id int64) error 
 	}
 
 	var predID, succID int64
-	if tok.SuccessorID != nil {
+	switch {
+	case tok.SuccessorID != nil:
 		predID = tok.ID
 		succID = *tok.SuccessorID
-	} else if tok.RotatedFromID != nil {
+	case tok.RotatedFromID != nil:
 		succID = tok.ID
 		predID = *tok.RotatedFromID
-	} else {
+	default:
 		return fmt.Errorf("no rotation in progress for token %d", id)
 	}
 

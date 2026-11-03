@@ -161,13 +161,14 @@ func (f *fakeTokens) AbandonAPITokenRotation(ctx context.Context, id int64) erro
 	}
 
 	var predID, succID int64
-	if target.SuccessorID != nil {
+	switch {
+	case target.SuccessorID != nil:
 		predID = target.ID
 		succID = *target.SuccessorID
-	} else if target.RotatedFromID != nil {
+	case target.RotatedFromID != nil:
 		succID = target.ID
 		predID = *target.RotatedFromID
-	} else {
+	default:
 		return fmt.Errorf("no rotation in progress for token %d", id)
 	}
 

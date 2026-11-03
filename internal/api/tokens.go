@@ -267,7 +267,7 @@ func (s *Server) rotateToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var overlap time.Duration = auth.DefaultRotationOverlap
+	overlap := auth.DefaultRotationOverlap
 	if v := strings.TrimSpace(in.Overlap); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil || d <= 0 {
