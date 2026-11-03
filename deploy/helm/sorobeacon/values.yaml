@@ -343,5 +343,10 @@ oidc:
   # Claim naming the user's role (viewer, editor or admin), for an issuer that
   # carries one. Empty makes every SSO user an admin.
   roleClaim: ""
+  # Claim naming the user's group memberships, and mappings from provider
+  # groups to SoroBeacon roles/workspaces.
+  groupClaim: ""
+  groupMappings: ""
+  groupCacheTTL: ""
   # How long a started login may take to come back.
   loginStateTTL: "10m"
