@@ -117,8 +117,9 @@ type Dispatcher struct {
 	EscalationBatch    int
 	// now is the clock used for escalation bookkeeping. Nil means time.Now;
 	// tests substitute it so a delayed step can be reached without sleeping.
-	now      func() time.Time
-	flapping alerts.FlappingConfig
+	now           func() time.Time
+	flapping      alerts.FlappingConfig
+	monitorBudget *MonitorBudgetTracker
 }
 
 // NewDispatcher wires a Dispatcher with default retry settings.
@@ -156,6 +157,27 @@ func (d *Dispatcher) RateLimits() RateLimits {
 }
 
 // WithFlapping configures when repeated alert episodes are damped.
+// WithMonitorBudget attaches a monitor notification budget tracker.
+func (d *Dispatcher) WithMonitorBudget(tracker *MonitorBudgetTracker) *Dispatcher {
+	d.monitorBudget = tracker
+	return d
+}
+
+// WithMonitorCap sets a per-monitor notification volume cap.
+func (d *Dispatcher) WithMonitorCap(cfg MonitorCapConfig) *Dispatcher {
+	if d.monitorBudget == nil {
+		d.monitorBudget = NewMonitorBudgetTracker(cfg)
+	} else {
+		d.monitorBudget.defaultCfg = cfg.Normalized()
+	}
+	return d
+}
+
+// MonitorBudget returns the attached MonitorBudgetTracker, if any.
+func (d *Dispatcher) MonitorBudget() *MonitorBudgetTracker {
+	return d.monitorBudget
+}
+
 func (d *Dispatcher) WithFlapping(config alerts.FlappingConfig) *Dispatcher {
 	if config.Episodes > 0 {
 		d.flapping.Episodes = config.Episodes
@@ -247,6 +269,32 @@ func (d *Dispatcher) Dispatch(ctx context.Context, a Alert) {
 	if d.suppressed(ctx, a) {
 		return
 	}
+	if d.monitorBudget != nil && a.MonitorID > 0 {
+		now := d.nowTime()
+		action := d.monitorBudget.RecordAlert(ctx, a, now)
+		switch action.Outcome {
+		case CapOutcomeSuppressed:
+			reason := fmt.Sprintf("monitor %d notification volume cap reached (%d in %s)", a.MonitorID, action.Count, action.Window)
+			if err := d.store.SetAlertSuppressed(ctx, a.ID, reason); err != nil {
+				d.log.Error("mark alert suppressed due to monitor cap", "alert_id", a.ID, "monitor_id", a.MonitorID, "err", err)
+			}
+			if d.metrics != nil {
+				d.metrics.RecordThrottle("monitor_cap")
+			}
+			d.log.Warn("monitor notification volume cap reached; alert suppressed", "alert_id", a.ID, "monitor_id", a.MonitorID, "count", action.Count)
+			return
+		case CapOutcomeSummary:
+			a.Digest = fmt.Sprintf("Monitor %q reached notification volume cap: %d alerts in %s. Subsequent notifications are throttled.",
+				a.MonitorName, action.Count, action.Window)
+			if d.metrics != nil {
+				d.metrics.RecordThrottle("monitor_cap")
+			}
+			d.log.Warn("monitor notification volume cap reached; delivering summary notification", "alert_id", a.ID, "monitor_id", a.MonitorID, "count", action.Count)
+		case CapOutcomeAllow:
+			// Allowed within normal budget
+		}
+	}
+
 	if a.RuleID > 0 {
 		state, ok := d.flappingState(ctx, a)
 		if ok && state.Flapping && state.CurrentEpisodeAlerts > 1 {
