@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/secrets"
 )
 
@@ -292,6 +293,25 @@ type Config struct {
 	// channel types without a specific limit (NOTIFY_RATE_LIMIT_DEFAULT_RPS).
 	// Zero keeps the built-in notifier default; see notify.RateLimits.
 	NotifyRateLimitDefaultRPS float64
+
+	// Server TLS / mTLS (HTTP API + dashboard + gRPC server).
+	TLSCertFile     string
+	TLSKeyFile      string
+	TLSClientCAFile string
+	TLSClientAuth   string
+	MTLSBindings    []auth.MTLSBinding
+
+	// Upstream SoroTrail client TLS / mTLS.
+	SoroTrailTLSCertFile   string
+	SoroTrailTLSKeyFile    string
+	SoroTrailTLSCAFile     string
+	SoroTrailTLSServerName string
+
+	// Database client TLS / mTLS (PostgreSQL).
+	DatabaseSSLMode         string
+	DatabaseSSLCertFile     string
+	DatabaseSSLKeyFile      string
+	DatabaseSSLRootCertFile string
 }
 
 // OTLPConfig is the tracing slice of the configuration. It is a struct so a
@@ -953,6 +973,8 @@ func LoadProblems() (Config, []Problem) {
 			cfg.NotifyRateLimitDefaultRPS = rps
 		}
 	}
+
+	loadMTLS(&cfg, fileValues, sqliteBackend, &ps)
 
 	return cfg, ps.list
 }

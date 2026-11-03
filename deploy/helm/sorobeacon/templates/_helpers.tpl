@@ -168,4 +168,17 @@ SECRETS_PROVIDER: {{ .Values.secrets.provider | quote }}
 SECRETS_CACHE_TTL: {{ .Values.secrets.cacheTtl | quote }}
 VAULT_ADDR: {{ .Values.secrets.vaultAddr | quote }}
 VAULT_NAMESPACE: {{ .Values.secrets.vaultNamespace | quote }}
+TLS_CERT_FILE: {{ .Values.tls.certFile | quote }}
+TLS_KEY_FILE: {{ .Values.tls.keyFile | quote }}
+TLS_CLIENT_CA_FILE: {{ .Values.tls.clientCAFile | quote }}
+TLS_CLIENT_AUTH: {{ .Values.tls.clientAuth | quote }}
+MTLS_PRINCIPAL_MAP: {{ .Values.tls.principalMap | quote }}
+SOROTRAIL_TLS_CERT_FILE: {{ .Values.tls.sorotrailCertFile | quote }}
+SOROTRAIL_TLS_KEY_FILE: {{ .Values.tls.sorotrailKeyFile | quote }}
+SOROTRAIL_TLS_CA_FILE: {{ .Values.tls.sorotrailCAFile | quote }}
+SOROTRAIL_TLS_SERVER_NAME: {{ .Values.tls.sorotrailServerName | quote }}
+DATABASE_SSL_MODE: {{ .Values.database.sslMode | quote }}
+DATABASE_SSL_CERT_FILE: {{ .Values.database.sslCertFile | quote }}
+DATABASE_SSL_KEY_FILE: {{ .Values.database.sslKeyFile | quote }}
+DATABASE_SSL_ROOT_CERT_FILE: {{ .Values.database.sslRootCertFile | quote }}
 {{- end }}

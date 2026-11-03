@@ -19,6 +19,7 @@ package grpc
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net"
@@ -27,7 +28,9 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
 	"github.com/sorotrail/sorobeacon/internal/apierr"
@@ -42,18 +45,36 @@ type Server struct {
 	auth           *auth.Authenticator
 	log            *slog.Logger
 	srv            *grpc.Server
+	tlsCfg         *tls.Config
 	streamInterval time.Duration
 }
 
 // New builds a gRPC server. The server is not started until Serve is called.
 func New(st store.Store, authn *auth.Authenticator, log *slog.Logger) *Server {
 	s := &Server{store: st, auth: authn, log: log, streamInterval: 2 * time.Second}
+	s.initGRPCServer()
+	return s
+}
+
+func (s *Server) initGRPCServer() {
 	opts := []grpc.ServerOption{
 		grpc.UnaryInterceptor(s.authUnary),
 		grpc.StreamInterceptor(s.authStream),
 	}
+	if s.tlsCfg != nil {
+		opts = append(opts, grpc.Creds(credentials.NewTLS(s.tlsCfg)))
+	}
 	s.srv = grpc.NewServer(opts...)
 	RegisterMonitorServiceServer(s.srv, s)
+}
+
+// WithTLSConfig configures TLS / mutual TLS credentials on the gRPC server.
+func (s *Server) WithTLSConfig(tlsCfg *tls.Config) *Server {
+	if s == nil {
+		return nil
+	}
+	s.tlsCfg = tlsCfg
+	s.initGRPCServer()
 	return s
 }
 
@@ -140,25 +161,39 @@ func (s *Server) authContext(ctx context.Context) (context.Context, error) {
 	if s.auth == nil || !s.auth.Enabled() {
 		return workspace.With(ctx, workspace.Default), nil
 	}
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
+	md, hasMD := metadata.FromIncomingContext(ctx)
+	if hasMD {
+		if vals := md.Get("authorization"); len(vals) > 0 {
+			token, ok := auth.Bearer(vals[0])
+			if !ok {
+				return nil, status.Error(codes.Unauthenticated, "invalid authorization header")
+			}
+			req := (&http.Request{Header: make(http.Header)}).WithContext(ctx)
+			req.Header.Set("Authorization", "Bearer "+token)
+			principal, ok := s.auth.Principal(req)
+			if !ok {
+				return nil, status.Error(codes.Unauthenticated, "invalid token")
+			}
+			return workspace.With(ctx, principal.Workspace), nil
+		}
+	}
+	if s.auth.MTLSEnabled() {
+		if p, ok := peer.FromContext(ctx); ok && p.AuthInfo != nil {
+			if tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo); ok && len(tlsInfo.State.PeerCertificates) > 0 {
+				principal, authStatus := s.auth.ResolveClientCertificate(tlsInfo.State.PeerCertificates[0])
+				if authStatus == auth.AuthForbidden {
+					return nil, status.Error(codes.PermissionDenied, "client certificate subject not permitted")
+				}
+				if authStatus == auth.AuthOK && principal != nil {
+					return workspace.With(ctx, principal.Workspace), nil
+				}
+			}
+		}
+	}
+	if !hasMD {
 		return nil, status.Error(codes.Unauthenticated, "missing metadata")
 	}
-	vals := md.Get("authorization")
-	if len(vals) == 0 {
-		return nil, status.Error(codes.Unauthenticated, "missing authorization metadata")
-	}
-	token, ok := auth.Bearer(vals[0])
-	if !ok {
-		return nil, status.Error(codes.Unauthenticated, "invalid authorization header")
-	}
-	req := (&http.Request{Header: make(http.Header)}).WithContext(ctx)
-	req.Header.Set("Authorization", "Bearer "+token)
-	principal, ok := s.auth.Principal(req)
-	if !ok {
-		return nil, status.Error(codes.Unauthenticated, "invalid token")
-	}
-	return workspace.With(ctx, principal.Workspace), nil
+	return nil, status.Error(codes.Unauthenticated, "missing authorization metadata")
 }
 
 // --- service interface ---

@@ -105,6 +105,11 @@ type Authenticator struct {
 	// set OIDC_ISSUER.
 	oidc *OIDCProvider
 
+	// mtlsEnabled and mtlsBindings configure client-certificate authentication
+	// for HTTP and gRPC requests when mutual TLS is enabled.
+	mtlsEnabled  bool
+	mtlsBindings []MTLSBinding
+
 	tt       time.Duration
 	mu       sync.Mutex
 	sessions map[string]sessionInfo
@@ -196,7 +201,7 @@ func (a *Authenticator) Enabled() bool {
 	// Either credential source closes the door. An SSO-only deployment has no
 	// static token and is still protected, so reporting disabled would leave
 	// every page open to whoever finds the port.
-	return a != nil && (len(a.tokens) > 0 || a.oidc.Enabled())
+	return a != nil && (len(a.tokens) > 0 || a.oidc.Enabled() || a.MTLSEnabled())
 }
 
 // Verify reports whether candidate matches any configured token.
@@ -588,6 +593,9 @@ func (a *Authenticator) AuthenticateRequest(r *http.Request) (*Principal, AuthSt
 	}
 	sid := SessionID(r)
 	if sid == "" {
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 && a.MTLSEnabled() {
+			return a.ResolveClientCertificate(r.TLS.PeerCertificates[0])
+		}
 		return nil, AuthUnauthenticated
 	}
 	info, status := a.getSessionStatus(r.Context(), sid)
