@@ -38,15 +38,16 @@ import (
 
 // Server implements the gRPC MonitorService alongside the existing REST API.
 type Server struct {
-	store store.Store
-	auth  *auth.Authenticator
-	log   *slog.Logger
-	srv   *grpc.Server
+	store          store.Store
+	auth           *auth.Authenticator
+	log            *slog.Logger
+	srv            *grpc.Server
+	streamInterval time.Duration
 }
 
 // New builds a gRPC server. The server is not started until Serve is called.
 func New(st store.Store, authn *auth.Authenticator, log *slog.Logger) *Server {
-	s := &Server{store: st, auth: authn, log: log}
+	s := &Server{store: st, auth: authn, log: log, streamInterval: 2 * time.Second}
 	opts := []grpc.ServerOption{
 		grpc.UnaryInterceptor(s.authUnary),
 		grpc.StreamInterceptor(s.authStream),
@@ -54,6 +55,21 @@ func New(st store.Store, authn *auth.Authenticator, log *slog.Logger) *Server {
 	s.srv = grpc.NewServer(opts...)
 	RegisterMonitorServiceServer(s.srv, s)
 	return s
+}
+
+// WithStreamInterval overrides the poll interval for StreamAlerts. Non-positive
+// values are ignored.
+func (s *Server) WithStreamInterval(d time.Duration) *Server {
+	if d > 0 {
+		s.streamInterval = d
+	}
+	return s
+}
+
+// ServiceDesc returns the registered MonitorService gRPC descriptor so
+// surface-sweep tests can enumerate every unary and streaming RPC dynamically.
+func ServiceDesc() grpc.ServiceDesc {
+	return monitorServiceDesc
 }
 
 // Serve starts the gRPC server on the given address. It blocks until the
@@ -354,6 +370,12 @@ func (s *Server) ListAlerts(ctx context.Context, req *ListAlertsRequest) (*ListA
 // client. It terminates cleanly when the client disconnects.
 func (s *Server) StreamAlerts(req *StreamAlertsRequest, stream AlertStream) error {
 	ctx := stream.Context()
+	if req.MonitorID > 0 {
+		if _, err := s.store.GetMonitor(ctx, req.MonitorID); err != nil {
+			c := apierr.Classify(err)
+			return status.Error(c.GRPCCode, c.Message)
+		}
+	}
 	var lastID int64
 
 	// Seed with the most recent alert so the stream starts from "now"
@@ -366,7 +388,11 @@ func (s *Server) StreamAlerts(req *StreamAlertsRequest, stream AlertStream) erro
 		lastID = initial[0].ID
 	}
 
-	ticker := time.NewTicker(2 * time.Second)
+	interval := s.streamInterval
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -374,6 +400,9 @@ func (s *Server) StreamAlerts(req *StreamAlertsRequest, stream AlertStream) erro
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			if err := s.checkAuth(ctx); err != nil {
+				return err
+			}
 			alerts, err := s.store.ListAlerts(ctx, store.AlertFilter{
 				MonitorID: req.MonitorID,
 				Sort:      "created_at_asc",
