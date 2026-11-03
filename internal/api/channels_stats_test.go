@@ -33,6 +33,10 @@ func (s *channelStatsStore) GetChannelDeliveryStats(_ context.Context, id int64,
 	return s.stats, s.err
 }
 
+func (s *channelStatsStore) GetChannelAckReconciliation(_ context.Context, _ int64) (store.ChannelAckReconciliation, error) {
+	return store.ChannelAckReconciliation{}, nil
+}
+
 func getChannelStats(t *testing.T, st *channelStatsStore, path string) (int, map[string]any, string) {
 	t.Helper()
 	srv := httptest.NewServer(newProbeServer(st, &fakeRPC{}))

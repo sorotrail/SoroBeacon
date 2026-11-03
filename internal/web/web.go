@@ -108,6 +108,7 @@ var templateFuncs = template.FuncMap{
 	"relTimePtr":    relTimePtr,
 	"severityClass": severityClass,
 	"auditFields":   auditFields,
+	"receiptLabel":  notify.ReceiptCapabilityLabel,
 }
 
 const tsLayout = "2006-01-02 15:04:05"
@@ -1348,6 +1349,11 @@ func (s *Server) channels(w http.ResponseWriter, r *http.Request) {
 		}
 		health[ch.ID] = ds
 	}
+	ackReconciliations, err := s.store.ListChannelAckReconciliations(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
 	empty := ""
 	if len(channels) == 0 {
 		empty = "no_channels"
@@ -1363,6 +1369,7 @@ func (s *Server) channels(w http.ResponseWriter, r *http.Request) {
 		// DeliveryStats is keyed by channel id; index in the template reads a
 		// missing entry as the zero value, which is exactly "no attempts".
 		"DeliveryStats": health, "DeliveryWindow": deliveryHealthWindowLabel,
+		"AckReconciliations": ackReconciliations,
 	})
 }
 

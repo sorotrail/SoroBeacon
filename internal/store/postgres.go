@@ -1741,6 +1741,179 @@ func (p *Postgres) RecordChannelSigningKeyUsage(ctx context.Context, channelID i
 	return err
 }
 
+// ReconcileChannelAcknowledgements evaluates delivery vs human acknowledgement for all channels
+// in the context's workspace (or instance-wide under a system context).
+func (p *Postgres) ReconcileChannelAcknowledgements(ctx context.Context, cfg AckReconciliationConfig) ([]ChannelAckReconciliation, error) {
+	if cfg.LookbackWindow <= 0 {
+		cfg.LookbackWindow = 7 * 24 * time.Hour
+	}
+	if cfg.CriticalAckWindow <= 0 {
+		cfg.CriticalAckWindow = 1 * time.Hour
+	}
+	if cfg.WarningAckWindow <= 0 {
+		cfg.WarningAckWindow = 4 * time.Hour
+	}
+	if cfg.MinDeliveries <= 0 {
+		cfg.MinDeliveries = 3
+	}
+	if cfg.FlagThresholdRate <= 0 {
+		cfg.FlagThresholdRate = 1.0
+	}
+
+	now := time.Now().UTC()
+	lookbackCutoff := now.Add(-cfg.LookbackWindow)
+	critCutoff := now.Add(-cfg.CriticalAckWindow)
+	warnCutoff := now.Add(-cfg.WarningAckWindow)
+
+	ws, isTenant := tenantWorkspace(ctx)
+	targetWS := ""
+	if isTenant {
+		targetWS = string(ws)
+	}
+
+	query := `
+		SELECT
+			c.id,
+			c.workspace_id,
+			COUNT(q.alert_id),
+			COUNT(CASE WHEN q.alert_id IS NOT NULL AND q.acknowledged_at IS NOT NULL THEN 1 END),
+			COUNT(CASE WHEN q.alert_id IS NOT NULL AND q.acknowledged_at IS NULL THEN 1 END)
+		FROM channels c
+		LEFT JOIN (
+			SELECT DISTINCT
+				da.channel_id,
+				da.alert_id,
+				a.acknowledged_at
+			FROM delivery_attempts da
+			JOIN alerts a ON a.id = da.alert_id
+			WHERE da.status = 'success'
+			  AND a.suppressed = FALSE
+			  AND a.inhibited_by_rule_id IS NULL
+			  AND a.retracted_at IS NULL
+			  AND a.severity IN ('warning', 'critical')
+			  AND a.created_at >= $1
+			  AND (
+				  a.acknowledged_at IS NOT NULL
+				  OR (a.severity = 'critical' AND a.created_at <= $2)
+				  OR (a.severity = 'warning' AND a.created_at <= $3)
+			  )
+		) q ON q.channel_id = c.id
+		WHERE ($4 = '' OR c.workspace_id = $4)
+		GROUP BY c.id, c.workspace_id
+		ORDER BY c.id`
+
+	rows, err := p.pool.Query(ctx, query, lookbackCutoff, critCutoff, warnCutoff, targetWS)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	var reconciliations []ChannelAckReconciliation
+	for rows.Next() {
+		var r ChannelAckReconciliation
+		if err := rows.Scan(&r.ChannelID, &r.WorkspaceID, &r.DeliveredTotal, &r.AcknowledgedTotal, &r.UnacknowledgedTotal); err != nil {
+			return nil, mapErr(err)
+		}
+		r.ComputedAt = now
+		if r.DeliveredTotal > 0 {
+			rate := float64(r.UnacknowledgedTotal) / float64(r.DeliveredTotal)
+			r.UnackRate = &rate
+			if r.DeliveredTotal >= cfg.MinDeliveries && rate >= cfg.FlagThresholdRate {
+				r.Flagged = true
+			}
+		}
+		reconciliations = append(reconciliations, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapErr(err)
+	}
+
+	for _, r := range reconciliations {
+		_, err := p.pool.Exec(ctx, `
+			INSERT INTO channel_ack_reconciliations (
+				channel_id, workspace_id, delivered_total, acknowledged_total, unacknowledged_total, unack_rate, flagged, computed_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (channel_id) DO UPDATE SET
+				workspace_id = EXCLUDED.workspace_id,
+				delivered_total = EXCLUDED.delivered_total,
+				acknowledged_total = EXCLUDED.acknowledged_total,
+				unacknowledged_total = EXCLUDED.unacknowledged_total,
+				unack_rate = EXCLUDED.unack_rate,
+				flagged = EXCLUDED.flagged,
+				computed_at = EXCLUDED.computed_at`,
+			r.ChannelID, r.WorkspaceID, r.DeliveredTotal, r.AcknowledgedTotal, r.UnacknowledgedTotal, r.UnackRate, r.Flagged, r.ComputedAt,
+		)
+		if err != nil {
+			return nil, mapErr(err)
+		}
+	}
+
+	return reconciliations, nil
+}
+
+// GetChannelAckReconciliation returns the current acknowledgement reconciliation for one channel.
+func (p *Postgres) GetChannelAckReconciliation(ctx context.Context, channelID int64) (ChannelAckReconciliation, error) {
+	ws := workspaceID(ctx)
+	var r ChannelAckReconciliation
+	var exists bool
+	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&exists, &r.ChannelID, &r.WorkspaceID, &r.DeliveredTotal, &r.AcknowledgedTotal, &r.UnacknowledgedTotal, &r.UnackRate, &r.Flagged, &r.ComputedAt)
+	}, `
+		SELECT
+			(SELECT count(*) FROM channels WHERE id = $1 AND workspace_id = $2) > 0,
+			COALESCE(car.channel_id, $1),
+			COALESCE(car.workspace_id, $2),
+			COALESCE(car.delivered_total, 0),
+			COALESCE(car.acknowledged_total, 0),
+			COALESCE(car.unacknowledged_total, 0),
+			car.unack_rate,
+			COALESCE(car.flagged, FALSE),
+			COALESCE(car.computed_at, now())
+		FROM channels c
+		LEFT JOIN channel_ack_reconciliations car ON car.channel_id = c.id
+		WHERE c.id = $1 AND c.workspace_id = $2`,
+		channelID, ws)
+	if err != nil {
+		return r, mapErr(err)
+	}
+	if !exists {
+		return r, ErrNotFound
+	}
+	return r, nil
+}
+
+// ListChannelAckReconciliations returns the latest acknowledgement reconciliations for all channels.
+func (p *Postgres) ListChannelAckReconciliations(ctx context.Context) (map[int64]ChannelAckReconciliation, error) {
+	ws, isTenant := tenantWorkspace(ctx)
+	targetWS := ""
+	if isTenant {
+		targetWS = string(ws)
+	}
+
+	out := make(map[int64]ChannelAckReconciliation)
+	rows, err := p.pool.Query(ctx, `
+		SELECT channel_id, workspace_id, delivered_total, acknowledged_total, unacknowledged_total, unack_rate, flagged, computed_at
+		FROM channel_ack_reconciliations
+		WHERE ($1 = '' OR workspace_id = $1)
+		ORDER BY channel_id`, targetWS)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var r ChannelAckReconciliation
+		if err := rows.Scan(&r.ChannelID, &r.WorkspaceID, &r.DeliveredTotal, &r.AcknowledgedTotal, &r.UnacknowledgedTotal, &r.UnackRate, &r.Flagged, &r.ComputedAt); err != nil {
+			return nil, mapErr(err)
+		}
+		out[r.ChannelID] = r
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapErr(err)
+	}
+	return out, nil
+}
+
 // --- alerts ---
 
 // CreateAlert wraps the transaction with the store.create_alert span, so
@@ -1877,12 +2050,12 @@ func (p *Postgres) createAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 		// caller: a contract id only means anything on the chain it was
 		// deployed to, so the monitor owns the answer and an alert cannot be
 		// filed against a chain its monitor does not watch.
-		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, backfilled, ledger, network, workspace_id)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, (SELECT network FROM monitors WHERE id = $1), $8)
-			 RETURNING id, created_at, network`,
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, backfilled, ledger, network, workspace_id)
+			 VALUES ($1, $2, $3, $4, $5, COALESCE(NULLIF($9, ''), (SELECT severity FROM rules WHERE id = $2), 'warning'), $6, $7, (SELECT network FROM monitors WHERE id = $1), $8)
+			 RETURNING id, created_at, network, severity`,
 		a.MonitorID, a.RuleID, a.EventID, jsonOrEmpty(a.Payload), nullableJSON(a.Enrichment), a.Backfilled, int64(a.Ledger),
-		workspaceID(ctx),
-	).Scan(&a.ID, &a.CreatedAt, &a.Network)
+		workspaceID(ctx), string(a.Severity),
+	).Scan(&a.ID, &a.CreatedAt, &a.Network, &a.Severity)
 	if err != nil {
 		return "", mapErr(err)
 	}

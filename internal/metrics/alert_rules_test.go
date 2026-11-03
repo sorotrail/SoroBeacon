@@ -57,6 +57,7 @@ func TestExportedMetricNamesMatchesRegistryForAlerts(t *testing.T) {
 	m.RecordDelivery("slack", true)
 	m.RecordThrottle("slack")
 	m.SetBreakerState("ch-1", "slack", "closed")
+	m.SetChannelUnacknowledged("ch-1", "slack", false, 0.0)
 	m.RecordStoreRead("primary")
 	m.RecordReplicaFallback()
 	m.SetReplicaEnabled(true)

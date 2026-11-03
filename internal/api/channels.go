@@ -493,6 +493,7 @@ const (
 // timestamps leave the handler, exactly as the store type promises.
 type channelStatsResponse struct {
 	store.ChannelDeliveryStats
+	AckReconciliation *store.ChannelAckReconciliation `json:"ack_reconciliation,omitempty"`
 	// Window is the effective window as it was requested (trimmed), or the
 	// default "24h" when the parameter was omitted, so a client can match
 	// the echo against what it asked for.
@@ -548,7 +549,11 @@ func (s *Server) channelStats(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, channelStatsResponse{ChannelDeliveryStats: stats, Window: windowLabel})
+	resp := channelStatsResponse{ChannelDeliveryStats: stats, Window: windowLabel}
+	if ack, err := s.store.GetChannelAckReconciliation(r.Context(), id); err == nil && ack.ChannelID != 0 {
+		resp.AckReconciliation = &ack
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // listChannelSigningKeys serves GET /channels/{id}/keys.

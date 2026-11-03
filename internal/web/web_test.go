@@ -61,6 +61,9 @@ func (emptyStore) ListChannelsPage(context.Context, store.ListFilter) ([]store.C
 func (emptyStore) GetChannelDeliveryStats(context.Context, int64, time.Time) (store.ChannelDeliveryStats, error) {
 	return store.ChannelDeliveryStats{}, nil
 }
+func (emptyStore) ListChannelAckReconciliations(context.Context) (map[int64]store.ChannelAckReconciliation, error) {
+	return nil, nil
+}
 func (emptyStore) ListSavedSearches(context.Context) ([]store.SavedSearch, error) { return nil, nil }
 func (emptyStore) CreateSavedSearch(context.Context, *store.SavedSearch) error    { return nil }
 func (emptyStore) GetSavedSearch(context.Context, int64) (*store.SavedSearch, error) {

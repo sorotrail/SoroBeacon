@@ -78,6 +78,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("EventArchiveRecordsFiltersPagesAndPrunes", func(t *testing.T) { testEventArchive(t, newStore) })
 	t.Run("GetMonitorStats", func(t *testing.T) { testGetMonitorStats(t, newStore) })
 	t.Run("ChannelDeliveryStatsAggregation", func(t *testing.T) { testChannelDeliveryStats(t, newStore) })
+	t.Run("ChannelAckReconciliation", func(t *testing.T) { testChannelAckReconciliation(t, newStore) })
 	t.Run("AlertCountsByDayZeroFillAndWindow", func(t *testing.T) { testAlertCountsByDay(t, newStore) })
 	t.Run("DuplicateMonitorCopiesRulesChannelsDisabledUniqueName", func(t *testing.T) { testDuplicateMonitor(t, newStore) })
 	t.Run("LedgerHashesAndAlertRetraction", func(t *testing.T) { testLedgerHashesAndRetraction(t, newStore) })
