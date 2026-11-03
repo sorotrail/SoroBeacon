@@ -464,3 +464,23 @@ func TestRecordHeartbeatSuccess(t *testing.T) {
 	assert.InDelta(t, float64(time.Now().Unix()), got, 5,
 		"the gauge should stamp the moment of the last successful ping")
 }
+
+func TestRecordNotModified(t *testing.T) {
+	m := New()
+	m.RecordNotModified("/api/v1/alerts")
+	m.RecordNotModified("/api/v1/alerts")
+	m.RecordNotModified("/api/v1/stats/alerts-daily")
+
+	assert.Equal(t, float64(2), m.sampleValue(t, "sorobeacon_http_not_modified_total", map[string]string{"route": "/api/v1/alerts"}))
+	assert.Equal(t, float64(1), m.sampleValue(t, "sorobeacon_http_not_modified_total", map[string]string{"route": "/api/v1/stats/alerts-daily"}))
+
+	// Test via Middleware with 304 response
+	handler := m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	req := httptest.NewRequest("GET", "/api/v1/channels/1/stats", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, float64(1), m.sampleValue(t, "sorobeacon_http_not_modified_total", map[string]string{"route": "/api/v1/channels/1/stats"}))
+}

@@ -57,6 +57,7 @@ type Metrics struct {
 	deliveries       *prometheus.CounterVec
 	throttles        *prometheus.CounterVec
 	httpDuration     *prometheus.HistogramVec
+	httpNotModifiedTotal *prometheus.CounterVec
 	lastPollAgoSec   *prometheus.GaugeVec
 	pollPanics       *prometheus.CounterVec
 	breakerStates    *prometheus.GaugeVec
@@ -196,6 +197,11 @@ func New() *Metrics {
 			Buckets: prometheus.DefBuckets,
 		}, []string{"route", "method", "status"}),
 
+		httpNotModifiedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_http_not_modified_total",
+			Help: "HTTP 304 Not Modified responses served, by route pattern.",
+		}, []string{"route"}),
+
 		// Where read-only queries actually went. The pool label is the closed
 		// set {primary, replica}, so cardinality is bounded; watching the ratio
 		// is how an operator confirms replica routing is doing anything, and
@@ -242,7 +248,7 @@ func New() *Metrics {
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
 		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired, m.deliveries, m.throttles,
-		m.httpDuration, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
+		m.httpDuration, m.httpNotModifiedTotal, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
 		m.reorgsTotal, m.lastReorgLedger, m.breakerStates, m.pollPanics,
 		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.deadLetters, m.heartbeatLastSuccess,
 		m.ruleEvalsTotal, m.ruleMatchesTotal, m.ruleErrorsTotal, m.ruleDuration, m.requestBodyRejectionsTotal,
@@ -545,12 +551,28 @@ func (m *Metrics) Middleware(next http.Handler) http.Handler {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
 		route := r.URL.Path
-		if p := RoutePattern(r); p != "" {
-			route = p
+		if RoutePattern != nil {
+			if p := RoutePattern(r); p != "" {
+				route = p
+			}
 		}
 		m.httpDuration.WithLabelValues(route, r.Method, strconv.Itoa(rec.status)).
 			Observe(time.Since(start).Seconds())
+		if rec.status == http.StatusNotModified {
+			m.RecordNotModified(route)
+		}
 	})
+}
+
+// RecordNotModified increments the sorobeacon_http_not_modified_total counter for route.
+func (m *Metrics) RecordNotModified(route string) {
+	if m == nil || m.httpNotModifiedTotal == nil {
+		return
+	}
+	if route == "" {
+		route = "unknown"
+	}
+	m.httpNotModifiedTotal.WithLabelValues(route).Inc()
 }
 
 // RoutePattern extracts the matched route pattern from the request

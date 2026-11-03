@@ -32,6 +32,8 @@ type emptyStore struct {
 }
 
 func (emptyStore) GetStats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
+func (emptyStore) AlertChangeKey(context.Context) (int64, int64, error) { return 0, 0, nil }
+func (emptyStore) ChannelDeliveryChangeKey(context.Context, int64) (int64, int64, error) { return 0, 0, nil }
 func (emptyStore) GetMonitorStats(context.Context, int64) (store.MonitorStats, error) {
 	return store.MonitorStats{}, nil
 }
@@ -1498,6 +1500,50 @@ func TestAlertDeliveries_EmptyIsNotAnError(t *testing.T) {
 	body, _ := io.ReadAll(res.Body)
 	if !strings.Contains(string(body), "No delivery attempts yet") {
 		t.Fatalf("expected the empty-state message, got: %s", body)
+	}
+}
+
+func TestAlertDeliveries_ConditionalNotModified(t *testing.T) {
+	st := deliveriesStore{attempts: []store.DeliveryAttempt{
+		{ID: 1, ChannelID: 7, Status: "success", ResponseSnippet: "200 OK"},
+	}}
+	srv := httptest.NewServer(newDeliveriesServer(t, st).Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/alerts/1/deliveries")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.StatusCode)
+	}
+
+	etag := res.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("expected ETag header to be set")
+	}
+	if got := res.Header.Get("Cache-Control"); got != "private, no-cache" {
+		t.Fatalf("expected Cache-Control private, no-cache, got %s", got)
+	}
+
+	// Revalidate with If-None-Match
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/alerts/1/deliveries", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("If-None-Match", etag)
+	res304, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res304.Body.Close()
+	if res304.StatusCode != http.StatusNotModified {
+		t.Fatalf("expected 304 Not Modified, got %d", res304.StatusCode)
+	}
+	body, _ := io.ReadAll(res304.Body)
+	if len(body) != 0 {
+		t.Fatalf("expected empty body for 304, got %s", body)
 	}
 }
 

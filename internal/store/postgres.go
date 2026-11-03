@@ -1489,6 +1489,28 @@ func (p *Postgres) GetChannelDeliveryStats(ctx context.Context, channelID int64,
 	return cs, nil
 }
 
+// ChannelDeliveryChangeKey returns the max delivery attempt ID and count for channelID in the caller's workspace.
+func (p *Postgres) ChannelDeliveryChangeKey(ctx context.Context, channelID int64) (maxID int64, count int64, err error) {
+	ws := workspaceID(ctx)
+	var exists bool
+	err = p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&exists, &maxID, &count)
+	}, `
+		SELECT
+			(SELECT count(*) FROM channels WHERE id = $1 AND workspace_id = $2) > 0,
+			COALESCE(max(da.id), 0),
+			count(*)
+		FROM delivery_attempts da
+		WHERE da.channel_id = $1`, channelID, ws)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !exists {
+		return 0, 0, ErrNotFound
+	}
+	return maxID, count, nil
+}
+
 func (p *Postgres) encryptSigningSecret(secret string) (string, error) {
 	if p.cipher == nil || secret == "" {
 		return secret, nil
@@ -2044,6 +2066,15 @@ func (p *Postgres) ListAlertsPrimary(ctx context.Context, f AlertFilter) ([]Aler
 		return nil, err
 	}
 	return pgx.CollectRows(rows, scanAlert)
+}
+
+// AlertChangeKey returns the max alert ID and count for the caller's workspace.
+func (p *Postgres) AlertChangeKey(ctx context.Context) (maxID int64, count int64, err error) {
+	ws := workspaceID(ctx)
+	err = p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&maxID, &count)
+	}, `SELECT COALESCE(max(id), 0), count(*) FROM alerts WHERE workspace_id = $1`, ws)
+	return maxID, count, err
 }
 
 // CreateDeadLetter records a delivery that exhausted its retry budget.

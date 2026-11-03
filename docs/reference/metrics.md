@@ -40,6 +40,7 @@ host is shared.
 | `sorobeacon_dead_letters_total` | gauge | - | `0`; a positive value means failed deliveries are waiting for a redrive |
 | `sorobeacon_heartbeat_last_success_timestamp_seconds` | gauge | — | a recent unix timestamp while `HEARTBEAT_URL` is configured; `0` means no ping has succeeded since this process started (the metric only moves when ingest is healthy) |
 | `sorobeacon_http_request_duration_seconds` | histogram | `route`, `method`, `status` | request times at millisecond scale |
+| `sorobeacon_http_not_modified_total` | counter | `route` | increments on HTTP 304 Not Modified responses served via conditional requests |
 
 Details worth knowing:
 
@@ -66,6 +67,9 @@ Details worth knowing:
 * Both histograms use the default buckets — boundaries at 0.005, 0.01,
   0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5 and 10 seconds — and expose
   `_bucket`, `_sum` and `_count` series.
+* `sorobeacon_http_not_modified_total` tracks 304 Not Modified responses across
+  conditional GET endpoints, labeled by route pattern (e.g. `/alerts`,
+  `/stats/alerts-daily`, `/channels/{id}/stats`).
 
 ## Example queries
 

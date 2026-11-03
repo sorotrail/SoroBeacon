@@ -252,6 +252,30 @@ func testWorkspaceIsolation(t *testing.T, newStore conformanceFactory) {
 	}
 	assert.Zero(t, totalBeta, "acme's alert must not appear in beta's chart")
 
+	// --- conditional change keys ---
+	maxAcme, countAcme, err := st.AlertChangeKey(acme)
+	require.NoError(t, err)
+	assert.Equal(t, acmeAlert.ID, maxAcme)
+	assert.Equal(t, int64(1), countAcme)
+
+	maxBeta, countBeta, err := st.AlertChangeKey(beta)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), maxBeta)
+	assert.Equal(t, int64(0), countBeta)
+
+	_, _, err = st.ChannelDeliveryChangeKey(beta, acmeChannel.ID)
+	assert.ErrorIs(t, err, ErrNotFound, "cross-workspace channel delivery change key is 404")
+
+	delivMax, delivCount, err := st.ChannelDeliveryChangeKey(acme, acmeChannel.ID)
+	require.NoError(t, err)
+	assert.Greater(t, delivMax, int64(0))
+	assert.Equal(t, int64(1), delivCount)
+
+	betaDelivMax, betaDelivCount, err := st.ChannelDeliveryChangeKey(beta, betaChannel.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), betaDelivMax)
+	assert.Equal(t, int64(0), betaDelivCount)
+
 	// --- saved searches and templates ---
 
 	// "At most one default search" used to be an instance-wide rule backed by a
