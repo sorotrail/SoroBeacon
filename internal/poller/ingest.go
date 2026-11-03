@@ -154,17 +154,22 @@ func (in *Ingestor) fireAlert(ctx context.Context, m store.Monitor, rule store.R
 		return false, false
 	}
 
+	runbookURL, responseGuidance := store.ResolveAlertGuidance(&rule, &m, "", "")
+	payload = store.WithGuidance(payload, runbookURL, responseGuidance)
+
 	alert := &store.Alert{
-		MonitorID:      m.ID,
-		RuleID:         rule.ID,
-		EventID:        eventID,
-		Payload:        payload,
-		Ledger:         ev.Ledger,
-		LedgerClosedAt: ev.LedgerClosedAt,
-		Cooldown:       ruleCooldown(rule),
-		Backfilled:     opts.Backfilled,
-		Severity:       rule.Severity,
-		RuleVersion:    rule.Version,
+		MonitorID:        m.ID,
+		RuleID:           rule.ID,
+		EventID:          eventID,
+		Payload:          payload,
+		Ledger:           ev.Ledger,
+		LedgerClosedAt:   ev.LedgerClosedAt,
+		Cooldown:         ruleCooldown(rule),
+		Backfilled:       opts.Backfilled,
+		Severity:         rule.Severity,
+		RuleVersion:      rule.Version,
+		RunbookURL:       runbookURL,
+		ResponseGuidance: responseGuidance,
 	}
 	if in.enricher != nil {
 		alert.Enrichment, err = in.enricher.Fetch(ctx, ev.ContractID, ev.EventName())
@@ -221,20 +226,22 @@ func (in *Ingestor) fireAlert(ctx context.Context, m store.Monitor, rule store.R
 		return true, false
 	}
 	in.dispatch.Dispatch(ctx, notify.Alert{
-		ID:          alert.ID,
-		MonitorID:   m.ID,
-		MonitorName: m.Name,
-		RuleID:      rule.ID,
-		RuleType:    rule.Type,
-		EventID:     eventID,
-		ContractID:  ev.ContractID,
-		EventName:   ev.EventName(),
-		Ledger:      ev.Ledger,
-		TxHash:      ev.TxHash,
-		Payload:     alert.Payload,
-		Enrichment:  alert.Enrichment,
-		CreatedAt:   alert.CreatedAt,
-		Severity:    string(alert.Severity),
+		ID:               alert.ID,
+		MonitorID:        m.ID,
+		MonitorName:      m.Name,
+		RuleID:           rule.ID,
+		RuleType:         rule.Type,
+		EventID:          eventID,
+		ContractID:       ev.ContractID,
+		EventName:        ev.EventName(),
+		Ledger:           ev.Ledger,
+		TxHash:           ev.TxHash,
+		Payload:          alert.Payload,
+		Enrichment:       alert.Enrichment,
+		CreatedAt:        alert.CreatedAt,
+		Severity:         string(alert.Severity),
+		RunbookURL:       alert.RunbookURL,
+		ResponseGuidance: alert.ResponseGuidance,
 	})
 	return true, true
 }

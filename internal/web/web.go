@@ -956,15 +956,27 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	runbookURL, err := store.ValidateRunbookURL(r.FormValue("runbook_url"))
+	if err != nil {
+		http.Error(w, "invalid runbook_url: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	responseGuidance, err := store.ValidateResponseGuidance(r.FormValue("response_guidance"))
+	if err != nil {
+		http.Error(w, "invalid response_guidance: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 	// The form's network select is hidden on a single-chain instance, so the
 	// value is usually empty and lands on the primary — which is the only
 	// chain there is. An unlabelled monitor would be polled by nobody.
 	m := store.Monitor{
-		Name:        name,
-		ContractIDs: contracts,
-		Enabled:     true,
-		Network:     s.networkChoice(r.FormValue("network")),
-		Tags:        splitTags(r.FormValue("tags")),
+		Name:             name,
+		ContractIDs:      contracts,
+		Enabled:          true,
+		Network:          s.networkChoice(r.FormValue("network")),
+		Tags:             splitTags(r.FormValue("tags")),
+		RunbookURL:       runbookURL,
+		ResponseGuidance: responseGuidance,
 	}
 	if err := s.store.CreateMonitor(r.Context(), &m); err != nil {
 		s.fail(w, err)
@@ -1045,10 +1057,12 @@ func (s *Server) monitorPage(r *http.Request, id int64) (map[string]any, error) 
 		// The rule builder's own state. The page is also rendered after the
 		// builder rejects a malformed form, which fills these in with what
 		// the user typed; the defaults are the empty form.
-		"BuilderType":      "",
-		"BuilderFields":    "",
-		"BuilderRawParams": defaultBuilderParams,
-		"BuilderErrors":    []string{},
+		"BuilderType":             "",
+		"BuilderFields":           "",
+		"BuilderRawParams":        defaultBuilderParams,
+		"BuilderRunbookURL":       "",
+		"BuilderResponseGuidance": "",
+		"BuilderErrors":           []string{},
 	}, nil
 }
 
@@ -2092,23 +2106,38 @@ func (s *Server) retryDelivery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	na := notify.Alert{
-		ID:        alert.ID,
-		MonitorID: alert.MonitorID,
-		RuleID:    alert.RuleID,
-		EventID:   alert.EventID,
-		Payload:   alert.Payload,
-		CreatedAt: alert.CreatedAt,
-		Severity:  string(alert.Severity),
+		ID:               alert.ID,
+		MonitorID:        alert.MonitorID,
+		RuleID:           alert.RuleID,
+		EventID:          alert.EventID,
+		Payload:          alert.Payload,
+		CreatedAt:        alert.CreatedAt,
+		Severity:         string(alert.Severity),
+		RunbookURL:       alert.RunbookURL,
+		ResponseGuidance: alert.ResponseGuidance,
 		// A federated alert has no local rule, so the channels that key on
 		// the rule need the instance it came from to tell two peers' alerts
 		// apart.
 		FederationOrigin: alert.FederationOrigin,
 	}
-	if m, merr := s.store.GetMonitor(r.Context(), alert.MonitorID); merr == nil && m != nil {
+	var m *store.Monitor
+	if mon, merr := s.store.GetMonitor(r.Context(), alert.MonitorID); merr == nil && mon != nil {
+		m = mon
 		na.MonitorName = m.Name
 	}
-	if rule, rerr := s.store.GetRule(r.Context(), alert.RuleID); rerr == nil && rule != nil {
+	var rule *store.Rule
+	if ru, rerr := s.store.GetRule(r.Context(), alert.RuleID); rerr == nil && ru != nil {
+		rule = ru
 		na.RuleType = rule.Type
+	}
+	if na.RunbookURL == "" || na.ResponseGuidance == "" {
+		url, guidance := store.ResolveAlertGuidance(rule, m, "", "")
+		if na.RunbookURL == "" {
+			na.RunbookURL = url
+		}
+		if na.ResponseGuidance == "" {
+			na.ResponseGuidance = guidance
+		}
 	}
 	notify.NewDispatcher(s.store, s.factory, s.log).Retry(r.Context(), na, *ch)
 	s.writeDeliveriesFragment(w, r, alertID, "")
@@ -2234,18 +2263,37 @@ func (s *Server) alertDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fields := payloadFields(a.Payload)
+	runbookURL := a.RunbookURL
+	if runbookURL == "" {
+		runbookURL = fields.runbookURL
+	}
+	responseGuidance := a.ResponseGuidance
+	if responseGuidance == "" {
+		responseGuidance = fields.responseGuidance
+	}
+	if runbookURL == "" || responseGuidance == "" {
+		u, g := store.ResolveAlertGuidance(rule, monitor, "", "")
+		if runbookURL == "" {
+			runbookURL = u
+		}
+		if responseGuidance == "" {
+			responseGuidance = g
+		}
+	}
 	s.render(w, r, "alert", map[string]any{
-		"Title":          fmt.Sprintf("Alert #%d", a.ID),
-		"Alert":          a,
-		"Monitor":        monitor,
-		"Rule":           rule,
-		"Attempts":       attempts,
-		"ChannelNames":   channelNames,
-		"AckNote":        ackNote(r),
-		"ContractID":     fields.contractID,
-		"EventName":      fields.eventName,
-		"Ledger":         fields.ledger,
-		"LedgerClosedAt": fields.closedAt,
+		"Title":            fmt.Sprintf("Alert #%d", a.ID),
+		"Alert":            a,
+		"Monitor":          monitor,
+		"Rule":             rule,
+		"Attempts":         attempts,
+		"ChannelNames":     channelNames,
+		"AckNote":          ackNote(r),
+		"ContractID":       fields.contractID,
+		"EventName":        fields.eventName,
+		"Ledger":           fields.ledger,
+		"LedgerClosedAt":   fields.closedAt,
+		"RunbookURL":       runbookURL,
+		"ResponseGuidance": responseGuidance,
 	})
 }
 
@@ -2298,10 +2346,12 @@ func (s *Server) acknowledgeAlert(w http.ResponseWriter, r *http.Request) {
 }
 
 type alertPayloadFields struct {
-	contractID string
-	eventName  string
-	ledger     string
-	closedAt   time.Time
+	contractID       string
+	eventName        string
+	ledger           string
+	closedAt         time.Time
+	runbookURL       string
+	responseGuidance string
 }
 
 // payloadFields pulls the permalink columns out of the stored event JSON
@@ -2328,6 +2378,8 @@ func payloadFields(raw json.RawMessage) alertPayloadFields {
 			out.closedAt = t
 		}
 	}
+	out.runbookURL = stringifyPayload(m["runbook_url"])
+	out.responseGuidance = stringifyPayload(m["response_guidance"])
 	return out
 }
 

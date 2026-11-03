@@ -166,7 +166,53 @@ func (s *Server) createRuleFromBuilder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	rule := store.Rule{MonitorID: id, Type: ruleType, Params: params, Enabled: true}
+	rawRunbook := r.FormValue("runbook_url")
+	if rawRunbook == "" {
+		rawRunbook = r.FormValue("param_runbook_url")
+	}
+	rawGuidance := r.FormValue("response_guidance")
+	if rawGuidance == "" {
+		rawGuidance = r.FormValue("param_response_guidance")
+	}
+	var guidanceProblems rules.FieldErrors
+	runbookURL, err := rules.ValidateRunbookURL(rawRunbook)
+	if err != nil {
+		guidanceProblems = append(guidanceProblems, builderProblems(err)...)
+	}
+	responseGuidance, err := rules.ValidateResponseGuidance(rawGuidance)
+	if err != nil {
+		guidanceProblems = append(guidanceProblems, builderProblems(err)...)
+	}
+	if len(guidanceProblems) > 0 {
+		if schema != nil && r.FormValue("use_builder") == "true" {
+			values := make(map[string]string, len(schema))
+			for _, f := range schema {
+				if v := r.FormValue("param_" + f.Name); v != "" {
+					values[f.Name] = v
+				}
+			}
+			s.renderRuleBuilderError(w, r, id, ruleType, values, guidanceProblems)
+			return
+		}
+		http.Error(w, guidanceProblems.Error(), http.StatusBadRequest)
+		return
+	}
+	if pURL, pGuidance, perr := rules.ParseGuidance(params); perr == nil {
+		if runbookURL == "" {
+			runbookURL = pURL
+		}
+		if responseGuidance == "" {
+			responseGuidance = pGuidance
+		}
+	}
+	rule := store.Rule{
+		MonitorID:        id,
+		Type:             ruleType,
+		Params:           params,
+		Enabled:          true,
+		RunbookURL:       runbookURL,
+		ResponseGuidance: responseGuidance,
+	}
 	if err := s.store.CreateRule(r.Context(), &rule); err != nil {
 		s.fail(w, err)
 		return
@@ -220,6 +266,8 @@ func (s *Server) renderRuleBuilderError(
 	// rendered, so it is marked as such rather than escaped a second time.
 	data["BuilderFields"] = template.HTML(builderFields(s.registry.ParamSchema(ruleType), values))
 	data["BuilderRawParams"] = r.FormValue("params")
+	data["BuilderRunbookURL"] = r.FormValue("runbook_url")
+	data["BuilderResponseGuidance"] = r.FormValue("response_guidance")
 	data["BuilderErrors"] = messages
 	s.renderStatus(w, r, http.StatusBadRequest, "monitor", data)
 }

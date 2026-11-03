@@ -9,10 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/workspace"
@@ -168,6 +171,12 @@ type Monitor struct {
 	// within the restore window. When set, the monitor is excluded from
 	// evaluation and regular listings.
 	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+	// RunbookURL is the optional monitor-level runbook link (http or https)
+	// inherited by rules on this monitor that do not specify their own.
+	RunbookURL string `json:"runbook_url,omitempty"`
+	// ResponseGuidance is an optional short markdown/text note describing what
+	// an on-call responder should do when an alert fires on this monitor.
+	ResponseGuidance string `json:"response_guidance,omitempty"`
 }
 
 // MaxMonitorTags bounds how many tags one monitor may carry, and MaxTagLen
@@ -230,6 +239,226 @@ type Rule struct {
 	// increments it so alerts can record which rule revision produced them
 	// and stateful evaluators can detect mid-flight edits.
 	Version int `json:"version"`
+	// RunbookURL is an optional http/https link to the runbook for this rule.
+	// When set, it overrides the monitor-level and workspace-level defaults.
+	RunbookURL string `json:"runbook_url,omitempty"`
+	// ResponseGuidance is an optional short markdown/text note with immediate
+	// triage instructions for alerts produced by this rule.
+	ResponseGuidance string `json:"response_guidance,omitempty"`
+}
+
+// MaxRunbookURLLen and MaxResponseGuidanceLen bound operator-supplied runbook
+// links and triage guidance stored on workspaces, monitors, rules, and alerts.
+const (
+	MaxRunbookURLLen      = 2048
+	MaxResponseGuidanceLen = 500
+)
+
+// ValidateRunbookURL trims and validates an optional runbook URL. An empty or
+// whitespace-only string is valid and returns "". Non-empty URLs must be valid
+// UTF-8, at most MaxRunbookURLLen characters, free of whitespace and control
+// characters, use an explicit http or https scheme, and carry a non-empty host.
+func ValidateRunbookURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", nil
+	}
+	if !utf8.ValidString(trimmed) {
+		return "", errors.New("runbook_url must be valid UTF-8")
+	}
+	if len(trimmed) > MaxRunbookURLLen {
+		return "", fmt.Errorf("runbook_url exceeds maximum length of %d characters", MaxRunbookURLLen)
+	}
+	for _, r := range trimmed {
+		if r <= 0x20 || r == 0x7f || unicode.IsSpace(r) || unicode.IsControl(r) {
+			return "", errors.New("runbook_url must not contain whitespace or control characters")
+		}
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("invalid runbook_url: %w", err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", errors.New("runbook_url must use http or https scheme")
+	}
+	if u.Opaque != "" || u.Host == "" || u.Hostname() == "" {
+		return "", errors.New("runbook_url must include a valid host")
+	}
+	return scheme + trimmed[len(u.Scheme):], nil
+}
+
+// ValidateResponseGuidance normalizes line endings, trims surrounding
+// whitespace, and validates an optional response guidance note. An empty or
+// whitespace-only note returns "". Non-empty notes must be valid UTF-8, at most
+// MaxResponseGuidanceLen runes, and free of control characters other than
+// newline and tab.
+func ValidateResponseGuidance(raw string) (string, error) {
+	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	trimmed := strings.TrimSpace(normalized)
+	if trimmed == "" {
+		return "", nil
+	}
+	if !utf8.ValidString(trimmed) {
+		return "", errors.New("response_guidance must be valid UTF-8")
+	}
+	if utf8.RuneCountInString(trimmed) > MaxResponseGuidanceLen {
+		return "", fmt.Errorf("response_guidance exceeds maximum length of %d characters", MaxResponseGuidanceLen)
+	}
+	for _, r := range trimmed {
+		if (r < 0x20 && r != '\n' && r != '\t') || r == 0x7f || (unicode.IsControl(r) && r != '\n' && r != '\t') {
+			return "", errors.New("response_guidance must not contain control characters")
+		}
+	}
+	return trimmed, nil
+}
+
+// ResolveRunbookURL returns the first non-empty runbook URL in precedence
+// order (for example: rule -> monitor -> workspace default).
+func ResolveRunbookURL(candidates ...string) string {
+	for _, c := range candidates {
+		if trimmed := strings.TrimSpace(c); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+// ResolveResponseGuidance returns the first non-empty response guidance note
+// in precedence order (for example: rule -> monitor -> workspace default).
+func ResolveResponseGuidance(candidates ...string) string {
+	for _, c := range candidates {
+		if trimmed := strings.TrimSpace(c); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+// ResolveAlertGuidance resolves the effective runbook URL and response guidance
+// across the rule -> monitor -> workspace inheritance chain.
+func ResolveAlertGuidance(rule *Rule, monitor *Monitor, workspaceRunbookURL, workspaceResponseGuidance string) (runbookURL, responseGuidance string) {
+	var rURL, rGuidance, mURL, mGuidance string
+	if rule != nil {
+		rURL = rule.RunbookURL
+		rGuidance = rule.ResponseGuidance
+		if rURL == "" || rGuidance == "" {
+			pURL, hasURL, pGuidance, hasGuidance := extractParamsGuidance(rule.Params)
+			if rURL == "" && hasURL {
+				rURL = pURL
+			}
+			if rGuidance == "" && hasGuidance {
+				rGuidance = pGuidance
+			}
+		}
+	}
+	if monitor != nil {
+		mURL = monitor.RunbookURL
+		mGuidance = monitor.ResponseGuidance
+	}
+	return ResolveRunbookURL(rURL, mURL, workspaceRunbookURL),
+		ResolveResponseGuidance(rGuidance, mGuidance, workspaceResponseGuidance)
+}
+
+func extractParamsGuidance(raw json.RawMessage) (runbookURL string, hasURL bool, responseGuidance string, hasGuidance bool) {
+	if len(raw) == 0 {
+		return "", false, "", false
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
+		return "", false, "", false
+	}
+	if v, ok := obj["runbook_url"]; ok && len(v) > 0 && string(v) != "null" {
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil {
+			runbookURL = s
+			hasURL = true
+		}
+	}
+	if v, ok := obj["response_guidance"]; ok && len(v) > 0 && string(v) != "null" {
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil {
+			responseGuidance = s
+			hasGuidance = true
+		}
+	}
+	return runbookURL, hasURL, responseGuidance, hasGuidance
+}
+
+func normalizeMonitorGuidance(m *Monitor) error {
+	if m == nil {
+		return nil
+	}
+	u, err := ValidateRunbookURL(m.RunbookURL)
+	if err != nil {
+		return err
+	}
+	g, err := ValidateResponseGuidance(m.ResponseGuidance)
+	if err != nil {
+		return err
+	}
+	m.RunbookURL = u
+	m.ResponseGuidance = g
+	return nil
+}
+
+func normalizeRuleGuidance(r *Rule) error {
+	if r == nil {
+		return nil
+	}
+	pURL, hasURL, pGuidance, hasGuidance := extractParamsGuidance(r.Params)
+	if r.RunbookURL == "" && hasURL {
+		r.RunbookURL = pURL
+	}
+	if r.ResponseGuidance == "" && hasGuidance {
+		r.ResponseGuidance = pGuidance
+	}
+	u, err := ValidateRunbookURL(r.RunbookURL)
+	if err != nil {
+		return err
+	}
+	g, err := ValidateResponseGuidance(r.ResponseGuidance)
+	if err != nil {
+		return err
+	}
+	r.RunbookURL = u
+	r.ResponseGuidance = g
+	return nil
+}
+
+// WithGuidance annotates an alert JSON payload object with runbook_url and
+// response_guidance when non-empty. A payload that is not a JSON object is
+// returned untouched.
+func WithGuidance(payload json.RawMessage, runbookURL, responseGuidance string) json.RawMessage {
+	if runbookURL == "" && responseGuidance == "" {
+		return payload
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(payload, &obj); err != nil || obj == nil {
+		return payload
+	}
+	changed := false
+	if runbookURL != "" {
+		if existing, ok := obj["runbook_url"].(string); !ok || existing == "" {
+			obj["runbook_url"] = runbookURL
+			changed = true
+		}
+	}
+	if responseGuidance != "" {
+		if existing, ok := obj["response_guidance"].(string); !ok || existing == "" {
+			obj["response_guidance"] = responseGuidance
+			changed = true
+		}
+	}
+	if !changed {
+		return payload
+	}
+	merged, err := json.Marshal(obj)
+	if err != nil {
+		return payload
+	}
+	return merged
 }
 
 func canonicalJSONEqual(a, b []byte) bool {
@@ -573,6 +802,12 @@ type Alert struct {
 	// stamped at creation time so editing a rule later does not lose which
 	// version matched historical alerts.
 	RuleVersion int `json:"rule_version,omitempty"`
+	// RunbookURL is the resolved runbook link (rule -> monitor -> workspace)
+	// captured when the alert was created.
+	RunbookURL string `json:"runbook_url,omitempty"`
+	// ResponseGuidance is the resolved triage guidance (rule -> monitor ->
+	// workspace) captured when the alert was created.
+	ResponseGuidance string `json:"response_guidance,omitempty"`
 }
 
 // Maintenance window scopes. A window suppresses matching alerts for its
@@ -1774,6 +2009,13 @@ type Escalations interface {
 // a previous start already created it.
 type Workspaces interface {
 	EnsureWorkspace(ctx context.Context, id workspace.ID) error
+	// SetWorkspaceGuidance sets the workspace-level default runbook URL and
+	// response guidance inherited by monitors and rules that do not define
+	// their own.
+	SetWorkspaceGuidance(ctx context.Context, id workspace.ID, runbookURL, responseGuidance string) error
+	// GetWorkspaceGuidance returns the workspace-level default runbook URL and
+	// response guidance.
+	GetWorkspaceGuidance(ctx context.Context, id workspace.ID) (runbookURL, responseGuidance string, err error)
 	// AssignLegacyNetwork labels rows the network migration left unlabelled.
 	// It runs once at startup in the instance's cross-tenant scope, and its
 	// predicate is the empty network rather than a tenant, so it is idempotent.

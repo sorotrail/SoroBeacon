@@ -283,7 +283,10 @@ func (r *Registry) Validate(ruleType string, params json.RawMessage) error {
 			if err := a.Validate(params); err != nil {
 				return err
 			}
-			_, err := ParseCooldown(params)
+			if _, err := ParseCooldown(params); err != nil {
+				return err
+			}
+			_, _, err := ParseGuidance(params)
 			return err
 		}
 		return fmt.Errorf("unknown rule type %q (registered: %v)", ruleType, r.Types())
@@ -291,9 +294,12 @@ func (r *Registry) Validate(ruleType string, params json.RawMessage) error {
 	if err := e.Validate(params); err != nil {
 		return err
 	}
-	// The cooldown applies to every rule type, so it is validated once here
-	// rather than duplicated in each evaluator's Validate.
-	_, err := ParseCooldown(params)
+	// The cooldown and guidance fields apply to every rule type, so they are
+	// validated once here rather than duplicated in each evaluator's Validate.
+	if _, err := ParseCooldown(params); err != nil {
+		return err
+	}
+	_, _, err := ParseGuidance(params)
 	return err
 }
 

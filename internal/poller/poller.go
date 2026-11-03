@@ -911,16 +911,21 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 		return false
 	}
 
+	runbookURL, responseGuidance := store.ResolveAlertGuidance(&rule, &m, "", "")
+	payload = store.WithGuidance(payload, runbookURL, responseGuidance)
+
 	alert := &store.Alert{
-		MonitorID:      m.ID,
-		RuleID:         rule.ID,
-		EventID:        eventID,
-		Payload:        payload,
-		Ledger:         ev.Ledger,
-		LedgerClosedAt: ev.LedgerClosedAt,
-		Cooldown:       ruleCooldown(rule),
-		Severity:       rule.Severity,
-		RuleVersion:    rule.Version,
+		MonitorID:        m.ID,
+		RuleID:           rule.ID,
+		EventID:          eventID,
+		Payload:          payload,
+		Ledger:           ev.Ledger,
+		LedgerClosedAt:   ev.LedgerClosedAt,
+		Cooldown:         ruleCooldown(rule),
+		Severity:         rule.Severity,
+		RuleVersion:      rule.Version,
+		RunbookURL:       runbookURL,
+		ResponseGuidance: responseGuidance,
 	}
 	outcome, err := p.store.CreateAlert(ctx, alert)
 	if err != nil {
@@ -976,9 +981,11 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 		CreatedAt: alert.CreatedAt,
 		// GroupCount is 1 for the first alert in a window (the one
 		// we are delivering now) and 0 when grouping is disabled.
-		GroupCount:  1,
-		WindowStart: time.Time{},
-		WindowEnd:   time.Time{},
+		GroupCount:       1,
+		WindowStart:      time.Time{},
+		WindowEnd:        time.Time{},
+		RunbookURL:       alert.RunbookURL,
+		ResponseGuidance: alert.ResponseGuidance,
 	})
 	return true
 }
@@ -1114,12 +1121,17 @@ func (p *Poller) fireAbsence(ctx context.Context, m store.Monitor, rule store.Ru
 		return
 	}
 
+	runbookURL, responseGuidance := store.ResolveAlertGuidance(&rule, &m, "", "")
+	payload = store.WithGuidance(payload, runbookURL, responseGuidance)
+
 	alert := &store.Alert{
-		MonitorID:   m.ID,
-		RuleID:      rule.ID,
-		EventID:     AbsenceEventID(lastSeen),
-		Payload:     payload,
-		RuleVersion: rule.Version,
+		MonitorID:        m.ID,
+		RuleID:           rule.ID,
+		EventID:          AbsenceEventID(lastSeen),
+		Payload:          payload,
+		RuleVersion:      rule.Version,
+		RunbookURL:       runbookURL,
+		ResponseGuidance: responseGuidance,
 	}
 	outcome, err := p.store.CreateAlert(ctx, alert)
 	if err != nil {
@@ -1143,16 +1155,18 @@ func (p *Poller) fireAbsence(ctx context.Context, m store.Monitor, rule store.Ru
 		"event_name", spec.EventName, "silent_for", silent)
 
 	p.dispatch.Dispatch(ctx, notify.Alert{
-		ID:          alert.ID,
-		MonitorID:   m.ID,
-		MonitorName: m.Name,
-		RuleID:      rule.ID,
-		RuleType:    rule.Type,
-		EventID:     alert.EventID,
-		EventName:   spec.EventName,
-		Silence:     silent,
-		Payload:     payload,
-		CreatedAt:   alert.CreatedAt,
+		ID:               alert.ID,
+		MonitorID:        m.ID,
+		MonitorName:      m.Name,
+		RuleID:           rule.ID,
+		RuleType:         rule.Type,
+		EventID:          alert.EventID,
+		EventName:        spec.EventName,
+		Silence:          silent,
+		Payload:          alert.Payload,
+		CreatedAt:        alert.CreatedAt,
+		RunbookURL:       alert.RunbookURL,
+		ResponseGuidance: alert.ResponseGuidance,
 	})
 }
 
