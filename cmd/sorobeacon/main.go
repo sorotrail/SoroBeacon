@@ -852,16 +852,11 @@ func shutdownTelemetry(log *slog.Logger, tel *telemetry.Provider) {
 // the factory treats ${secret:...} strings as literals exactly as it did
 // before the feature. The Vault token is a credential and is never logged.
 func buildSecretResolver(cfg config.Config, log *slog.Logger) *secrets.Resolver {
-	switch cfg.SecretsProvider {
-	case "env":
-		log.Info("external secrets enabled", "secrets_provider", "env", "cache_ttl", cfg.SecretsCacheTTL.String())
-		return secrets.NewResolver(secrets.NewEnvProvider()).WithTTL(cfg.SecretsCacheTTL)
-	case "vault":
-		log.Info("external secrets enabled", "secrets_provider", "vault", "vault_addr", cfg.VaultAddr, "cache_ttl", cfg.SecretsCacheTTL.String())
-		return secrets.NewResolver(secrets.NewVaultProvider(cfg.VaultAddr, cfg.VaultToken, cfg.VaultNamespace)).WithTTL(cfg.SecretsCacheTTL)
-	default:
+	if cfg.SecretsProvider == "" {
 		return nil
 	}
+	log.Info("external secrets enabled", "secrets_provider", cfg.SecretsProvider, "cache_ttl", cfg.SecretsCacheTTL.String())
+	return config.BuildResolver(cfg)
 }
 
 // buildSource wires the configured event source and its health checker. It is

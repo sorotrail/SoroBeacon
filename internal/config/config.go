@@ -3,6 +3,7 @@
 package config
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"log/slog"
@@ -358,6 +359,15 @@ func (p *problemList) add(field string, err error) {
 	p.list = append(p.list, Problem{Field: field, Reason: err.Error()})
 }
 
+func (p *problemList) has(field string) bool {
+	for _, pr := range p.list {
+		if pr.Field == field {
+			return true
+		}
+	}
+	return false
+}
+
 // Load reads configuration from the environment and, optionally, a YAML file
 // pointed to by CONFIG_FILE. Environment values win over the file, and the file
 // wins over defaults so a checked-in config stays sane while emergency
@@ -391,6 +401,31 @@ func LoadProblems() (Config, []Problem) {
 		return Config{}, []Problem{{Field: "CONFIG_FILE", Reason: err.Error()}}
 	}
 
+	var secretsCfg Config
+	if err := loadSecrets(&secretsCfg, fileValues); err != nil {
+		ps.add("SECRETS_PROVIDER", err)
+	}
+	secretResolver := BuildResolver(secretsCfg)
+
+	lookupSecret := func(key string) string {
+		raw := lookupConfigValue(key, fileValues)
+		if !secrets.IsReference(raw) {
+			return raw
+		}
+		if secretResolver == nil {
+			ps.add(key, fmt.Errorf("cannot resolve secret reference %s for %s: SECRETS_PROVIDER is not configured", raw, key))
+			return ""
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		val, err := secretResolver.ResolveString(ctx, raw)
+		if err != nil {
+			ps.add(key, fmt.Errorf("resolve %s secret reference %s: %w", key, raw, err))
+			return ""
+		}
+		return val
+	}
+
 	nets, err := ParseNetworks(func(key string) string {
 		return lookupConfigValue(key, fileValues)
 	})
@@ -407,7 +442,7 @@ func LoadProblems() (Config, []Problem) {
 		Networks:           nets,
 		RPCURL:             net.RPCURL,
 		RPCURLs:            net.RPCURLs,
-		DatabaseURL:        lookupConfigValue("DATABASE_URL", fileValues),
+		DatabaseURL:        lookupSecret("DATABASE_URL"),
 		InstanceName:       strings.TrimSpace(lookupConfigValue("INSTANCE_NAME", fileValues)),
 		PollInterval:       DefaultPollInterval,
 		HeartbeatInterval:  DefaultHeartbeatInterval,
@@ -425,10 +460,17 @@ func LoadProblems() (Config, []Problem) {
 		// alerts exactly as soon as it did before this feature.
 		ReorgTrackingWindow:    DefaultReorgTrackingWindow,
 		ReorgConfirmationDepth: 0,
+		SecretsProvider:        secretsCfg.SecretsProvider,
+		SecretsCacheTTL:        secretsCfg.SecretsCacheTTL,
+		VaultAddr:              secretsCfg.VaultAddr,
+		VaultToken:             secretsCfg.VaultToken,
+		VaultNamespace:         secretsCfg.VaultNamespace,
 	}
 
-	if err := validateDatabaseURL(cfg.DatabaseURL); err != nil {
-		ps.add("DATABASE_URL", err)
+	if !ps.has("DATABASE_URL") {
+		if err := validateDatabaseURL(cfg.DatabaseURL); err != nil {
+			ps.add("DATABASE_URL", err)
+		}
 	}
 	// The pool knobs below are Postgres-only. Knowing the backend here lets
 	// Load fail loudly when a SQLite deployment carries them instead of
@@ -492,17 +534,23 @@ func LoadProblems() (Config, []Problem) {
 		}
 	}
 
-	tokens, err := parseAPITokens(lookupConfigValue("API_TOKEN", fileValues))
-	if err != nil {
-		ps.add("API_TOKEN", err)
+	rawAPITokens := lookupSecret("API_TOKEN")
+	if !ps.has("API_TOKEN") {
+		tokens, err := parseAPITokens(rawAPITokens)
+		if err != nil {
+			ps.add("API_TOKEN", err)
+		}
+		cfg.APITokens = tokens
 	}
-	cfg.APITokens = tokens
 
-	bound, err := parseWorkspaceTokens(lookupConfigValue("WORKSPACE_TOKENS", fileValues))
-	if err != nil {
-		ps.add("WORKSPACE_TOKENS", err)
+	rawWSTokens := lookupSecret("WORKSPACE_TOKENS")
+	if !ps.has("WORKSPACE_TOKENS") {
+		bound, err := parseWorkspaceTokens(rawWSTokens)
+		if err != nil {
+			ps.add("WORKSPACE_TOKENS", err)
+		}
+		cfg.WorkspaceTokens = bound
 	}
-	cfg.WorkspaceTokens = bound
 	// A token that names two workspaces is rejected at startup, not at the
 	// first request: resolution would otherwise depend on which configured
 	// entry the comparison happened to hit, which is the one failure mode
@@ -512,7 +560,7 @@ func LoadProblems() (Config, []Problem) {
 	}
 
 	oidc, err := parseOIDC(func(key string) string {
-		return lookupConfigValue(key, fileValues)
+		return lookupSecret(key)
 	})
 	if err != nil {
 		ps.add("OIDC_ISSUER", err)
@@ -549,12 +597,14 @@ func LoadProblems() (Config, []Problem) {
 	// credential, so neither it nor anything derived from it is ever
 	// echoed back in an error. It is validated after POLL_INTERVAL (which
 	// is parsed above) because the interval comparison depends on it.
-	if v := lookupConfigValue("HEARTBEAT_URL", fileValues); v != "" {
-		u, err := url.Parse(v)
-		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-			ps.add("HEARTBEAT_URL", fmt.Errorf("invalid HEARTBEAT_URL: want an http(s) URL with a host (the URL itself is not printed because its path is a credential)"))
-		} else {
-			cfg.HeartbeatURL = v
+	if v := lookupSecret("HEARTBEAT_URL"); v != "" {
+		if !ps.has("HEARTBEAT_URL") {
+			u, err := url.Parse(v)
+			if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+				ps.add("HEARTBEAT_URL", fmt.Errorf("invalid HEARTBEAT_URL: want an http(s) URL with a host (the URL itself is not printed because its path is a credential)"))
+			} else {
+				cfg.HeartbeatURL = v
+			}
 		}
 	}
 	if v := lookupConfigValue("HEARTBEAT_INTERVAL", fileValues); v != "" {
@@ -702,24 +752,29 @@ func LoadProblems() (Config, []Problem) {
 	// sets REPLICA_DATABASE_URL believes reads are being routed, and a
 	// deployment that silently serves everything from the primary while
 	// claiming otherwise is worse than one that refuses to boot.
-	replicaURL := strings.TrimSpace(lookupConfigValue("REPLICA_DATABASE_URL", fileValues))
+	replicaURL := strings.TrimSpace(lookupSecret("REPLICA_DATABASE_URL"))
 	switch {
 	case sqliteBackend && replicaURL != "":
 		ps.add("REPLICA_DATABASE_URL", fmt.Errorf("REPLICA_DATABASE_URL has no effect on a sqlite DATABASE_URL: SQLite serves reads and writes from one file; unset it or use Postgres"))
 	case replicaURL != "":
-		if err := validateReplicaDatabaseURL(replicaURL, cfg.DatabaseURL); err != nil {
-			ps.add("REPLICA_DATABASE_URL", err)
-		} else {
-			cfg.ReplicaDatabaseURL = replicaURL
+		if !ps.has("REPLICA_DATABASE_URL") {
+			if err := validateReplicaDatabaseURL(replicaURL, cfg.DatabaseURL); err != nil {
+				ps.add("REPLICA_DATABASE_URL", err)
+			} else {
+				cfg.ReplicaDatabaseURL = replicaURL
+			}
 		}
 	default:
 		cfg.ReplicaDatabaseURL = replicaURL
 	}
-	key, err := parseEncryptionKey(lookupConfigValue("CONFIG_ENCRYPTION_KEY", fileValues))
-	if err != nil {
-		ps.add("CONFIG_ENCRYPTION_KEY", err)
+	rawEncKey := lookupSecret("CONFIG_ENCRYPTION_KEY")
+	if !ps.has("CONFIG_ENCRYPTION_KEY") {
+		key, err := parseEncryptionKey(rawEncKey)
+		if err != nil {
+			ps.add("CONFIG_ENCRYPTION_KEY", err)
+		}
+		cfg.ConfigEncryptionKey = key
 	}
-	cfg.ConfigEncryptionKey = key
 	grpcAddr := lookupConfigValue("GRPC_ADDR", fileValues)
 	if grpcAddr != "" {
 		if err := validateHTTPAddr(grpcAddr); err != nil {
@@ -761,7 +816,7 @@ func LoadProblems() (Config, []Problem) {
 			cfg.FlappingQuietAfter = d
 		}
 	}
-	cfg.AlertEnrichmentURL = strings.TrimSpace(lookupConfigValue("ALERT_ENRICHMENT_URL", fileValues))
+	cfg.AlertEnrichmentURL = strings.TrimSpace(lookupSecret("ALERT_ENRICHMENT_URL"))
 	cfg.AlertEnrichmentTimeout = 2 * time.Second
 	cfg.AlertEnrichmentCacheTTL = 5 * time.Minute
 	if v := lookupConfigValue("ALERT_ENRICHMENT_TIMEOUT", fileValues); v != "" {
@@ -899,10 +954,6 @@ func LoadProblems() (Config, []Problem) {
 		}
 	}
 
-	if err := loadSecrets(&cfg, fileValues); err != nil {
-		ps.add("SECRETS_PROVIDER", err)
-	}
-
 	return cfg, ps.list
 }
 
@@ -914,10 +965,18 @@ func LoadProblems() (Config, []Problem) {
 // one: environment first, config file as the fallback.
 func loadSecrets(cfg *Config, fileValues map[string]string) error {
 	cfg.SecretsProvider = strings.ToLower(strings.TrimSpace(lookupConfigValue("SECRETS_PROVIDER", fileValues)))
-	switch cfg.SecretsProvider {
-	case "", "env", "vault":
-	default:
-		return fmt.Errorf("invalid SECRETS_PROVIDER %q (want env|vault, or unset to disable external secrets)", cfg.SecretsProvider)
+	hasVault := false
+	if cfg.SecretsProvider != "" {
+		for _, rawP := range strings.Split(cfg.SecretsProvider, ",") {
+			p := strings.TrimSpace(rawP)
+			switch p {
+			case "env", "file":
+			case "vault", "all":
+				hasVault = true
+			default:
+				return fmt.Errorf("invalid SECRETS_PROVIDER %q (want env|vault|file, or unset to disable external secrets)", cfg.SecretsProvider)
+			}
+		}
 	}
 
 	cfg.SecretsCacheTTL = secrets.DefaultTTL
@@ -935,10 +994,36 @@ func loadSecrets(cfg *Config, fileValues map[string]string) error {
 	cfg.VaultAddr = strings.TrimRight(strings.TrimSpace(lookupConfigValue("VAULT_ADDR", fileValues)), "/")
 	cfg.VaultToken = lookupConfigValue("VAULT_TOKEN", fileValues)
 	cfg.VaultNamespace = strings.TrimSpace(lookupConfigValue("VAULT_NAMESPACE", fileValues))
-	if cfg.SecretsProvider == "vault" && cfg.VaultAddr == "" {
-		return fmt.Errorf("VAULT_ADDR is required when SECRETS_PROVIDER=vault")
+	if hasVault && cfg.VaultAddr == "" {
+		return fmt.Errorf("VAULT_ADDR is required when SECRETS_PROVIDER includes vault")
 	}
 	return nil
+}
+
+// BuildResolver returns a secrets.Resolver built from cfg.SecretsProvider.
+// It returns nil when external secrets are disabled.
+func BuildResolver(cfg Config) *secrets.Resolver {
+	if cfg.SecretsProvider == "" {
+		return nil
+	}
+	r := secrets.NewResolver()
+	for _, rawP := range strings.Split(cfg.SecretsProvider, ",") {
+		switch strings.TrimSpace(rawP) {
+		case "env":
+			r.Register(secrets.NewEnvProvider())
+		case "file":
+			r.Register(secrets.NewFileProvider())
+		case "vault":
+			r.Register(secrets.NewVaultProvider(cfg.VaultAddr, cfg.VaultToken, cfg.VaultNamespace))
+		case "all":
+			r.Register(secrets.NewEnvProvider())
+			r.Register(secrets.NewFileProvider())
+			if cfg.VaultAddr != "" {
+				r.Register(secrets.NewVaultProvider(cfg.VaultAddr, cfg.VaultToken, cfg.VaultNamespace))
+			}
+		}
+	}
+	return r.WithTTL(cfg.SecretsCacheTTL)
 }
 
 func valueOrFallback(key string, fileValues map[string]string, fallback string) string {
