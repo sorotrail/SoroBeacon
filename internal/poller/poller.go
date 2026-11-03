@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"sort"
 	"strconv"
 	"strings"
@@ -321,7 +322,11 @@ func (p *Poller) Run(ctx context.Context) {
 			if ctx.Err() != nil {
 				continue
 			}
-			delay = min(delay*2, 10*p.Interval())
+			baseDelay := min(delay*2, 10*p.Interval())
+			delay = baseDelay
+			if half := baseDelay / 2; half > 0 {
+				delay = half + time.Duration(rand.Int63n(int64(half)))
+			}
 			p.recordBackoff(true)
 			p.log.Error("poll failed", "err", err, "retry_in", delay)
 			continue
@@ -356,6 +361,10 @@ func (p *Poller) recordCycle(ok bool, took time.Duration) {
 // which stage was slow. Exported so tests (and one-shot tools) can drive
 // the poller without the timing loop.
 func (p *Poller) Poll(ctx context.Context) error {
+	if degraded, ok := p.store.(store.DegradationReporter); ok && degraded.Degraded() {
+		return store.ErrUnavailable
+	}
+
 	if p.telemetry != nil {
 		var span trace.Span
 		ctx, span = p.telemetry.WithRequestID(ctx, "poller.poll")

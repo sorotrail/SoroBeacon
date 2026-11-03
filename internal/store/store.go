@@ -20,6 +20,9 @@ import (
 // ErrNotFound is returned when a requested row does not exist.
 var ErrNotFound = errors.New("not found")
 
+// ErrUnavailable is returned when the database is unreachable or operating in degraded mode.
+var ErrUnavailable = errors.New("database unavailable")
+
 // Priority ranks a monitor's contracts in the poller's schedule. It is a
 // small closed set rather than a free integer so the scheduler, the API
 // validation and the database CHECK constraint all agree on the vocabulary.

@@ -84,6 +84,9 @@ func classify(err error) failureKind {
 	if err == nil {
 		return failurePermanent
 	}
+	if errors.Is(err, ErrUnavailable) {
+		return failureUnavailable
+	}
 	// The caller's deadline is not the database's fault, and the context
 	// is already done: there is nothing to wait for.
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

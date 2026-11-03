@@ -59,6 +59,7 @@
 ## 📏 Operations
 
 * [Health and readiness endpoints](operations/health-checks.md)
+* [Degraded mode and database outage handling](operations/degraded-mode.md)
 * [Backing up and restoring the database](operations/backup-restore.md)
 * [Securing a SoroBeacon deployment](operations/security.md)
 * [Upgrading a running deployment](operations/upgrading.md)

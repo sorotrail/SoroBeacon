@@ -106,11 +106,20 @@ type Server struct {
 	// tokens mints and resolves scoped API tokens. Nil leaves the /tokens
 	// endpoints off and only static credentials authenticating.
 	tokens *auth.Manager
+	// breaker fast-fails requests when the database is unavailable.
+	breaker *store.StoreBreaker
 }
 
 // New wires an API server. Rate limiting stays off until WithRateLimit, and
 // live alerts stay quiet until WithBroadcaster shares the poller's fan-out.
 func New(st store.Store, reg *rules.Registry, f *notify.Factory, rpc HealthChecker, log *slog.Logger) *Server {
+	var b *store.StoreBreaker
+	if bp, ok := st.(interface{ Breaker() *store.StoreBreaker }); ok {
+		b = bp.Breaker()
+	}
+	if b == nil {
+		b = store.NewStoreBreaker(3, 5*time.Second)
+	}
 	return &Server{
 		store: st, registry: reg, factory: f, rpc: rpc, log: log,
 		maxBodyBytes:       DefaultMaxBodyBytes,
@@ -118,7 +127,14 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, rpc HealthCheck
 		endpointBodyLimits: make(map[string]int64),
 		broadcaster:        broadcast.New(broadcast.DefaultBuffer),
 		streamHeartbeat:    defaultStreamHeartbeat,
+		breaker:            b,
 	}
+}
+
+// WithBreaker sets the circuit breaker protecting the server against database outages.
+func (s *Server) WithBreaker(b *store.StoreBreaker) *Server {
+	s.breaker = b
+	return s
 }
 
 // WithMaxBodyBytes sets the write-endpoint body limit applied by
@@ -283,6 +299,7 @@ func (s *Server) Routes() chi.Router {
 	// Innermost, so only authenticated, rate-limited requests are audited
 	// and an audit failure never blocks the request.
 	mux.Use(AuditMiddleware(s.store, s.log))
+	mux.Use(s.degradedMiddleware)
 	// JSON clients hitting a typo'd path or the wrong method should get
 	// the same envelope as every other API error, not chi's plain-text
 	// 404/405. The dashboard mux is a different router and is untouched.
@@ -609,7 +626,53 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	if c.Code == apierr.CodeInternalError {
 		s.log.Error("api error", "request_id", reqid.From(r), "err", err)
 	}
+	if c.Status == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", "5")
+		if s.breaker != nil {
+			s.breaker.RecordFailure(err)
+		}
+		if s.metrics != nil {
+			s.metrics.RecordDatabaseUnavailable()
+		}
+	}
 	writeErrCode(w, r, c.Status, c.Code, c.Message)
+}
+
+func (s *Server) isDegraded() bool {
+	if rep, ok := s.store.(store.DegradationReporter); ok && rep.Degraded() {
+		return true
+	}
+	if s.breaker != nil && s.breaker.Degraded() {
+		return true
+	}
+	return false
+}
+
+// isExemptFromDegraded reports whether a path is allowed to answer during degraded mode.
+func isExemptFromDegraded(path string) bool {
+	p := strings.TrimPrefix(path, "/api/v1")
+	switch p {
+	case "/livez", "/readyz", "/health", "/version", "/poller":
+		return true
+	}
+	return false
+}
+
+// degradedMiddleware fails fast with 503 Service Unavailable when the store is degraded,
+// protecting the recovering database from request stampedes.
+func (s *Server) degradedMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isExemptFromDegraded(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if s.isDegraded() {
+			w.Header().Set("Retry-After", "5")
+			writeErrCode(w, r, http.StatusServiceUnavailable, apierr.CodeServiceUnavailable, "database unavailable: service operating in degraded mode")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // constraintMessage describes a constraint violation in the caller's terms.
