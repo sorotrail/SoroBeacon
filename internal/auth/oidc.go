@@ -64,6 +64,15 @@ const (
 	// allow-list is configured, and `profile` for the name on the sign-in log
 	// line, so both are harmless extras rather than required claims.
 	DefaultOIDCScopes = "openid profile email"
+
+	// DefaultGroupClaim is the ID-token claim name inspected when
+	// GroupMappings is non-empty and GroupClaim is not explicitly set.
+	DefaultGroupClaim = "groups"
+
+	// DefaultGroupCacheTTL bounds how long a resolved OIDC group mapping is
+	// cached per subject before re-evaluation against current mappings and any
+	// configured GroupResolver.
+	DefaultGroupCacheTTL = 5 * time.Minute
 )
 
 // ErrOIDCLogin is what a login that cannot be completed reports: the state is
@@ -74,10 +83,129 @@ const (
 var ErrOIDCLogin = errors.New("auth: sign-in attempt could not be verified")
 
 // ErrOIDCAccount reports that a correctly verified identity is not allowed
-// here, i.e. it failed the configured e-mail domain allow-list. It is distinct
-// from ErrOIDCLogin because it is worth telling the *operator* (in a log line)
-// that someone they did not authorise knocked: the token was real.
+// here, i.e. it failed the configured e-mail domain allow-list or group
+// mapping. It is distinct from ErrOIDCLogin because it is worth telling the
+// *operator* (in a log line) that someone they did not authorise knocked: the
+// token was real.
 var ErrOIDCAccount = errors.New("auth: this account is not allowed")
+
+// ErrOIDCToken reports that an OIDC bearer token could not be verified
+// (invalid signature, issuer, audience, or expiry).
+var ErrOIDCToken = errors.New("auth: invalid OIDC bearer token")
+
+// ErrOIDCForbidden reports that a verified OIDC token's group claims did not
+// match any configured group mapping. It wraps ErrOIDCAccount and never echoes
+// raw claim values.
+var ErrOIDCForbidden = fmt.Errorf("%w: no matching OIDC group mapping", ErrOIDCAccount)
+
+// GroupMapping maps one provider group claim value to a (Workspace, Role)
+// pair. When a token carries multiple groups, matching rules within the same
+// workspace resolve to the highest-precedence role (admin > editor > viewer),
+// and across workspaces the highest role wins with declaration order in
+// GroupMappings breaking ties.
+type GroupMapping struct {
+	Group     string
+	Workspace workspace.ID
+	Role      Role
+}
+
+// WorkspaceGrant is one resolved (Workspace, Role) pair granted to an OIDC
+// identity.
+type WorkspaceGrant struct {
+	Workspace workspace.ID
+	Role      Role
+}
+
+// ParseGroupMappings parses a comma-separated list of declarative
+// `<group>=<workspace>:<role>` (or `<group>:<workspace>:<role>`) rules.
+// Errors name the 1-based entry position and never echo raw group claim values.
+func ParseGroupMappings(raw string) ([]GroupMapping, error) {
+	if strings.TrimSpace(raw) == "" {
+		if raw != "" {
+			return nil, errors.New("invalid OIDC_GROUP_MAPPINGS: set but contains no entries")
+		}
+		return nil, nil
+	}
+	var out []GroupMapping
+	for i, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		where := fmt.Sprintf("invalid OIDC_GROUP_MAPPINGS entry %d", i+1)
+		var groupPart, targetPart string
+		if eq := strings.LastIndexByte(entry, '='); eq >= 0 {
+			groupPart = strings.TrimSpace(entry[:eq])
+			targetPart = strings.TrimSpace(entry[eq+1:])
+		} else {
+			lastColon := strings.LastIndexByte(entry, ':')
+			if lastColon <= 0 {
+				return nil, fmt.Errorf("%s: want <group>=<workspace>:<role>", where)
+			}
+			prevColon := strings.LastIndexByte(entry[:lastColon], ':')
+			if prevColon <= 0 {
+				return nil, fmt.Errorf("%s: want <group>=<workspace>:<role>", where)
+			}
+			groupPart = strings.TrimSpace(entry[:prevColon])
+			targetPart = strings.TrimSpace(entry[prevColon+1:])
+		}
+		if groupPart == "" {
+			return nil, fmt.Errorf("%s: group name is empty", where)
+		}
+		wsRaw, roleRaw, ok := strings.Cut(targetPart, ":")
+		if !ok {
+			return nil, fmt.Errorf("%s: missing workspace:role separator (want <group>=<workspace>:<role>)", where)
+		}
+		wsRaw = strings.TrimSpace(wsRaw)
+		if wsRaw == "" || !workspace.Valid(wsRaw) {
+			return nil, fmt.Errorf("%s: invalid workspace id (ids are 1-40 characters of [a-z0-9_-])", where)
+		}
+		role, ok := ParseRole(roleRaw)
+		if !ok {
+			return nil, fmt.Errorf("%s: invalid role (want viewer, editor or admin)", where)
+		}
+		out = append(out, GroupMapping{
+			Group:     groupPart,
+			Workspace: workspace.ID(wsRaw),
+			Role:      role,
+		})
+	}
+	if len(out) == 0 {
+		return nil, errors.New("invalid OIDC_GROUP_MAPPINGS: set but contains no entries")
+	}
+	return out, nil
+}
+
+// ValidateGroupMappings validates a slice of GroupMapping rules and returns a
+// normalised copy. Errors name the 1-based rule index and never echo raw group
+// names.
+func ValidateGroupMappings(in []GroupMapping) ([]GroupMapping, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make([]GroupMapping, 0, len(in))
+	for i, m := range in {
+		where := fmt.Sprintf("auth: invalid OIDC group mapping %d", i+1)
+		g := strings.TrimSpace(m.Group)
+		if g == "" {
+			return nil, fmt.Errorf("%s: group name is empty", where)
+		}
+		ws := workspace.ID(strings.TrimSpace(string(m.Workspace)))
+		if ws == "" || !workspace.Valid(string(ws)) {
+			return nil, fmt.Errorf("%s: invalid workspace id", where)
+		}
+		role, ok := ParseRole(m.Role.String())
+		if !ok {
+			return nil, fmt.Errorf("%s: invalid role (want viewer, editor or admin)", where)
+		}
+		out = append(out, GroupMapping{
+			Group:     g,
+			Workspace: ws,
+			Role:      role,
+		})
+	}
+	return out, nil
+}
 
 // OIDCConfig is one provider, as configured by the environment
 // (OIDC_* variables; see internal/config).
@@ -114,6 +242,22 @@ type OIDCConfig struct {
 	// means every identity that signs in is an admin, which is what a
 	// deployment with one provider and one operator wants.
 	RoleClaim string
+	// GroupClaim names the ID-token claim carrying group memberships
+	// (default DefaultGroupClaim = "groups" when GroupMappings is non-empty).
+	GroupClaim string
+	// GroupMappings is the ordered declarative mapping from provider groups to
+	// (Workspace, Role) pairs. When non-empty, group mapping is active and
+	// fail-closed: tokens whose group claim is missing, empty, or matches no
+	// configured rule are denied and never defaulted to Workspace or RoleAdmin.
+	GroupMappings []GroupMapping
+	// GroupCacheTTL bounds how long a verified identity's group resolution or
+	// session group grant is cached before re-evaluation (default
+	// DefaultGroupCacheTTL = 5m when GroupMappings is non-empty).
+	GroupCacheTTL time.Duration
+	// GroupResolver is an optional callback consulted when a subject's cached
+	// group grant expires so that group removal at the provider revokes access
+	// within GroupCacheTTL without waiting for session or token expiry.
+	GroupResolver func(ctx context.Context, subject string) ([]string, error)
 	// AllowedDomains, when non-empty, is the allow-list an identity must pass:
 	// its `email` claim must have one of these domains. Empty means every
 	// account the provider will authenticate is accepted, which is a real
@@ -140,9 +284,44 @@ type Identity struct {
 	// resolved here, at the one place that has both the claims and the
 	// configuration, so no handler has to know how the mapping works.
 	Workspace workspace.ID
-	// Role is what this caller may do. It comes from the configured role
-	// claim, and defaults to admin when no claim is configured.
+	// Role is what this caller may do. It comes from the configured role or
+	// group claim, and defaults to admin when no claim mapping is configured.
 	Role Role
+	// Grants holds all resolved (Workspace, Role) pairs when GroupMappings
+	// matches multiple workspaces.
+	Grants []WorkspaceGrant
+	// Groups holds the verified group names from the token for session
+	// re-evaluation on mapping reload; never logged or echoed.
+	Groups []string
+	// Scopes holds optional fine-grained API scopes when the token carries
+	// `sorobeacon_scopes`. Empty means the identity is unrestricted within its
+	// Role.
+	Scopes []Scope
+}
+
+// RoleInWorkspace reports the role granted to this identity in ws, if any.
+func (id *Identity) RoleInWorkspace(ws workspace.ID) (Role, bool) {
+	if id == nil {
+		return RoleUnknown, false
+	}
+	for _, g := range id.Grants {
+		if g.Workspace == ws {
+			return g.Role, true
+		}
+	}
+	if id.Workspace == ws && id.Role != RoleUnknown {
+		return id.Role, true
+	}
+	return RoleUnknown, false
+}
+
+type cachedGroupResolution struct {
+	workspace      workspace.ID
+	role           Role
+	grants         []WorkspaceGrant
+	groups         []string
+	expiresAt      time.Time
+	mappingVersion uint64
 }
 
 // OIDCProvider is a configured provider: it can start a login and finish one.
@@ -161,6 +340,13 @@ type OIDCProvider struct {
 	ws             workspace.ID
 	wsClaim        string
 	roleClaim      string
+	groupClaim     string
+	groupMappings  []GroupMapping
+	groupCacheTTL  time.Duration
+	explicitTTL    bool
+	groupResolver  func(ctx context.Context, subject string) ([]string, error)
+	mappingVersion uint64
+	groupCache     map[string]cachedGroupResolution
 	stateTTL       time.Duration
 
 	// pending holds logins in flight, keyed by state. Server-side rather than
@@ -212,6 +398,22 @@ func NewOIDCProvider(ctx context.Context, cfg OIDCConfig) (*OIDCProvider, error)
 	if ttl <= 0 {
 		ttl = DefaultLoginStateTTL
 	}
+	if cfg.GroupCacheTTL < 0 {
+		return nil, errors.New("auth: OIDC group cache TTL must not be negative")
+	}
+	mappings, err := ValidateGroupMappings(cfg.GroupMappings)
+	if err != nil {
+		return nil, err
+	}
+	groupClaim := strings.TrimSpace(cfg.GroupClaim)
+	if groupClaim == "" && len(mappings) > 0 {
+		groupClaim = DefaultGroupClaim
+	}
+	groupCacheTTL := cfg.GroupCacheTTL
+	explicitTTL := groupCacheTTL > 0
+	if groupCacheTTL <= 0 {
+		groupCacheTTL = DefaultGroupCacheTTL
+	}
 
 	provider, err := oidc.NewProvider(ctx, issuer)
 	if err != nil {
@@ -239,6 +441,13 @@ func NewOIDCProvider(ctx context.Context, cfg OIDCConfig) (*OIDCProvider, error)
 		ws:             ws,
 		wsClaim:        strings.TrimSpace(cfg.WorkspaceClaim),
 		roleClaim:      strings.TrimSpace(cfg.RoleClaim),
+		groupClaim:     groupClaim,
+		groupMappings:  mappings,
+		groupCacheTTL:  groupCacheTTL,
+		explicitTTL:    explicitTTL,
+		groupResolver:  cfg.GroupResolver,
+		mappingVersion: 1,
+		groupCache:     map[string]cachedGroupResolution{},
 		stateTTL:       ttl,
 		pending:        map[string]*pendingLogin{},
 		now:            time.Now,
@@ -248,9 +457,90 @@ func NewOIDCProvider(ctx context.Context, cfg OIDCConfig) (*OIDCProvider, error)
 
 func (p *OIDCProvider) withNow(f func() time.Time) *OIDCProvider {
 	if f != nil {
+		p.mu.Lock()
 		p.now = f
+		p.mu.Unlock()
 	}
 	return p
+}
+
+// HasGroupMappings reports whether declarative group-to-(workspace, role)
+// mappings are active on this provider.
+func (p *OIDCProvider) HasGroupMappings() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.groupMappings) > 0
+}
+
+// GroupMappings returns a copy of the active declarative group mappings.
+func (p *OIDCProvider) GroupMappings() []GroupMapping {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]GroupMapping, len(p.groupMappings))
+	copy(out, p.groupMappings)
+	return out
+}
+
+// SetGroupMappings validates and atomically replaces the active group mappings
+// without restarting the provider, clearing any cached resolutions so the new
+// rules take effect immediately.
+func (p *OIDCProvider) SetGroupMappings(mappings []GroupMapping) error {
+	if p == nil {
+		return errors.New("auth: OIDC is not configured")
+	}
+	valid, err := ValidateGroupMappings(mappings)
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.groupMappings = valid
+	if p.groupClaim == "" && len(valid) > 0 {
+		p.groupClaim = DefaultGroupClaim
+	}
+	p.mappingVersion++
+	p.groupCache = map[string]cachedGroupResolution{}
+	return nil
+}
+
+// SetGroupResolver configures a callback used to re-fetch a subject's current
+// provider groups when its cached resolution expires, ensuring group removal at
+// the provider revokes access within GroupCacheTTL.
+func (p *OIDCProvider) SetGroupResolver(fn func(ctx context.Context, subject string) ([]string, error)) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.groupResolver = fn
+	p.groupCache = map[string]cachedGroupResolution{}
+}
+
+// EvictSubject drops any cached group resolution for subject so the next
+// evaluation re-checks claims or the configured GroupResolver immediately.
+func (p *OIDCProvider) EvictSubject(subject string) {
+	if p == nil || subject == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.groupCache, subject)
+}
+
+// GroupCacheTTL returns the bounded cache lifetime for group resolutions.
+func (p *OIDCProvider) GroupCacheTTL() time.Duration {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.groupCacheTTL
 }
 
 // Enabled reports whether this is a usable provider. A nil receiver is the
@@ -288,8 +578,8 @@ func (p *OIDCProvider) BeginLogin(next string) (redirectURL, state string, err e
 	if err != nil {
 		return "", "", err
 	}
-	now := p.now()
 	p.mu.Lock()
+	now := p.now()
 	p.sweepLocked(now)
 	p.pending[state] = &pendingLogin{
 		nonce:    nonce,
@@ -403,16 +693,44 @@ func (p *OIDCProvider) CompleteLogin(ctx context.Context, q url.Values, cookieSt
 		return nil, "", fmt.Errorf("auth: OIDC id_token nonce mismatch: %w", ErrOIDCLogin)
 	}
 
+	identity, err := p.identityFromToken(ctx, idToken, false)
+	if err != nil {
+		return nil, "", err
+	}
+	return identity, pending.next, nil
+}
+
+// VerifyBearer verifies a raw OIDC ID token presented as an HTTP Bearer token
+// and resolves its workspace, role, and grants using the provider's domain and
+// group mapping rules.
+//
+// An unverified token (bad signature, wrong issuer/audience, expired) returns
+// ErrOIDCToken (401 Unauthorized). A verified token whose claims do not match
+// the configured AllowedDomains or GroupMappings fails closed with
+// ErrOIDCForbidden / ErrOIDCAccount (403 Forbidden). Raw claim values and
+// tokens are never echoed in errors.
+func (p *OIDCProvider) VerifyBearer(ctx context.Context, rawIDToken string) (*Identity, error) {
+	if !p.Enabled() || strings.TrimSpace(rawIDToken) == "" {
+		return nil, ErrOIDCToken
+	}
+	idToken, err := p.verifier.Verify(ctx, rawIDToken)
+	if err != nil {
+		return nil, ErrOIDCToken
+	}
+	return p.identityFromToken(ctx, idToken, true)
+}
+
+func (p *OIDCProvider) identityFromToken(ctx context.Context, idToken *oidc.IDToken, useBearerCache bool) (*Identity, error) {
 	var claims struct {
 		Subject string `json:"sub"`
 		Email   string `json:"email"`
 		Name    string `json:"name"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
-		return nil, "", fmt.Errorf("auth: OIDC id_token claims: %w", err)
+		return nil, errors.New("auth: OIDC id_token claims could not be decoded")
 	}
 	if strings.TrimSpace(claims.Subject) == "" {
-		return nil, "", errors.New("auth: OIDC id_token carried no sub claim")
+		return nil, errors.New("auth: OIDC id_token carried no sub claim")
 	}
 
 	identity := &Identity{
@@ -421,45 +739,155 @@ func (p *OIDCProvider) CompleteLogin(ctx context.Context, q url.Values, cookieSt
 		Name:      claims.Name,
 		Workspace: p.ws,
 		// An identity that signs in is an operator of this instance until
-		// the provider says otherwise. A deployment that wants less maps a
-		// role claim; one that does not get the reach it had before roles
-		// existed.
+		// the provider says otherwise. When GroupMappings is configured below,
+		// this default is replaced by fail-closed group resolution.
 		Role: RoleAdmin,
 	}
 	if err := p.checkAccount(identity); err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	if p.wsClaim != "" || p.roleClaim != "" {
-		// A second pass into the whole claim set: the typed struct above knows
-		// the three claims this package cares about intrinsically, and the
-		// workspace and role claims are names the operator chose.
-		var raw map[string]any
-		if err := idToken.Claims(&raw); err != nil {
-			return nil, "", fmt.Errorf("auth: OIDC id_token claims: %w", err)
+
+	var raw map[string]any
+	if err := idToken.Claims(&raw); err != nil {
+		return nil, errors.New("auth: OIDC id_token claims could not be decoded")
+	}
+	if scopes, ok := claimScopes(raw, "sorobeacon_scopes"); ok {
+		identity.Scopes = scopes
+	}
+
+	p.mu.Lock()
+	groupMappings := make([]GroupMapping, len(p.groupMappings))
+	copy(groupMappings, p.groupMappings)
+	groupClaim := p.groupClaim
+	groupCacheTTL := p.groupCacheTTL
+	groupResolver := p.groupResolver
+	mappingVersion := p.mappingVersion
+	now := p.now()
+	cached, hasCached := p.groupCache[identity.Subject]
+	p.mu.Unlock()
+
+	if len(groupMappings) > 0 {
+		if groupClaim == "" {
+			groupClaim = DefaultGroupClaim
 		}
-		if p.wsClaim != "" {
-			if mapped, ok := claimString(raw, p.wsClaim); ok && workspace.Valid(mapped) {
-				identity.Workspace = workspace.ID(mapped)
+		tokenGroups, _ := claimStrings(raw, groupClaim)
+
+		// If this subject has an unexpired cached resolution under the current
+		// mapping version, and the token's own groups match the cached groups,
+		// return the cached grant within the bounded TTL. Once the TTL expires,
+		// consult GroupResolver (if configured) so group removal at the
+		// provider revokes access even for a still-unexpired bearer token.
+		if useBearerCache && hasCached && cached.mappingVersion == mappingVersion && now.Before(cached.expiresAt) && sameStringSet(tokenGroups, cached.groups) {
+			identity.Workspace = cached.workspace
+			identity.Role = cached.role
+			identity.Grants = cloneGrants(cached.grants)
+			identity.Groups = append([]string(nil), cached.groups...)
+			return identity, nil
+		}
+
+		effectiveGroups := tokenGroups
+		if groupResolver != nil && (!useBearerCache || !hasCached || !now.Before(cached.expiresAt)) {
+			resolved, err := groupResolver(ctx, identity.Subject)
+			if err != nil {
+				return nil, ErrOIDCForbidden
 			}
-			// An absent or unusable claim falls back to the configured workspace
-			// rather than refusing the login: OIDC_WORKSPACE is the operator's own
-			// statement of where such a user belongs, so the fallback is a choice
-			// on record, not a silent default. It is logged by the caller, which
-			// sees the workspace in the sign-in line it writes.
+			effectiveGroups = resolved
 		}
-		if p.roleClaim != "" {
-			// A role claim that names no known role is ignored for the same
-			// reason: the operator configured the mapping, and an identity the
-			// provider did not classify keeps the default rather than losing
-			// its access to an instance it can otherwise sign in to.
-			if mapped, ok := claimString(raw, p.roleClaim); ok {
-				if role, ok := ParseRole(mapped); ok {
-					identity.Role = role
-				}
+
+		ws, role, grants, ok := resolveGroupMappings(effectiveGroups, groupMappings)
+		if !ok {
+			p.EvictSubject(identity.Subject)
+			return nil, ErrOIDCForbidden
+		}
+		identity.Workspace = ws
+		identity.Role = role
+		identity.Grants = grants
+		identity.Groups = append([]string(nil), effectiveGroups...)
+
+		p.mu.Lock()
+		if p.mappingVersion == mappingVersion {
+			p.groupCache[identity.Subject] = cachedGroupResolution{
+				workspace:      ws,
+				role:           role,
+				grants:         cloneGrants(grants),
+				groups:         append([]string(nil), effectiveGroups...),
+				expiresAt:      now.Add(groupCacheTTL),
+				mappingVersion: mappingVersion,
+			}
+		}
+		p.mu.Unlock()
+		return identity, nil
+	}
+
+	if p.wsClaim != "" {
+		if mapped, ok := claimString(raw, p.wsClaim); ok && workspace.Valid(mapped) {
+			identity.Workspace = workspace.ID(mapped)
+		}
+	}
+	if p.roleClaim != "" {
+		if mapped, ok := claimString(raw, p.roleClaim); ok {
+			if role, ok := ParseRole(mapped); ok {
+				identity.Role = role
 			}
 		}
 	}
-	return identity, pending.next, nil
+	return identity, nil
+}
+
+// revalidateSession checks whether an OIDC-minted session's group grant is
+// still valid under the current mappings and bounded cache TTL.
+func (p *OIDCProvider) revalidateSession(ctx context.Context, s sessionInfo) (sessionInfo, AuthStatus) {
+	if !p.Enabled() || s.oidcSubject == "" {
+		return s, AuthOK
+	}
+	p.mu.Lock()
+	groupMappings := make([]GroupMapping, len(p.groupMappings))
+	copy(groupMappings, p.groupMappings)
+	groupCacheTTL := p.groupCacheTTL
+	explicitTTL := p.explicitTTL
+	groupResolver := p.groupResolver
+	mappingVersion := p.mappingVersion
+	now := p.now()
+	p.mu.Unlock()
+
+	if len(groupMappings) == 0 {
+		return s, AuthOK
+	}
+
+	ttlExpired := groupCacheTTL > 0 && !s.groupCheckedAt.IsZero() && !now.Before(s.groupCheckedAt.Add(groupCacheTTL))
+	versionChanged := s.mappingVersion != mappingVersion
+
+	if !ttlExpired && !versionChanged {
+		return s, AuthOK
+	}
+
+	groups := s.oidcGroups
+	if ttlExpired {
+		if groupResolver != nil {
+			fresh, err := groupResolver(ctx, s.oidcSubject)
+			if err != nil {
+				return s, AuthForbidden
+			}
+			groups = fresh
+		} else if explicitTTL {
+			// When GroupCacheTTL was explicitly configured without a background
+			// GroupResolver, the cached group grant expires at the documented
+			// bound so group removal at the provider cannot outlive GroupCacheTTL.
+			return s, AuthForbidden
+		}
+	}
+
+	ws, role, grants, ok := resolveGroupMappings(groups, groupMappings)
+	if !ok {
+		return s, AuthForbidden
+	}
+	s.workspace = ws
+	s.role = role
+	s.grants = grants
+	s.oidcGroups = append([]string(nil), groups...)
+	s.groupCheckedAt = now
+	s.mappingVersion = mappingVersion
+	return s, AuthOK
 }
 
 // take consumes a pending login, reporting nil for an unknown, expired or
@@ -558,7 +986,7 @@ func normaliseScopes(in []string) []string {
 // meaningful as one, and a provider that answers with a number or an object is
 // treated as not having supplied it rather than coerced.
 func claimString(claims map[string]any, name string) (string, bool) {
-	v, ok := claims[name]
+	v, ok := lookupClaim(claims, name)
 	if !ok {
 		return "", false
 	}
@@ -568,6 +996,169 @@ func claimString(claims map[string]any, name string) (string, bool) {
 	}
 	s = strings.TrimSpace(s)
 	return s, s != ""
+}
+
+// lookupClaim resolves a top-level or dot-separated nested claim path.
+func lookupClaim(claims map[string]any, name string) (any, bool) {
+	if claims == nil || name == "" {
+		return nil, false
+	}
+	if v, ok := claims[name]; ok {
+		return v, true
+	}
+	if !strings.Contains(name, ".") {
+		return nil, false
+	}
+	cur := claims
+	parts := strings.Split(name, ".")
+	for i, part := range parts {
+		v, ok := cur[part]
+		if !ok {
+			return nil, false
+		}
+		if i == len(parts)-1 {
+			return v, true
+		}
+		next, ok := v.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		cur = next
+	}
+	return nil, false
+}
+
+// claimStrings extracts a string slice or single string claim (such as OIDC
+// `groups`). Non-string values are ignored; an absent or empty claim reports
+// false.
+func claimStrings(claims map[string]any, name string) ([]string, bool) {
+	v, ok := lookupClaim(claims, name)
+	if !ok || v == nil {
+		return nil, false
+	}
+	var out []string
+	seen := map[string]bool{}
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	switch raw := v.(type) {
+	case string:
+		add(raw)
+	case []string:
+		for _, s := range raw {
+			add(s)
+		}
+	case []any:
+		for _, item := range raw {
+			if s, ok := item.(string); ok {
+				add(s)
+			}
+		}
+	default:
+		return nil, false
+	}
+	return out, len(out) > 0
+}
+
+func claimScopes(claims map[string]any, name string) ([]Scope, bool) {
+	raw, ok := claimStrings(claims, name)
+	if !ok {
+		return nil, false
+	}
+	scopes, err := ParseScopes(raw)
+	if err != nil || len(scopes) == 0 {
+		return nil, false
+	}
+	return scopes, true
+}
+
+// resolveGroupMappings matches a caller's groups against the configured rules.
+//
+// Precedence is deterministic and independent of the order in which the
+// provider serialises the group array in the ID token:
+//  1. Every rule in rules whose Group is present in groups matches.
+//  2. Within any single workspace, the highest-precedence role wins
+//     (admin > editor > viewer, via Role.AtLeast).
+//  3. Across workspaces, the primary (Workspace, Role) is the matched grant
+//     with the highest role, with ties broken by the earliest matching rule in
+//     the operator's declared GroupMappings order.
+//  4. When no rule matches, resolveGroupMappings fails closed (returns false)
+//     and never defaults to any workspace or role.
+func resolveGroupMappings(groups []string, rules []GroupMapping) (workspace.ID, Role, []WorkspaceGrant, bool) {
+	if len(groups) == 0 || len(rules) == 0 {
+		return "", RoleUnknown, nil, false
+	}
+	present := make(map[string]struct{}, len(groups))
+	for _, g := range groups {
+		if g = strings.TrimSpace(g); g != "" {
+			present[g] = struct{}{}
+		}
+	}
+	if len(present) == 0 {
+		return "", RoleUnknown, nil, false
+	}
+
+	var grants []WorkspaceGrant
+	grantIdx := make(map[workspace.ID]int)
+
+	for _, r := range rules {
+		if _, ok := present[r.Group]; !ok {
+			continue
+		}
+		if idx, exists := grantIdx[r.Workspace]; exists {
+			if r.Role.AtLeast(grants[idx].Role) {
+				grants[idx].Role = r.Role
+			}
+			continue
+		}
+		grantIdx[r.Workspace] = len(grants)
+		grants = append(grants, WorkspaceGrant{
+			Workspace: r.Workspace,
+			Role:      r.Role,
+		})
+	}
+	if len(grants) == 0 {
+		return "", RoleUnknown, nil, false
+	}
+
+	best := grants[0]
+	for _, g := range grants[1:] {
+		if g.Role.AtLeast(best.Role) && !best.Role.AtLeast(g.Role) {
+			best = g
+		}
+	}
+	return best.Workspace, best.Role, grants, true
+}
+
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]int, len(a))
+	for _, s := range a {
+		set[s]++
+	}
+	for _, s := range b {
+		if set[s] == 0 {
+			return false
+		}
+		set[s]--
+	}
+	return true
+}
+
+func cloneGrants(in []WorkspaceGrant) []WorkspaceGrant {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]WorkspaceGrant, len(in))
+	copy(out, in)
+	return out
 }
 
 func lowerAll(in []string) []string {

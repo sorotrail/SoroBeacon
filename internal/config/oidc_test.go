@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
@@ -24,6 +25,7 @@ func oidcEnv(t *testing.T, env map[string]string) {
 	for _, key := range []string{
 		"OIDC_ISSUER", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET", "OIDC_REDIRECT_URL",
 		"OIDC_SCOPES", "OIDC_WORKSPACE", "OIDC_WORKSPACE_CLAIM", "OIDC_ROLE_CLAIM",
+		"OIDC_GROUP_CLAIM", "OIDC_GROUP_MAPPINGS", "OIDC_GROUP_CACHE_TTL",
 		"OIDC_ALLOWED_DOMAINS", "OIDC_LOGIN_STATE_TTL",
 	} {
 		t.Setenv(key, "")
@@ -189,6 +191,21 @@ func TestLoadRejectsUnusableSingleSignOn(t *testing.T) {
 			env:     map[string]string{"OIDC_ISSUER": "https://accounts.example.com", "OIDC_CLIENT_ID": "c", "OIDC_REDIRECT_URL": callback, "OIDC_LOGIN_STATE_TTL": "-5m"},
 			wantErr: "OIDC_LOGIN_STATE_TTL",
 		},
+		{
+			name:    "group mappings invalid role",
+			env:     map[string]string{"OIDC_ISSUER": "https://accounts.example.com", "OIDC_CLIENT_ID": "c", "OIDC_REDIRECT_URL": callback, "OIDC_GROUP_MAPPINGS": "sre=prod:superadmin"},
+			wantErr: "OIDC_GROUP_MAPPINGS",
+		},
+		{
+			name:    "group mappings invalid workspace",
+			env:     map[string]string{"OIDC_ISSUER": "https://accounts.example.com", "OIDC_CLIENT_ID": "c", "OIDC_REDIRECT_URL": callback, "OIDC_GROUP_MAPPINGS": "sre=Invalid Workspace:admin"},
+			wantErr: "OIDC_GROUP_MAPPINGS",
+		},
+		{
+			name:    "group cache ttl zero",
+			env:     map[string]string{"OIDC_ISSUER": "https://accounts.example.com", "OIDC_CLIENT_ID": "c", "OIDC_REDIRECT_URL": callback, "OIDC_GROUP_CACHE_TTL": "0s"},
+			wantErr: "OIDC_GROUP_CACHE_TTL",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			oidcEnv(t, tc.env)
@@ -197,6 +214,29 @@ func TestLoadRejectsUnusableSingleSignOn(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.wantErr)
 		})
 	}
+}
+
+func TestLoadSingleSignOnGroupMappings(t *testing.T) {
+	cfg := loadWithOIDC(t, map[string]string{
+		"OIDC_ISSUER":          oidcBase,
+		"OIDC_CLIENT_ID":       "beacon-web",
+		"OIDC_REDIRECT_URL":    "https://beacon.example.com/login/oidc/callback",
+		"OIDC_GROUP_CLAIM":     "groups",
+		"OIDC_GROUP_MAPPINGS":  "sre-prod=prod:admin, devs=staging:editor, org:auditors:prod:viewer",
+		"OIDC_GROUP_CACHE_TTL": "2m",
+	})
+	require.Equal(t, "groups", cfg.OIDC.GroupClaim)
+	require.Equal(t, 2*time.Minute, cfg.OIDC.GroupCacheTTL)
+	require.Equal(t, []auth.GroupMapping{
+		{Group: "sre-prod", Workspace: "prod", Role: auth.RoleAdmin},
+		{Group: "devs", Workspace: "staging", Role: auth.RoleEditor},
+		{Group: "org:auditors", Workspace: "prod", Role: auth.RoleViewer},
+	}, cfg.OIDC.GroupMappings)
+	assert.Equal(t, []workspace.ID{workspace.Default, "prod", "staging"}, cfg.Workspaces())
+	authCfg := cfg.OIDC.AuthOIDC()
+	assert.Equal(t, cfg.OIDC.GroupClaim, authCfg.GroupClaim)
+	assert.Equal(t, cfg.OIDC.GroupMappings, authCfg.GroupMappings)
+	assert.Equal(t, cfg.OIDC.GroupCacheTTL, authCfg.GroupCacheTTL)
 }
 
 // TestLogAttrsHidesTheSSOClientSecret is the reason fields are opted into the

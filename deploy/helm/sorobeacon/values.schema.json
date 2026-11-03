@@ -481,6 +481,18 @@
           "type": "string",
           "description": "OIDC_ROLE_CLAIM: claim naming the user's role."
         },
+        "groupClaim": {
+          "type": "string",
+          "description": "OIDC_GROUP_CLAIM: claim naming the user's group memberships."
+        },
+        "groupMappings": {
+          "type": "string",
+          "description": "OIDC_GROUP_MAPPINGS: comma-separated group=workspace:role mappings."
+        },
+        "groupCacheTTL": {
+          "type": "string",
+          "description": "OIDC_GROUP_CACHE_TTL: how long resolved group mappings are cached."
+        },
         "loginStateTTL": {
           "type": "string",
           "pattern": "^[0-9]+(ms|s|m|h)$",
