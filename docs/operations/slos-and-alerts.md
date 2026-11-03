@@ -151,3 +151,14 @@ An alerting system that crashes or loses network connectivity stops emitting met
 - **Triage Steps**:
   1. Open **SoroBeacon — Channels** to identify the `channel_id` and `channel_type` with an open breaker.
   2. Verify downstream webhook endpoint reachability and rate limits.
+
+### `SoroBeaconChannelNeverAcknowledged` {#sorobeaconchannelneveracknowledged}
+
+- **Severity**: `ticket`
+- **Meaning**: `sorobeacon_channel_unacknowledged_flagged == 1` for at least 15 minutes. The channel accepts deliveries (HTTP 200 or provider acceptance), but zero delivered alerts have been acknowledged within the evaluation SLA window.
+- **Triage Steps**:
+  1. Open **SoroBeacon — Channels** and check the channel flagged as `unacknowledged`.
+  2. Verify that the destination (Slack channel, Discord channel, email inbox, or webhook recipient) has active human watchers.
+  3. Send a test alert using the **Send test** button on the Channels dashboard to verify reachability.
+  4. Review alert routing and escalation policies to confirm the right team is notified.
+  5. *Note on limits*: Unacknowledged does not prove unseen; operators may have acted without clicking acknowledge. Never automatically disable the channel; raise with channel owners to confirm visibility.

@@ -1884,6 +1884,213 @@ func (s *SQLite) RecordChannelSigningKeyUsage(ctx context.Context, channelID int
 	return err
 }
 
+// ReconcileChannelAcknowledgements evaluates delivery vs human acknowledgement for all channels
+// in the context's workspace (or instance-wide under a system context).
+func (s *SQLite) ReconcileChannelAcknowledgements(ctx context.Context, cfg AckReconciliationConfig) ([]ChannelAckReconciliation, error) {
+	if cfg.LookbackWindow <= 0 {
+		cfg.LookbackWindow = 7 * 24 * time.Hour
+	}
+	if cfg.CriticalAckWindow <= 0 {
+		cfg.CriticalAckWindow = 1 * time.Hour
+	}
+	if cfg.WarningAckWindow <= 0 {
+		cfg.WarningAckWindow = 4 * time.Hour
+	}
+	if cfg.MinDeliveries <= 0 {
+		cfg.MinDeliveries = 3
+	}
+	if cfg.FlagThresholdRate <= 0 {
+		cfg.FlagThresholdRate = 1.0
+	}
+
+	now := time.Now().UTC()
+	lookbackCutoff := sqliteTimeString(now.Add(-cfg.LookbackWindow))
+	critCutoff := sqliteTimeString(now.Add(-cfg.CriticalAckWindow))
+	warnCutoff := sqliteTimeString(now.Add(-cfg.WarningAckWindow))
+
+	ws, isTenant := tenantWorkspace(ctx)
+	targetWS := ""
+	if isTenant {
+		targetWS = string(ws)
+	}
+
+	query := `
+		SELECT
+			c.id,
+			c.workspace_id,
+			COUNT(q.alert_id),
+			COUNT(CASE WHEN q.alert_id IS NOT NULL AND q.acknowledged_at IS NOT NULL AND q.acknowledged_at != '' THEN 1 END),
+			COUNT(CASE WHEN q.alert_id IS NOT NULL AND (q.acknowledged_at IS NULL OR q.acknowledged_at = '') THEN 1 END)
+		FROM channels c
+		LEFT JOIN (
+			SELECT DISTINCT
+				da.channel_id,
+				da.alert_id,
+				a.acknowledged_at
+			FROM delivery_attempts da
+			JOIN alerts a ON a.id = da.alert_id
+			WHERE da.status = 'success'
+			  AND (a.suppressed = 0 OR a.suppressed IS NULL)
+			  AND a.inhibited_by_rule_id IS NULL
+			  AND a.retracted_at IS NULL
+			  AND a.severity IN ('warning', 'critical')
+			  AND a.created_at >= ?
+			  AND (
+				  (a.acknowledged_at IS NOT NULL AND a.acknowledged_at != '')
+				  OR (a.severity = 'critical' AND a.created_at <= ?)
+				  OR (a.severity = 'warning' AND a.created_at <= ?)
+			  )
+		) q ON q.channel_id = c.id
+		WHERE (? = '' OR c.workspace_id = ?)
+		GROUP BY c.id, c.workspace_id
+		ORDER BY c.id`
+
+	rows, err := s.db.QueryContext(ctx, query, lookbackCutoff, critCutoff, warnCutoff, targetWS, targetWS)
+	if err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	defer rows.Close()
+
+	var reconciliations []ChannelAckReconciliation
+	for rows.Next() {
+		var r ChannelAckReconciliation
+		if err := rows.Scan(&r.ChannelID, &r.WorkspaceID, &r.DeliveredTotal, &r.AcknowledgedTotal, &r.UnacknowledgedTotal); err != nil {
+			return nil, mapSQLiteErr(err)
+		}
+		r.ComputedAt = now
+		if r.DeliveredTotal > 0 {
+			rate := float64(r.UnacknowledgedTotal) / float64(r.DeliveredTotal)
+			r.UnackRate = &rate
+			if r.DeliveredTotal >= cfg.MinDeliveries && rate >= cfg.FlagThresholdRate {
+				r.Flagged = true
+			}
+		}
+		reconciliations = append(reconciliations, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+
+	computedStr := sqliteTimeString(now)
+	for _, r := range reconciliations {
+		var rateVal sql.NullFloat64
+		if r.UnackRate != nil {
+			rateVal = sql.NullFloat64{Float64: *r.UnackRate, Valid: true}
+		}
+		flaggedInt := 0
+		if r.Flagged {
+			flaggedInt = 1
+		}
+		_, err := s.db.ExecContext(ctx, `
+			INSERT INTO channel_ack_reconciliations (
+				channel_id, workspace_id, delivered_total, acknowledged_total, unacknowledged_total, unack_rate, flagged, computed_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (channel_id) DO UPDATE SET
+				workspace_id = excluded.workspace_id,
+				delivered_total = excluded.delivered_total,
+				acknowledged_total = excluded.acknowledged_total,
+				unacknowledged_total = excluded.unacknowledged_total,
+				unack_rate = excluded.unack_rate,
+				flagged = excluded.flagged,
+				computed_at = excluded.computed_at`,
+			r.ChannelID, r.WorkspaceID, r.DeliveredTotal, r.AcknowledgedTotal, r.UnacknowledgedTotal, rateVal, flaggedInt, computedStr,
+		)
+		if err != nil {
+			return nil, mapSQLiteErr(err)
+		}
+	}
+
+	return reconciliations, nil
+}
+
+// GetChannelAckReconciliation returns the current acknowledgement reconciliation for one channel.
+func (s *SQLite) GetChannelAckReconciliation(ctx context.Context, channelID int64) (ChannelAckReconciliation, error) {
+	ws := workspaceID(ctx)
+	var r ChannelAckReconciliation
+	var exists int64
+	var rateVal sql.NullFloat64
+	var flaggedInt int64
+	var computedStr sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			(SELECT count(*) FROM channels WHERE id = ? AND workspace_id = ?),
+			COALESCE(car.channel_id, ?),
+			COALESCE(car.workspace_id, ?),
+			COALESCE(car.delivered_total, 0),
+			COALESCE(car.acknowledged_total, 0),
+			COALESCE(car.unacknowledged_total, 0),
+			car.unack_rate,
+			COALESCE(car.flagged, 0),
+			car.computed_at
+		FROM channels c
+		LEFT JOIN channel_ack_reconciliations car ON car.channel_id = c.id
+		WHERE c.id = ? AND c.workspace_id = ?`,
+		channelID, ws, channelID, ws, channelID, ws).
+		Scan(&exists, &r.ChannelID, &r.WorkspaceID, &r.DeliveredTotal, &r.AcknowledgedTotal, &r.UnacknowledgedTotal, &rateVal, &flaggedInt, &computedStr)
+	if err != nil {
+		return r, mapSQLiteErr(err)
+	}
+	if exists == 0 {
+		return r, ErrNotFound
+	}
+	if rateVal.Valid {
+		r.UnackRate = &rateVal.Float64
+	}
+	r.Flagged = flaggedInt != 0
+	if computedStr.Valid && computedStr.String != "" {
+		t, err := parseSQLiteTime(computedStr.String)
+		if err == nil {
+			r.ComputedAt = t
+		}
+	}
+	return r, nil
+}
+
+// ListChannelAckReconciliations returns the latest acknowledgement reconciliations for all channels.
+func (s *SQLite) ListChannelAckReconciliations(ctx context.Context) (map[int64]ChannelAckReconciliation, error) {
+	ws, isTenant := tenantWorkspace(ctx)
+	targetWS := ""
+	if isTenant {
+		targetWS = string(ws)
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT channel_id, workspace_id, delivered_total, acknowledged_total, unacknowledged_total, unack_rate, flagged, computed_at
+		FROM channel_ack_reconciliations
+		WHERE (? = '' OR workspace_id = ?)
+		ORDER BY channel_id`, targetWS, targetWS)
+	if err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	defer rows.Close()
+
+	out := make(map[int64]ChannelAckReconciliation)
+	for rows.Next() {
+		var r ChannelAckReconciliation
+		var rateVal sql.NullFloat64
+		var flaggedInt int64
+		var computedStr sql.NullString
+		if err := rows.Scan(&r.ChannelID, &r.WorkspaceID, &r.DeliveredTotal, &r.AcknowledgedTotal, &r.UnacknowledgedTotal, &rateVal, &flaggedInt, &computedStr); err != nil {
+			return nil, mapSQLiteErr(err)
+		}
+		if rateVal.Valid {
+			r.UnackRate = &rateVal.Float64
+		}
+		r.Flagged = flaggedInt != 0
+		if computedStr.Valid && computedStr.String != "" {
+			t, err := parseSQLiteTime(computedStr.String)
+			if err == nil {
+				r.ComputedAt = t
+			}
+		}
+		out[r.ChannelID] = r
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	return out, nil
+}
+
 func (s *SQLite) ListMonitorsForChannel(ctx context.Context, channelID int64) ([]Monitor, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT m.id, m.name, m.contract_ids, m.tags, m.enabled, m.created_at, m.last_matched_at, m.priority, m.network, m.deleted_at
@@ -2002,13 +2209,13 @@ func (s *SQLite) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error
 	err = tx.QueryRowContext(ctx,
 		// The network is read from the monitor rather than taken from the
 		// caller, as on Postgres: the monitor owns which chain it watches.
-		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, ledger, network, workspace_id)
-		 VALUES (?, ?, ?, ?, ?, ?, (SELECT network FROM monitors WHERE id = ?), ?)
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, ledger, network, workspace_id)
+		 VALUES (?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), (SELECT severity FROM rules WHERE id = ?), 'warning'), ?, (SELECT network FROM monitors WHERE id = ?), ?)
 		 ON CONFLICT (rule_id, event_id) DO NOTHING
-		 RETURNING id, created_at, network`,
-		a.MonitorID, a.RuleID, a.EventID, string(jsonOrEmpty(a.Payload)), nullableJSON(a.Enrichment), int64(a.Ledger),
+		 RETURNING id, created_at, network, severity`,
+		a.MonitorID, a.RuleID, a.EventID, string(jsonOrEmpty(a.Payload)), nullableJSON(a.Enrichment), string(a.Severity), a.RuleID, int64(a.Ledger),
 		a.MonitorID, workspaceID(ctx),
-	).Scan(&id, &created, &a.Network)
+	).Scan(&id, &created, &a.Network, &a.Severity)
 	if errors.Is(err, sql.ErrNoRows) {
 		// No row can mean two different things: the event was already alerted
 		// on (the dedup unique index swallowed the insert), or the monitor and

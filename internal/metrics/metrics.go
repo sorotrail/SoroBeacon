@@ -61,6 +61,8 @@ type Metrics struct {
 	lastPollAgoSec   *prometheus.GaugeVec
 	pollPanics       *prometheus.CounterVec
 	breakerStates    *prometheus.GaugeVec
+	channelUnackFlagged *prometheus.GaugeVec
+	channelUnackRate    *prometheus.GaugeVec
 
 	storeReads           *prometheus.CounterVec
 	storeFallbacks       prometheus.Counter
@@ -251,6 +253,16 @@ func New() *Metrics {
 			Name: "sorobeacon_database_unavailable_total",
 			Help: "Count of database unavailable failures encountered across the service.",
 		}),
+
+		channelUnackFlagged: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_channel_unacknowledged_flagged",
+			Help: "Whether a channel is flagged as accepting deliveries but never acknowledged (1=flagged, 0=healthy).",
+		}, []string{"channel_id", "channel_type"}),
+
+		channelUnackRate: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_channel_unacknowledged_delivery_rate",
+			Help: "Share of delivered alerts that were never acknowledged within the SLA window [0.0 - 1.0].",
+		}, []string{"channel_id", "channel_type"}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
 		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired, m.deliveries, m.throttles,
@@ -258,7 +270,7 @@ func New() *Metrics {
 		m.reorgsTotal, m.lastReorgLedger, m.breakerStates, m.pollPanics,
 		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.deadLetters, m.deadLettersByChannel, m.heartbeatLastSuccess,
 		m.ruleEvalsTotal, m.ruleMatchesTotal, m.ruleErrorsTotal, m.ruleDuration, m.requestBodyRejectionsTotal,
-		m.databaseDegraded, m.databaseUnavailableTotal)
+		m.databaseDegraded, m.databaseUnavailableTotal, m.channelUnackFlagged, m.channelUnackRate)
 	return m
 }
 
@@ -576,6 +588,39 @@ func (m *Metrics) SetBreakerState(channelID string, channelType string, state st
 	}
 }
 
+// SetChannelUnacknowledged records the reconciliation outcome for one channel.
+func (m *Metrics) SetChannelUnacknowledged(channelID string, channelType string, flagged bool, rate float64) {
+	if m == nil {
+		return
+	}
+	val := 0.0
+	if flagged {
+		val = 1.0
+	}
+	m.channelUnackFlagged.WithLabelValues(channelID, channelType).Set(val)
+	m.channelUnackRate.WithLabelValues(channelID, channelType).Set(rate)
+}
+
+// SetChannelUnacknowledgedFlagged sets the flagged gauge for one channel.
+func (m *Metrics) SetChannelUnacknowledgedFlagged(channelID string, channelType string, flagged bool) {
+	if m == nil {
+		return
+	}
+	val := 0.0
+	if flagged {
+		val = 1.0
+	}
+	m.channelUnackFlagged.WithLabelValues(channelID, channelType).Set(val)
+}
+
+// SetChannelUnacknowledgedRate sets the unacknowledged delivery rate gauge for one channel.
+func (m *Metrics) SetChannelUnacknowledgedRate(channelID string, channelType string, rate float64) {
+	if m == nil {
+		return
+	}
+	m.channelUnackRate.WithLabelValues(channelID, channelType).Set(rate)
+}
+
 // statusRecorder captures the status code a handler wrote, for the HTTP
 // duration metric.
 type statusRecorder struct {
@@ -693,6 +738,8 @@ func ExportedMetricNames() []string {
 		"sorobeacon_request_body_rejections_total",
 		"sorobeacon_database_degraded",
 		"sorobeacon_database_unavailable_total",
+		"sorobeacon_channel_unacknowledged_flagged",
+		"sorobeacon_channel_unacknowledged_delivery_rate",
 	}
 }
 

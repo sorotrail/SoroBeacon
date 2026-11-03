@@ -62,6 +62,7 @@ var transferTables = []transferTable{
 	{name: "monitors", key: []string{"id"}},
 	{name: "channels", key: []string{"id"}},
 	{name: "channel_signing_keys", key: []string{"id"}},
+	{name: "channel_ack_reconciliations", key: []string{"channel_id"}},
 	{name: "monitor_channels", key: []string{"monitor_id", "channel_id"}},
 	{name: "rules", key: []string{"id"}},
 	{name: "saved_searches", key: []string{"id"}},

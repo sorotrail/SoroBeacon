@@ -224,3 +224,15 @@ groups:
           summary: "A notification channel circuit breaker has remained open for >5m"
           description: "Channel circuit breaker state is 2 (open), indicating repeated downstream webhook or provider failures."
           runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconchannelcircuitbreakeropen"
+
+      - alert: SoroBeaconChannelNeverAcknowledged
+        expr: max by (channel_id, channel_type) (sorobeacon_channel_unacknowledged_flagged) == 1
+        for: 15m
+        labels:
+          severity: ticket
+          component: delivery
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "A notification channel accepts deliveries but alerts are never acknowledged"
+          description: "Channel has accepted deliveries but 0 alerts have been acknowledged within the evaluation window."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconchannelneveracknowledged"

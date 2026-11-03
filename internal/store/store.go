@@ -691,6 +691,49 @@ func (c ChannelDeliveryStats) SuccessPercent() float64 {
 	return math.Round(*c.SuccessRate*1000) / 10
 }
 
+// ChannelAckReconciliation summarizes delivery vs human acknowledgement for one
+// channel. A channel that accepts deliveries (e.g. HTTP 200) but whose alerts
+// are never acknowledged within the SLA window is flagged as unacknowledged.
+type ChannelAckReconciliation struct {
+	ChannelID           int64     `json:"channel_id"`
+	WorkspaceID         string    `json:"workspace_id"`
+	DeliveredTotal      int64     `json:"delivered_total"`
+	AcknowledgedTotal   int64     `json:"acknowledged_total"`
+	UnacknowledgedTotal int64     `json:"unacknowledged_total"`
+	UnackRate           *float64  `json:"unack_rate,omitempty"`
+	Flagged             bool      `json:"flagged"`
+	ComputedAt          time.Time `json:"computed_at"`
+}
+
+// AckReconciliationConfig configures delivery vs acknowledgement evaluation.
+type AckReconciliationConfig struct {
+	// LookbackWindow is the evaluation duration for qualifying deliveries (default 7 days).
+	LookbackWindow time.Duration
+	// CriticalAckWindow is the duration after alert creation before an unacknowledged
+	// critical alert is considered unacknowledged (default 1 hour).
+	CriticalAckWindow time.Duration
+	// WarningAckWindow is the duration after alert creation before an unacknowledged
+	// warning alert is considered unacknowledged (default 4 hours).
+	WarningAckWindow time.Duration
+	// MinDeliveries is the minimum number of qualifying delivered alerts required
+	// before a channel can be flagged (default 3).
+	MinDeliveries int64
+	// FlagThresholdRate is the unacknowledged rate above which a channel is flagged
+	// (default 1.0, meaning 100% unacknowledged).
+	FlagThresholdRate float64
+}
+
+// DefaultAckReconciliationConfig returns production defaults for acknowledgement reconciliation.
+func DefaultAckReconciliationConfig() AckReconciliationConfig {
+	return AckReconciliationConfig{
+		LookbackWindow:    7 * 24 * time.Hour,
+		CriticalAckWindow: 1 * time.Hour,
+		WarningAckWindow:  4 * time.Hour,
+		MinDeliveries:     3,
+		FlagThresholdRate: 1.0,
+	}
+}
+
 // AbsenceState is the last time a rule saw the event it is waiting for.
 // Absence-of-event rules are driven by a periodic sweep rather than by event
 // arrival, so the sweep needs one of these per (rule, awaited pattern); there
@@ -1192,6 +1235,11 @@ type Channels interface {
 	RetireChannelSigningKey(ctx context.Context, channelID int64, keyID string) error
 	RevokeChannelSigningKey(ctx context.Context, channelID int64, keyID string) error
 	RecordChannelSigningKeyUsage(ctx context.Context, channelID int64, keyID string, usedAt time.Time) error
+
+	// Channel acknowledgement reconciliation
+	ReconcileChannelAcknowledgements(ctx context.Context, cfg AckReconciliationConfig) ([]ChannelAckReconciliation, error)
+	GetChannelAckReconciliation(ctx context.Context, channelID int64) (ChannelAckReconciliation, error)
+	ListChannelAckReconciliations(ctx context.Context) (map[int64]ChannelAckReconciliation, error)
 }
 
 // Alerts persists alerts and delivery attempts.
