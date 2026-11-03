@@ -583,6 +583,26 @@ when one is present.
 | --- | --- | --- | --- | --- |
 | `INSTANCE_NAME` | string | empty | optional | Stable identity for this deployment, stamped as the `origin` on every federated alert. It must be unique across instances that federate with each other. Empty is fine for a standalone instance, but creating a `federation` channel then fails with an actionable error; the process still starts. |
 
+## Mutual TLS (mTLS) and component TLS
+
+SoroBeacon supports TLS 1.2+ (preferring TLS 1.3) and mutual TLS (mTLS) across the HTTP API and dashboard, the gRPC server, the upstream SoroTrail client, and PostgreSQL connections. Certificates, private keys, and CA bundles are validated at startup (failing fast on mismatched, unreadable, or expired files) and hot-reloaded on `SIGHUP` without dropping active connections. The operational runbook for certificate generation, rotation, and principal mapping is in [Mutual TLS (mTLS) Operations](operations/mtls.md).
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `TLS_CERT_FILE` | file path | empty (HTTP plaintext) | optional | PEM-encoded server certificate chain served by the HTTP API, dashboard, and gRPC server. Must be paired with `TLS_KEY_FILE`. |
+| `TLS_KEY_FILE` | file path | empty | optional | PEM-encoded private key matching `TLS_CERT_FILE`. |
+| `TLS_CLIENT_CA_FILE` | file path | empty | optional | PEM-encoded CA bundle used to verify client certificates presented to the HTTP API and gRPC server. |
+| `TLS_CLIENT_AUTH` | enum | `none` (`require` when `TLS_CLIENT_CA_FILE` is set) | optional | Client certificate verification mode: `none` \| `request` \| `require`. |
+| `MTLS_PRINCIPAL_MAP` | comma-separated list | empty | optional | Maps verified client certificate identities (SPIFFE URI SANs, DNS SANs, email SANs, or `cn:<CommonName>`) to `<workspace>[:<role>]` (e.g. `spiffe://cluster.local/ns/prod/sa/ingestor=acme:editor,cn:ops=default:admin`). |
+| `SOROTRAIL_TLS_CERT_FILE` | file path | empty | optional | PEM-encoded client certificate presented when polling an upstream SoroTrail indexer over HTTPS. Must be paired with `SOROTRAIL_TLS_KEY_FILE`. |
+| `SOROTRAIL_TLS_KEY_FILE` | file path | empty | optional | PEM-encoded private key matching `SOROTRAIL_TLS_CERT_FILE`. |
+| `SOROTRAIL_TLS_CA_FILE` | file path | empty | optional | PEM-encoded root CA bundle used to verify the upstream SoroTrail server certificate. |
+| `SOROTRAIL_TLS_SERVER_NAME` | string | empty (derived from URL host) | optional | Optional SNI / server hostname override used when verifying the upstream SoroTrail certificate. |
+| `DATABASE_SSL_MODE` | enum | empty (URL query default) | optional | PostgreSQL SSL mode (`disable` \| `allow` \| `prefer` \| `require` \| `verify-ca` \| `verify-full`) applied to `DATABASE_URL` and `REPLICA_DATABASE_URL`. Rejected on SQLite. |
+| `DATABASE_SSL_CERT_FILE` | file path | empty | optional | PEM-encoded client certificate presented to PostgreSQL (`sslcert`). Must be paired with `DATABASE_SSL_KEY_FILE`. |
+| `DATABASE_SSL_KEY_FILE` | file path | empty | optional | PEM-encoded private key matching `DATABASE_SSL_CERT_FILE` (`sslkey`). |
+| `DATABASE_SSL_ROOT_CERT_FILE` | file path | empty | optional | PEM-encoded CA bundle used to verify the PostgreSQL server certificate (`sslrootcert`). |
+
 ## Channel health
 
 | Variable | Type | Default | Required | What it does |

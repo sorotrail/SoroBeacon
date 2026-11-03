@@ -255,6 +255,13 @@ database:
   # failure with jitter. Empty keeps the application defaults (5 and 2s).
   connectAttempts: 5
   connectDelay: "2s"
+  # Optional PostgreSQL TLS / mTLS settings (DATABASE_SSL_*).
+  sslMode: ""
+  sslCertFile: ""
+  sslKeyFile: ""
+  sslRootCertFile: ""
+  # Optional Secret mounted read-only at /etc/sorobeacon/tls/database.
+  tlsSecretName: ""
 
 # ── Credentials (Secret) ─────────────────────────────────────────────────────
 auth:
@@ -350,3 +357,22 @@ oidc:
   groupCacheTTL: ""
   # How long a started login may take to come back.
   loginStateTTL: "10m"
+
+# ── Mutual TLS (mTLS) and component TLS ─────────────────────────────────────
+tls:
+  # Optional Secret mounted read-only at /etc/sorobeacon/tls/server.
+  secretName: ""
+  # Server TLS certificate, private key, client CA bundle, client auth mode
+  # (none | request | require), and client-cert subject -> workspace[:role] map.
+  certFile: ""
+  keyFile: ""
+  clientCAFile: ""
+  clientAuth: ""
+  principalMap: ""
+  # Optional Secret mounted read-only at /etc/sorobeacon/tls/sorotrail for
+  # outbound mTLS to an upstream SoroTrail indexer.
+  sorotrailSecretName: ""
+  sorotrailCertFile: ""
+  sorotrailKeyFile: ""
+  sorotrailCAFile: ""
+  sorotrailServerName: ""
