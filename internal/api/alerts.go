@@ -338,6 +338,10 @@ func (s *Server) listDeliveries(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, r, http.StatusBadRequest, "invalid status")
 		return
 	}
+	if _, err := s.store.GetAlert(r.Context(), id); err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	list, err := s.store.ListDeliveryAttempts(r.Context(), id, status)
 	if err != nil {
 		s.fail(w, r, err)

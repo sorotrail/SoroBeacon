@@ -270,6 +270,10 @@ func (d *deliveriesAPIStore) ListDeliveryAttempts(_ context.Context, alertID int
 	return d.attempts, nil
 }
 
+func (d *deliveriesAPIStore) GetAlert(_ context.Context, id int64) (*store.Alert, error) {
+	return &store.Alert{ID: id}, nil
+}
+
 func TestListDeliveries_StatusFilter(t *testing.T) {
 	all := []store.DeliveryAttempt{
 		{ID: 1, Status: store.DeliveryStatusFailed},

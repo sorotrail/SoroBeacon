@@ -188,6 +188,10 @@ func (s *Server) listRules(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, r, http.StatusBadRequest, "invalid monitor id")
 		return
 	}
+	if _, err := s.store.GetMonitor(r.Context(), monitorID); err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	list, err := s.store.ListRules(r.Context(), monitorID, false)
 	if err != nil {
 		s.fail(w, r, err)
