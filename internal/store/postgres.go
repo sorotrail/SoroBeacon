@@ -853,9 +853,9 @@ func (p *Postgres) CreateMonitorWithRules(ctx context.Context, m *Monitor, rules
 	for _, r := range rules {
 		r.MonitorID = m.ID
 		if err := tx.QueryRow(ctx,
-			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES ($1, $2, $3, $4) RETURNING id`,
+			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES ($1, $2, $3, $4) RETURNING id, version`,
 			r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled,
-		).Scan(&r.ID); err != nil {
+		).Scan(&r.ID, &r.Version); err != nil {
 			return mapErr(err)
 		}
 	}
@@ -980,9 +980,9 @@ func (p *Postgres) CreateRule(ctx context.Context, r *Rule) error {
 		return err
 	}
 	return mapErr(p.pool.QueryRow(ctx,
-		`INSERT INTO rules (monitor_id, type, params, enabled) VALUES ($1, $2, $3, $4) RETURNING id`,
+		`INSERT INTO rules (monitor_id, type, params, enabled) VALUES ($1, $2, $3, $4) RETURNING id, version`,
 		r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled,
-	).Scan(&r.ID))
+	).Scan(&r.ID, &r.Version))
 }
 
 func (p *Postgres) CreateRules(ctx context.Context, rules []*Rule) error {
@@ -1001,9 +1001,9 @@ func (p *Postgres) CreateRules(ctx context.Context, rules []*Rule) error {
 			return err
 		}
 		if err := tx.QueryRow(ctx,
-			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES ($1, $2, $3, $4) RETURNING id`,
+			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES ($1, $2, $3, $4) RETURNING id, version`,
 			r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled,
-		).Scan(&r.ID); err != nil {
+		).Scan(&r.ID, &r.Version); err != nil {
 			return mapErr(err)
 		}
 	}
@@ -1013,10 +1013,10 @@ func (p *Postgres) CreateRules(ctx context.Context, rules []*Rule) error {
 func (p *Postgres) GetRule(ctx context.Context, id int64) (*Rule, error) {
 	var r Rule
 	err := p.pool.QueryRow(ctx,
-		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled FROM rules r
+		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version FROM rules r
 		   JOIN monitors m ON m.id = r.monitor_id
 		  WHERE r.id = $1 AND m.workspace_id = $2`, id, workspaceID(ctx),
-	).Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled)
+	).Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled, &r.Version)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -1030,7 +1030,7 @@ func (p *Postgres) ListRules(ctx context.Context, monitorID int64, enabledOnly b
 		// different scopes: the API (one workspace) and the poller's per-monitor
 		// rule loading, which runs under the cross-tenant system scope and would
 		// otherwise find no rules for a monitor outside the default workspace.
-		q := `SELECT r.id, r.monitor_id, r.type, r.params, r.enabled FROM rules r
+		q := `SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version FROM rules r
 		         JOIN monitors m ON m.id = r.monitor_id
 		        WHERE r.monitor_id = $1`
 		args := []any{monitorID}
@@ -1048,7 +1048,7 @@ func (p *Postgres) ListRules(ctx context.Context, monitorID int64, enabledOnly b
 		}
 		page, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Rule, error) {
 			var r Rule
-			err := row.Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled)
+			err := row.Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled, &r.Version)
 			return r, err
 		})
 		if err != nil {
@@ -1064,17 +1064,67 @@ func (p *Postgres) ListRules(ctx context.Context, monitorID int64, enabledOnly b
 }
 
 func (p *Postgres) UpdateRule(ctx context.Context, r *Rule) error {
-	tag, err := p.pool.Exec(ctx,
-		`UPDATE rules SET type = $3, params = $4, enabled = $5 WHERE id = $1
-		   AND monitor_id IN (SELECT id FROM monitors WHERE workspace_id = $2)`,
-		r.ID, workspaceID(ctx), r.Type, jsonOrEmpty(r.Params), r.Enabled)
+	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	ws := workspaceID(ctx)
+	var oldType string
+	var oldParams []byte
+	if err := tx.QueryRow(ctx,
+		`SELECT r.type, r.params FROM rules r
+		   JOIN monitors m ON m.id = r.monitor_id
+		  WHERE r.id = $1 AND m.workspace_id = $2
+		  FOR UPDATE OF r`,
+		r.ID, ws,
+	).Scan(&oldType, &oldParams); err != nil {
+		return mapErr(err)
 	}
-	return nil
+
+	newParams := jsonOrEmpty(r.Params)
+	conditionChanged := oldType != r.Type || !canonicalJSONEqual(oldParams, newParams)
+	disabled := !r.Enabled
+
+	if conditionChanged {
+		if err := tx.QueryRow(ctx,
+			`UPDATE rules
+			    SET type = $2, params = $3, enabled = $4, version = version + 1,
+			        last_alert_at = NULL, suppressed_since_last = 0
+			  WHERE id = $1
+			  RETURNING version`,
+			r.ID, r.Type, newParams, r.Enabled,
+		).Scan(&r.Version); err != nil {
+			return mapErr(err)
+		}
+	} else {
+		if err := tx.QueryRow(ctx,
+			`UPDATE rules
+			    SET type = $2, params = $3, enabled = $4, version = version + 1
+			  WHERE id = $1
+			  RETURNING version`,
+			r.ID, r.Type, newParams, r.Enabled,
+		).Scan(&r.Version); err != nil {
+			return mapErr(err)
+		}
+	}
+
+	if conditionChanged || disabled {
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM rule_absence_state WHERE rule_id = $1`, r.ID); err != nil {
+			return mapErr(err)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE alert_escalations
+			    SET completed_at = now(), updated_at = now()
+			  WHERE completed_at IS NULL
+			    AND alert_id IN (SELECT id FROM alerts WHERE rule_id = $1 AND workspace_id = $2)`,
+			r.ID, ws); err != nil {
+			return mapErr(err)
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 func (p *Postgres) DeleteRule(ctx context.Context, id int64) error {
@@ -1129,6 +1179,11 @@ func (p *Postgres) RecordAbsenceSeen(ctx context.Context, ruleID int64, eventNam
 		 SET last_seen_at = GREATEST(rule_absence_state.last_seen_at, EXCLUDED.last_seen_at),
 		     updated_at   = now()`,
 		ruleID, eventName, at.UTC())
+	return err
+}
+
+func (p *Postgres) DeleteAbsenceStateForRule(ctx context.Context, ruleID int64) error {
+	_, err := p.pool.Exec(ctx, `DELETE FROM rule_absence_state WHERE rule_id = $1`, ruleID)
 	return err
 }
 
@@ -2050,12 +2105,12 @@ func (p *Postgres) createAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 		// caller: a contract id only means anything on the chain it was
 		// deployed to, so the monitor owns the answer and an alert cannot be
 		// filed against a chain its monitor does not watch.
-		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, backfilled, ledger, network, workspace_id)
-			 VALUES ($1, $2, $3, $4, $5, COALESCE(NULLIF($9, ''), (SELECT severity FROM rules WHERE id = $2), 'warning'), $6, $7, (SELECT network FROM monitors WHERE id = $1), $8)
-			 RETURNING id, created_at, network, severity`,
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, backfilled, ledger, network, workspace_id, rule_version)
+			 VALUES ($1, $2, $3, $4, $5, COALESCE(NULLIF($9, ''), (SELECT severity FROM rules WHERE id = $2), 'warning'), $6, $7, (SELECT network FROM monitors WHERE id = $1), $8, COALESCE(NULLIF($10, 0), (SELECT version FROM rules WHERE id = $2), 1))
+			 RETURNING id, created_at, network, severity, rule_version`,
 		a.MonitorID, a.RuleID, a.EventID, jsonOrEmpty(a.Payload), nullableJSON(a.Enrichment), a.Backfilled, int64(a.Ledger),
-		workspaceID(ctx), string(a.Severity),
-	).Scan(&a.ID, &a.CreatedAt, &a.Network, &a.Severity)
+		workspaceID(ctx), string(a.Severity), a.RuleVersion,
+	).Scan(&a.ID, &a.CreatedAt, &a.Network, &a.Severity, &a.RuleVersion)
 	if err != nil {
 		return "", mapErr(err)
 	}
@@ -2121,12 +2176,12 @@ func (p *Postgres) createFederatedAlert(ctx context.Context, tx pgx.Tx, a *Alert
 	}
 
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, ledger, network, workspace_id, federated, federation_origin, source_monitor_id, source_rule_id)
-		 VALUES (NULL, NULL, $1, $2, $3, $4, $5, '', $6, TRUE, $7, $8, $9)
-		 RETURNING id, created_at`,
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, ledger, network, workspace_id, federated, federation_origin, source_monitor_id, source_rule_id, rule_version)
+		 VALUES (NULL, NULL, $1, $2, $3, $4, $5, '', $6, TRUE, $7, $8, $9, COALESCE(NULLIF($10, 0), 1))
+		 RETURNING id, created_at, rule_version`,
 		a.EventID, jsonOrEmpty(a.Payload), nullableJSON(a.Enrichment), NormalizedSeverity(a.Severity), int64(a.Ledger),
-		workspaceID(ctx), a.FederationOrigin, a.SourceMonitorID, a.SourceRuleID,
-	).Scan(&a.ID, &a.CreatedAt); err != nil {
+		workspaceID(ctx), a.FederationOrigin, a.SourceMonitorID, a.SourceRuleID, a.RuleVersion,
+	).Scan(&a.ID, &a.CreatedAt, &a.RuleVersion); err != nil {
 		return "", mapErr(err)
 	}
 
@@ -2181,9 +2236,9 @@ func (p *Postgres) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	var origin *string
 	var sourceMonitorID, sourceRuleID *int64
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version
 		   FROM alerts WHERE id = $1 AND workspace_id = $2`, id, workspaceID(ctx),
-	).Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.AcknowledgedBy, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID)
+	).Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.AcknowledgedBy, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID, &a.RuleVersion)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -2454,7 +2509,7 @@ func (p *Postgres) DeleteExpiredDeadLetters(ctx context.Context, cutoff time.Tim
 // readers call it so the routed and primary-bound forms cannot drift into
 // returning different pages.
 func buildAlertQuery(ctx context.Context, f AlertFilter) (string, []any) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version
 		 FROM alerts WHERE TRUE`
 	args := []any{}
 	n := 0
@@ -2541,7 +2596,7 @@ func scanAlert(row pgx.CollectableRow) (Alert, error) {
 	var monitorID, ruleID *int64
 	var origin *string
 	var sourceMonitorID, sourceRuleID *int64
-	err := row.Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.AcknowledgedBy, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID)
+	err := row.Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.AcknowledgedBy, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID, &a.RuleVersion)
 	a.Ledger = uint32(ledger)
 	if monitorID != nil {
 		a.MonitorID = *monitorID
@@ -2571,7 +2626,7 @@ func (p *Postgres) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit in
 		limit = DefaultPruneBatch
 	}
 	rows, err := p.pool.Query(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version
 		   FROM alerts WHERE created_at < $1 ORDER BY created_at ASC, id ASC LIMIT $2`,
 		cutoff, limit)
 	if err != nil {
@@ -4196,4 +4251,3 @@ func (p *Postgres) DeletePersistedOperation(ctx context.Context, id string) erro
 	}
 	return nil
 }
-

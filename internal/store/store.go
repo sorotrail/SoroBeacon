@@ -226,6 +226,26 @@ type Rule struct {
 	// SeverityWarning, so rules created before the field existed keep
 	// today's behaviour. It is validated at the API boundary.
 	Severity Severity `json:"severity"`
+	// Version is the 1-indexed revision of this rule. Every UpdateRule call
+	// increments it so alerts can record which rule revision produced them
+	// and stateful evaluators can detect mid-flight edits.
+	Version int `json:"version"`
+}
+
+func canonicalJSONEqual(a, b []byte) bool {
+	var va, vb any
+	if err := json.Unmarshal(a, &va); err != nil {
+		return string(a) == string(b)
+	}
+	if err := json.Unmarshal(b, &vb); err != nil {
+		return string(a) == string(b)
+	}
+	ca, errA := json.Marshal(va)
+	cb, errB := json.Marshal(vb)
+	if errA != nil || errB != nil {
+		return string(a) == string(b)
+	}
+	return string(ca) == string(cb)
 }
 
 // DefaultChannelTimeout is the timeout applied to channels when unset (15s),
@@ -549,6 +569,10 @@ type Alert struct {
 	// trip, and they are never used as local keys.
 	SourceMonitorID int64 `json:"source_monitor_id,omitempty"`
 	SourceRuleID    int64 `json:"source_rule_id,omitempty"`
+	// RuleVersion is the revision of the rule that produced this alert. It is
+	// stamped at creation time so editing a rule later does not lose which
+	// version matched historical alerts.
+	RuleVersion int `json:"rule_version,omitempty"`
 }
 
 // Maintenance window scopes. A window suppresses matching alerts for its
@@ -1526,6 +1550,9 @@ type Absence interface {
 	// baseline write must not undo a real observation. Writing an older
 	// instant is therefore a no-op rather than an error.
 	RecordAbsenceSeen(ctx context.Context, ruleID int64, eventName string, at time.Time) error
+	// DeleteAbsenceStateForRule removes any stored silence clocks for ruleID so
+	// an edited or disabled absence rule starts from a clean baseline.
+	DeleteAbsenceStateForRule(ctx context.Context, ruleID int64) error
 }
 
 // Backfills persists historical replay progress, so an interrupted backfill

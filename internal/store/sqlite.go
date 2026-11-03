@@ -754,9 +754,9 @@ func (s *SQLite) CreateMonitorWithRules(ctx context.Context, m *Monitor, rules [
 	for _, r := range rules {
 		r.MonitorID = m.ID
 		if err := tx.QueryRowContext(ctx,
-			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES (?, ?, ?, ?) RETURNING id`,
+			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES (?, ?, ?, ?) RETURNING id, version`,
 			r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled),
-		).Scan(&r.ID); err != nil {
+		).Scan(&r.ID, &r.Version); err != nil {
 			return mapSQLiteErr(err)
 		}
 	}
@@ -855,7 +855,7 @@ func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, erro
 		return nil, err
 	}
 	rules, err := querySQLiteRules(ctx, tx,
-		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled FROM rules r
+		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version FROM rules r
 		   JOIN monitors m ON m.id = r.monitor_id
 		  WHERE r.monitor_id = ? AND m.workspace_id = ? ORDER BY r.id`, id, ws)
 	if err != nil {
@@ -1044,9 +1044,9 @@ func (s *SQLite) CreateRule(ctx context.Context, r *Rule) error {
 		return err
 	}
 	return mapSQLiteErr(s.db.QueryRowContext(ctx,
-		`INSERT INTO rules (monitor_id, type, params, enabled) VALUES (?, ?, ?, ?) RETURNING id`,
+		`INSERT INTO rules (monitor_id, type, params, enabled) VALUES (?, ?, ?, ?) RETURNING id, version`,
 		r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled),
-	).Scan(&r.ID))
+	).Scan(&r.ID, &r.Version))
 }
 
 func (s *SQLite) CreateRules(ctx context.Context, rules []*Rule) error {
@@ -1065,9 +1065,9 @@ func (s *SQLite) CreateRules(ctx context.Context, rules []*Rule) error {
 			return err
 		}
 		if err := tx.QueryRowContext(ctx,
-			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES (?, ?, ?, ?) RETURNING id`,
+			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES (?, ?, ?, ?) RETURNING id, version`,
 			r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled),
-		).Scan(&r.ID); err != nil {
+		).Scan(&r.ID, &r.Version); err != nil {
 			return mapSQLiteErr(err)
 		}
 	}
@@ -1076,7 +1076,7 @@ func (s *SQLite) CreateRules(ctx context.Context, rules []*Rule) error {
 
 func (s *SQLite) GetRule(ctx context.Context, id int64) (*Rule, error) {
 	rules, err := querySQLiteRules(ctx, s.db,
-		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled FROM rules r
+		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version FROM rules r
 		   JOIN monitors m ON m.id = r.monitor_id
 		  WHERE r.id = ? AND m.workspace_id = ?`, id, workspaceID(ctx))
 	if err != nil {
@@ -1093,7 +1093,7 @@ func (s *SQLite) ListRules(ctx context.Context, monitorID int64, enabledOnly boo
 	// different scopes: the API (one workspace) and the poller's per-monitor
 	// rule loading, which runs under the cross-tenant system scope and would
 	// otherwise find no rules for a monitor outside the default workspace.
-	q := `SELECT r.id, r.monitor_id, r.type, r.params, r.enabled FROM rules r
+	q := `SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version FROM rules r
 	         JOIN monitors m ON m.id = r.monitor_id
 	        WHERE r.monitor_id = ?`
 	args := []any{monitorID}
@@ -1129,7 +1129,7 @@ func scanSQLiteRule(r rowScanner) (Rule, error) {
 	var rule Rule
 	var params string
 	var enabled int64
-	if err := r.Scan(&rule.ID, &rule.MonitorID, &rule.Type, &params, &enabled); err != nil {
+	if err := r.Scan(&rule.ID, &rule.MonitorID, &rule.Type, &params, &enabled, &rule.Version); err != nil {
 		return rule, mapSQLiteErr(err)
 	}
 	rule.Enabled = enabled != 0
@@ -1138,21 +1138,66 @@ func scanSQLiteRule(r rowScanner) (Rule, error) {
 }
 
 func (s *SQLite) UpdateRule(ctx context.Context, r *Rule) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE rules SET type = ?, params = ?, enabled = ? WHERE id = ?
-		  AND monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?)`,
-		r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), r.ID, workspaceID(ctx))
-	if err != nil {
-		return mapSQLiteErr(err)
-	}
-	n, err := res.RowsAffected()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if n == 0 {
-		return ErrNotFound
+	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
+
+	ws := workspaceID(ctx)
+	var oldType, oldParams string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT r.type, r.params FROM rules r
+		   JOIN monitors m ON m.id = r.monitor_id
+		  WHERE r.id = ? AND m.workspace_id = ?`,
+		r.ID, ws,
+	).Scan(&oldType, &oldParams); err != nil {
+		return mapSQLiteErr(err)
 	}
-	return nil
+
+	newParams := jsonOrEmpty(r.Params)
+	conditionChanged := oldType != r.Type || !canonicalJSONEqual([]byte(oldParams), newParams)
+	disabled := !r.Enabled
+
+	if conditionChanged {
+		if err := tx.QueryRowContext(ctx,
+			`UPDATE rules
+			    SET type = ?, params = ?, enabled = ?, version = version + 1,
+			        last_alert_at = NULL, suppressed_since_last = 0
+			  WHERE id = ?
+			  RETURNING version`,
+			r.Type, string(newParams), boolToInt(r.Enabled), r.ID,
+		).Scan(&r.Version); err != nil {
+			return mapSQLiteErr(err)
+		}
+	} else {
+		if err := tx.QueryRowContext(ctx,
+			`UPDATE rules
+			    SET type = ?, params = ?, enabled = ?, version = version + 1
+			  WHERE id = ?
+			  RETURNING version`,
+			r.Type, string(newParams), boolToInt(r.Enabled), r.ID,
+		).Scan(&r.Version); err != nil {
+			return mapSQLiteErr(err)
+		}
+	}
+
+	if conditionChanged || disabled {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM rule_absence_state WHERE rule_id = ?`, r.ID); err != nil {
+			return mapSQLiteErr(err)
+		}
+		nowStr := sqliteTimeString(time.Now())
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE alert_escalations
+			    SET completed_at = ?, updated_at = ?
+			  WHERE completed_at IS NULL
+			    AND alert_id IN (SELECT id FROM alerts WHERE rule_id = ? AND workspace_id = ?)`,
+			nowStr, nowStr, r.ID, ws); err != nil {
+			return mapSQLiteErr(err)
+		}
+	}
+	return mapSQLiteErr(tx.Commit())
 }
 
 // DeleteRule scopes through the rule's monitor, because rules carry no
@@ -1215,6 +1260,11 @@ func (s *SQLite) RecordAbsenceSeen(ctx context.Context, ruleID int64, eventName 
 		     updated_at   = excluded.updated_at`,
 		ruleID, eventName, sqliteTimeString(at), sqliteTimeString(time.Now()))
 	return err
+}
+
+func (s *SQLite) DeleteAbsenceStateForRule(ctx context.Context, ruleID int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM rule_absence_state WHERE rule_id = ?`, ruleID)
+	return mapSQLiteErr(err)
 }
 
 // --- channels ---
@@ -2209,13 +2259,13 @@ func (s *SQLite) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error
 	err = tx.QueryRowContext(ctx,
 		// The network is read from the monitor rather than taken from the
 		// caller, as on Postgres: the monitor owns which chain it watches.
-		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, ledger, network, workspace_id)
-		 VALUES (?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), (SELECT severity FROM rules WHERE id = ?), 'warning'), ?, (SELECT network FROM monitors WHERE id = ?), ?)
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, ledger, network, workspace_id, rule_version)
+		 VALUES (?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), (SELECT severity FROM rules WHERE id = ?), 'warning'), ?, (SELECT network FROM monitors WHERE id = ?), ?, COALESCE(NULLIF(?, 0), (SELECT version FROM rules WHERE id = ?), 1))
 		 ON CONFLICT (rule_id, event_id) DO NOTHING
-		 RETURNING id, created_at, network, severity`,
+		 RETURNING id, created_at, network, severity, rule_version`,
 		a.MonitorID, a.RuleID, a.EventID, string(jsonOrEmpty(a.Payload)), nullableJSON(a.Enrichment), string(a.Severity), a.RuleID, int64(a.Ledger),
-		a.MonitorID, workspaceID(ctx),
-	).Scan(&id, &created, &a.Network, &a.Severity)
+		a.MonitorID, workspaceID(ctx), a.RuleVersion, a.RuleID,
+	).Scan(&id, &created, &a.Network, &a.Severity, &a.RuleVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		// No row can mean two different things: the event was already alerted
 		// on (the dedup unique index swallowed the insert), or the monitor and
@@ -2282,13 +2332,13 @@ func (s *SQLite) createFederatedAlert(ctx context.Context, tx *sql.Tx, a *Alert)
 	var id int64
 	var created string
 	err := tx.QueryRowContext(ctx,
-		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, ledger, network, workspace_id, federated, federation_origin, source_monitor_id, source_rule_id)
-		 VALUES (NULL, NULL, ?, ?, ?, ?, ?, '', ?, 1, ?, ?, ?)
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, ledger, network, workspace_id, federated, federation_origin, source_monitor_id, source_rule_id, rule_version)
+		 VALUES (NULL, NULL, ?, ?, ?, ?, ?, '', ?, 1, ?, ?, ?, COALESCE(NULLIF(?, 0), 1))
 		 ON CONFLICT DO NOTHING
-		 RETURNING id, created_at`,
+		 RETURNING id, created_at, rule_version`,
 		a.EventID, string(jsonOrEmpty(a.Payload)), nullableJSON(a.Enrichment), NormalizedSeverity(a.Severity), int64(a.Ledger),
-		workspaceID(ctx), a.FederationOrigin, a.SourceMonitorID, a.SourceRuleID,
-	).Scan(&id, &created)
+		workspaceID(ctx), a.FederationOrigin, a.SourceMonitorID, a.SourceRuleID, a.RuleVersion,
+	).Scan(&id, &created, &a.RuleVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		// The dedup index swallowed the insert: this event has already been
 		// stored for this origin.
@@ -2339,7 +2389,7 @@ func (s *SQLite) GroupAlerts(ctx context.Context, key string, windowStart time.T
 
 func (s *SQLite) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	a, err := scanSQLiteAlert(s.db.QueryRowContext(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id FROM alerts WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx)))
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version FROM alerts WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx)))
 	if err != nil {
 		return nil, err
 	}
@@ -2557,7 +2607,7 @@ func (s *SQLite) DeleteExpiredDeadLetters(ctx context.Context, cutoff time.Time,
 }
 
 func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id FROM alerts WHERE 1 = 1`
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version FROM alerts WHERE 1 = 1`
 	args := []any{}
 	// Conditional because ListAlerts serves two callers with different scopes:
 	// the API listing (one workspace) and the frequency rule's match-log
@@ -2675,7 +2725,7 @@ func scanSQLiteAlert(r rowScanner) (Alert, error) {
 	var origin sql.NullString
 	var acknowledged, acknowledgedBy sql.NullString
 	var sourceMonitorID, sourceRuleID sql.NullInt64
-	if err := r.Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &payload, &enrichment, &created, &ledger, &retracted, &inhibited, &suppressed, &suppressionReason, &acknowledged, &acknowledgedBy, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID); err != nil {
+	if err := r.Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &payload, &enrichment, &created, &ledger, &retracted, &inhibited, &suppressed, &suppressionReason, &acknowledged, &acknowledgedBy, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID, &a.RuleVersion); err != nil {
 		return a, mapSQLiteErr(err)
 	}
 	if monitorID.Valid {
@@ -2824,7 +2874,7 @@ func (s *SQLite) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int)
 		limit = DefaultPruneBatch
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version
 		   FROM alerts WHERE created_at < ? ORDER BY created_at ASC, id ASC LIMIT ?`,
 		sqliteTimeString(cutoff), limit)
 	if err != nil {
@@ -4263,4 +4313,3 @@ func (s *SQLite) DeletePersistedOperation(ctx context.Context, id string) error 
 	}
 	return nil
 }
-

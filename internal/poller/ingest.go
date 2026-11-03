@@ -101,7 +101,7 @@ func (in *Ingestor) Handle(ctx context.Context, decoded *stellar.DecodedEvent, m
 		for _, rule := range ruleList {
 			// The rule id rides in the context so a stateful evaluator (the
 			// frequency rule) can key its per-rule state.
-			ruleCtx := rules.WithRuleID(ctx, rule.ID)
+			ruleCtx := rules.WithRuleVersion(rules.WithRuleID(ctx, rule.ID), rule.Version)
 			matched, err := in.registry.Evaluate(ruleCtx, rule.Type, decoded, rule.Params)
 			if err != nil {
 				in.log.Warn("rule evaluation failed", "rule_id", rule.ID, "event_id", decoded.ID, "err", err)
@@ -164,6 +164,7 @@ func (in *Ingestor) fireAlert(ctx context.Context, m store.Monitor, rule store.R
 		Cooldown:       ruleCooldown(rule),
 		Backfilled:     opts.Backfilled,
 		Severity:       rule.Severity,
+		RuleVersion:    rule.Version,
 	}
 	if in.enricher != nil {
 		alert.Enrichment, err = in.enricher.Fetch(ctx, ev.ContractID, ev.EventName())

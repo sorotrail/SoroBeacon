@@ -81,13 +81,22 @@ func AuditMiddleware(st store.Store, log *slog.Logger) func(http.Handler) http.H
 				targetID = idFromBody(rec.body.Bytes())
 			}
 			diff := json.RawMessage(`{}`)
+			diffMap := map[string]any{}
 			if len(fields) > 0 {
-				if b, err := json.Marshal(map[string]any{"fields": fields}); err == nil {
+				diffMap["fields"] = fields
+			}
+			if spec.targetType == "rule" {
+				if v := versionFromBody(rec.body.Bytes()); v > 0 {
+					diffMap["version"] = v
+				}
+			}
+			if len(diffMap) > 0 {
+				if b, err := json.Marshal(diffMap); err == nil {
 					diff = b
 				}
 			}
 			entry := &store.AuditEntry{
-				Actor:      reqid.From(r),
+				Actor:      actor(r),
 				Action:     spec.action,
 				TargetType: spec.targetType,
 				TargetID:   targetID,
@@ -239,6 +248,14 @@ func idFromBody(body []byte) int64 {
 	}
 	_ = json.Unmarshal(body, &out)
 	return out.ID
+}
+
+func versionFromBody(body []byte) int {
+	var out struct {
+		Version int `json:"version"`
+	}
+	_ = json.Unmarshal(body, &out)
+	return out.Version
 }
 
 // changedFields returns the sorted top-level field names present in the

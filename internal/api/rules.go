@@ -209,6 +209,9 @@ func (s *Server) updateRule(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	if s.registry != nil {
+		s.registry.ResetRuleState(rule.ID)
+	}
 	writeJSON(w, http.StatusOK, rule)
 }
 
@@ -220,6 +223,9 @@ func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.DeleteRule(r.Context(), rule.ID); err != nil {
 		s.fail(w, r, err)
 		return
+	}
+	if s.registry != nil {
+		s.registry.ResetRuleState(rule.ID)
 	}
 	writeNoContent(w)
 }

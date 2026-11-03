@@ -222,6 +222,44 @@ here is the second user topic. Verified: `201`.
   contract's documentation or a manual `getEvents` query before concluding
   "monitoring is broken".
 
+## Safe rule changes and deployment
+
+Deploying a change to a live rule in production follows a predictable,
+audit-tracked lifecycle so an edit cannot fire a spurious alert from half-old
+state or silently drop an active condition:
+
+1. **Backtest before deploying.** Test candidate parameters with
+   `POST /api/v1/monitors/{id}/rules/{ruleID}/dry-run` (against recent matched
+   alert payloads) or `POST /api/v1/monitors/{id}/rules/{ruleID}/replay`
+   (against the archived event corpus over a time range) to inspect what would
+   have matched before updating the live rule.
+2. **Rule versioning (`version` and `rule_version`).** Every rule starts at
+   `version: 1` when created and increments its `version` on each
+   `PATCH /api/v1/monitors/{id}/rules/{ruleID}`. Every alert row is stamped
+   with `rule_version` at creation time, and the audit log (`GET /api/v1/audit`)
+   records the new revision alongside the changed field names.
+3. **Consistent poll-cycle snapshots.** If a rule is edited while the poller is
+   mid-batch, all events in the active poll cycle finish evaluating against the
+   cycle's rule snapshot. The updated rule version takes effect cleanly at the
+   start of the next poll cycle.
+4. **Automatic state resets on edit or disable.** When a rule's condition
+   (`type` or `params`) changes:
+   * **`frequency_threshold`** clears its in-memory rolling window and armed
+     episode state (and ignores stored alerts from older `rule_version`s on
+     restart), so pre-edit matches never combine with post-edit matches.
+   * **`absence_of_event`** deletes its stored `rule_absence_state` clock so
+     the next sweep re-arms from the edit timestamp rather than firing
+     immediately on pre-edit silence.
+   * **Cooldowns** reset `last_alert_at` and `suppressed_since_last` so the
+     new condition can alert immediately on its first match.
+   * **In-flight escalations** for unacknowledged alerts of the old rule
+     version are marked completed so stale escalation steps do not fire after
+     the rule was changed or disabled.
+5. **Disabling vs. deleting a rule.** Setting `"enabled": false` pauses
+   evaluation, clears stateful windows/clocks, and stops open escalations while
+   preserving the rule configuration and all historical alerts. Deleting a rule
+   removes the rule definition permanently.
+
 ## The rule types
 
 * [`event_emitted`](../rules/event-emitted.md)

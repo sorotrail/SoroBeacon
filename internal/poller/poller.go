@@ -820,7 +820,7 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 
 	processed := true
 	for _, m := range monitors {
-		ruleList, err := p.store.ListRules(ctx, m.ID, true)
+		ruleList, err := p.listRulesForCycle(ctx, byContract, m.ID)
 		if err != nil {
 			p.log.Error("list rules", "monitor_id", m.ID, "err", err)
 			processed = false
@@ -839,7 +839,7 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 			// The rule id rides in the context so a stateful evaluator (the
 			// frequency rule) can key its per-rule state.
 			p.evaluations++
-			ruleCtx := rules.WithRuleID(ctx, rule.ID)
+			ruleCtx := rules.WithRuleVersion(rules.WithRuleID(ctx, rule.ID), rule.Version)
 			start := time.Now()
 			matched, err := p.registry.Evaluate(ruleCtx, rule.Type, decoded, rule.Params)
 			duration := time.Since(start)
@@ -920,6 +920,7 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 		LedgerClosedAt: ev.LedgerClosedAt,
 		Cooldown:       ruleCooldown(rule),
 		Severity:       rule.Severity,
+		RuleVersion:    rule.Version,
 	}
 	outcome, err := p.store.CreateAlert(ctx, alert)
 	if err != nil {
@@ -1114,10 +1115,11 @@ func (p *Poller) fireAbsence(ctx context.Context, m store.Monitor, rule store.Ru
 	}
 
 	alert := &store.Alert{
-		MonitorID: m.ID,
-		RuleID:    rule.ID,
-		EventID:   AbsenceEventID(lastSeen),
-		Payload:   payload,
+		MonitorID:   m.ID,
+		RuleID:      rule.ID,
+		EventID:     AbsenceEventID(lastSeen),
+		Payload:     payload,
+		RuleVersion: rule.Version,
 	}
 	outcome, err := p.store.CreateAlert(ctx, alert)
 	if err != nil {
