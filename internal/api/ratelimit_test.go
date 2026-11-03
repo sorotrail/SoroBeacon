@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/apierr"
 	"golang.org/x/time/rate"
 )
 
@@ -80,8 +81,8 @@ func TestRateLimitAllowsThenDenies(t *testing.T) {
 	if body["error"] != "rate limit exceeded" {
 		t.Fatalf("error envelope = %#v", body)
 	}
-	if body["code"] != http.StatusText(http.StatusTooManyRequests) {
-		t.Fatalf("code = %#v", body["code"])
+	if body["code"] != apierr.CodeRateLimited {
+		t.Fatalf("code = %#v, want %s", body["code"], apierr.CodeRateLimited)
 	}
 }
 

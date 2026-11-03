@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sorotrail/sorobeacon/internal/apierr"
 	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/rules"
@@ -136,8 +137,8 @@ func TestMaxBodyBytes_OversizedReturns413Envelope(t *testing.T) {
 	if env["error"] != "request body too large" {
 		t.Fatalf("error = %v, want request body too large", env["error"])
 	}
-	if env["code"] != http.StatusText(http.StatusRequestEntityTooLarge) {
-		t.Fatalf("code = %v, want %s", env["code"], http.StatusText(http.StatusRequestEntityTooLarge))
+	if env["code"] != apierr.CodePayloadTooLarge {
+		t.Fatalf("code = %v, want %s", env["code"], apierr.CodePayloadTooLarge)
 	}
 	if _, ok := env["request_id"]; !ok {
 		t.Fatalf("envelope missing request_id: %v", env)

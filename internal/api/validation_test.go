@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sorotrail/sorobeacon/internal/apierr"
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
@@ -73,6 +74,10 @@ func (v *validationStore) SetMonitorsEnabled(_ context.Context, ids []int64, _ b
 	return len(ids), []int64{}, nil
 }
 
+func (v *validationStore) CreateAuditEntry(_ context.Context, _ *store.AuditEntry) error {
+	return nil
+}
+
 type errorEnvelope struct {
 	Error     string `json:"error"`
 	Code      string `json:"code"`
@@ -124,8 +129,8 @@ func TestCreateMonitor_MultipleValidationDetails(t *testing.T) {
 	if env.Error != "validation failed" {
 		t.Fatalf("error = %q, want validation failed", env.Error)
 	}
-	if env.Code != "Bad Request" {
-		t.Fatalf("code = %q, want Bad Request", env.Code)
+	if env.Code != apierr.CodeInvalidArgument {
+		t.Fatalf("code = %q, want %q", env.Code, apierr.CodeInvalidArgument)
 	}
 	got := map[string]string{}
 	for _, d := range env.Details {

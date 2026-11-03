@@ -352,7 +352,7 @@ update time; the registry calls the evaluator's `Validate` and then checks
 * `details` lists **every** problem, each as a `field`/`reason` pair, with
   the field path prefixed under `params` (and `rules[i].params.…` in a bulk
   request);
-* `code` is the HTTP status text and `request_id` echoes the
+* `code` is the machine-readable error code (such as `INVALID_ARGUMENT`) and `request_id` echoes the
   `X-Request-ID` header, so a reported error maps to one log line.
 
 For example, a `frequency_threshold` with a bad `window` and no `count`:
@@ -360,7 +360,7 @@ For example, a `frequency_threshold` with a bad `window` and no `count`:
 ```json
 {
   "error": "validation failed",
-  "code": "Bad Request",
+  "code": "INVALID_ARGUMENT",
   "request_id": "b1c8f5a2-…",
   "details": [
     {"field": "params.count",  "reason": "frequency_threshold: count must be a positive integer"},
@@ -375,7 +375,7 @@ An unknown rule type reports on `type` instead (one detail, and the top-level
 ```json
 {
   "error": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold contract_allowlist event_name_glob numeric_range token_supply_change token_event self_transfer time_window frequency_threshold composite topic_regex address_watchlist topic_position absence_of_event])",
-  "code": "Bad Request",
+  "code": "INVALID_ARGUMENT",
   "request_id": "…",
   "details": [
     {"field": "type", "reason": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold contract_allowlist event_name_glob numeric_range token_supply_change token_event self_transfer time_window frequency_threshold composite topic_regex address_watchlist topic_position absence_of_event])"}
