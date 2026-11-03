@@ -34,6 +34,12 @@ type Metrics struct {
 	pollDuration  *prometheus.HistogramVec
 	pollLagLedger *prometheus.GaugeVec
 
+	// Upstream mode (SoroTrail) health gauges: how far the upstream indexer
+	// itself trails the chain head, and how many consecutive upstream HTTP
+	// requests have failed.
+	upstreamLagLedger *prometheus.GaugeVec
+	upstreamFailures  *prometheus.GaugeVec
+
 	// Priority tier gauges: how many contracts each tier carries, and how
 	// far behind the tip the freshest event seen for that tier is. The lag
 	// gauge is labelled by the closed tier set, so cardinality is bounded.
@@ -49,20 +55,20 @@ type Metrics struct {
 	eventsMatched   *prometheus.CounterVec
 	ruleEvaluations *prometheus.CounterVec
 	// Per-rule-type metrics (cardinality bounded by rule type names)
-	ruleEvalsTotal   *prometheus.CounterVec
-	ruleMatchesTotal *prometheus.CounterVec
-	ruleErrorsTotal  *prometheus.CounterVec
-	ruleDuration     *prometheus.HistogramVec
-	alertsFired      *prometheus.CounterVec
-	deliveries       *prometheus.CounterVec
-	throttles        *prometheus.CounterVec
-	httpDuration     *prometheus.HistogramVec
+	ruleEvalsTotal       *prometheus.CounterVec
+	ruleMatchesTotal     *prometheus.CounterVec
+	ruleErrorsTotal      *prometheus.CounterVec
+	ruleDuration         *prometheus.HistogramVec
+	alertsFired          *prometheus.CounterVec
+	deliveries           *prometheus.CounterVec
+	throttles            *prometheus.CounterVec
+	httpDuration         *prometheus.HistogramVec
 	httpNotModifiedTotal *prometheus.CounterVec
-	lastPollAgoSec   *prometheus.GaugeVec
-	pollPanics       *prometheus.CounterVec
-	breakerStates    *prometheus.GaugeVec
-	channelUnackFlagged *prometheus.GaugeVec
-	channelUnackRate    *prometheus.GaugeVec
+	lastPollAgoSec       *prometheus.GaugeVec
+	pollPanics           *prometheus.CounterVec
+	breakerStates        *prometheus.GaugeVec
+	channelUnackFlagged  *prometheus.GaugeVec
+	channelUnackRate     *prometheus.GaugeVec
 
 	storeReads           *prometheus.CounterVec
 	storeFallbacks       prometheus.Counter
@@ -106,6 +112,16 @@ func New() *Metrics {
 		pollLagLedger: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "sorobeacon_poll_lag_ledgers",
 			Help: "How far a network's poller resume point trails that chain's tip, in ledgers.",
+		}, networks),
+
+		upstreamLagLedger: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_upstream_lag_ledgers",
+			Help: "How far the upstream SoroTrail indexer trails the chain head, in ledgers, by network.",
+		}, networks),
+
+		upstreamFailures: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_upstream_consecutive_failures",
+			Help: "Consecutive failed requests against the upstream event source, by network.",
 		}, networks),
 
 		pollPriorityContracts: prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -265,6 +281,7 @@ func New() *Metrics {
 		}, []string{"channel_id", "channel_type"}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
+		m.upstreamLagLedger, m.upstreamFailures,
 		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired, m.deliveries, m.throttles,
 		m.httpDuration, m.httpNotModifiedTotal, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
 		m.reorgsTotal, m.lastReorgLedger, m.breakerStates, m.pollPanics,
@@ -336,6 +353,31 @@ func (m *Metrics) SetPollLag(ledgersBehind int64) {
 		return
 	}
 	m.pollLagLedger.WithLabelValues(m.lv()...).Set(float64(ledgersBehind))
+}
+
+// SetUpstreamLag records how far behind the chain head the upstream SoroTrail
+// indexer is. Clamped at zero so clock skew between upstream and chain head
+// never reports negative lag.
+func (m *Metrics) SetUpstreamLag(ledgersBehind int64) {
+	if m == nil || m.upstreamLagLedger == nil {
+		return
+	}
+	if ledgersBehind < 0 {
+		ledgersBehind = 0
+	}
+	m.upstreamLagLedger.WithLabelValues(m.lv()...).Set(float64(ledgersBehind))
+}
+
+// SetUpstreamFailures records consecutive failed requests against the upstream
+// SoroTrail source. Resets to zero on the next successful request.
+func (m *Metrics) SetUpstreamFailures(count int) {
+	if m == nil || m.upstreamFailures == nil {
+		return
+	}
+	if count < 0 {
+		count = 0
+	}
+	m.upstreamFailures.WithLabelValues(m.lv()...).Set(float64(count))
 }
 
 // SetPriorityContracts records how many contracts the cycle scheduled in each
@@ -711,6 +753,8 @@ func ExportedMetricNames() []string {
 		"sorobeacon_polls_total",
 		"sorobeacon_poll_duration_seconds",
 		"sorobeacon_poll_lag_ledgers",
+		"sorobeacon_upstream_lag_ledgers",
+		"sorobeacon_upstream_consecutive_failures",
 		"sorobeacon_poll_priority_contracts",
 		"sorobeacon_poll_lag_ledgers_by_priority",
 		"sorobeacon_reorgs_total",
@@ -742,4 +786,3 @@ func ExportedMetricNames() []string {
 		"sorobeacon_channel_unacknowledged_delivery_rate",
 	}
 }
-

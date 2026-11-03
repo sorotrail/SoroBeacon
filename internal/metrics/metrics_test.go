@@ -19,29 +19,29 @@ const (
 	poolNamePrimary = "primary"
 	poolNameReplica = "replica"
 
-	storeReadsName        = "sorobeacon_store_reads_total"
-	storeFallbacksName    = "sorobeacon_store_replica_fallbacks_total"
-	replicaEnabledName    = "sorobeacon_store_replica_enabled"
-	pollsName             = "sorobeacon_polls_total"
-	pollDurationName      = "sorobeacon_poll_duration_seconds"
-	pollLagName           = "sorobeacon_poll_lag_ledgers"
-	pollAgeName           = "sorobeacon_seconds_since_last_poll"
-	eventsScannedName     = "sorobeacon_events_scanned_total"
-	eventsMatchedName     = "sorobeacon_events_matched_total"
-	ruleEvaluationsName   = "sorobeacon_rule_evaluations_total"
-	alertsFiredName       = "sorobeacon_alerts_fired_total"
-	deliveriesName        = "sorobeacon_alert_deliveries_total"
-	priorityContractsName = "sorobeacon_poll_priority_contracts"
-	priorityLagName       = "sorobeacon_poll_lag_ledgers_by_priority"
-	reorgsName            = "sorobeacon_reorgs_total"
-	lastReorgLedgerName   = "sorobeacon_last_reorg_ledger"
-	throttlesName         = "sorobeacon_alert_throttles_total"
-	breakerStateName      = "sorobeacon_channel_breaker_state"
-	httpDurationName      = "sorobeacon_http_request_duration_seconds"
-	streamDroppedName     = "sorobeacon_alerts_stream_dropped_total"
-	deadLettersName       = "sorobeacon_dead_letters_total"
+	storeReadsName         = "sorobeacon_store_reads_total"
+	storeFallbacksName     = "sorobeacon_store_replica_fallbacks_total"
+	replicaEnabledName     = "sorobeacon_store_replica_enabled"
+	pollsName              = "sorobeacon_polls_total"
+	pollDurationName       = "sorobeacon_poll_duration_seconds"
+	pollLagName            = "sorobeacon_poll_lag_ledgers"
+	pollAgeName            = "sorobeacon_seconds_since_last_poll"
+	eventsScannedName      = "sorobeacon_events_scanned_total"
+	eventsMatchedName      = "sorobeacon_events_matched_total"
+	ruleEvaluationsName    = "sorobeacon_rule_evaluations_total"
+	alertsFiredName        = "sorobeacon_alerts_fired_total"
+	deliveriesName         = "sorobeacon_alert_deliveries_total"
+	priorityContractsName  = "sorobeacon_poll_priority_contracts"
+	priorityLagName        = "sorobeacon_poll_lag_ledgers_by_priority"
+	reorgsName             = "sorobeacon_reorgs_total"
+	lastReorgLedgerName    = "sorobeacon_last_reorg_ledger"
+	throttlesName          = "sorobeacon_alert_throttles_total"
+	breakerStateName       = "sorobeacon_channel_breaker_state"
+	httpDurationName       = "sorobeacon_http_request_duration_seconds"
+	streamDroppedName      = "sorobeacon_alerts_stream_dropped_total"
+	deadLettersName        = "sorobeacon_dead_letters_total"
 	deadLettersChannelName = "sorobeacon_dead_letters"
-	pollPanicsName        = "sorobeacon_poll_panics_total"
+	pollPanicsName         = "sorobeacon_poll_panics_total"
 )
 
 func TestRecordPollTracksOutcomesAndDuration(t *testing.T) {
@@ -65,6 +65,21 @@ func TestSetPollLagRecordsGauge(t *testing.T) {
 	m.SetPollLag(17)
 
 	assert.Equal(t, float64(17), m.sampleValue(t, pollLagName, nil))
+}
+
+func TestUpstreamGauges(t *testing.T) {
+	m := New()
+
+	m.SetUpstreamLag(42)
+	m.SetUpstreamFailures(3)
+
+	assert.Equal(t, float64(42), m.sampleValue(t, "sorobeacon_upstream_lag_ledgers", nil))
+	assert.Equal(t, float64(3), m.sampleValue(t, "sorobeacon_upstream_consecutive_failures", nil))
+
+	m.SetUpstreamLag(-5)
+	m.SetUpstreamFailures(-1)
+	assert.Equal(t, float64(0), m.sampleValue(t, "sorobeacon_upstream_lag_ledgers", nil))
+	assert.Equal(t, float64(0), m.sampleValue(t, "sorobeacon_upstream_consecutive_failures", nil))
 }
 
 func TestTickPollAgeRecordsGauge(t *testing.T) {
