@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1561,6 +1562,305 @@ func (s *SQLite) RecordChannelHealth(ctx context.Context, channelID int64, u Cha
 
 func (s *SQLite) DeleteChannel(ctx context.Context, id int64) error {
 	return s.deleteByID(ctx, "channels", id)
+}
+
+func (s *SQLite) encryptSigningSecret(secret string) (string, error) {
+	if s.cipher == nil || secret == "" {
+		return secret, nil
+	}
+	ciphertext, err := s.cipher.Encrypt([]byte(secret))
+	if err != nil {
+		return "", fmt.Errorf("encrypt signing key: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
+func (s *SQLite) decryptSigningSecret(stored string) (string, error) {
+	if s.cipher == nil || stored == "" {
+		return stored, nil
+	}
+	data, err := base64.StdEncoding.DecodeString(stored)
+	if err != nil {
+		return stored, nil
+	}
+	plaintext, err := s.cipher.Decrypt(data)
+	if err != nil {
+		return stored, nil
+	}
+	return string(plaintext), nil
+}
+
+func (s *SQLite) CreateChannelSigningKey(ctx context.Context, k *ChannelSigningKey) error {
+	if k.ChannelID <= 0 {
+		return errors.New("channel_id is required")
+	}
+	if k.KeyID == "" {
+		return errors.New("key_id is required")
+	}
+	if k.Secret == "" {
+		return errors.New("secret is required")
+	}
+	if k.Status == "" {
+		k.Status = SigningKeyStatusActive
+	}
+	secret, err := s.encryptSigningSecret(k.Secret)
+	if err != nil {
+		return err
+	}
+	ws := workspaceID(ctx)
+	if k.WorkspaceID != "" {
+		ws = workspace.ID(k.WorkspaceID)
+	}
+	if k.CreatedAt.IsZero() {
+		k.CreatedAt = time.Now().UTC()
+	}
+	created := sqliteTimeString(k.CreatedAt)
+
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO channel_signing_keys (channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		k.ChannelID, ws, k.KeyID, secret, boolToInt(k.IsCurrent), k.Status, created, sqliteNullTime(k.ExpiresAt), sqliteNullTime(k.LastUsedAt), sqliteNullTime(k.RevokedAt),
+	)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return err
+	}
+	k.ID = id
+	k.CreatedAt, _ = parseSQLiteTime(created)
+	return nil
+}
+
+func (s *SQLite) GetChannelSigningKey(ctx context.Context, channelID int64, keyID string) (*ChannelSigningKey, error) {
+	var k ChannelSigningKey
+	var storedSecret, created string
+	var isCurrent int
+	var expiresAt, lastUsedAt, revokedAt sql.NullString
+
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at
+		 FROM channel_signing_keys
+		 WHERE channel_id = ? AND key_id = ? AND workspace_id = ?`,
+		channelID, keyID, workspaceID(ctx),
+	).Scan(&k.ID, &k.ChannelID, &k.WorkspaceID, &k.KeyID, &storedSecret, &isCurrent, &k.Status, &created, &expiresAt, &lastUsedAt, &revokedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, mapSQLiteErr(err)
+	}
+	k.IsCurrent = isCurrent != 0
+	k.CreatedAt, _ = parseSQLiteTime(created)
+	k.ExpiresAt, _ = parseSQLiteTimePtr(expiresAt)
+	k.LastUsedAt, _ = parseSQLiteTimePtr(lastUsedAt)
+	k.RevokedAt, _ = parseSQLiteTimePtr(revokedAt)
+
+	dec, err := s.decryptSigningSecret(storedSecret)
+	if err != nil {
+		return nil, err
+	}
+	k.Secret = dec
+	return &k, nil
+}
+
+func (s *SQLite) ListChannelSigningKeys(ctx context.Context, channelID int64) ([]ChannelSigningKey, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, channel_id, workspace_id, key_id, is_current, status, created_at, expires_at, last_used_at, revoked_at
+		 FROM channel_signing_keys
+		 WHERE channel_id = ? AND workspace_id = ?
+		 ORDER BY created_at DESC, id DESC`,
+		channelID, workspaceID(ctx),
+	)
+	if err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []ChannelSigningKey
+	for rows.Next() {
+		var k ChannelSigningKey
+		var isCurrent int
+		var created string
+		var expiresAt, lastUsedAt, revokedAt sql.NullString
+		if err := rows.Scan(&k.ID, &k.ChannelID, &k.WorkspaceID, &k.KeyID, &isCurrent, &k.Status, &created, &expiresAt, &lastUsedAt, &revokedAt); err != nil {
+			return nil, err
+		}
+		k.IsCurrent = isCurrent != 0
+		k.CreatedAt, _ = parseSQLiteTime(created)
+		k.ExpiresAt, _ = parseSQLiteTimePtr(expiresAt)
+		k.LastUsedAt, _ = parseSQLiteTimePtr(lastUsedAt)
+		k.RevokedAt, _ = parseSQLiteTimePtr(revokedAt)
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) GetCurrentChannelSigningKey(ctx context.Context, channelID int64) (*ChannelSigningKey, error) {
+	var k ChannelSigningKey
+	var storedSecret, created string
+	var isCurrent int
+	var expiresAt, lastUsedAt, revokedAt sql.NullString
+
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at
+		 FROM channel_signing_keys
+		 WHERE channel_id = ? AND workspace_id = ? AND is_current = 1 AND status = 'active'
+		 ORDER BY created_at DESC, id DESC LIMIT 1`,
+		channelID, workspaceID(ctx),
+	).Scan(&k.ID, &k.ChannelID, &k.WorkspaceID, &k.KeyID, &storedSecret, &isCurrent, &k.Status, &created, &expiresAt, &lastUsedAt, &revokedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, mapSQLiteErr(err)
+	}
+	k.IsCurrent = isCurrent != 0
+	k.CreatedAt, _ = parseSQLiteTime(created)
+	k.ExpiresAt, _ = parseSQLiteTimePtr(expiresAt)
+	k.LastUsedAt, _ = parseSQLiteTimePtr(lastUsedAt)
+	k.RevokedAt, _ = parseSQLiteTimePtr(revokedAt)
+
+	dec, err := s.decryptSigningSecret(storedSecret)
+	if err != nil {
+		return nil, err
+	}
+	k.Secret = dec
+	return &k, nil
+}
+
+func (s *SQLite) RotateChannelSigningKey(ctx context.Context, channelID int64, newKey *ChannelSigningKey) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var exists int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM channels WHERE id = ? AND workspace_id = ?`, channelID, workspaceID(ctx)).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		return ErrNotFound
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE channel_signing_keys SET is_current = 0 WHERE channel_id = ? AND workspace_id = ?`,
+		channelID, workspaceID(ctx),
+	); err != nil {
+		return err
+	}
+
+	secret, err := s.encryptSigningSecret(newKey.Secret)
+	if err != nil {
+		return err
+	}
+	newKey.ChannelID = channelID
+	newKey.WorkspaceID = string(workspaceID(ctx))
+	newKey.IsCurrent = true
+	newKey.Status = SigningKeyStatusActive
+	if newKey.CreatedAt.IsZero() {
+		newKey.CreatedAt = time.Now().UTC()
+	}
+	created := sqliteTimeString(newKey.CreatedAt)
+
+	res, err := tx.ExecContext(ctx,
+		`INSERT INTO channel_signing_keys (channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at)
+		 VALUES (?, ?, ?, ?, 1, 'active', ?, ?, ?, ?)`,
+		newKey.ChannelID, newKey.WorkspaceID, newKey.KeyID, secret, created, sqliteNullTime(newKey.ExpiresAt), sqliteNullTime(newKey.LastUsedAt), sqliteNullTime(newKey.RevokedAt),
+	)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return err
+	}
+	newKey.ID = id
+	newKey.CreatedAt, _ = parseSQLiteTime(created)
+
+	return tx.Commit()
+}
+
+func (s *SQLite) RetireChannelSigningKey(ctx context.Context, channelID int64, keyID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var isCurrent int
+	var status string
+	err = tx.QueryRowContext(ctx,
+		`SELECT is_current, status FROM channel_signing_keys WHERE channel_id = ? AND key_id = ? AND workspace_id = ?`,
+		channelID, keyID, workspaceID(ctx),
+	).Scan(&isCurrent, &status)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return mapSQLiteErr(err)
+	}
+	if isCurrent != 0 {
+		return fmt.Errorf("cannot retire active current signing key %q; rotate first", keyID)
+	}
+	if status == SigningKeyStatusRevoked {
+		return fmt.Errorf("key %q is already revoked", keyID)
+	}
+
+	res, err := tx.ExecContext(ctx,
+		`UPDATE channel_signing_keys SET status = 'retired' WHERE channel_id = ? AND key_id = ? AND workspace_id = ?`,
+		channelID, keyID, workspaceID(ctx),
+	)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit()
+}
+
+func (s *SQLite) RevokeChannelSigningKey(ctx context.Context, channelID int64, keyID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	nowStr := sqliteTimeString(time.Now())
+	res, err := tx.ExecContext(ctx,
+		`UPDATE channel_signing_keys SET status = 'revoked', is_current = 0, revoked_at = ?
+		 WHERE channel_id = ? AND key_id = ? AND workspace_id = ?`,
+		nowStr, channelID, keyID, workspaceID(ctx),
+	)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit()
+}
+
+func (s *SQLite) RecordChannelSigningKeyUsage(ctx context.Context, channelID int64, keyID string, usedAt time.Time) error {
+	if usedAt.IsZero() {
+		usedAt = time.Now()
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE channel_signing_keys SET last_used_at = ? WHERE channel_id = ? AND key_id = ?`,
+		sqliteTimeString(usedAt), channelID, keyID,
+	)
+	return err
 }
 
 func (s *SQLite) ListMonitorsForChannel(ctx context.Context, channelID int64) ([]Monitor, error) {

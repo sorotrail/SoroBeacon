@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1456,6 +1457,236 @@ func (p *Postgres) GetChannelDeliveryStats(ctx context.Context, channelID int64,
 	}
 	cs.deriveSuccessRate()
 	return cs, nil
+}
+
+func (p *Postgres) encryptSigningSecret(secret string) (string, error) {
+	if p.cipher == nil || secret == "" {
+		return secret, nil
+	}
+	ciphertext, err := p.cipher.Encrypt([]byte(secret))
+	if err != nil {
+		return "", fmt.Errorf("encrypt signing key: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
+func (p *Postgres) decryptSigningSecret(stored string) (string, error) {
+	if p.cipher == nil || stored == "" {
+		return stored, nil
+	}
+	data, err := base64.StdEncoding.DecodeString(stored)
+	if err != nil {
+		return stored, nil
+	}
+	plaintext, err := p.cipher.Decrypt(data)
+	if err != nil {
+		return stored, nil
+	}
+	return string(plaintext), nil
+}
+
+func (p *Postgres) CreateChannelSigningKey(ctx context.Context, k *ChannelSigningKey) error {
+	if k.ChannelID <= 0 {
+		return errors.New("channel_id is required")
+	}
+	if k.KeyID == "" {
+		return errors.New("key_id is required")
+	}
+	if k.Secret == "" {
+		return errors.New("secret is required")
+	}
+	if k.Status == "" {
+		k.Status = SigningKeyStatusActive
+	}
+	secret, err := p.encryptSigningSecret(k.Secret)
+	if err != nil {
+		return err
+	}
+	ws := workspaceID(ctx)
+	if k.WorkspaceID != "" {
+		ws = workspace.ID(k.WorkspaceID)
+	}
+	return p.pool.QueryRow(ctx,
+		`INSERT INTO channel_signing_keys (channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9, $10)
+		 RETURNING id, created_at`,
+		k.ChannelID, ws, k.KeyID, secret, k.IsCurrent, k.Status, pgCreatedAt(k.CreatedAt), k.ExpiresAt, k.LastUsedAt, k.RevokedAt,
+	).Scan(&k.ID, &k.CreatedAt)
+}
+
+func (p *Postgres) GetChannelSigningKey(ctx context.Context, channelID int64, keyID string) (*ChannelSigningKey, error) {
+	var k ChannelSigningKey
+	var storedSecret string
+	err := p.pool.QueryRow(ctx,
+		`SELECT id, channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at
+		 FROM channel_signing_keys
+		 WHERE channel_id = $1 AND key_id = $2 AND workspace_id = $3`,
+		channelID, keyID, workspaceID(ctx),
+	).Scan(&k.ID, &k.ChannelID, &k.WorkspaceID, &k.KeyID, &storedSecret, &k.IsCurrent, &k.Status, &k.CreatedAt, &k.ExpiresAt, &k.LastUsedAt, &k.RevokedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	dec, err := p.decryptSigningSecret(storedSecret)
+	if err != nil {
+		return nil, err
+	}
+	k.Secret = dec
+	return &k, nil
+}
+
+func (p *Postgres) ListChannelSigningKeys(ctx context.Context, channelID int64) ([]ChannelSigningKey, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT id, channel_id, workspace_id, key_id, is_current, status, created_at, expires_at, last_used_at, revoked_at
+		 FROM channel_signing_keys
+		 WHERE channel_id = $1 AND workspace_id = $2
+		 ORDER BY created_at DESC, id DESC`,
+		channelID, workspaceID(ctx),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChannelSigningKey
+	for rows.Next() {
+		var k ChannelSigningKey
+		if err := rows.Scan(&k.ID, &k.ChannelID, &k.WorkspaceID, &k.KeyID, &k.IsCurrent, &k.Status, &k.CreatedAt, &k.ExpiresAt, &k.LastUsedAt, &k.RevokedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) GetCurrentChannelSigningKey(ctx context.Context, channelID int64) (*ChannelSigningKey, error) {
+	var k ChannelSigningKey
+	var storedSecret string
+	err := p.pool.QueryRow(ctx,
+		`SELECT id, channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at
+		 FROM channel_signing_keys
+		 WHERE channel_id = $1 AND workspace_id = $2 AND is_current = TRUE AND status = 'active'
+		 ORDER BY created_at DESC, id DESC LIMIT 1`,
+		channelID, workspaceID(ctx),
+	).Scan(&k.ID, &k.ChannelID, &k.WorkspaceID, &k.KeyID, &storedSecret, &k.IsCurrent, &k.Status, &k.CreatedAt, &k.ExpiresAt, &k.LastUsedAt, &k.RevokedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	dec, err := p.decryptSigningSecret(storedSecret)
+	if err != nil {
+		return nil, err
+	}
+	k.Secret = dec
+	return &k, nil
+}
+
+func (p *Postgres) RotateChannelSigningKey(ctx context.Context, channelID int64, newKey *ChannelSigningKey) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM channels WHERE id = $1 AND workspace_id = $2)`, channelID, workspaceID(ctx)).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNotFound
+	}
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE channel_signing_keys SET is_current = FALSE WHERE channel_id = $1 AND workspace_id = $2`,
+		channelID, workspaceID(ctx),
+	); err != nil {
+		return err
+	}
+
+	secret, err := p.encryptSigningSecret(newKey.Secret)
+	if err != nil {
+		return err
+	}
+	newKey.ChannelID = channelID
+	newKey.WorkspaceID = string(workspaceID(ctx))
+	newKey.IsCurrent = true
+	newKey.Status = SigningKeyStatusActive
+
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO channel_signing_keys (channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at)
+		 VALUES ($1, $2, $3, $4, TRUE, 'active', COALESCE($5, now()), $6, $7, $8)
+		 RETURNING id, created_at`,
+		newKey.ChannelID, newKey.WorkspaceID, newKey.KeyID, secret, pgCreatedAt(newKey.CreatedAt), newKey.ExpiresAt, newKey.LastUsedAt, newKey.RevokedAt,
+	).Scan(&newKey.ID, &newKey.CreatedAt); err != nil {
+		return mapErr(err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) RetireChannelSigningKey(ctx context.Context, channelID int64, keyID string) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var isCurrent bool
+	var status string
+	err = tx.QueryRow(ctx,
+		`SELECT is_current, status FROM channel_signing_keys WHERE channel_id = $1 AND key_id = $2 AND workspace_id = $3`,
+		channelID, keyID, workspaceID(ctx),
+	).Scan(&isCurrent, &status)
+	if err != nil {
+		return mapErr(err)
+	}
+	if isCurrent {
+		return fmt.Errorf("cannot retire active current signing key %q; rotate first", keyID)
+	}
+	if status == SigningKeyStatusRevoked {
+		return fmt.Errorf("key %q is already revoked", keyID)
+	}
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE channel_signing_keys SET status = 'retired' WHERE channel_id = $1 AND key_id = $2 AND workspace_id = $3`,
+		channelID, keyID, workspaceID(ctx),
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) RevokeChannelSigningKey(ctx context.Context, channelID int64, keyID string) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE channel_signing_keys SET status = 'revoked', is_current = FALSE, revoked_at = now()
+		 WHERE channel_id = $1 AND key_id = $2 AND workspace_id = $3`,
+		channelID, keyID, workspaceID(ctx),
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) RecordChannelSigningKeyUsage(ctx context.Context, channelID int64, keyID string, usedAt time.Time) error {
+	if usedAt.IsZero() {
+		usedAt = time.Now()
+	}
+	_, err := p.pool.Exec(ctx,
+		`UPDATE channel_signing_keys SET last_used_at = $1 WHERE channel_id = $2 AND key_id = $3`,
+		usedAt, channelID, keyID,
+	)
+	return err
 }
 
 // --- alerts ---
