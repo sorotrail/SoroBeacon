@@ -10,6 +10,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -120,11 +122,17 @@ type EventNamer interface {
 // the API validating params, the dashboard listing types — do not have to know
 // the difference; only the poller does, via Absence.
 type Registry struct {
-	evaluators map[string]RuleEvaluator
-	absences   map[string]AbsenceEvaluator
+	mu                  sync.RWMutex
+	evaluators          map[string]RuleEvaluator
+	absences            map[string]AbsenceEvaluator
 	// telemetry is optional tracing; a nil Registry.telemetry (tests construct
 	// registries directly) just means no spans.
-	telemetry *telemetry.Provider
+	telemetry           *telemetry.Provider
+	evalTimeout         time.Duration
+	quarantineThreshold int
+	isolation           map[int64]*ruleIsolationEntry
+	quarantineHook      QuarantineTransitionFunc
+	evalObserver        func(context.Context, EvalObservation)
 }
 
 // WithTelemetry attaches tracing to every evaluation this registry runs.
@@ -139,8 +147,11 @@ func (r *Registry) WithTelemetry(t *telemetry.Provider) *Registry {
 // NewRegistry returns a Registry with the built-in rule types registered.
 func NewRegistry() *Registry {
 	r := &Registry{
-		evaluators: map[string]RuleEvaluator{},
-		absences:   map[string]AbsenceEvaluator{},
+		evaluators:          map[string]RuleEvaluator{},
+		absences:            map[string]AbsenceEvaluator{},
+		evalTimeout:         DefaultEvalTimeout,
+		quarantineThreshold: DefaultQuarantineThreshold,
+		isolation:           map[int64]*ruleIsolationEntry{},
 	}
 	r.Register(TypeEventEmitted, EventEmitted{})
 	r.Register(TypeValueThreshold, ValueThreshold{})
@@ -195,10 +206,12 @@ func (r *Registry) Types() []string {
 	return out
 }
 
-// Evaluate runs the evaluator registered for ruleType.
+// Evaluate runs the evaluator registered for ruleType inside the per-rule
+// isolation boundary (timeout, panic recovery, atomic state rollback, and
+// quarantine tracking).
 func (r *Registry) Evaluate(ctx context.Context, ruleType string, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error) {
 	ctx, span := r.startEvalSpan(ctx, ruleType, ev)
-	matched, err := r.evaluate(ctx, ruleType, ev, params)
+	matched, err := r.evaluateIsolated(ctx, ruleType, ev, params)
 	if err != nil {
 		telemetry.RecordError(span, err)
 	}
@@ -379,7 +392,7 @@ func (r *Registry) DryRun(ctx context.Context, ruleType string, events []*stella
 	return matches, nil
 }
 
-// ResetRuleState clears any in-memory state held by stateful evaluators for
+// ResetRuleState clears any in-memory state and quarantine strikes held for
 // ruleID. Safe to call on a nil receiver.
 func (r *Registry) ResetRuleState(ruleID int64) {
 	if r == nil || ruleID == 0 {
@@ -390,4 +403,5 @@ func (r *Registry) ResetRuleState(ruleID int64) {
 			sr.ResetRule(ruleID)
 		}
 	}
+	r.clearIsolationState(context.Background(), ruleID)
 }
