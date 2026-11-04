@@ -75,6 +75,41 @@ the token bucket and does not send `Retry-After`; clients should treat
 
 Probes (`/health`, `/livez`, `/readyz`) are exempt from rate limiting.
 
+## Idempotent writes
+
+Every mutating endpoint (`POST`, `PUT`, `PATCH`, `DELETE`) accepts an optional
+`Idempotency-Key` request header (at most 255 characters) so clients and
+infrastructure automation can safely retry after network timeouts or lost
+responses:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
+  -d '{"name":"USDC Vault","contract_ids":["CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"]}'
+```
+
+* **Workspace-scoped and persistent**: Keys are stored in `idempotency_keys`
+  keyed by `(workspace_id, idempotency_key)` with a 24-hour retention window,
+  so two workspaces never collide on the same key and idempotency survives
+  process restarts.
+* **Exact replay**: Repeating a request with the same key, HTTP method, path,
+  and request body within the retention window returns the stored status code,
+  `Content-Type`, and response body without re-executing the write or writing a
+  duplicate audit entry, and sets `Idempotency-Replayed: true` on the response.
+  Replayed `DELETE` calls return the original `204 No Content` rather than
+  `404 Not Found`.
+* **Payload mismatch detection**: Reusing an unexpired `Idempotency-Key` with a
+  different HTTP method, URL path, or request body digest is rejected with
+  `409 Conflict` (`"code": "CONFLICT"`).
+* **Concurrent deduplication**: Concurrent requests arriving with the same
+  `(workspace_id, Idempotency-Key)` and identical payload coalesce onto the
+  single in-flight execution and return the same created/updated resource.
+* **Terraform provider**: `terraform-provider-sorobeacon` automatically sends
+  `Idempotency-Key` on all write requests (`POST`, `PATCH`, `DELETE`) and
+  reuses the same key across transient retry attempts.
+
 ## Conditional requests
 
 Read endpoints across the dominant polling surfaces — alert listings (`GET /alerts`), daily alert statistics (`GET /stats/alerts-daily`), per-channel delivery summaries (`GET /channels/{id}/stats`), and monitor/channel lists — set a strong entity tag (`ETag`) and respond to conditional requests (`If-None-Match`) with `304 Not Modified` and no body.
