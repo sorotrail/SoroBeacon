@@ -3153,6 +3153,44 @@
           }
         }
       }
+    },
+    "/retention": {
+      "get": {
+        "summary": "Get effective workspace alert retention policy",
+        "description": "Required role: viewer. Returns the workspace's effective alert retention policy, its policy_source (workspace, instance, or unset), and the current pruned_before horizon.",
+        "responses": {
+          "200": {
+            "description": "Workspace retention policy summary"
+          }
+        }
+      },
+      "put": {
+        "summary": "Set workspace alert retention policy override",
+        "description": "Required role: admin. Configures a per-workspace alert retention override. Shortening an active retention window requires confirm_shorten=true.",
+        "responses": {
+          "200": {
+            "description": "Updated workspace retention policy summary"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Reset workspace alert retention policy to instance default",
+        "description": "Required role: admin. Deletes the workspace's retention override so it falls back to the instance-wide ALERT_RETENTION default. If resetting shortens effective retention, confirm_shorten=true is required.",
+        "responses": {
+          "200": {
+            "description": "Effective workspace retention policy after reset"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
     }
   },
   "components": {

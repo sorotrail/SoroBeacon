@@ -10,6 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 // conformanceStore is a Store plus the small test-only hooks a backend must
@@ -118,6 +120,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("FederatedAlertsFollowTheDeliveringWorkspace", func(t *testing.T) { testFederatedAlertFollowsTheDeliveringWorkspace(t, newStore) })
 	t.Run("PersistedOperations", func(t *testing.T) { testPersistedOperations(t, newStore) })
 	t.Run("RuleChangeSafety", func(t *testing.T) { testRuleChangeSafety(t, newStore) })
+	t.Run("WorkspaceRetentionPoliciesAndPruning", func(t *testing.T) { testWorkspaceRetentionPoliciesAndPruning(t, newStore) })
 }
 
 // testChannelDigest pins the digest settings round trip and the pending
@@ -2400,4 +2403,131 @@ func testRuleChangeSafety(t *testing.T, newStore conformanceFactory) {
 	require.NoError(t, err)
 	require.Len(t, states, 1)
 	assert.Equal(t, r2.ID, states[0].RuleID)
+}
+
+func testWorkspaceRetentionPoliciesAndPruning(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	SetInstanceAlertRetention(st, 30*24*time.Hour)
+	t.Cleanup(func() { SetInstanceAlertRetention(st, 0) })
+
+	wsA := workspace.ID("ws-short")
+	wsB := workspace.ID("ws-long")
+	ctxA := workspace.With(context.Background(), wsA)
+	ctxB := workspace.With(context.Background(), wsB)
+
+	// 1. Default policy inherits instance ALERT_RETENTION (30d).
+	polA, err := st.GetWorkspaceRetentionPolicy(ctxA, wsA)
+	require.NoError(t, err)
+	assert.False(t, polA.Configured)
+	assert.Equal(t, RetentionPolicySourceInstance, polA.PolicySource)
+	assert.Equal(t, int64(30*86400), polA.EffectiveRetentionSeconds)
+
+	// 2. Shortening from 30d instance default to 7d without ConfirmShorten fails.
+	_, err = st.SetWorkspaceRetentionPolicy(ctxA, SetWorkspaceRetentionInput{
+		WorkspaceID:    string(wsA),
+		Retention:      7 * 24 * time.Hour,
+		ConfirmShorten: false,
+		Actor:          "admin-a",
+	})
+	require.ErrorIs(t, err, ErrRetentionShortenUnconfirmed)
+
+	// 3. Shortening with ConfirmShorten: true succeeds and records an audit entry.
+	polA, err = st.SetWorkspaceRetentionPolicy(ctxA, SetWorkspaceRetentionInput{
+		WorkspaceID:    string(wsA),
+		Retention:      7 * 24 * time.Hour,
+		ConfirmShorten: true,
+		Actor:          "admin-a",
+	})
+	require.NoError(t, err)
+	assert.True(t, polA.Configured)
+	assert.Equal(t, RetentionPolicySourceWorkspace, polA.PolicySource)
+	assert.Equal(t, int64(7*86400), polA.EffectiveRetentionSeconds)
+
+	// 4. Extending wsB from 30d default to 90d does not require ConfirmShorten.
+	polB, err := st.SetWorkspaceRetentionPolicy(ctxB, SetWorkspaceRetentionInput{
+		WorkspaceID:    string(wsB),
+		Retention:      90 * 24 * time.Hour,
+		ConfirmShorten: false,
+		Actor:          "admin-b",
+	})
+	require.NoError(t, err)
+	assert.True(t, polB.Configured)
+	assert.Equal(t, int64(90*86400), polB.EffectiveRetentionSeconds)
+
+	// 5. Resetting wsB (90d -> 30d default) shortens retention and requires ConfirmShorten.
+	_, err = st.DeleteWorkspaceRetentionPolicy(ctxB, wsB, false, "admin-b")
+	require.ErrorIs(t, err, ErrRetentionShortenUnconfirmed)
+
+	// 6. Seed 10-day-old and 2-day-old alerts in both workspaces.
+	now := time.Now().UTC()
+	monA := &Monitor{Name: "mon-a", ContractIDs: []string{"CA"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctxA, monA))
+	ruleA := &Rule{MonitorID: monA.ID, Type: "event_emitted", Params: json.RawMessage(`{"event_name":"transfer"}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctxA, ruleA))
+	chA := &Channel{Name: "ch-a", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateChannel(ctxA, chA))
+
+	oldAlertA := &Alert{MonitorID: monA.ID, RuleID: ruleA.ID, EventID: "a-old", Payload: json.RawMessage(`{}`)}
+	recentAlertA := &Alert{MonitorID: monA.ID, RuleID: ruleA.ID, EventID: "a-recent", Payload: json.RawMessage(`{}`)}
+	_, err = st.CreateAlert(ctxA, oldAlertA)
+	require.NoError(t, err)
+	_, err = st.CreateAlert(ctxA, recentAlertA)
+	require.NoError(t, err)
+	require.NoError(t, st.setAlertCreatedAt(ctxA, oldAlertA.ID, now.Add(-10*24*time.Hour)))
+	require.NoError(t, st.setAlertCreatedAt(ctxA, recentAlertA.ID, now.Add(-2*24*time.Hour)))
+	require.NoError(t, st.RecordDeliveryAttempt(ctxA, &DeliveryAttempt{
+		AlertID:   oldAlertA.ID,
+		ChannelID: chA.ID,
+		Status:    DeliveryStatusSuccess,
+	}))
+
+	monB := &Monitor{Name: "mon-b", ContractIDs: []string{"CB"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctxB, monB))
+	ruleB := &Rule{MonitorID: monB.ID, Type: "event_emitted", Params: json.RawMessage(`{"event_name":"transfer"}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctxB, ruleB))
+
+	oldAlertB := &Alert{MonitorID: monB.ID, RuleID: ruleB.ID, EventID: "b-old", Payload: json.RawMessage(`{}`)}
+	_, err = st.CreateAlert(ctxB, oldAlertB)
+	require.NoError(t, err)
+	require.NoError(t, st.setAlertCreatedAt(ctxB, oldAlertB.ID, now.Add(-10*24*time.Hour)))
+
+	// 7. Read-time visibility horizon hides wsA's 10-day-old alert even before pruning,
+	// while wsB's 10-day-old alert remains visible under its 90-day policy.
+	alertsA, err := st.ListAlerts(ctxA, AlertFilter{})
+	require.NoError(t, err)
+	require.Len(t, alertsA, 1, "wsA 10d alert must be hidden by 7d retention horizon")
+	assert.Equal(t, recentAlertA.ID, alertsA[0].ID)
+
+	_, err = st.GetAlert(ctxA, oldAlertA.ID)
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	statsA, err := st.GetStats(ctxA)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), statsA.Alerts)
+	assert.Equal(t, RetentionPolicySourceWorkspace, statsA.RetentionPolicySource)
+	assert.NotNil(t, statsA.PrunedBefore)
+
+	alertsB, err := st.ListAlerts(ctxB, AlertFilter{})
+	require.NoError(t, err)
+	require.Len(t, alertsB, 1, "wsB 10d alert must remain visible under 90d retention")
+	assert.Equal(t, oldAlertB.ID, alertsB[0].ID)
+
+	// 8. Per-workspace pruning removes wsA's expired alert and cascades delivery_attempts + alert_dedup,
+	// without touching wsB's 10-day-old alert.
+	deletedA, err := st.DeleteExpiredAlertsForWorkspace(ctxA, wsA, now.Add(-7*24*time.Hour), 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deletedA)
+
+	// Because alert_dedup was cleared for oldAlertA, re-inserting EventID "a-old" creates a fresh alert.
+	reinsertA := &Alert{MonitorID: monA.ID, RuleID: ruleA.ID, EventID: "a-old", Payload: json.RawMessage(`{}`)}
+	outcome, err := st.CreateAlert(ctxA, reinsertA)
+	require.NoError(t, err)
+	assert.Equal(t, AlertCreated, outcome, "pruned alert's dedup entry must be cleared")
+
+	// 9. Audit trail recorded the retention policy updates.
+	audits, err := st.ListAuditEntries(ctxA, AuditFilter{TargetType: AuditTargetWorkspaceRetention})
+	require.NoError(t, err)
+	require.Len(t, audits, 2)
+	assert.Equal(t, "admin-b", audits[0].Actor)
+	assert.Equal(t, "admin-a", audits[1].Actor)
 }

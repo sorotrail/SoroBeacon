@@ -97,6 +97,8 @@ type Metrics struct {
 	alertPartitionErrorsTotal   *prometheus.CounterVec
 	alertPartitionsCreatedTotal prometheus.Counter
 	alertPartitionsDroppedTotal prometheus.Counter
+	alertPrunerDeletedTotal     *prometheus.CounterVec
+	workspaceRetentionSeconds   *prometheus.GaugeVec
 }
 
 // networkLabel is the Prometheus label every ingest metric carries.
@@ -338,6 +340,16 @@ func New() *Metrics {
 			Name: "sorobeacon_alert_partitions_dropped_total",
 			Help: "Total expired monthly alert partitions dropped by the automated partition lifecycle manager.",
 		}),
+
+		alertPrunerDeletedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_alert_pruner_deleted_total",
+			Help: "Total expired alerts deleted by the retention pruner, by workspace_id and policy_source (workspace|instance).",
+		}, []string{"workspace_id", "policy_source"}),
+
+		workspaceRetentionSeconds: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_workspace_retention_seconds",
+			Help: "Effective alert retention duration in seconds per workspace_id and policy_source (workspace|instance|none).",
+		}, []string{"workspace_id", "policy_source"}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
 		m.upstreamLagLedger, m.upstreamFailures,
@@ -348,7 +360,8 @@ func New() *Metrics {
 		m.ruleEvalsTotal, m.ruleMatchesTotal, m.ruleErrorsTotal, m.ruleDuration, m.requestBodyRejectionsTotal,
 		m.databaseDegraded, m.databaseUnavailableTotal, m.channelUnackFlagged, m.channelUnackRate,
 		m.workspaceAlertsRaised, m.workspaceRuleEvaluations, m.workspaceNotifications, m.workspaceAPIRequests, m.workspaceStoredRows,
-		m.alertPartitionRunwayMonths, m.alertPartitionErrorsTotal, m.alertPartitionsCreatedTotal, m.alertPartitionsDroppedTotal)
+		m.alertPartitionRunwayMonths, m.alertPartitionErrorsTotal, m.alertPartitionsCreatedTotal, m.alertPartitionsDroppedTotal,
+		m.alertPrunerDeletedTotal, m.workspaceRetentionSeconds)
 	return m
 }
 
@@ -854,5 +867,7 @@ func ExportedMetricNames() []string {
 		"sorobeacon_alert_partition_errors_total",
 		"sorobeacon_alert_partitions_created_total",
 		"sorobeacon_alert_partitions_dropped_total",
+		"sorobeacon_alert_pruner_deleted_total",
+		"sorobeacon_workspace_retention_seconds",
 	}
 }

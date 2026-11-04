@@ -942,6 +942,40 @@ func buildRESTIsolationChecks(fx *isolationFixture) map[string]func(t *testing.T
 			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodGet, "/workspaces/beta/delete", "")
 			assert.Equal(t, http.StatusForbidden, crossCode)
 		},
+		"GET /retention": func(t *testing.T) {
+			code, raw := fx.doREST(t, fx.alphaToken, http.MethodGet, "/retention", "")
+			require.Equal(t, http.StatusOK, code)
+			var resp RetentionResponse
+			require.NoError(t, json.Unmarshal(raw, &resp))
+			assert.Equal(t, "alpha", resp.WorkspaceID)
+			require.Len(t, resp.Workspaces, 1)
+			assert.Equal(t, "alpha", resp.Workspaces[0].WorkspaceID)
+
+			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodGet, "/retention?workspace=beta", "")
+			assert.Equal(t, http.StatusForbidden, crossCode)
+		},
+		"PUT /retention": func(t *testing.T) {
+			code, raw := fx.doREST(t, fx.alphaToken, http.MethodPut, "/retention", `{"alert_retention_days":30}`)
+			require.Equal(t, http.StatusOK, code)
+			var resp RetentionSummary
+			require.NoError(t, json.Unmarshal(raw, &resp))
+			assert.Equal(t, "alpha", resp.WorkspaceID)
+			assert.Equal(t, int64(30*86400), resp.AlertRetentionSeconds)
+
+			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodPut, "/retention?workspace=beta", `{"alert_retention_days":7,"confirm_shorten":true}`)
+			assert.Equal(t, http.StatusForbidden, crossCode)
+		},
+		"DELETE /retention": func(t *testing.T) {
+			code, raw := fx.doREST(t, fx.alphaToken, http.MethodDelete, "/retention?confirm_shorten=true", "")
+			require.Equal(t, http.StatusOK, code)
+			var resp RetentionSummary
+			require.NoError(t, json.Unmarshal(raw, &resp))
+			assert.Equal(t, "alpha", resp.WorkspaceID)
+			assert.False(t, resp.Configured)
+
+			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodDelete, "/retention?workspace=beta&confirm_shorten=true", "")
+			assert.Equal(t, http.StatusForbidden, crossCode)
+		},
 	}
 }
 

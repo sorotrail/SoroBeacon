@@ -213,6 +213,22 @@ func Classify(err error) Classified {
 			GRPCCode: codes.Aborted,
 		}
 	}
+	if errors.Is(err, store.ErrRetentionShortenUnconfirmed) {
+		return Classified{
+			Status:   http.StatusConflict,
+			Code:     CodeConflict,
+			Message:  err.Error(),
+			GRPCCode: codes.FailedPrecondition,
+		}
+	}
+	if errors.Is(err, store.ErrInvalidRetention) {
+		return Classified{
+			Status:   http.StatusBadRequest,
+			Code:     CodeInvalidArgument,
+			Message:  err.Error(),
+			GRPCCode: codes.InvalidArgument,
+		}
+	}
 	var quotaErr *store.QuotaExceededError
 	if errors.As(err, &quotaErr) || errors.Is(err, store.ErrQuotaExceeded) {
 		msg := "workspace quota exceeded"

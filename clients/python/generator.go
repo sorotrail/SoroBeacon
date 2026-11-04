@@ -198,6 +198,9 @@ var knownRouteBindings = []routeBinding{
 	{"DELETE", "/workspaces/{id}", "delete_workspace"},
 	{"POST", "/workspaces/{id}/delete", "post_delete_workspace"},
 	{"GET", "/workspaces/{id}/delete", "get_workspace_deletion"},
+	{"GET", "/retention", "get_retention"},
+	{"PUT", "/retention", "set_retention"},
+	{"DELETE", "/retention", "reset_retention"},
 	{"GET", "/audit", "list_audit_logs"},
 	{"GET", "/templates", "list_templates"},
 	{"POST", "/templates", "create_template"},
@@ -2313,6 +2316,38 @@ func writeClientClass(b *bytes.Buffer) {
             query=query or None,
             headers=headers,
         )
+
+    def get_retention(
+        self,
+        params: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        return self._request("GET", "/retention", query=params, headers=headers)
+
+    def set_retention(
+        self,
+        input_data: Mapping[str, Any],
+        params: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        return self._request(
+            "PUT",
+            "/retention",
+            query=params,
+            body=input_data,
+            has_body=True,
+            headers=headers,
+        )
+
+    def reset_retention(
+        self,
+        params: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        return self._request("DELETE", "/retention", query=params, headers=headers)
 
     def list_audit_logs(
         self,

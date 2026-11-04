@@ -173,6 +173,46 @@ before the drop brings that month back; restoring a later dump cannot. A
   partitions remain attached as empty shells after their rows are deleted. The
   partition count therefore grows; the rows themselves are gone.
 
+## Per-workspace retention policies
+
+In multi-tenant deployments, each workspace can override the instance-wide
+`ALERT_RETENTION` window via `GET /api/v1/retention`, `PUT /api/v1/retention`,
+and `DELETE /api/v1/retention`:
+
+- **Effective policy resolution**: When a workspace has an explicit override in
+  `workspace_retention_policies`, its `policy_source` is `workspace`.
+  When no override is set (or after `DELETE /api/v1/retention`), the workspace
+  inherits `ALERT_RETENTION` with `policy_source: "instance"` (or `"unset"` when
+  neither a workspace policy nor `ALERT_RETENTION` is configured).
+- **Shortening confirmation guardrail**: Lowering a workspace's effective
+  retention window (for example from `90d` to `7d`, or resetting a `90d`
+  override when the instance default is `7d`) permanently prunes older alerts on
+  the next retention pass. The API rejects unconfirmed shortenings with
+  `409 CONFLICT` (`confirmation_required: true`) unless `confirm_shorten: true`
+  (or `?confirm_shorten=true`) is supplied. Every policy change or reset is
+  recorded in `audit_log` under `target_type = "workspace_retention"`.
+- **Per-workspace pruning & shared partition lifecycle**: During each prune
+  pass, `RunAlertPruner` resolves the effective retention window for every
+  workspace and deletes expired rows per workspace in bounded batches,
+  cascading to `delivery_attempts`, `alert_escalations`, `dead_letters`, and
+  `alert_dedup`. Because monthly Postgres partitions (`alerts_YYYY_MM`) are
+  shared across workspaces, a monthly partition is only detached and dropped
+  when its upper bound is older than the **longest** effective retention horizon
+  across all workspaces (`MaxEffectiveRetention`). Workspaces with shorter
+  retention windows still have their expired rows removed immediately via batched
+  per-workspace `DELETE`s and read-time cutoff filtering.
+- **Query & export horizon metadata**: Alert queries, stats, and exports enforce
+  each workspace's active retention cutoff at read time (`created_at >= now -
+  effective_retention`) so expired rows are never returned between hourly pruner
+  ticks. `GET /api/v1/alerts`, `GET /api/v1/stats`, `GET /api/v1/stats/alerts-daily`,
+  `GET /api/v1/alerts.csv`, and `GET /api/v1/alerts/export` expose the active
+  cutoff via `pruned_before` (and `X-Pruned-Before` / `X-Retention-Policy-Source`
+  response headers).
+- **Observability**: Pruner passes log structured per-workspace attributes
+  (`workspace_id`, `policy_source`, `retention`, `deleted`, `cutoff`) and export
+  `sorobeacon_alert_pruner_deleted_total{workspace_id,policy_source}` and
+  `sorobeacon_workspace_retention_seconds{workspace_id,policy_source}`.
+
 ## Choosing a window
 
 Choose the shortest window that still supports incident review and audit

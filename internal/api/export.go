@@ -38,6 +38,8 @@ func (s *Server) exportAlertsNDJSON(w http.ResponseWriter, r *http.Request) {
 		names[m.ID] = m.Name
 	}
 
+	prunedBefore, policySource := s.workspaceRetentionHorizon(r.Context())
+	setRetentionHorizonHeaders(w, prunedBefore, policySource)
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Request-ID", reqid.From(r))

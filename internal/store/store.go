@@ -1311,6 +1311,13 @@ type Stats struct {
 	// omitted from JSON so a healthy instance reports exactly the shape it
 	// always did.
 	RetentionGap *RetentionGap `json:"retention_gap,omitempty"`
+	// PrunedBefore reports the workspace's active alert retention cutoff
+	// (now - effective retention) when a retention policy is in effect.
+	PrunedBefore *time.Time `json:"pruned_before,omitempty"`
+	// RetentionPolicySource reports whether PrunedBefore came from a
+	// workspace-specific override ("workspace") or the instance default
+	// ("instance").
+	RetentionPolicySource string `json:"retention_policy_source,omitempty"`
 }
 
 // NetworkStats is one network's ingest checkpoint as stored, independent of
@@ -2395,6 +2402,17 @@ type Idempotency interface {
 	PruneExpiredIdempotencyKeys(ctx context.Context, before time.Time) (int64, error)
 }
 
+// RetentionPolicies persists per-workspace alert retention policies and
+// per-workspace expired alert pruning.
+type RetentionPolicies interface {
+	GetWorkspaceRetentionPolicy(ctx context.Context, ws workspace.ID) (WorkspaceRetentionPolicy, error)
+	SetWorkspaceRetentionPolicy(ctx context.Context, in SetWorkspaceRetentionInput) (WorkspaceRetentionPolicy, error)
+	DeleteWorkspaceRetentionPolicy(ctx context.Context, ws workspace.ID, confirmShorten bool, actor string) (WorkspaceRetentionPolicy, error)
+	ListWorkspaceRetentionPolicies(ctx context.Context) ([]WorkspaceRetentionPolicy, error)
+	ExpiredAlertsForWorkspace(ctx context.Context, ws workspace.ID, cutoff time.Time, limit int) ([]Alert, error)
+	DeleteExpiredAlertsForWorkspace(ctx context.Context, ws workspace.ID, cutoff time.Time, limit int) (int64, error)
+}
+
 // Store is everything the application needs from persistence.
 //
 // Tenancy: every method below is scoped to the workspace carried by ctx
@@ -2430,6 +2448,7 @@ type Store interface {
 	PersistedOperations
 	Usage
 	Quotas
+	RetentionPolicies
 	Idempotency
 	GetStats(ctx context.Context) (Stats, error)
 	// GetMonitorStats returns one monitor's alert, delivery and per-rule

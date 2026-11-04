@@ -65,7 +65,8 @@ func isQuotaExemptPath(path string) bool {
 		return true
 	}
 	trimmed := strings.TrimPrefix(path, "/api/v1")
-	return trimmed == "/quotas" || strings.HasPrefix(trimmed, "/quotas/")
+	return trimmed == "/quotas" || strings.HasPrefix(trimmed, "/quotas/") ||
+		trimmed == "/retention" || strings.HasPrefix(trimmed, "/retention/")
 }
 
 func estimateRESTQueryCost(r *http.Request) float64 {

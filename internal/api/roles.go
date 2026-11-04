@@ -111,6 +111,9 @@ var routeRoles = auth.NewRouteTable(map[string]auth.Role{
 	"GET /usage":              auth.RoleViewer,
 	"GET /quotas":             auth.RoleViewer,
 	"PUT /quotas":             auth.RoleAdmin,
+	"GET /retention":          auth.RoleViewer,
+	"PUT /retention":          auth.RoleAdmin,
+	"DELETE /retention":       auth.RoleAdmin,
 
 	// Workspace lifecycle operations are administrative and irreversible.
 	"DELETE /workspaces/{id}":      auth.RoleAdmin,
