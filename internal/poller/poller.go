@@ -160,8 +160,9 @@ type Poller struct {
 	warnedOrphans bool
 	// slowRuleThreshold is the duration after which a rule evaluation is
 	// considered slow and logged. Zero disables slow rule logging.
-	slowRuleThreshold time.Duration
-	usageMeter        *usage.Meter
+	slowRuleThreshold   time.Duration
+	workspaceEvalBudget time.Duration
+	usageMeter          *usage.Meter
 }
 
 // Position returns the last successful poll snapshot. Safe to call from
@@ -208,18 +209,20 @@ func (p *Poller) recordBackoff(backingOff bool) {
 // Stellar RPC node, or the SoroTrail source for upstream mode.
 func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval time.Duration, log *slog.Logger) *Poller {
 	p := &Poller{
-		source:   src,
-		store:    st,
-		registry: reg,
-		log:      log,
-		now:      time.Now,
-		dispatch: d,
-		ing:      NewIngestor(st, reg, d, log),
-		sched:    NewScheduler(),
+		source:              src,
+		store:               st,
+		registry:            reg,
+		log:                 log,
+		now:                 time.Now,
+		dispatch:            d,
+		ing:                 NewIngestor(st, reg, d, log),
+		sched:               NewScheduler(),
+		workspaceEvalBudget: rules.DefaultWorkspaceEvalBudget,
 	}
 	// Written through the same atomic SetInterval uses, so construction and
 	// a later reload can never disagree about which value is live.
 	p.interval.Store(int64(interval))
+	p.bindRegistryHooks()
 	return p
 }
 
@@ -310,6 +313,65 @@ func (p *Poller) WithReorg(window, depth uint32) *Poller {
 func (p *Poller) WithSlowRuleThreshold(d time.Duration) *Poller {
 	p.slowRuleThreshold = d
 	return p
+}
+
+// WithRuleTimeout configures the per-rule evaluation timeout (excluding
+// attributed database I/O). Zero disables the timeout.
+func (p *Poller) WithRuleTimeout(d time.Duration) *Poller {
+	if p.registry != nil {
+		p.registry.WithEvalTimeout(d)
+	}
+	return p
+}
+
+// WithRuleQuarantineThreshold configures how many consecutive rule-attributed
+// evaluation failures (timeouts, panics, or runtime errors) quarantine a rule.
+// Zero disables automatic quarantine.
+func (p *Poller) WithRuleQuarantineThreshold(threshold int) *Poller {
+	if p.registry != nil {
+		p.registry.WithQuarantineThreshold(threshold)
+	}
+	return p
+}
+
+// WithWorkspaceEvalBudget bounds how much total rule-evaluation time a single
+// workspace may consume on one event before its remaining rules are skipped
+// for that event. Zero disables the per-workspace budget.
+func (p *Poller) WithWorkspaceEvalBudget(d time.Duration) *Poller {
+	p.workspaceEvalBudget = d
+	if p.ing != nil {
+		p.ing.WithWorkspaceEvalBudget(d)
+	}
+	return p
+}
+
+// ReenableRule clears any quarantine and failure strikes for ruleID and resets
+// its stateful evaluator state so a fixed rule can resume evaluation cleanly.
+func (p *Poller) ReenableRule(ctx context.Context, ruleID int64) bool {
+	if p == nil || p.registry == nil {
+		return false
+	}
+	return p.registry.ReenableRule(ctx, ruleID)
+}
+
+// QuarantinedRules returns a snapshot of all currently quarantined rules.
+func (p *Poller) QuarantinedRules() []rules.RuleQuarantineState {
+	if p == nil || p.registry == nil {
+		return nil
+	}
+	return p.registry.QuarantinedRules()
+}
+
+func (p *Poller) bindRegistryHooks() {
+	if p == nil || p.registry == nil {
+		return
+	}
+	p.registry.WithQuarantineHook(func(ctx context.Context, state rules.RuleQuarantineState) {
+		handleQuarantineTransition(ctx, p.log, p.metrics, p.store, p.registry, state)
+	})
+	p.registry.WithEvalObserver(func(_ context.Context, obs rules.EvalObservation) {
+		handleEvalObservation(p.log, p.metrics, p.slowRuleThreshold, obs)
+	})
 }
 
 // Run polls until ctx is cancelled. RPC errors back off exponentially
@@ -828,8 +890,10 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 		return true
 	}
 
+	orderedMonitors := orderMonitorsByWorkspaceFairness(monitors)
+	workspaceElapsed := make(map[string]time.Duration)
 	processed := true
-	for _, m := range monitors {
+	for _, m := range orderedMonitors {
 		ruleList, err := p.listRulesForCycle(ctx, byContract, m.ID)
 		if err != nil {
 			p.log.Error("list rules", "monitor_id", m.ID, "err", err)
@@ -847,6 +911,21 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 				}
 				continue
 			}
+			if p.workspaceEvalBudget > 0 && workspaceElapsed[m.WorkspaceID] >= p.workspaceEvalBudget {
+				p.metrics.RecordWorkspaceRuleBudgetExhausted(m.WorkspaceID)
+				if p.log != nil {
+					p.log.Warn("workspace rule evaluation budget exceeded; skipping rule for event",
+						"workspace_id", m.WorkspaceID,
+						"monitor_id", m.ID,
+						"rule_id", rule.ID,
+						"rule_type", rule.Type,
+						"event_id", decoded.ID,
+						"budget", p.workspaceEvalBudget,
+						"elapsed", workspaceElapsed[m.WorkspaceID],
+					)
+				}
+				continue
+			}
 			// The rule id rides in the context so a stateful evaluator (the
 			// frequency rule) can key its per-rule state.
 			p.evaluations++
@@ -855,11 +934,19 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 			start := time.Now()
 			matched, err := p.registry.Evaluate(ruleCtx, rule.Type, decoded, rule.Params)
 			duration := time.Since(start)
+			workspaceElapsed[m.WorkspaceID] += duration
 			if p.metrics != nil {
 				p.metrics.RecordRuleEval(rule.Type, matched, err, duration)
 			}
 			if err != nil {
-				p.log.Warn("rule evaluation failed", "rule_id", rule.ID, "event_id", decoded.ID, "err", err)
+				if rules.IsRuleIsolatedFailure(err) {
+					logIsolatedRuleFailure(p.log, m, rule, decoded.ID, err)
+					continue
+				}
+				if p.log != nil {
+					p.log.Warn("rule evaluation failed due to storage error",
+						"rule_id", rule.ID, "monitor_id", m.ID, "event_id", decoded.ID, "err", err)
+				}
 				processed = false
 				continue
 			}

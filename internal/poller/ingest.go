@@ -3,6 +3,7 @@ package poller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -38,15 +39,25 @@ type Ingestor struct {
 	// live is the optional SSE fan-out. When set, every alert this Ingestor
 	// creates for a live event is published to it; nil (the NewIngestor
 	// default) disables live alerts entirely.
-	live       *broadcast.Broadcaster
-	enricher   *alerts.Enricher
-	usageMeter *usage.Meter
+	live                *broadcast.Broadcaster
+	enricher            *alerts.Enricher
+	usageMeter          *usage.Meter
+	slowRuleThreshold   time.Duration
+	workspaceEvalBudget time.Duration
 }
 
 // NewIngestor wires an Ingestor. d receives every alert unless the caller
 // disables delivery (HandleOptions.Deliver).
 func NewIngestor(st IngestStore, reg *rules.Registry, d Dispatcher, log *slog.Logger) *Ingestor {
-	return &Ingestor{store: st, registry: reg, dispatch: d, log: log}
+	in := &Ingestor{
+		store:               st,
+		registry:            reg,
+		dispatch:            d,
+		log:                 log,
+		workspaceEvalBudget: rules.DefaultWorkspaceEvalBudget,
+	}
+	in.bindRegistryHooks()
+	return in
 }
 
 // WithMetrics attaches Prometheus instrumentation to alert evaluation.
@@ -72,6 +83,60 @@ func (in *Ingestor) WithPublisher(b *broadcast.Broadcaster) *Ingestor {
 func (in *Ingestor) WithEnricher(e *alerts.Enricher) *Ingestor {
 	in.enricher = e
 	return in
+}
+
+// WithRuleTimeout configures the per-rule evaluation timeout on the registry.
+func (in *Ingestor) WithRuleTimeout(d time.Duration) *Ingestor {
+	if in.registry != nil {
+		in.registry.WithEvalTimeout(d)
+	}
+	return in
+}
+
+// WithRuleQuarantineThreshold configures the consecutive failure count that
+// quarantines a rule.
+func (in *Ingestor) WithRuleQuarantineThreshold(threshold int) *Ingestor {
+	if in.registry != nil {
+		in.registry.WithQuarantineThreshold(threshold)
+	}
+	return in
+}
+
+// WithWorkspaceEvalBudget bounds how much total rule-evaluation time a single
+// workspace may consume on one event before its remaining rules are skipped
+// for that event.
+func (in *Ingestor) WithWorkspaceEvalBudget(d time.Duration) *Ingestor {
+	in.workspaceEvalBudget = d
+	return in
+}
+
+// ReenableRule clears any quarantine and failure strikes for ruleID and resets
+// its stateful evaluator state.
+func (in *Ingestor) ReenableRule(ctx context.Context, ruleID int64) bool {
+	if in == nil || in.registry == nil {
+		return false
+	}
+	return in.registry.ReenableRule(ctx, ruleID)
+}
+
+// QuarantinedRules returns a snapshot of all currently quarantined rules.
+func (in *Ingestor) QuarantinedRules() []rules.RuleQuarantineState {
+	if in == nil || in.registry == nil {
+		return nil
+	}
+	return in.registry.QuarantinedRules()
+}
+
+func (in *Ingestor) bindRegistryHooks() {
+	if in == nil || in.registry == nil {
+		return
+	}
+	in.registry.WithQuarantineHook(func(ctx context.Context, state rules.RuleQuarantineState) {
+		handleQuarantineTransition(ctx, in.log, in.metrics, in.store, in.registry, state)
+	})
+	in.registry.WithEvalObserver(func(_ context.Context, obs rules.EvalObservation) {
+		handleEvalObservation(in.log, in.metrics, in.slowRuleThreshold, obs)
+	})
 }
 
 // HandleOptions controls how one event's matches are recorded.
@@ -100,7 +165,9 @@ type HandleResult struct {
 // logged, not fatal: one bad event must not stall ingestion.
 func (in *Ingestor) Handle(ctx context.Context, decoded *stellar.DecodedEvent, monitors []store.Monitor, opts HandleOptions) HandleResult {
 	var res HandleResult
-	for _, m := range monitors {
+	orderedMonitors := orderMonitorsByWorkspaceFairness(monitors)
+	workspaceElapsed := make(map[string]time.Duration)
+	for _, m := range orderedMonitors {
 		ruleList, err := in.store.ListRules(ctx, m.ID, true)
 		if err != nil {
 			in.log.Error("list rules", "monitor_id", m.ID, "err", err)
@@ -108,13 +175,41 @@ func (in *Ingestor) Handle(ctx context.Context, decoded *stellar.DecodedEvent, m
 		}
 		var evals int64
 		for _, rule := range ruleList {
+			if in.workspaceEvalBudget > 0 && workspaceElapsed[m.WorkspaceID] >= in.workspaceEvalBudget {
+				in.metrics.RecordWorkspaceRuleBudgetExhausted(m.WorkspaceID)
+				if in.log != nil {
+					in.log.Warn("workspace rule evaluation budget exceeded; skipping rule for event",
+						"workspace_id", m.WorkspaceID,
+						"monitor_id", m.ID,
+						"rule_id", rule.ID,
+						"rule_type", rule.Type,
+						"event_id", decoded.ID,
+						"budget", in.workspaceEvalBudget,
+						"elapsed", workspaceElapsed[m.WorkspaceID],
+					)
+				}
+				continue
+			}
 			// The rule id rides in the context so a stateful evaluator (the
 			// frequency rule) can key its per-rule state.
 			ruleCtx := rules.WithRuleVersion(rules.WithRuleID(ctx, rule.ID), rule.Version)
+			start := time.Now()
 			matched, err := in.registry.Evaluate(ruleCtx, rule.Type, decoded, rule.Params)
+			duration := time.Since(start)
+			workspaceElapsed[m.WorkspaceID] += duration
 			evals++
+			if in.metrics != nil {
+				in.metrics.RecordRuleEval(rule.Type, matched, err, duration)
+			}
 			if err != nil {
-				in.log.Warn("rule evaluation failed", "rule_id", rule.ID, "event_id", decoded.ID, "err", err)
+				if rules.IsRuleIsolatedFailure(err) {
+					logIsolatedRuleFailure(in.log, m, rule, decoded.ID, err)
+					continue
+				}
+				if in.log != nil {
+					in.log.Warn("rule evaluation failed due to storage error",
+						"rule_id", rule.ID, "monitor_id", m.ID, "event_id", decoded.ID, "err", err)
+				}
 				continue
 			}
 			if !matched {
@@ -141,6 +236,179 @@ func (in *Ingestor) Handle(ctx context.Context, decoded *stellar.DecodedEvent, m
 		}
 	}
 	return res
+}
+
+// orderMonitorsByWorkspaceFairness interleaves monitors round-robin across
+// workspaces while preserving each workspace's relative monitor order, so one
+// workspace with many monitors or slow rules cannot monopolize per-event rule
+// evaluation ahead of other workspaces watching the same contract.
+func orderMonitorsByWorkspaceFairness(monitors []store.Monitor) []store.Monitor {
+	if len(monitors) <= 1 {
+		return monitors
+	}
+	var workspaces []string
+	byWorkspace := make(map[string][]store.Monitor)
+	for _, m := range monitors {
+		ws := m.WorkspaceID
+		if _, seen := byWorkspace[ws]; !seen {
+			workspaces = append(workspaces, ws)
+		}
+		byWorkspace[ws] = append(byWorkspace[ws], m)
+	}
+	if len(workspaces) <= 1 {
+		return monitors
+	}
+	out := make([]store.Monitor, 0, len(monitors))
+	for idx := 0; len(out) < len(monitors); idx++ {
+		for _, ws := range workspaces {
+			list := byWorkspace[ws]
+			if idx < len(list) {
+				out = append(out, list[idx])
+			}
+		}
+	}
+	return out
+}
+
+func handleQuarantineTransition(
+	ctx context.Context,
+	log *slog.Logger,
+	m *metrics.Metrics,
+	st any,
+	reg *rules.Registry,
+	state rules.RuleQuarantineState,
+) {
+	totalQuarantined := 0
+	if reg != nil {
+		totalQuarantined = reg.QuarantinedCount()
+	}
+	m.RecordRuleQuarantined(state.RuleID, state.RuleType, string(state.Reason), state.Quarantined, totalQuarantined)
+	if state.Quarantined {
+		if log != nil {
+			log.Error("rule quarantined after repeated evaluation failures",
+				"rule_id", state.RuleID,
+				"rule_type", state.RuleType,
+				"rule_version", state.RuleVersion,
+				"reason", string(state.Reason),
+				"consecutive_failures", state.ConsecutiveFailures,
+				"total_failures", state.TotalFailures,
+				"last_error", state.LastError,
+				"last_duration", state.LastDuration,
+			)
+		}
+	} else {
+		if log != nil {
+			log.Info("quarantined rule re-enabled",
+				"rule_id", state.RuleID,
+				"rule_type", state.RuleType,
+				"rule_version", state.RuleVersion,
+			)
+		}
+	}
+
+	auditor, ok := st.(store.Audits)
+	if !ok || state.RuleID == 0 {
+		return
+	}
+	status := "recovered"
+	if state.Quarantined {
+		status = "quarantined"
+	}
+	detail, err := json.Marshal(map[string]any{
+		"status":               status,
+		"rule_id":              state.RuleID,
+		"rule_type":            state.RuleType,
+		"rule_version":         state.RuleVersion,
+		"reason":               string(state.Reason),
+		"consecutive_failures": state.ConsecutiveFailures,
+		"last_error":           state.LastError,
+	})
+	if err != nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	_ = auditor.CreateAuditEntry(ctx, &store.AuditEntry{
+		Actor:      "system:rule_quarantine",
+		Action:     store.AuditActionUpdate,
+		TargetType: "rule",
+		TargetID:   state.RuleID,
+		Diff:       detail,
+	})
+}
+
+func handleEvalObservation(
+	log *slog.Logger,
+	m *metrics.Metrics,
+	slowThreshold time.Duration,
+	obs rules.EvalObservation,
+) {
+	m.RecordRuleIsolatedEval(obs.RuleID, obs.RuleType, obs.RuleDuration)
+	if obs.FailureKind != rules.EvalFailureNone && obs.FailureKind != rules.EvalFailureStorage {
+		m.RecordRuleEvalFailure(obs.RuleID, obs.RuleType, string(obs.FailureKind))
+	}
+	if slowThreshold > 0 && obs.RuleDuration >= slowThreshold && log != nil {
+		log.Warn("slow rule evaluation",
+			"rule_id", obs.RuleID,
+			"rule_type", obs.RuleType,
+			"rule_duration", obs.RuleDuration,
+			"db_duration", obs.DBDuration,
+		)
+	}
+}
+
+func logIsolatedRuleFailure(log *slog.Logger, m store.Monitor, rule store.Rule, eventID string, err error) {
+	if log == nil {
+		return
+	}
+	var evalErr *rules.RuleEvalError
+	if errors.As(err, &evalErr) {
+		switch evalErr.Kind {
+		case rules.EvalFailurePanic:
+			log.Error("rule evaluation panicked and was isolated",
+				"rule_id", rule.ID,
+				"monitor_id", m.ID,
+				"workspace_id", m.WorkspaceID,
+				"rule_type", rule.Type,
+				"event_id", eventID,
+				"quarantined", evalErr.Quarantined,
+				"err", err,
+			)
+			return
+		case rules.EvalFailureTimeout:
+			log.Warn("rule evaluation timed out and was isolated",
+				"rule_id", rule.ID,
+				"monitor_id", m.ID,
+				"workspace_id", m.WorkspaceID,
+				"rule_type", rule.Type,
+				"event_id", eventID,
+				"rule_duration", evalErr.Duration,
+				"db_duration", evalErr.DBDuration,
+				"quarantined", evalErr.Quarantined,
+				"err", err,
+			)
+			return
+		case rules.EvalFailureQuarantined:
+			log.Warn("skipping quarantined rule",
+				"rule_id", rule.ID,
+				"monitor_id", m.ID,
+				"workspace_id", m.WorkspaceID,
+				"rule_type", rule.Type,
+				"event_id", eventID,
+				"err", err,
+			)
+			return
+		}
+	}
+	log.Warn("rule evaluation failed",
+		"rule_id", rule.ID,
+		"monitor_id", m.ID,
+		"workspace_id", m.WorkspaceID,
+		"rule_type", rule.Type,
+		"event_id", eventID,
+		"err", err,
+	)
 }
 
 // fireAlert persists a deduped, cooldown-gated alert and, when delivery is
