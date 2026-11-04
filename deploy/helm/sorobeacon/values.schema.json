@@ -260,6 +260,10 @@
           "type": "string",
           "description": "How long to keep alerts, e.g. 90d or 24h. Empty keeps history forever."
         },
+        "auditRetention": {
+          "type": "string",
+          "description": "How long to keep audit log entries, e.g. 90d or 24h. Empty keeps history forever."
+        },
         "configFile": {
           "type": "string",
           "description": "Path to a config file read as a fallback for unset variables. Empty disables it; the chart mounts nothing."

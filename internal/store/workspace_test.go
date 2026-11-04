@@ -312,6 +312,53 @@ func testWorkspaceIsolation(t *testing.T, newStore conformanceFactory) {
 	assert.Len(t, templatesAcme, 1)
 	assert.ErrorIs(t, st.DeleteMonitorTemplate(beta, tmpl.ID), ErrNotFound)
 
+	// --- audit log ---
+
+	require.NoError(t, st.CreateAuditEntry(acme, &AuditEntry{
+		Action:     AuditActionCreate,
+		TargetType: AuditTargetMonitor,
+		TargetID:   acmeMonitor.ID,
+		Actor:      "alice@acme",
+		ActorType:  AuditActorPerson,
+		Surface:    AuditSurfaceREST,
+		Outcome:    AuditOutcomeSucceeded,
+		StatusCode: 201,
+	}))
+	require.NoError(t, st.CreateAuditEntry(beta, &AuditEntry{
+		Action:     AuditActionCreate,
+		TargetType: AuditTargetMonitor,
+		TargetID:   betaMonitor.ID,
+		Actor:      "bot-beta",
+		ActorType:  AuditActorAutomation,
+		Surface:    AuditSurfaceREST,
+		Outcome:    AuditOutcomeSucceeded,
+		StatusCode: 201,
+	}))
+	auditAcme, err := st.ListAuditEntries(acme, AuditFilter{Limit: 50})
+	require.NoError(t, err)
+	require.Len(t, auditAcme, 1)
+	assert.Equal(t, "acme", auditAcme[0].WorkspaceID)
+	assert.Equal(t, "alice@acme", auditAcme[0].Actor)
+
+	auditBeta, err := st.ListAuditEntries(beta, AuditFilter{Limit: 50})
+	require.NoError(t, err)
+	require.Len(t, auditBeta, 1)
+	assert.Equal(t, "beta", auditBeta[0].WorkspaceID)
+	assert.Equal(t, "bot-beta", auditBeta[0].Actor)
+
+	auditDefault, err := st.ListAuditEntries(bg, AuditFilter{Limit: 50})
+	require.NoError(t, err)
+	assert.Empty(t, auditDefault, "default workspace must not see acme or beta audit records")
+
+	auditSystem, err := st.ListAuditEntries(system, AuditFilter{Limit: 50})
+	require.NoError(t, err)
+	assert.Len(t, auditSystem, 2, "operator/system context sees audit records across all workspaces")
+
+	auditSystemFiltered, err := st.ListAuditEntries(system, AuditFilter{WorkspaceID: "acme", Limit: 50})
+	require.NoError(t, err)
+	require.Len(t, auditSystemFiltered, 1)
+	assert.Equal(t, "acme", auditSystemFiltered[0].WorkspaceID)
+
 	// --- the cross-tenant scope ---
 
 	// Instance work (ingest, retention, reorg) runs under WithSystem and is the
@@ -372,7 +419,7 @@ func testDeleteByIDAllowlist(t *testing.T, newStore conformanceFactory) {
 
 // unallowlistedTableNames is checked against deleteByID's map rather than its
 // SQL, so it lives with the test that runs the method.
-var unallowlistedTableNames = []string{"workspaces", "rules", "alerts", "monitor_channels", "ingest_state"}
+var unallowlistedTableNames = []string{"workspaces", "rules", "alerts", "monitor_channels", "ingest_state", "audit_log"}
 
 // TestDeleteTableAllowlist asserts the allowlist as data, so it is enforced
 // without a database and cannot drift from a backend's SQL silently.
@@ -422,6 +469,7 @@ var unscopedStoreMethods = map[string]string{
 	"RuleFiredWithin":                    "the inhibition check asks about one rule the dispatcher already resolved; rule_id implies the tenant",
 	"transferAlertTimeRange":             "the SQLite/Postgres transfer spans every workspace: it reads the copied alerts' created_at range to size the target's partitions before any row arrives",
 	"transferDeriveTable":                "the SQLite/Postgres transfer spans every workspace: it rebuilds alert_dedup from the alerts the transfer just copied",
+	"DeleteExpiredAuditEntries":          "audit retention sweeps every workspace under AUDIT_RETENTION",
 }
 
 // sqlSourceFiles lists every non-test Go source in the package directory.
@@ -463,7 +511,7 @@ func sqlSourceFiles(t *testing.T) []string {
 // the position test is only what stops a log message saying "alerts" from
 // obliging a predicate.
 func TestEveryScopedQueryCarriesWorkspace(t *testing.T) {
-	tenantTableRead := regexp.MustCompile(`(?i)\b(?:FROM|INTO|UPDATE|JOIN)\s+(?:ONLY\s+)?(monitors|channels|alerts|saved_searches|monitor_templates|api_tokens)\b`)
+	tenantTableRead := regexp.MustCompile(`(?i)\b(?:FROM|INTO|UPDATE|JOIN)\s+(?:ONLY\s+)?(monitors|channels|alerts|saved_searches|monitor_templates|api_tokens|audit_log)\b`)
 
 	for _, file := range sqlSourceFiles(t) {
 		functions := sqlFunctions(t, file)

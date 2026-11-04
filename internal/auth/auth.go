@@ -550,7 +550,11 @@ func (a *Authenticator) AuthenticateRequest(r *http.Request) (*Principal, AuthSt
 		return nil, AuthUnauthenticated
 	}
 	if !a.Enabled() {
-		return &Principal{Workspace: workspace.Default, Role: RoleAdmin}, AuthOK
+		actorType := "person"
+		if _, ok := Bearer(r.Header.Get("Authorization")); ok {
+			actorType = "automation"
+		}
+		return &Principal{Workspace: workspace.Default, Role: RoleAdmin, ActorType: actorType}, AuthOK
 	}
 	if raw, ok := Bearer(r.Header.Get("Authorization")); ok {
 		if strings.HasPrefix(raw, TokenPrefix) {
@@ -565,7 +569,12 @@ func (a *Authenticator) AuthenticateRequest(r *http.Request) (*Principal, AuthSt
 			return p, AuthOK
 		}
 		if entry, ok := a.lookupStatic(raw); ok {
-			return &Principal{Workspace: entry.workspace, Role: entry.role}, AuthOK
+			return &Principal{
+				Workspace: entry.workspace,
+				Role:      entry.role,
+				Name:      "api-token",
+				ActorType: "automation",
+			}, AuthOK
 		}
 		if a.oidc.Enabled() && strings.Count(raw, ".") == 2 {
 			id, err := a.oidc.VerifyBearer(r.Context(), raw)
@@ -575,10 +584,18 @@ func (a *Authenticator) AuthenticateRequest(r *http.Request) (*Principal, AuthSt
 				}
 				return nil, AuthUnauthenticated
 			}
+			name := id.Email
+			actorType := "person"
+			if name == "" {
+				name = id.Subject
+				actorType = "automation"
+			}
 			p := &Principal{
 				Workspace: id.Workspace,
 				Role:      id.Role,
 				Grants:    cloneGrants(id.Grants),
+				Name:      name,
+				ActorType: actorType,
 			}
 			if len(id.Scopes) > 0 {
 				p.restricted = true
@@ -606,6 +623,8 @@ func (a *Authenticator) AuthenticateRequest(r *http.Request) (*Principal, AuthSt
 		Workspace: info.workspace,
 		Role:      info.role,
 		Grants:    cloneGrants(info.grants),
+		Name:      info.oidcSubject,
+		ActorType: "person",
 	}, AuthOK
 }
 

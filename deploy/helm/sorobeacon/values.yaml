@@ -181,6 +181,9 @@ config:
   # or 24h. Empty keeps history forever, so an upgrade never starts deleting
   # anything by accident.
   alertRetention: ""
+  # How long to keep audit log entries, e.g. 90d or 24h. Empty keeps audit
+  # history forever.
+  auditRetention: ""
   # Comma-separated RPC endpoints to fail over between. Empty uses rpcUrl
   # alone. The first entry is the primary.
   rpcUrls: ""

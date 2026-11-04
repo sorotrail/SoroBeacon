@@ -3667,24 +3667,64 @@ func (s *SQLite) DeleteDigestAlerts(ctx context.Context, channelID int64, ids []
 // --- audit log ---
 
 func (s *SQLite) CreateAuditEntry(ctx context.Context, e *AuditEntry) error {
-	diff := e.Diff
-	if len(diff) == 0 {
-		diff = json.RawMessage(`{}`)
+	NormalizeAuditEntry(ctx, e)
+	if e.CreatedAt.IsZero() {
+		e.CreatedAt = time.Now().UTC().Truncate(time.Millisecond)
+	} else {
+		e.CreatedAt = e.CreatedAt.UTC().Truncate(time.Millisecond)
 	}
-	var created string
-	if err := s.db.QueryRowContext(ctx,
-		`INSERT INTO audit_log (actor, action, target_type, target_id, diff) VALUES (?, ?, ?, ?, ?) RETURNING id, created_at`,
-		e.Actor, e.Action, e.TargetType, e.TargetID, string(diff)).Scan(&e.ID, &created); err != nil {
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return mapSQLiteErr(err)
 	}
-	var err error
-	e.CreatedAt, err = parseSQLiteTime(created)
-	return err
+	defer func() { _ = tx.Rollback() }()
+
+	var prevHash string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE((SELECT record_hash FROM audit_log WHERE workspace_id = ? ORDER BY id DESC LIMIT 1), '')`,
+		e.WorkspaceID).Scan(&prevHash); err != nil {
+		return mapSQLiteErr(err)
+	}
+	e.PrevHash = prevHash
+	e.RecordHash = ComputeAuditRecordHash(*e)
+
+	var created string
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO audit_log (
+			workspace_id, actor, actor_type, action, target_type, target_id,
+			resource_id, surface, source_ip, outcome, status_code, reason,
+			diff, prev_hash, record_hash, created_at
+		) VALUES (
+			?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?
+		) RETURNING id, created_at`,
+		e.WorkspaceID, e.Actor, e.ActorType, e.Action, e.TargetType, e.TargetID,
+		e.ResourceID, e.Surface, e.SourceIP, e.Outcome, e.StatusCode, e.Reason,
+		string(e.Diff), e.PrevHash, e.RecordHash, sqliteTimeString(e.CreatedAt),
+	).Scan(&e.ID, &created); err != nil {
+		return mapSQLiteErr(err)
+	}
+	if e.CreatedAt, err = parseSQLiteTime(created); err != nil {
+		return err
+	}
+	return mapSQLiteErr(tx.Commit())
 }
 
 func (s *SQLite) ListAuditEntries(ctx context.Context, f AuditFilter) ([]AuditEntry, error) {
 	where := []string{"1 = 1"}
 	args := []any{}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		if f.WorkspaceID != "" && f.WorkspaceID != string(ws) {
+			return []AuditEntry{}, nil
+		}
+		where = append(where, "workspace_id = ?")
+		args = append(args, string(ws))
+	} else if f.WorkspaceID != "" {
+		where = append(where, "workspace_id = ?")
+		args = append(args, f.WorkspaceID)
+	}
 	if f.TargetType != "" {
 		where = append(where, "target_type = ?")
 		args = append(args, f.TargetType)
@@ -3692,6 +3732,14 @@ func (s *SQLite) ListAuditEntries(ctx context.Context, f AuditFilter) ([]AuditEn
 	if f.TargetID != 0 {
 		where = append(where, "target_id = ?")
 		args = append(args, f.TargetID)
+	}
+	if f.ResourceID != "" {
+		where = append(where, "resource_id = ?")
+		args = append(args, f.ResourceID)
+	}
+	if f.Action != "" {
+		where = append(where, "action = ?")
+		args = append(args, f.Action)
 	}
 	if !f.From.IsZero() {
 		where = append(where, "created_at >= ?")
@@ -3705,13 +3753,28 @@ func (s *SQLite) ListAuditEntries(ctx context.Context, f AuditFilter) ([]AuditEn
 		where = append(where, "actor = ?")
 		args = append(args, f.Actor)
 	}
+	if f.ActorType != "" {
+		where = append(where, "actor_type = ?")
+		args = append(args, f.ActorType)
+	}
+	if f.Surface != "" {
+		where = append(where, "surface = ?")
+		args = append(args, f.Surface)
+	}
+	if f.Outcome != "" {
+		where = append(where, "outcome = ?")
+		args = append(args, f.Outcome)
+	}
 	if f.AfterID != 0 {
 		// The listing is id DESC, so the next page holds strictly smaller ids.
 		where = append(where, "id < ?")
 		args = append(args, f.AfterID)
 	}
 	args = append(args, clampAuditLimit(f.Limit))
-	q := `SELECT id, actor, action, target_type, target_id, diff, created_at FROM audit_log WHERE ` +
+	q := `SELECT id, workspace_id, actor, actor_type, action, target_type, target_id,
+	             resource_id, surface, source_ip, outcome, status_code, reason,
+	             diff, prev_hash, record_hash, created_at
+	        FROM audit_log WHERE ` +
 		strings.Join(where, " AND ") + ` ORDER BY id DESC LIMIT ?`
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -3722,7 +3785,11 @@ func (s *SQLite) ListAuditEntries(ctx context.Context, f AuditFilter) ([]AuditEn
 	for rows.Next() {
 		var e AuditEntry
 		var diff, created string
-		if err := rows.Scan(&e.ID, &e.Actor, &e.Action, &e.TargetType, &e.TargetID, &diff, &created); err != nil {
+		if err := rows.Scan(
+			&e.ID, &e.WorkspaceID, &e.Actor, &e.ActorType, &e.Action, &e.TargetType, &e.TargetID,
+			&e.ResourceID, &e.Surface, &e.SourceIP, &e.Outcome, &e.StatusCode, &e.Reason,
+			&diff, &e.PrevHash, &e.RecordHash, &created,
+		); err != nil {
 			return nil, err
 		}
 		e.Diff = json.RawMessage(diff)

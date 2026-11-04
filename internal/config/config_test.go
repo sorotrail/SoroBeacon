@@ -50,6 +50,7 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("OIDC_WORKSPACE_CLAIM", "")
 	t.Setenv("OIDC_ALLOWED_DOMAINS", "")
 	t.Setenv("OIDC_LOGIN_STATE_TTL", "")
+	t.Setenv("AUDIT_RETENTION", "")
 
 	cfg, err := Load()
 	require.NoError(t, err)
@@ -73,6 +74,7 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Zero(t, cfg.DatabaseMaxConnLifetime)
 	assert.Zero(t, cfg.DatabaseMaxConnIdleTime)
 	assert.Equal(t, time.Duration(0), cfg.AlertRetention)
+	assert.Equal(t, time.Duration(0), cfg.AuditRetention)
 	assert.Equal(t, DefaultMonitorSilentAfter, cfg.MonitorSilentAfter)
 	assert.Zero(t, cfg.NotifyRateLimitSlackRPS)
 	assert.Zero(t, cfg.NotifyRateLimitTelegramRPS)
@@ -1486,5 +1488,21 @@ func TestSecretResolutionConfig(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "postgres://envuser:envpass@envhost:5432/envdb", cfg.DatabaseURL)
 	})
+}
+
+func TestLoadAuditRetention(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("ALERT_RETENTION", "30d")
+	t.Setenv("AUDIT_RETENTION", "365d")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 30*24*time.Hour, cfg.AlertRetention)
+	assert.Equal(t, 365*24*time.Hour, cfg.AuditRetention, "AUDIT_RETENTION is independent of ALERT_RETENTION")
+
+	t.Setenv("AUDIT_RETENTION", "0s")
+	_, err = Load()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "AUDIT_RETENTION")
 }
 

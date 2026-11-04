@@ -407,6 +407,22 @@ func newIsolationFixture(t *testing.T, st store.Store) *isolationFixture {
 	_, _, err = tokenMgr.Rotate(betaCtx, betaRotTok.ID, canaryBetaTokenName+"-rotating", []auth.Scope{auth.ScopeMonitorsRead}, time.Hour, time.Time{})
 	require.NoError(t, err)
 
+	// Seed audit entries in alpha and beta to verify workspace isolation on GET /audit.
+	require.NoError(t, st.CreateAuditEntry(alphaCtx, &store.AuditEntry{
+		Actor:      "alpha-admin",
+		Action:     store.AuditActionCreate,
+		TargetType: store.AuditTargetMonitor,
+		TargetID:   alphaMon.ID,
+		Diff:       json.RawMessage(`{"fields":["name"]}`),
+	}))
+	require.NoError(t, st.CreateAuditEntry(betaCtx, &store.AuditEntry{
+		Actor:      canaryBetaTokenName,
+		Action:     store.AuditActionCreate,
+		TargetType: store.AuditTargetMonitor,
+		TargetID:   betaMon.ID,
+		Diff:       json.RawMessage(`{"fields":["name"]}`),
+	}))
+
 	return &isolationFixture{
 		st:                   st,
 		broadcaster:          bcast,
@@ -487,8 +503,6 @@ var restCrossWorkspaceExceptions = map[string]string{
 	"POST /graphql/operations":        "persisted_operations is an instance-wide registry of GraphQL query documents.",
 	"GET /graphql/operations/{id}":    "persisted_operations is an instance-wide registry of GraphQL query documents.",
 	"DELETE /graphql/operations/{id}": "persisted_operations is an instance-wide registry of GraphQL query documents.",
-
-	"GET /audit": "audit_log is an instance-wide administrative audit trail gated to RoleAdmin.",
 }
 
 // assertSameNotFoundStatus verifies that presenting workspace beta's object ID
@@ -994,6 +1008,15 @@ func buildRESTIsolationChecks(fx *isolationFixture) map[string]func(t *testing.T
 			assert.Equal(t, "alpha", bundle.Manifest.WorkspaceID)
 
 			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodGet, "/workspaces/beta/export", "")
+			assert.Equal(t, http.StatusForbidden, crossCode)
+		},
+		"GET /audit": func(t *testing.T) {
+			code, raw := fx.doREST(t, fx.alphaToken, http.MethodGet, "/audit", "")
+			require.Equal(t, http.StatusOK, code)
+			assert.Contains(t, string(raw), "alpha-admin")
+			assert.NotContains(t, string(raw), canaryBetaTokenName)
+
+			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodGet, "/audit?workspace=beta", "")
 			assert.Equal(t, http.StatusForbidden, crossCode)
 		},
 	}

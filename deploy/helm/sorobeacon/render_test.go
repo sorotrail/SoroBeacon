@@ -194,6 +194,7 @@ func TestRender_ConfigDefaultsMatchTheApplication(t *testing.T) {
 		"RATE_LIMIT_TRUST_FORWARDED":  "false",
 		"CORS_ALLOWED_ORIGINS":        "",
 		"ALERT_RETENTION":             "",
+		"AUDIT_RETENTION":             "",
 		"DATABASE_MAX_CONNS":          "0",
 		"DATABASE_MIN_CONNS":          "0",
 		"DATABASE_MAX_CONN_LIFETIME":  "",

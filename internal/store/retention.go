@@ -318,13 +318,20 @@ func (p *Postgres) SetWorkspaceRetentionPolicy(ctx context.Context, in SetWorksp
 		"confirm_shorten":            in.ConfirmShorten,
 		"policy_source":              RetentionPolicySourceWorkspace,
 	})
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO audit_log (actor, action, target_type, target_id, diff) VALUES ($1, $2, $3, $4, $5)`,
-		actor, AuditActionUpdate, AuditTargetWorkspaceRetention, int64(0), diffPayload); err != nil {
+
+	if err := tx.Commit(ctx); err != nil {
 		return WorkspaceRetentionPolicy{}, mapErr(err)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
+	if err := p.CreateAuditEntry(workspace.With(ctx, ws), &AuditEntry{
+		WorkspaceID: string(ws),
+		Actor:       actor,
+		Action:      AuditActionUpdate,
+		TargetType:  AuditTargetWorkspaceRetention,
+		TargetID:    0,
+		ResourceID:  string(ws),
+		Diff:        diffPayload,
+	}); err != nil {
 		return WorkspaceRetentionPolicy{}, mapErr(err)
 	}
 
@@ -372,11 +379,15 @@ func (p *Postgres) DeleteWorkspaceRetentionPolicy(ctx context.Context, ws worksp
 		return WorkspaceRetentionPolicy{}, ErrRetentionShortenUnconfirmed
 	}
 
+	var (
+		actorName   string
+		diffPayload []byte
+	)
 	if prevConfigured {
 		if _, err := tx.Exec(ctx, `DELETE FROM workspace_retention_policies WHERE workspace_id = $1`, string(ws)); err != nil {
 			return WorkspaceRetentionPolicy{}, mapErr(err)
 		}
-		actorName := strings.TrimSpace(actor)
+		actorName = strings.TrimSpace(actor)
 		if actorName == "" {
 			actorName = string(ws)
 		}
@@ -384,7 +395,7 @@ func (p *Postgres) DeleteWorkspaceRetentionPolicy(ctx context.Context, ws worksp
 		if instSec > 0 {
 			fallbackSource = RetentionPolicySourceInstance
 		}
-		diffPayload, _ := json.Marshal(map[string]any{
+		diffPayload, _ = json.Marshal(map[string]any{
 			"workspace_id":               string(ws),
 			"previous_retention_seconds": prevSec,
 			"previous_effective_seconds": prevSec,
@@ -394,15 +405,24 @@ func (p *Postgres) DeleteWorkspaceRetentionPolicy(ctx context.Context, ws worksp
 			"confirm_shorten":            confirmShorten,
 			"policy_source":              fallbackSource,
 		})
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO audit_log (actor, action, target_type, target_id, diff) VALUES ($1, $2, $3, $4, $5)`,
-			actorName, AuditActionDelete, AuditTargetWorkspaceRetention, int64(0), diffPayload); err != nil {
-			return WorkspaceRetentionPolicy{}, mapErr(err)
-		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return WorkspaceRetentionPolicy{}, mapErr(err)
+	}
+
+	if prevConfigured {
+		if err := p.CreateAuditEntry(workspace.With(ctx, ws), &AuditEntry{
+			WorkspaceID: string(ws),
+			Actor:       actorName,
+			Action:      AuditActionDelete,
+			TargetType:  AuditTargetWorkspaceRetention,
+			TargetID:    0,
+			ResourceID:  string(ws),
+			Diff:        diffPayload,
+		}); err != nil {
+			return WorkspaceRetentionPolicy{}, mapErr(err)
+		}
 	}
 
 	return resolvePolicyFields(ws, 0, false, "", nil, instRetention, time.Now().UTC()), nil
