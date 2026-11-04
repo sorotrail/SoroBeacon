@@ -725,3 +725,36 @@ func (s *FairnessScheduler) ChannelBacklog(channelID int64) ChannelBacklog {
 	}
 	return p.backlog()
 }
+
+// StopWorkspace purges any queued asynchronous submissions for wsID and removes
+// the workspace and channel slot pools so no queued work for a deleting
+// workspace can start after teardown begins.
+func (s *FairnessScheduler) StopWorkspace(wsID string, channelIDs []int64) int {
+	if s == nil {
+		return 0
+	}
+	ws := normalizeWorkspaceID(wsID)
+	s.mu.Lock()
+	wsPool := s.workspaces[ws]
+	delete(s.workspaces, ws)
+	for _, chID := range channelIDs {
+		delete(s.channels, chID)
+	}
+	s.mu.Unlock()
+
+	dropped := 0
+	if wsPool != nil {
+		wsPool.submitMu.Lock()
+		dropped = len(wsPool.submitQueue)
+		wsPool.submitQueue = nil
+		wsPool.submitMu.Unlock()
+	}
+	if m := s.getMetrics(); m != nil {
+		m.SetNotifyWorkspaceBacklog(ws, "first_attempt", 0, 0)
+		m.SetNotifyWorkspaceBacklog(ws, "retry", 0, 0)
+		for _, chID := range channelIDs {
+			m.SetNotifyChannelBacklog(chID, 0, 0)
+		}
+	}
+	return dropped
+}

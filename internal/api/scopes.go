@@ -51,9 +51,9 @@ var routeScopes = auth.NewRouteTable(map[string][]auth.Scope{
 	"DELETE /channels/{id}":    {auth.ScopeChannelsWrite},
 	// Testing a channel sends a real notification through it, which is a write
 	// even though nothing is stored.
-	"POST /channels/{id}/test":      {auth.ScopeChannelsWrite},
-	"POST /channels/bulk":           {auth.ScopeChannelsWrite},
-	"POST /channels/{id}/duplicate": {auth.ScopeChannelsWrite},
+	"POST /channels/{id}/test":                {auth.ScopeChannelsWrite},
+	"POST /channels/bulk":                     {auth.ScopeChannelsWrite},
+	"POST /channels/{id}/duplicate":           {auth.ScopeChannelsWrite},
 	"GET /channels/{id}/keys":                 {auth.ScopeChannelsRead},
 	"POST /channels/{id}/keys/rotate":         {auth.ScopeChannelsWrite},
 	"POST /channels/{id}/keys/{keyID}/retire": {auth.ScopeChannelsWrite},
@@ -85,17 +85,39 @@ var routeScopes = auth.NewRouteTable(map[string][]auth.Scope{
 	"GET /quotas":             {auth.ScopeStatsRead},
 	"PUT /quotas":             {auth.ScopeMonitorsWrite},
 
-	"POST /tokens":             {auth.ScopeTokensWrite},
-	"GET /tokens":              {auth.ScopeTokensRead},
-	"GET /tokens/{id}":         {auth.ScopeTokensRead},
+	"DELETE /workspaces/{id}": {
+		auth.ScopeMonitorsWrite,
+		auth.ScopeChannelsWrite,
+		auth.ScopeAlertsWrite,
+		auth.ScopeTemplatesWrite,
+		auth.ScopeTokensWrite,
+	},
+	"POST /workspaces/{id}/delete": {
+		auth.ScopeMonitorsWrite,
+		auth.ScopeChannelsWrite,
+		auth.ScopeAlertsWrite,
+		auth.ScopeTemplatesWrite,
+		auth.ScopeTokensWrite,
+	},
+	"GET /workspaces/{id}/delete": {
+		auth.ScopeMonitorsRead,
+		auth.ScopeChannelsRead,
+		auth.ScopeAlertsRead,
+		auth.ScopeTemplatesRead,
+		auth.ScopeTokensRead,
+	},
+
+	"POST /tokens":              {auth.ScopeTokensWrite},
+	"GET /tokens":               {auth.ScopeTokensRead},
+	"GET /tokens/{id}":          {auth.ScopeTokensRead},
 	"POST /tokens/{id}/rotate":  {auth.ScopeTokensWrite},
 	"POST /tokens/{id}/abandon": {auth.ScopeTokensWrite},
-	"POST /tokens/{id}/revoke": {auth.ScopeTokensWrite},
+	"POST /tokens/{id}/revoke":  {auth.ScopeTokensWrite},
 
 	// Persisted GraphQL operations:
-	"GET /graphql/operations":        {auth.ScopeNone},
-	"GET /graphql/operations/{id}":   {auth.ScopeNone},
-	"POST /graphql/operations":       {auth.ScopeMonitorsWrite},
+	"GET /graphql/operations":         {auth.ScopeNone},
+	"GET /graphql/operations/{id}":    {auth.ScopeNone},
+	"POST /graphql/operations":        {auth.ScopeMonitorsWrite},
 	"DELETE /graphql/operations/{id}": {auth.ScopeMonitorsWrite},
 
 	// Routes main added after the scope table was first written. Each one is

@@ -94,6 +94,7 @@ var transferTables = []transferTable{
 	{name: "workspace_quotas", key: []string{"workspace_id"}},
 	{name: "workspace_query_budget_state", key: []string{"workspace_id"}},
 	{name: "idempotency_keys", key: []string{"workspace_id", "idempotency_key"}},
+	{name: "workspace_deletions", key: []string{"workspace_id"}},
 }
 
 // transferDerived marks plan tables that only one backend physically has,

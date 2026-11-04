@@ -610,6 +610,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 
 	// HTTP: JSON API under /api/v1, dashboard at /.
 	apiSrv := api.New(st, registry, factory, health, log).
+		WithDispatcher(dispatcher).
 		WithPoller(p).
 		WithNetworks(config.NetworkNames(cfg.Networks)).
 		WithLeadership(leader).

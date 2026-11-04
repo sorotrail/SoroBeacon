@@ -254,7 +254,7 @@ type Rule struct {
 // MaxRunbookURLLen and MaxResponseGuidanceLen bound operator-supplied runbook
 // links and triage guidance stored on workspaces, monitors, rules, and alerts.
 const (
-	MaxRunbookURLLen      = 2048
+	MaxRunbookURLLen       = 2048
 	MaxResponseGuidanceLen = 500
 )
 
@@ -2012,6 +2012,113 @@ type Escalations interface {
 	AcknowledgeAlert(ctx context.Context, alertID int64, actor string) error
 }
 
+// WorkspaceDeletionStatus tracks the lifecycle of a workspace deletion.
+type WorkspaceDeletionStatus string
+
+const (
+	WorkspaceDeletionStatusPreview           WorkspaceDeletionStatus = "preview"
+	WorkspaceDeletionStatusStopping          WorkspaceDeletionStatus = "stopping"
+	WorkspaceDeletionStatusDeletingAlerts    WorkspaceDeletionStatus = "deleting_alerts"
+	WorkspaceDeletionStatusDeletingResources WorkspaceDeletionStatus = "deleting_resources"
+	WorkspaceDeletionStatusCompleted         WorkspaceDeletionStatus = "completed"
+)
+
+// DefaultWorkspaceDeleteBatchSize is the default number of alerts removed per
+// bounded batch transaction during workspace deletion.
+const DefaultWorkspaceDeleteBatchSize = 500
+
+// WorkspaceDeletionCounts holds per-table row counts for a workspace deletion
+// (either previewed via dry-run or actually removed).
+type WorkspaceDeletionCounts struct {
+	Monitors                         int64 `json:"monitors"`
+	Rules                            int64 `json:"rules"`
+	RuleAbsenceState                 int64 `json:"rule_absence_state"`
+	AlertInhibitions                 int64 `json:"alert_inhibitions"`
+	Channels                         int64 `json:"channels"`
+	MonitorChannels                  int64 `json:"monitor_channels"`
+	ChannelSigningKeys               int64 `json:"channel_signing_keys"`
+	ChannelAckReconciliations        int64 `json:"channel_ack_reconciliations"`
+	PendingDigests                   int64 `json:"pending_digests"`
+	EscalationPolicies               int64 `json:"escalation_policies"`
+	EscalationSteps                  int64 `json:"escalation_steps"`
+	EscalationStepChannels           int64 `json:"escalation_step_channels"`
+	MaintenanceWindows               int64 `json:"maintenance_windows"`
+	Backfills                        int64 `json:"backfills"`
+	Alerts                           int64 `json:"alerts"`
+	AlertDedup                       int64 `json:"alert_dedup"`
+	DeliveryAttempts                 int64 `json:"delivery_attempts"`
+	DeadLetters                      int64 `json:"dead_letters"`
+	AlertEscalations                 int64 `json:"alert_escalations"`
+	SavedSearches                    int64 `json:"saved_searches"`
+	MonitorTemplates                 int64 `json:"monitor_templates"`
+	APITokens                        int64 `json:"api_tokens"`
+	WorkspaceUsageRollups            int64 `json:"workspace_usage_rollups"`
+	WorkspaceNotificationUsageRollup int64 `json:"workspace_notification_usage_rollups"`
+	WorkspaceQuotas                  int64 `json:"workspace_quotas"`
+	WorkspaceQueryBudgetState        int64 `json:"workspace_query_budget_state"`
+	IdempotencyKeys                  int64 `json:"idempotency_keys"`
+	Workspaces                       int64 `json:"workspaces"`
+}
+
+// Total returns the total number of rows across all workspace-owned tables.
+func (c WorkspaceDeletionCounts) Total() int64 {
+	return c.Monitors + c.Rules + c.RuleAbsenceState + c.AlertInhibitions +
+		c.Channels + c.MonitorChannels + c.ChannelSigningKeys + c.ChannelAckReconciliations +
+		c.PendingDigests + c.EscalationPolicies + c.EscalationSteps + c.EscalationStepChannels +
+		c.MaintenanceWindows + c.Backfills + c.Alerts + c.AlertDedup +
+		c.DeliveryAttempts + c.DeadLetters + c.AlertEscalations + c.SavedSearches +
+		c.MonitorTemplates + c.APITokens + c.WorkspaceUsageRollups +
+		c.WorkspaceNotificationUsageRollup + c.WorkspaceQuotas +
+		c.WorkspaceQueryBudgetState + c.IdempotencyKeys + c.Workspaces
+}
+
+// WorkspaceDeletionOptions configures a DeleteWorkspace call.
+type WorkspaceDeletionOptions struct {
+	// DryRun, when true, inspects and returns the exact counts of rows that
+	// would be deleted for the workspace without modifying any state.
+	DryRun bool
+	// Confirm must equal string(id) when DryRun is false.
+	Confirm string
+	// Actor is the authenticated principal or request ID initiating the deletion.
+	Actor string
+	// BatchSize is the maximum number of alerts deleted per transaction batch
+	// (defaults to DefaultWorkspaceDeleteBatchSize when <= 0).
+	BatchSize int
+	// MaxAlertBatches, when > 0, stops after at most MaxAlertBatches alert
+	// batches so callers or tests can bound execution time per call and resume
+	// cleanly on the next call. Zero means run until all alerts are deleted.
+	MaxAlertBatches int
+	// OnStop is invoked immediately after Phase 1 (once monitors, channels,
+	// pending digests, escalations, and tokens have been disabled/cleared in the
+	// store) and before batched alert deletion begins, allowing the caller to
+	// cancel in-flight notification deliveries and drop active queues.
+	OnStop func(ctx context.Context, workspaceID string, channelIDs []int64)
+}
+
+// WorkspaceDeletionResult reports the outcome or checkpoint state of a
+// workspace deletion or dry-run preview.
+type WorkspaceDeletionResult struct {
+	WorkspaceID       string                  `json:"workspace_id"`
+	Status            WorkspaceDeletionStatus `json:"status"`
+	DryRun            bool                    `json:"dry_run"`
+	Completed         bool                    `json:"completed"`
+	IdempotentReplay  bool                    `json:"idempotent_replay,omitempty"`
+	Irreversible      bool                    `json:"irreversible"`
+	Actor             string                  `json:"actor,omitempty"`
+	BatchSize         int                     `json:"batch_size"`
+	BatchesCompleted  int64                   `json:"batches_completed"`
+	LastAlertID       int64                   `json:"last_alert_id,omitempty"`
+	MonitorsDisabled  int64                   `json:"monitors_disabled,omitempty"`
+	ChannelsDisabled  int64                   `json:"channels_disabled,omitempty"`
+	TokensRevoked     int64                   `json:"tokens_revoked,omitempty"`
+	InFlightCancelled int                     `json:"in_flight_deliveries_cancelled,omitempty"`
+	QueuedDropped     int                     `json:"queued_deliveries_dropped,omitempty"`
+	Counts            WorkspaceDeletionCounts `json:"counts"`
+	StartedAt         *time.Time              `json:"started_at,omitempty"`
+	UpdatedAt         *time.Time              `json:"updated_at,omitempty"`
+	CompletedAt       *time.Time              `json:"completed_at,omitempty"`
+}
+
 // Workspaces persists the tenant list. EnsureWorkspace is idempotent so
 // startup can assert every configured workspace exists without caring whether
 // a previous start already created it.
@@ -2028,6 +2135,13 @@ type Workspaces interface {
 	// It runs once at startup in the instance's cross-tenant scope, and its
 	// predicate is the empty network rather than a tenant, so it is idempotent.
 	AssignLegacyNetwork(ctx context.Context, network string) (int64, error)
+	// DeleteWorkspace permanently deletes a workspace and every row belonging to
+	// it across all workspace-scoped tables, or returns a read-only preview when
+	// opts.DryRun is true. Deletion is bounded and resumable across calls.
+	DeleteWorkspace(ctx context.Context, id workspace.ID, opts WorkspaceDeletionOptions) (*WorkspaceDeletionResult, error)
+	// GetWorkspaceDeletion returns the persisted deletion progress/tombstone for
+	// id, or ErrNotFound if no deletion has been initiated for id.
+	GetWorkspaceDeletion(ctx context.Context, id workspace.ID) (*WorkspaceDeletionResult, error)
 }
 
 // APITokens persists the scoped, database-backed API tokens. It is exactly
@@ -2193,14 +2307,14 @@ func (e *QuotaExceededError) Unwrap() error { return ErrQuotaExceeded }
 // WorkspaceQuota holds configurable resource limits and shared REST/GraphQL
 // query cost budget settings for a workspace. Zero values mean unlimited.
 type WorkspaceQuota struct {
-	WorkspaceID          string    `json:"workspace_id"`
-	MaxMonitors          int64     `json:"max_monitors"`
-	MaxRules             int64     `json:"max_rules"`
-	MaxChannels          int64     `json:"max_channels"`
-	MaxSubscriptions     int64     `json:"max_subscriptions"`
-	QueryCostBudget      float64   `json:"query_cost_budget"`
-	QueryCostRefillPerSec float64  `json:"query_cost_refill_per_sec"`
-	UpdatedAt            time.Time `json:"updated_at"`
+	WorkspaceID           string    `json:"workspace_id"`
+	MaxMonitors           int64     `json:"max_monitors"`
+	MaxRules              int64     `json:"max_rules"`
+	MaxChannels           int64     `json:"max_channels"`
+	MaxSubscriptions      int64     `json:"max_subscriptions"`
+	QueryCostBudget       float64   `json:"query_cost_budget"`
+	QueryCostRefillPerSec float64   `json:"query_cost_refill_per_sec"`
+	UpdatedAt             time.Time `json:"updated_at"`
 }
 
 // WorkspaceQueryBudgetDecision is the result of reserving or inspecting a
