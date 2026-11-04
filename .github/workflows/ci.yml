@@ -197,6 +197,37 @@ jobs:
         with:
           version: v2.12.2
 
+  # Security-focused static analysis of this repository's own code, with the
+  # tuned gosec rule set in .golangci-security.yml. Separate from lint so the
+  # pull request page tells a security finding from a style smell. Every
+  # finding in the current tree is triaged inline, so any finding here is new
+  # and fails the job; the action reports it as an annotation on the changed
+  # line of the pull request. It needs no secrets and no write token, so it
+  # behaves identically on pull requests from forks. CodeQL (codeql.yml)
+  # covers the taint-tracking side of the same questions.
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            terraform-provider-sorobeacon/go.sum
+      - name: gosec (root module)
+        uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.12.2
+          args: --config=.golangci-security.yml
+      - name: gosec (Terraform provider module)
+        uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.12.2
+          working-directory: terraform-provider-sorobeacon
+          args: --config=../.golangci-security.yml
+
   terraform-provider:
     runs-on: ubuntu-latest
     timeout-minutes: 10

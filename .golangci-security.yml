@@ -1,0 +1,49 @@
+version: "2"
+
+# Security-only golangci-lint configuration, run by the `security` job in
+# .github/workflows/ci.yml. It is a separate file from .golangci.yml so the
+# pull request page distinguishes a security finding from a style smell, the
+# same reason vulncheck is its own job.
+#
+# Only the gosec rules that map onto this codebase's real attack surface are
+# enabled. Running every default rule produces findings about things that do
+# not apply here (for example G104 duplicates errcheck), and a gate that cries
+# wolf gets ignored.
+#
+# Existing findings are triaged next to the code they excuse with
+# `//nolint:gosec // <reason>`, never in this file, so a reader of the code
+# sees the reasoning and a moved line takes its suppression with it.
+
+run:
+  timeout: 10m
+  # Test files build SQL, paths and URLs from fixtures on purpose.
+  tests: false
+
+linters:
+  default: none
+  enable:
+    - gosec
+  settings:
+    gosec:
+      includes:
+        - G103 # use of package unsafe (unsafe reflection/pointer tricks)
+        - G107 # HTTP request built from a variable URL (SSRF on delivery/archive paths)
+        - G110 # decompression bomb (request bodies accept gzip/deflate)
+        - G201 # SQL built with fmt formatting
+        - G202 # SQL built by string concatenation
+        - G203 # unescaped data in html/template (dashboard, notification templates)
+        - G304 # file path from a variable (path traversal)
+        - G305 # file traversal when extracting archives
+        - G402 # TLS InsecureSkipVerify / weak TLS configuration
+        - G404 # weak random number generator (math/rand) where it matters
+        - G501 # import of crypto/md5
+        - G505 # import of crypto/sha1
+  exclusions:
+    generated: strict
+    paths:
+      - internal/oidctest
+      - internal/notify/faultinject
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
