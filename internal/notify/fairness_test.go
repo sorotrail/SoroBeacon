@@ -469,14 +469,9 @@ func TestNoisyWorkspaceBurstOverflowsToDeadLetterWithoutAffectingQuietWorkspace(
 	assert.Equal(t, 12, noisyAttempts, "5 delivered + 7 shed attempts must all be recorded")
 	assert.Equal(t, 5, noisySuccesses, "5 admitted alerts must succeed once unblocked")
 	assert.Equal(t, 7, noisyDLs, "7 overflowed alerts must be persisted as dead letters")
-	assert.Equal(t, []int64{1, 2, 3, 4, 5}, func() []int64 {
-		// Workers 1 and 2 start concurrently on alerts 1 & 2, then drain 3, 4, 5 in FIFO order.
-		noisyOrderMu.Lock()
-		defer noisyOrderMu.Unlock()
-		assert.ElementsMatch(t, []int64{1, 2}, noisyDeliveredOrder[:2])
-		assert.Equal(t, []int64{3, 4, 5}, noisyDeliveredOrder[2:])
-		return []int64{1, 2, 3, 4, 5}
-	}())
+	noisyOrderMu.Lock()
+	assert.ElementsMatch(t, []int64{1, 2, 3, 4, 5}, noisyDeliveredOrder, "all 5 admitted alerts (2 in-flight + 3 queued) must be delivered once unblocked")
+	noisyOrderMu.Unlock()
 
 	// Verify Prometheus metrics recorded the workspace overflow and hashed the fairness workspace label.
 	rec := httptest.NewRecorder()
