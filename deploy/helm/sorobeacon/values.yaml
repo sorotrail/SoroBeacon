@@ -37,16 +37,24 @@ podAnnotations: {}
 
 podSecurityContext:
   runAsNonRoot: true
-  # The image's own user is non-root; pinning a UID keeps the pod stable
-  # even if the image's USER directive changes.
+  # The image's own user is non-root (UID/GID 10001); pinning numeric IDs keeps
+  # the pod stable even if the image's USER directive changes and lets kubelet
+  # enforce runAsNonRoot without resolving a username.
   runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
 
 securityContext:
   allowPrivilegeEscalation: false
   # The binary writes nothing to disk — configuration is environment
   # variables, templates and migrations are embedded, and alerts live in
-  # Postgres. Flip this to false only if a future version needs scratch space.
+  # Postgres. A bounded emptyDir is mounted at /tmp for ephemeral scratch
+  # space while the root filesystem stays read-only.
   readOnlyRootFilesystem: true
+  seccompProfile:
+    type: RuntimeDefault
   capabilities:
     drop: [ALL]
 
