@@ -144,13 +144,20 @@ func (s *SQLite) SetWorkspaceRetentionPolicy(ctx context.Context, in SetWorkspac
 		"confirm_shorten":            in.ConfirmShorten,
 		"policy_source":              RetentionPolicySourceWorkspace,
 	})
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO audit_log (actor, action, target_type, target_id, diff) VALUES (?, ?, ?, ?, ?)`,
-		actor, AuditActionUpdate, AuditTargetWorkspaceRetention, int64(0), string(diffPayload)); err != nil {
+
+	if err := tx.Commit(); err != nil {
 		return WorkspaceRetentionPolicy{}, mapSQLiteErr(err)
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := s.CreateAuditEntry(workspace.With(ctx, ws), &AuditEntry{
+		WorkspaceID: string(ws),
+		Actor:       actor,
+		Action:      AuditActionUpdate,
+		TargetType:  AuditTargetWorkspaceRetention,
+		TargetID:    0,
+		ResourceID:  string(ws),
+		Diff:        diffPayload,
+	}); err != nil {
 		return WorkspaceRetentionPolicy{}, mapSQLiteErr(err)
 	}
 
@@ -194,11 +201,15 @@ func (s *SQLite) DeleteWorkspaceRetentionPolicy(ctx context.Context, ws workspac
 		return WorkspaceRetentionPolicy{}, ErrRetentionShortenUnconfirmed
 	}
 
+	var (
+		actorName   string
+		diffPayload []byte
+	)
 	if prevConfigured {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM workspace_retention_policies WHERE workspace_id = ?`, string(ws)); err != nil {
 			return WorkspaceRetentionPolicy{}, mapSQLiteErr(err)
 		}
-		actorName := strings.TrimSpace(actor)
+		actorName = strings.TrimSpace(actor)
 		if actorName == "" {
 			actorName = string(ws)
 		}
@@ -206,7 +217,7 @@ func (s *SQLite) DeleteWorkspaceRetentionPolicy(ctx context.Context, ws workspac
 		if instSec > 0 {
 			fallbackSource = RetentionPolicySourceInstance
 		}
-		diffPayload, _ := json.Marshal(map[string]any{
+		diffPayload, _ = json.Marshal(map[string]any{
 			"workspace_id":               string(ws),
 			"previous_retention_seconds": prevSec,
 			"previous_effective_seconds": prevSec,
@@ -216,15 +227,24 @@ func (s *SQLite) DeleteWorkspaceRetentionPolicy(ctx context.Context, ws workspac
 			"confirm_shorten":            confirmShorten,
 			"policy_source":              fallbackSource,
 		})
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO audit_log (actor, action, target_type, target_id, diff) VALUES (?, ?, ?, ?, ?)`,
-			actorName, AuditActionDelete, AuditTargetWorkspaceRetention, int64(0), string(diffPayload)); err != nil {
-			return WorkspaceRetentionPolicy{}, mapSQLiteErr(err)
-		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return WorkspaceRetentionPolicy{}, mapSQLiteErr(err)
+	}
+
+	if prevConfigured {
+		if err := s.CreateAuditEntry(workspace.With(ctx, ws), &AuditEntry{
+			WorkspaceID: string(ws),
+			Actor:       actorName,
+			Action:      AuditActionDelete,
+			TargetType:  AuditTargetWorkspaceRetention,
+			TargetID:    0,
+			ResourceID:  string(ws),
+			Diff:        diffPayload,
+		}); err != nil {
+			return WorkspaceRetentionPolicy{}, mapSQLiteErr(err)
+		}
 	}
 
 	return resolvePolicyFields(ws, 0, false, "", nil, instRetention, time.Now().UTC()), nil

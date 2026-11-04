@@ -172,18 +172,28 @@ func (a *Authenticator) ResolveClientCertificate(cert *x509.Certificate) (*Princ
 		return nil, AuthUnauthenticated
 	}
 	if len(bindings) == 0 {
+		name := "mtls"
+		if ids := ExtractClientCertIdentities(cert); len(ids) > 0 {
+			name = ids[0]
+		}
 		return &Principal{
 			Workspace: workspace.Default,
 			Role:      RoleAdmin,
+			Name:      name,
+			ActorType: "automation",
 		}, AuthOK
 	}
 
 	candidates := ExtractClientCertIdentities(cert)
 	var grants []WorkspaceGrant
+	var matchedSubject string
 	for _, b := range bindings {
 		normBind := normalizeMTLSSubject(b.Subject)
 		for _, cand := range candidates {
 			if cand == b.Subject || normalizeMTLSSubject(cand) == normBind {
+				if matchedSubject == "" {
+					matchedSubject = b.Subject
+				}
 				grants = append(grants, WorkspaceGrant{
 					Workspace: b.Workspace,
 					Role:      b.Role,
@@ -199,5 +209,7 @@ func (a *Authenticator) ResolveClientCertificate(cert *x509.Certificate) (*Princ
 		Workspace: grants[0].Workspace,
 		Role:      grants[0].Role,
 		Grants:    grants,
+		Name:      matchedSubject,
+		ActorType: "automation",
 	}, AuthOK
 }

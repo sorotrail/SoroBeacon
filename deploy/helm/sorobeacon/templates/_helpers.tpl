@@ -143,6 +143,7 @@ RATE_LIMIT_BURST: {{ .Values.config.rateLimitBurst | int64 | quote }}
 RATE_LIMIT_TRUST_FORWARDED: {{ .Values.config.rateLimitTrustForwarded | toString | quote }}
 CORS_ALLOWED_ORIGINS: {{ .Values.config.corsAllowedOrigins | quote }}
 ALERT_RETENTION: {{ .Values.config.alertRetention | quote }}
+AUDIT_RETENTION: {{ .Values.config.auditRetention | quote }}
 DATABASE_MAX_CONNS: {{ .Values.database.maxConns | int64 | quote }}
 DATABASE_MIN_CONNS: {{ .Values.database.minConns | int64 | quote }}
 DATABASE_MAX_CONN_LIFETIME: {{ .Values.database.maxConnLifetime | quote }}

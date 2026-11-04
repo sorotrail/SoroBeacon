@@ -58,6 +58,7 @@ func (f *fakeStore) ListMonitors(context.Context, bool) ([]store.Monitor, error)
 func (f *fakeStore) GetMonitor(_ context.Context, id int64) (*store.Monitor, error) {
 	return &store.Monitor{ID: id}, nil
 }
+func (f *fakeStore) CreateAuditEntry(context.Context, *store.AuditEntry) error { return nil }
 
 // fakeRPC implements stellar.Client; the probes use GetHealth only.
 type fakeRPC struct {

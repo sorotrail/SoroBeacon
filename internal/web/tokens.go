@@ -76,6 +76,7 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
+		s.auditOutcome(r, store.AuditActionCreate, store.AuditTargetToken, 0, store.AuditOutcomeFailed, http.StatusBadRequest, err.Error(), "name", "scopes")
 		list, lerr := s.listTokens(r)
 		if lerr != nil {
 			s.fail(w, lerr)
@@ -92,6 +93,7 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.auditOutcome(r, store.AuditActionCreate, store.AuditTargetToken, tok.ID, store.AuditOutcomeSucceeded, http.StatusOK, "", "name", "scopes")
 	list, err := s.listTokens(r)
 	if err != nil {
 		s.fail(w, err)
@@ -124,12 +126,14 @@ func (s *Server) revokeToken(w http.ResponseWriter, r *http.Request) {
 		// Another workspace's token and a token that does not exist are the
 		// same 404 here, as they are through the API.
 		if errors.Is(err, store.ErrNotFound) {
+			s.auditOutcome(r, store.AuditActionDelete, store.AuditTargetToken, id, store.AuditOutcomeFailed, http.StatusNotFound, "token not found")
 			http.NotFound(w, r)
 			return
 		}
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionDelete, store.AuditTargetToken, id)
 	s.log.Info("api token revoked", "token_id", id)
 	http.Redirect(w, r, "/tokens", http.StatusSeeOther)
 }

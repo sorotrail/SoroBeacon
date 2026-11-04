@@ -207,6 +207,11 @@ type Config struct {
 	// are kept. Zero (the default, when ALERT_RETENTION is unset) keeps
 	// everything forever so upgrades never start deleting history.
 	AlertRetention time.Duration
+	// AuditRetention is how long administrative audit_log records are kept
+	// (AUDIT_RETENTION). It is configured separately from ALERT_RETENTION
+	// because audit records and alerts age under different operational and
+	// compliance policies. Zero (the default) keeps audit records forever.
+	AuditRetention time.Duration
 	// AlertEnrichmentURL is an optional operator-supplied HTTP JSON source.
 	AlertEnrichmentURL      string
 	AlertEnrichmentTimeout  time.Duration
@@ -810,6 +815,14 @@ func LoadProblems() (Config, []Problem) {
 			ps.add("ALERT_RETENTION", fmt.Errorf("invalid ALERT_RETENTION %q: %w", v, err))
 		} else {
 			cfg.AlertRetention = d
+		}
+	}
+	if v := lookupConfigValue("AUDIT_RETENTION", fileValues); v != "" {
+		d, err := ParseRetention(v)
+		if err != nil {
+			ps.add("AUDIT_RETENTION", fmt.Errorf("invalid AUDIT_RETENTION %q: %w", v, err))
+		} else {
+			cfg.AuditRetention = d
 		}
 	}
 	if v := lookupConfigValue("FLAPPING_EPISODES", fileValues); v != "" {

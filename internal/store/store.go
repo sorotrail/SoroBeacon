@@ -1846,40 +1846,67 @@ type SavedSearches interface {
 // Audit actions persisted on audit_log.action. A small closed set so the
 // API can filter on it and clients can branch on a stable token.
 const (
-	AuditActionCreate  = "create"
-	AuditActionUpdate  = "update"
-	AuditActionDelete  = "delete"
-	AuditActionRedrive = "redrive"
-	AuditActionDiscard = "discard"
+	AuditActionCreate      = "create"
+	AuditActionUpdate      = "update"
+	AuditActionDelete      = "delete"
+	AuditActionRedrive     = "redrive"
+	AuditActionDiscard     = "discard"
+	AuditActionRotate      = "rotate"
+	AuditActionAbandon     = "abandon"
+	AuditActionRevoke      = "revoke"
+	AuditActionRetire      = "retire"
+	AuditActionRestore     = "restore"
+	AuditActionSoftDelete  = "soft_delete"
+	AuditActionDuplicate   = "duplicate"
+	AuditActionAcknowledge = "acknowledge"
+	AuditActionImport      = "import"
+	AuditActionInstantiate = "instantiate"
+	AuditActionLogin       = "login"
+	AuditActionLogout      = "logout"
 )
 
-// AuditEntry is one append-only record of a mutating operation on a monitor,
-// rule or channel. Diff records which fields were sent — never their values:
-// channel config holds webhook URLs, bot tokens and SMTP credentials, so only
-// the fact that a field changed is stored, never what it changed to.
-// Actor is the request ID today and will carry the authenticated principal
-// once auth identifies one; the column is a plain string so that needs no
-// migration.
+// AuditEntry is one append-only record of an administrative action across REST,
+// GraphQL, gRPC, the web dashboard, or system background tasks.
+//
+// Diff records which fields were sent — never their values: channel config
+// holds webhook URLs, bot tokens and SMTP credentials, and API token operations
+// hold token secrets, so only field names and non-secret metadata are stored.
+// PrevHash and RecordHash form a per-workspace SHA-256 tamper-evidence hash
+// chain over the stored columns.
 type AuditEntry struct {
-	ID         int64           `json:"id"`
-	Actor      string          `json:"actor"`
-	Action     string          `json:"action"`
-	TargetType string          `json:"target_type"`
-	TargetID   int64           `json:"target_id"`
-	Diff       json.RawMessage `json:"diff,omitempty"`
-	CreatedAt  time.Time       `json:"created_at"`
+	ID          int64           `json:"id"`
+	WorkspaceID string          `json:"workspace_id"`
+	Actor       string          `json:"actor"`
+	ActorType   string          `json:"actor_type"`
+	Action      string          `json:"action"`
+	TargetType  string          `json:"target_type"`
+	TargetID    int64           `json:"target_id"`
+	ResourceID  string          `json:"resource_id,omitempty"`
+	Surface     string          `json:"surface"`
+	SourceIP    string          `json:"source_ip,omitempty"`
+	Outcome     string          `json:"outcome"`
+	StatusCode  int             `json:"status_code"`
+	Reason      string          `json:"reason,omitempty"`
+	Diff        json.RawMessage `json:"diff,omitempty"`
+	PrevHash    string          `json:"prev_hash,omitempty"`
+	RecordHash  string          `json:"record_hash,omitempty"`
+	CreatedAt   time.Time       `json:"created_at"`
 }
 
 // AuditFilter narrows ListAuditEntries. Zero values mean "no constraint".
 type AuditFilter struct {
-	TargetType string
-	TargetID   int64
-	From       time.Time
-	To         time.Time
-	Limit      int
-	// Actor narrows the log to one credential's entries. Empty means every
-	// actor.
-	Actor string
+	WorkspaceID string
+	TargetType  string
+	TargetID    int64
+	ResourceID  string
+	Action      string
+	Actor       string
+	ActorType   string
+	Surface     string
+	Outcome     string
+	From        time.Time
+	To          time.Time
+	Limit       int
 	// AfterID is the keyset cursor: the id of the last entry on the previous
 	// page, so the next page continues downwards from it. The listing is id
 	// DESC, hence the strict less-than. Zero means the first page.

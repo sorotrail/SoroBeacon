@@ -28,6 +28,9 @@ func AuthMiddleware(a *auth.Authenticator, log *slog.Logger) func(http.Handler) 
 			// authenticated at all, and which tenant and scopes it carries.
 			// Asking twice would let the two answers disagree.
 			principal, status := a.AuthenticateRequest(r)
+			if principal != nil {
+				recordAuditTracePrincipal(r.Context(), principal)
+			}
 			if status == auth.AuthForbidden {
 				log.Warn("oidc claim mapping denied",
 					"request_id", reqid.From(r),
