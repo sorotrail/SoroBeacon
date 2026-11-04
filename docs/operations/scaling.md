@@ -281,6 +281,7 @@ hot path in production because most `(rule, event)` pairs do not fire an alert.
 | `absence_of_event` | 765 | 681 | ~1,470,000 | 32 B / 1 alloc | **Medium** — `Spec` duration parse + topic name check |
 | `self_transfer` | 1,158 | 726 | ~1,380,000 | 80–192 B / 2–7 allocs | **Medium** — fast exit when `from != to`; `big.Int` compare on match |
 | `frequency_threshold` | 1,268 | 944 | ~1,060,000 | 112–136 B / 2–3 allocs | **Medium (stateful)** — mutex-guarded rolling-window slice prune |
+| `baseline_deviation` | 2,410 | 2,180 | ~458,000 | 320 B / 6 allocs | **Medium (stateful)** — bounded median/MAD + Welford window per bucket |
 | `token_supply_change` | 1,250 | 1,123 | ~890,000 | 136 B / 4 allocs | **Medium** — `json.NewDecoder` + `big.Int` amount threshold |
 | `time_window` | 1,241 | 1,154 | ~866,000 | 144 B / 3 allocs | **Medium** — `HH:MM` UTC clock parsing + weekday check |
 | `event_name_glob` | 1,161 | 1,760 | ~568,000 | 136 B / 4 allocs | **Medium** — `path.Match` across pattern list |
