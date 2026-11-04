@@ -10,6 +10,7 @@ import (
 
 	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/reqid"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 // defaultStreamHeartbeat is how often an idle SSE connection emits a comment.
@@ -73,6 +74,17 @@ func (s *Server) streamAlerts(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, r, http.StatusInternalServerError, "streaming unsupported")
 		return
 	}
+
+	ws, ok := workspace.From(r.Context())
+	if !ok || ws == "" {
+		ws = workspace.Default
+	}
+	releaseSub, err := s.acquireSubscriptionSlot(r.Context(), string(ws))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	defer releaseSub()
 
 	sub := s.broadcaster.Subscribe(monitorID)
 	// This defer is what keeps SubscriberCount at zero: every exit from the

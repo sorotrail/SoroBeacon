@@ -380,6 +380,9 @@ func (s *SQLite) CreateMonitor(ctx context.Context, m *Monitor) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 	ws := workspaceID(ctx)
+	if err := s.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
 	var created string
 	if err := tx.QueryRowContext(ctx,
 		`INSERT INTO monitors (name, contract_ids, tags, enabled, priority, workspace_id, network, created_at, runbook_url, response_guidance)
@@ -653,9 +656,28 @@ func (s *SQLite) SoftDeleteMonitor(ctx context.Context, id int64) error {
 // RestoreMonitor restores a soft-deleted monitor. Returns ErrNotFound
 // if the monitor doesn't exist or isn't deleted.
 func (s *SQLite) RestoreMonitor(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx,
+	ws := workspaceID(ctx)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var exists int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT count(*) FROM monitors WHERE id = ? AND workspace_id = ? AND deleted_at IS NOT NULL`,
+		id, ws).Scan(&exists); err != nil {
+		return mapSQLiteErr(err)
+	}
+	if exists == 0 {
+		return ErrNotFound
+	}
+	if err := s.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx,
 		`UPDATE monitors SET deleted_at = NULL WHERE id = ? AND workspace_id = ? AND deleted_at IS NOT NULL`,
-		id, workspaceID(ctx))
+		id, ws)
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -666,7 +688,7 @@ func (s *SQLite) RestoreMonitor(ctx context.Context, id int64) error {
 	if n == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return mapSQLiteErr(tx.Commit())
 }
 
 // ListDeletedMonitors returns soft-deleted monitors (the "trash").
@@ -775,6 +797,13 @@ func (s *SQLite) CreateMonitorWithRules(ctx context.Context, m *Monitor, rules [
 		return mapSQLiteErr(err)
 	}
 	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
+
+	if err := s.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	if err := s.checkRuleQuota(ctx, tx, ws, int64(len(rules))); err != nil {
+		return err
+	}
 
 	ids, err := json.Marshal(m.ContractIDs)
 	if err != nil {
@@ -904,6 +933,12 @@ func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, erro
 		   JOIN monitors m ON m.id = r.monitor_id
 		  WHERE r.monitor_id = ? AND m.workspace_id = ? ORDER BY r.id`, id, ws)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return nil, err
+	}
+	if err := s.checkRuleQuota(ctx, tx, ws, int64(len(rules))); err != nil {
 		return nil, err
 	}
 	// Name uniqueness is a workspace question, not a global one: two teams may
@@ -1091,13 +1126,25 @@ func (s *SQLite) CreateRule(ctx context.Context, r *Rule) error {
 	if err := normalizeRuleGuidance(r); err != nil {
 		return err
 	}
-	if err := s.requireMonitorWorkspace(ctx, s.db, r.MonitorID, workspaceID(ctx)); err != nil {
+	ws := workspaceID(ctx)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := s.requireMonitorWorkspace(ctx, tx, r.MonitorID, ws); err != nil {
 		return err
 	}
-	return mapSQLiteErr(s.db.QueryRowContext(ctx,
+	if err := s.checkRuleQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx,
 		`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES (?, ?, ?, ?, ?, ?) RETURNING id, version`,
 		r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), r.RunbookURL, r.ResponseGuidance,
-	).Scan(&r.ID, &r.Version))
+	).Scan(&r.ID, &r.Version); err != nil {
+		return mapSQLiteErr(err)
+	}
+	return mapSQLiteErr(tx.Commit())
 }
 
 func (s *SQLite) CreateRules(ctx context.Context, rules []*Rule) error {
@@ -1118,6 +1165,11 @@ func (s *SQLite) CreateRules(ctx context.Context, rules []*Rule) error {
 		if err := s.requireMonitorWorkspace(ctx, tx, r.MonitorID, ws); err != nil {
 			return err
 		}
+	}
+	if err := s.checkRuleQuota(ctx, tx, ws, int64(len(rules))); err != nil {
+		return err
+	}
+	for _, r := range rules {
 		if err := tx.QueryRowContext(ctx,
 			`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES (?, ?, ?, ?, ?, ?) RETURNING id, version`,
 			r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), r.RunbookURL, r.ResponseGuidance,
@@ -1342,8 +1394,16 @@ func (s *SQLite) CreateChannel(ctx context.Context, c *Channel) error {
 		return err
 	}
 	ws := workspaceID(ctx)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := s.checkChannelQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
 	var created string
-	if err := s.db.QueryRowContext(ctx,
+	if err := tx.QueryRowContext(ctx,
 		`INSERT INTO channels (name, type, config, enabled, digest_mode, digest_window_seconds, timeout, workspace_id, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
 		 RETURNING id, created_at`,
@@ -1353,7 +1413,10 @@ func (s *SQLite) CreateChannel(ctx context.Context, c *Channel) error {
 	}
 	c.WorkspaceID = string(ws)
 	c.CreatedAt, err = parseSQLiteTime(created)
-	return err
+	if err != nil {
+		return err
+	}
+	return mapSQLiteErr(tx.Commit())
 }
 
 func (s *SQLite) GetChannel(ctx context.Context, id int64) (*Channel, error) {

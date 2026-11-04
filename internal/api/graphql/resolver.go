@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,7 +20,9 @@ import (
 	"github.com/vektah/gqlparser/v2/parser"
 
 	"github.com/sorotrail/sorobeacon/internal/apierr"
+	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 func gqlErrorf(code string, format string, args ...any) *gqlerror.Error {
@@ -33,13 +36,38 @@ func gqlErrorf(code string, format string, args ...any) *gqlerror.Error {
 
 // Resolver holds the dependencies for GraphQL resolvers.
 type Resolver struct {
-	store store.Store
-	log   *slog.Logger
+	store   store.Store
+	log     *slog.Logger
+	metrics *metrics.Metrics
+	clock   func() time.Time
 }
 
 // NewResolver creates a new GraphQL resolver.
 func NewResolver(st store.Store, log *slog.Logger) *Resolver {
 	return &Resolver{store: st, log: log}
+}
+
+// WithMetrics attaches Prometheus metrics to the GraphQL resolver.
+func (r *Resolver) WithMetrics(m *metrics.Metrics) *Resolver {
+	if r != nil {
+		r.metrics = m
+	}
+	return r
+}
+
+// WithClock overrides the clock used for GraphQL query budget accounting in tests.
+func (r *Resolver) WithClock(clock func() time.Time) *Resolver {
+	if r != nil {
+		r.clock = clock
+	}
+	return r
+}
+
+func (r *Resolver) now() time.Time {
+	if r != nil && r.clock != nil {
+		return r.clock().UTC()
+	}
+	return time.Now().UTC()
 }
 
 // Query returns the root query resolver.
@@ -481,42 +509,111 @@ func NewHandler(resolver *Resolver, config ServerConfig) http.Handler {
 			return
 		}
 
-		// When a persisted query or allowlist query is evaluated, enforce depth and complexity limits
-		if queryDoc != "" && (opID != "" || config.AllowlistOnly) {
+		// Parse query document to enforce depth, complexity, and per-workspace query cost budget.
+		if queryDoc != "" {
 			parsedDoc, err := parser.ParseQuery(&ast.Source{Input: queryDoc})
 			if err == nil {
-				if config.MaxDepth > 0 {
-					depth := CalculateQueryDepth(parsedDoc)
-					if depth > config.MaxDepth {
-						w.WriteHeader(http.StatusOK)
-						_ = json.NewEncoder(w).Encode(map[string]any{
-							"errors": []map[string]any{
-								{
-									"message": fmt.Sprintf("query depth %d exceeds maximum allowed depth %d", depth, config.MaxDepth),
-									"extensions": map[string]any{
-										"code": CodeQueryDepthExceeded,
+				if opID != "" || config.AllowlistOnly {
+					if config.MaxDepth > 0 {
+						depth := CalculateQueryDepth(parsedDoc)
+						if depth > config.MaxDepth {
+							w.WriteHeader(http.StatusOK)
+							_ = json.NewEncoder(w).Encode(map[string]any{
+								"errors": []map[string]any{
+									{
+										"message": fmt.Sprintf("query depth %d exceeds maximum allowed depth %d", depth, config.MaxDepth),
+										"extensions": map[string]any{
+											"code": CodeQueryDepthExceeded,
+										},
 									},
 								},
-							},
-						})
-						return
+							})
+							return
+						}
+					}
+					if config.MaxComplexity > 0 {
+						complexity := CalculateQueryComplexity(parsedDoc, req.Variables)
+						if complexity > config.MaxComplexity {
+							w.WriteHeader(http.StatusOK)
+							_ = json.NewEncoder(w).Encode(map[string]any{
+								"errors": []map[string]any{
+									{
+										"message": fmt.Sprintf("query complexity %d exceeds maximum allowed complexity %d", complexity, config.MaxComplexity),
+										"extensions": map[string]any{
+											"code": CodeQueryComplexityExceeded,
+										},
+									},
+								},
+							})
+							return
+						}
 					}
 				}
-				if config.MaxComplexity > 0 {
-					complexity := CalculateQueryComplexity(parsedDoc, req.Variables)
-					if complexity > config.MaxComplexity {
-						w.WriteHeader(http.StatusOK)
-						_ = json.NewEncoder(w).Encode(map[string]any{
-							"errors": []map[string]any{
-								{
-									"message": fmt.Sprintf("query complexity %d exceeds maximum allowed complexity %d", complexity, config.MaxComplexity),
-									"extensions": map[string]any{
-										"code": CodeQueryComplexityExceeded,
+
+				if resolver != nil && resolver.store != nil {
+					cost := float64(CalculateQueryComplexity(parsedDoc, req.Variables))
+					if cost < 1 {
+						cost = 1
+					}
+					ws, ok := workspace.From(r.Context())
+					if !ok || ws == "" {
+						ws = workspace.Default
+					}
+					dec, budgetErr := store.SafeConsumeWorkspaceQueryBudget(
+						workspace.WithSystem(r.Context()),
+						resolver.store,
+						string(ws),
+						cost,
+						resolver.now(),
+					)
+					if budgetErr == nil && dec.Configured {
+						w.Header().Set("X-Query-Cost-Charged", strconv.FormatFloat(cost, 'f', -1, 64))
+						w.Header().Set("X-Query-Budget-Limit", strconv.FormatFloat(dec.Limit, 'f', -1, 64))
+						w.Header().Set("X-Query-Budget-Remaining", strconv.FormatFloat(dec.Remaining, 'f', -1, 64))
+						if !dec.Allowed {
+							retrySecs := int(math.Ceil(dec.RetryAfter.Seconds()))
+							if retrySecs < 1 {
+								retrySecs = 1
+							}
+							w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
+							if resolver.metrics != nil {
+								resolver.metrics.RecordWorkspaceQueryBudgetThrottled(string(ws), "graphql")
+								resolver.metrics.SetWorkspaceQueryBudgetRemaining(string(ws), dec.Remaining)
+							}
+							msg := fmt.Sprintf("workspace %q query cost budget exceeded (cost=%.2f, remaining=%.2f, budget=%.2f)",
+								string(ws), cost, dec.Remaining, dec.Limit)
+							w.WriteHeader(http.StatusTooManyRequests)
+							_ = json.NewEncoder(w).Encode(map[string]any{
+								"error":               msg,
+								"code":                apierr.CodeQuotaExceeded,
+								"quota":               store.QuotaResourceQueryCostBudget,
+								"resource":            store.QuotaResourceQueryCostBudget,
+								"workspace_id":        string(ws),
+								"cost":                cost,
+								"budget":              dec.Limit,
+								"remaining":           dec.Remaining,
+								"retry_after_seconds": retrySecs,
+								"errors": []map[string]any{
+									{
+										"message": msg,
+										"extensions": map[string]any{
+											"code":                apierr.CodeQuotaExceeded,
+											"quota":               store.QuotaResourceQueryCostBudget,
+											"resource":            store.QuotaResourceQueryCostBudget,
+											"cost":                cost,
+											"budget":              dec.Limit,
+											"remaining":           dec.Remaining,
+											"retry_after_seconds": retrySecs,
+										},
 									},
 								},
-							},
-						})
-						return
+							})
+							return
+						}
+						if resolver.metrics != nil {
+							resolver.metrics.RecordWorkspaceQueryCostCharged(string(ws), "graphql", cost)
+							resolver.metrics.SetWorkspaceQueryBudgetRemaining(string(ws), dec.Remaining)
+						}
 					}
 				}
 			}

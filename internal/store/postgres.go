@@ -365,6 +365,9 @@ func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
 		return err
 	}
 	ws := workspaceID(ctx)
+	if err := p.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
 	if err := tx.QueryRow(ctx,
 		`INSERT INTO monitors (name, contract_ids, tags, enabled, priority, workspace_id, network, created_at, runbook_url, response_guidance)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, now()), $9, $10)
@@ -657,16 +660,35 @@ func (p *Postgres) SoftDeleteMonitor(ctx context.Context, id int64) error {
 // RestoreMonitor restores a soft-deleted monitor. Returns ErrNotFound
 // if the monitor doesn't exist or isn't deleted.
 func (p *Postgres) RestoreMonitor(ctx context.Context, id int64) error {
-	tag, err := p.pool.Exec(ctx,
-		`UPDATE monitors SET deleted_at = NULL WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NOT NULL`,
-		id, workspaceID(ctx))
+	ws := workspaceID(ctx)
+	tx, err := p.pool.Begin(ctx)
 	if err != nil {
+		return mapErr(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	var exists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM monitors WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NOT NULL)`,
+		id, ws).Scan(&exists); err != nil {
+		return mapErr(err)
+	}
+	if !exists {
+		return ErrNotFound
+	}
+	if err := p.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
 		return err
+	}
+	tag, err := tx.Exec(ctx,
+		`UPDATE monitors SET deleted_at = NULL WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NOT NULL`,
+		id, ws)
+	if err != nil {
+		return mapErr(err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return mapErr(tx.Commit(ctx))
 }
 
 // ListDeletedMonitors returns soft-deleted monitors (the "trash").
@@ -805,6 +827,12 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 	if err != nil {
 		return nil, err
 	}
+	if err := p.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return nil, err
+	}
+	if err := p.checkRuleQuota(ctx, tx, ws, int64(len(rules))); err != nil {
+		return nil, err
+	}
 	// Name uniqueness is a workspace question, not a global one: two teams may
 	// each have a monitor called "Vault minter", and a copy must not be forced
 	// to "(copy 2)" because another tenant used the plain name first.
@@ -884,6 +912,12 @@ func (p *Postgres) CreateMonitorWithRules(ctx context.Context, m *Monitor, rules
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	if err := p.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	if err := p.checkRuleQuota(ctx, tx, ws, int64(len(rules))); err != nil {
 		return err
 	}
 	ids, err := json.Marshal(m.ContractIDs)
@@ -1028,13 +1062,25 @@ func (p *Postgres) CreateRule(ctx context.Context, r *Rule) error {
 	if err := normalizeRuleGuidance(r); err != nil {
 		return err
 	}
-	if err := p.requireMonitorWorkspace(ctx, p.pool, r.MonitorID, workspaceID(ctx)); err != nil {
+	ws := workspaceID(ctx)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return mapErr(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := p.requireMonitorWorkspace(ctx, tx, r.MonitorID, ws); err != nil {
 		return err
 	}
-	return mapErr(p.pool.QueryRow(ctx,
+	if err := p.checkRuleQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	if err := tx.QueryRow(ctx,
 		`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, version`,
 		r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled, r.RunbookURL, r.ResponseGuidance,
-	).Scan(&r.ID, &r.Version))
+	).Scan(&r.ID, &r.Version); err != nil {
+		return mapErr(err)
+	}
+	return mapErr(tx.Commit(ctx))
 }
 
 func (p *Postgres) CreateRules(ctx context.Context, rules []*Rule) error {
@@ -1057,6 +1103,11 @@ func (p *Postgres) CreateRules(ctx context.Context, rules []*Rule) error {
 		if err := p.requireMonitorWorkspace(ctx, tx, r.MonitorID, ws); err != nil {
 			return err
 		}
+	}
+	if err := p.checkRuleQuota(ctx, tx, ws, int64(len(rules))); err != nil {
+		return err
+	}
+	for _, r := range rules {
 		if err := tx.QueryRow(ctx,
 			`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, version`,
 			r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled, r.RunbookURL, r.ResponseGuidance,
@@ -1255,16 +1306,24 @@ func (p *Postgres) CreateChannel(ctx context.Context, c *Channel) error {
 		return err
 	}
 	ws := workspaceID(ctx)
-	if err := p.pool.QueryRow(ctx,
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return mapErr(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := p.checkChannelQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	if err := tx.QueryRow(ctx,
 		`INSERT INTO channels (name, type, config, enabled, digest_mode, digest_window_seconds, timeout, workspace_id, created_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, now()))
 		 RETURNING id, created_at`,
 		c.Name, c.Type, config, c.Enabled, c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(), ws, pgCreatedAt(c.CreatedAt),
 	).Scan(&c.ID, &c.CreatedAt); err != nil {
-		return err
+		return mapErr(err)
 	}
 	c.WorkspaceID = string(ws)
-	return nil
+	return mapErr(tx.Commit(ctx))
 }
 
 func (p *Postgres) GetChannel(ctx context.Context, id int64) (*Channel, error) {

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -112,6 +113,10 @@ type Server struct {
 	// usageMeter buffers per-workspace API request counts in memory and
 	// flushes them to durable rollups.
 	usageMeter *usage.Meter
+
+	subMu               sync.Mutex
+	activeSubscriptions map[string]int64
+	quotaClock          func() time.Time
 }
 
 // New wires an API server. Rate limiting stays off until WithRateLimit, and
@@ -321,6 +326,7 @@ func (s *Server) Routes() chi.Router {
 	}.Middleware())
 	mux.Use(RateLimitMiddleware(s.rateLimit))
 	mux.Use(s.usageMiddleware)
+	mux.Use(s.queryBudgetMiddleware)
 	// Innermost, so only authenticated, rate-limited requests are audited
 	// and an audit failure never blocks the request.
 	mux.Use(AuditMiddleware(s.store, s.log))
@@ -446,6 +452,8 @@ func (s *Server) Routes() chi.Router {
 	mux.Get("/stats", s.stats)
 	mux.Get("/stats/alerts-daily", s.withConditionalETag(s.alertsDailyChangeKey, s.alertsDaily))
 	mux.Get("/usage", s.usage)
+	mux.Get("/quotas", s.getQuotas)
+	mux.Put("/quotas", s.putQuotas)
 	mux.Get("/audit", s.listAudit)
 
 	return mux
@@ -659,7 +667,16 @@ func allowHeader(r *http.Request) string {
 
 // fail maps store errors to HTTP responses using the error taxonomy.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+	var quotaErr *store.QuotaExceededError
+	if errors.As(err, &quotaErr) {
+		s.writeQuotaExceeded(w, r, quotaErr)
+		return
+	}
 	c := apierr.Classify(err)
+	if c.Code == apierr.CodeQuotaExceeded {
+		s.writeQuotaExceeded(w, r, nil)
+		return
+	}
 	if c.Code == apierr.CodeInternalError {
 		s.log.Error("api error", "request_id", reqid.From(r), "err", err)
 	}

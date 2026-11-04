@@ -191,6 +191,8 @@ var knownRouteBindings = []routeBinding{
 	{"GET", "/stats", "getStats"},
 	{"GET", "/stats/alerts-daily", "getDailyAlertCounts"},
 	{"GET", "/usage", "getUsage"},
+	{"GET", "/quotas", "getQuotas"},
+	{"PUT", "/quotas", "setQuotas"},
 	{"GET", "/audit", "listAuditLogs"},
 	{"GET", "/templates", "listTemplates"},
 	{"POST", "/templates", "createTemplate"},
@@ -2027,6 +2029,28 @@ export class SoroBeaconClient {
   ): Promise<JsonObject> {
     return this.request<JsonObject>("GET", "/usage", {
       query: params as Record<string, unknown>,
+      requestOptions: options,
+    });
+  }
+
+  async getQuotas(
+    params?: { workspace?: string },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>("GET", "/quotas", {
+      query: params as Record<string, unknown>,
+      requestOptions: options,
+    });
+  }
+
+  async setQuotas(
+    input: Record<string, unknown>,
+    params?: { workspace?: string },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>("PUT", "/quotas", {
+      query: params as Record<string, unknown>,
+      body: input,
       requestOptions: options,
     });
   }
