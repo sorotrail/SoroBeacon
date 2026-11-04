@@ -170,6 +170,7 @@ func NewRegistry() *Registry {
 	r.Register(TypeTopicRegex, &TopicRegex{})
 	r.Register(TypeAddressWatchlist, &AddressWatchlist{})
 	r.Register(TypeTopicPosition, TopicPosition{})
+	r.Register(TypeBaselineDeviation, NewBaselineDeviation())
 	r.RegisterAbsence(TypeAbsenceOfEvent, Absence{})
 	return r
 }

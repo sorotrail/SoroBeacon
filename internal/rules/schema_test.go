@@ -176,6 +176,10 @@ var formFixtures = map[string]map[string]string{
 		"position": "1",
 		"equals":   "transfer",
 	},
+	TypeBaselineDeviation: {
+		"window":      "1h",
+		"sensitivity": "3",
+	},
 	TypeAbsenceOfEvent: {
 		"event_name": "transfer",
 		"window":     "5m",
@@ -258,6 +262,7 @@ var schemaParamsStructs = map[string]any{
 	TypeTopicRegex:         topicRegexParams{},
 	TypeAddressWatchlist:   addressWatchlistParams{},
 	TypeTopicPosition:      topicPositionParams{},
+	TypeBaselineDeviation:  baselineDeviationParams{},
 	TypeAbsenceOfEvent:     absenceParams{},
 }
 
