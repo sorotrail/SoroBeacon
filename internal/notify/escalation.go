@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sorotrail/sorobeacon/internal/store"
@@ -52,9 +54,7 @@ func (d *Dispatcher) deliverStep(ctx context.Context, a Alert, step store.Escala
 		d.log.Error("list escalation channels", "alert_id", a.ID, "err", err)
 		return
 	}
-	for _, ch := range channels {
-		d.deliver(ctx, a, ch)
-	}
+	d.deliverChannelGroup(ctx, a, channels)
 }
 
 // ProcessDueEscalations fires every escalation step due at or before now and
@@ -74,6 +74,65 @@ func (d *Dispatcher) ProcessDueEscalations(ctx context.Context, now time.Time) (
 	if err != nil {
 		return 0, err
 	}
+	if len(runs) == 0 {
+		return 0, nil
+	}
+
+	var wsOrder []string
+	byWS := make(map[string][]store.EscalationRun)
+	for _, run := range runs {
+		ws := d.resolveEscalationWorkspace(ctx, run)
+		if _, ok := byWS[ws]; !ok {
+			wsOrder = append(wsOrder, ws)
+		}
+		byWS[ws] = append(byWS[ws], run)
+	}
+
+	if len(wsOrder) <= 1 {
+		return d.processEscalationSlice(ctx, now, runs)
+	}
+
+	var delivered atomic.Int64
+	var wg sync.WaitGroup
+	for _, ws := range wsOrder {
+		wsRuns := byWS[ws]
+		wg.Add(1)
+		go func(slice []store.EscalationRun) {
+			defer wg.Done()
+			n, _ := d.processEscalationSlice(ctx, now, slice)
+			delivered.Add(int64(n))
+		}(wsRuns)
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		return int(delivered.Load()), ctx.Err()
+	}
+	return int(delivered.Load()), nil
+}
+
+func (d *Dispatcher) resolveEscalationWorkspace(ctx context.Context, run store.EscalationRun) string {
+	if policy, err := d.store.GetEscalationPolicy(ctx, run.PolicyID); err == nil && policy != nil {
+		if run.NextStep >= 0 && run.NextStep < len(policy.Steps) {
+			step := policy.Steps[run.NextStep]
+			if len(step.ChannelIDs) > 0 {
+				if channels, err := d.store.ListChannelsByIDs(ctx, step.ChannelIDs); err == nil {
+					for _, ch := range channels {
+						if ws := resolveWorkspaceID(ctx, ch); ws != "default" {
+							return ws
+						}
+					}
+				}
+			}
+		}
+	}
+	var a Alert
+	if err := json.Unmarshal(run.Snapshot, &a); err == nil {
+		return d.resolveAlertWorkspace(ctx, a)
+	}
+	return "default"
+}
+
+func (d *Dispatcher) processEscalationSlice(ctx context.Context, now time.Time, runs []store.EscalationRun) (int, error) {
 	delivered := 0
 	for _, run := range runs {
 		if ctx.Err() != nil {

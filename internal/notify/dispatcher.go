@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -104,8 +106,9 @@ type Dispatcher struct {
 	// digest is optional. When attached, channels with digest mode
 	// "window" accumulate alerts here and a summary is flushed once the
 	// window elapses.
-	deliveriesInFlight int
+	deliveriesInFlight atomic.Int64
 	digest             store.DigestQueue
+	fairness           *FairnessScheduler
 	// disableAfterFailures is how many consecutive permanent failures
 	// auto-disable a channel. Zero — the default — never auto-disables:
 	// silently switching off someone's alerting because a webhook 404'd
@@ -136,6 +139,7 @@ func NewDispatcher(s DispatchStore, f *Factory, log *slog.Logger) *Dispatcher {
 		BaseBackoff:        time.Second,
 		rateLimits:         RateLimits{},
 		rateLimiter:        NewRateLimiter(RateLimits{}),
+		fairness:           NewFairnessScheduler(FairnessConfig{}, nil),
 		EscalationInterval: DefaultEscalationInterval,
 		EscalationBatch:    DefaultEscalationBatch,
 		flapping: alerts.FlappingConfig{
@@ -227,7 +231,126 @@ func (d *Dispatcher) DisableAfterFailures() int {
 // WithMetrics attaches delivery instrumentation.
 func (d *Dispatcher) WithMetrics(m *metrics.Metrics) *Dispatcher {
 	d.metrics = m
+	if d.fairness != nil {
+		d.fairness.setMetrics(m)
+	}
 	return d
+}
+
+// WithFairness configures per-workspace and per-channel concurrency bounds,
+// retry lane isolation, and optional non-blocking async dispatch.
+func (d *Dispatcher) WithFairness(cfg FairnessConfig) *Dispatcher {
+	d.fairness = NewFairnessScheduler(cfg, d.metrics)
+	return d
+}
+
+// Fairness returns the active fairness configuration.
+func (d *Dispatcher) Fairness() FairnessConfig {
+	if d.fairness == nil {
+		return FairnessConfig{}.Normalized()
+	}
+	return d.fairness.cfg
+}
+
+// Backlog returns a point-in-time snapshot of all workspace and channel queues.
+func (d *Dispatcher) Backlog() FairnessSnapshot {
+	if d.fairness == nil {
+		return FairnessSnapshot{
+			Workspaces: map[string]WorkspaceBacklog{},
+			Channels:   map[int64]ChannelBacklog{},
+		}
+	}
+	return d.fairness.Snapshot()
+}
+
+// WorkspaceBacklog returns the live in-flight and queued delivery counts for one workspace.
+func (d *Dispatcher) WorkspaceBacklog(workspaceID string) WorkspaceBacklog {
+	if d.fairness == nil {
+		return WorkspaceBacklog{WorkspaceID: normalizeWorkspaceID(workspaceID)}
+	}
+	return d.fairness.WorkspaceBacklog(workspaceID)
+}
+
+// ChannelBacklog returns the live in-flight and queued delivery counts for one channel.
+func (d *Dispatcher) ChannelBacklog(channelID int64) ChannelBacklog {
+	if d.fairness == nil {
+		return ChannelBacklog{ChannelID: channelID}
+	}
+	return d.fairness.ChannelBacklog(channelID)
+}
+
+// InFlight returns the total number of channel deliveries currently executing.
+func (d *Dispatcher) InFlight() int {
+	return int(d.deliveriesInFlight.Load())
+}
+
+// Submit enqueues an alert onto its workspace's bounded delivery queue and
+// returns immediately so ingestion and rule evaluation never block on
+// downstream notification channels. When the workspace's queue is saturated,
+// the excess alert fails predictably into the dead-letter and health-recording
+// paths and Submit returns false.
+func (d *Dispatcher) Submit(ctx context.Context, a Alert) bool {
+	if d.fairness == nil {
+		d.fairness = NewFairnessScheduler(FairnessConfig{}, d.metrics)
+	}
+	wsID := d.resolveAlertWorkspace(ctx, a)
+	if err := d.fairness.Submit(ctx, wsID, a, d.dispatchSync); err != nil {
+		d.shedAlertOnOverflow(ctx, a, wsID, err)
+		return false
+	}
+	return true
+}
+
+// Wait blocks until all queued asynchronous deliveries have completed or ctx expires.
+func (d *Dispatcher) Wait(ctx context.Context) error {
+	if d.fairness == nil {
+		return nil
+	}
+	return d.fairness.Wait(ctx)
+}
+
+func (d *Dispatcher) resolveAlertWorkspace(ctx context.Context, a Alert) string {
+	if ws, ok := workspace.From(ctx); ok && !workspace.System(ctx) {
+		if trimmed := strings.TrimSpace(string(ws)); trimmed != "" {
+			return trimmed
+		}
+	}
+	if d.store != nil && a.MonitorID > 0 {
+		if channels, err := d.store.ListChannelsForMonitor(ctx, a.MonitorID); err == nil {
+			for _, ch := range channels {
+				if ws := strings.TrimSpace(ch.WorkspaceID); ws != "" {
+					return ws
+				}
+			}
+		}
+	}
+	return "default"
+}
+
+func (d *Dispatcher) shedAlertOnOverflow(ctx context.Context, a Alert, wsID string, overflowErr error) {
+	if d.store == nil {
+		return
+	}
+	channels, err := d.store.ListChannelsForMonitor(ctx, a.MonitorID)
+	if err != nil {
+		d.log.Error("list channels for overflow dead-letter", "alert_id", a.ID, "monitor_id", a.MonitorID, "err", err)
+		return
+	}
+	safeErr := sanitizeDeliveryError(overflowErr)
+	for _, ch := range channels {
+		if !severityMeetsThreshold(a.Severity, ch.MinSeverity) {
+			continue
+		}
+		if d.metrics != nil {
+			d.metrics.RecordDelivery(ch.Type, false)
+		}
+		d.recordWorkspaceNotification(ctx, ch, "throttled")
+		d.record(ctx, a.ID, ch.ID, "failed", safeErr.Error())
+		d.recordHealth(ctx, ch.ID, store.ChannelHealthUpdate{Error: safeErr.Error(), Permanent: false})
+		d.deadLetter(ctx, a, ch, overflowErr, 1)
+		d.log.Warn("alert delivery shed due to workspace queue saturation",
+			"alert_id", a.ID, "channel_id", ch.ID, "workspace", wsID, "err", safeErr)
+	}
 }
 
 // WithUsageMeter attaches per-workspace usage metering to notification delivery.
@@ -269,6 +392,14 @@ func digestEnabled(ch store.Channel) bool {
 // come first either way, so a silenced alert never starts an escalation that
 // would page on its next step.
 func (d *Dispatcher) Dispatch(ctx context.Context, a Alert) {
+	if d.fairness != nil && d.fairness.cfg.AsyncDispatch {
+		d.Submit(ctx, a)
+		return
+	}
+	d.dispatchSync(ctx, a)
+}
+
+func (d *Dispatcher) dispatchSync(ctx context.Context, a Alert) {
 	if d.inhibited(ctx, a) {
 		return
 	}
@@ -361,13 +492,16 @@ func (d *Dispatcher) flappingState(ctx context.Context, a Alert) (alerts.Flappin
 }
 
 // dispatchFlat is the pre-escalation behaviour: deliver to every enabled
-// channel attached to the monitor.
+// channel attached to the monitor. When channels span multiple workspaces,
+// each workspace's channels run concurrently so a slow consumer in one
+// workspace never stalls another workspace.
 func (d *Dispatcher) dispatchFlat(ctx context.Context, a Alert) {
 	channels, err := d.store.ListChannelsForMonitor(ctx, a.MonitorID)
 	if err != nil {
 		d.log.Error("list channels for alert", "alert_id", a.ID, "monitor_id", a.MonitorID, "err", err)
 		return
 	}
+	var immediate []store.Channel
 	for _, ch := range channels {
 		if !severityMeetsThreshold(a.Severity, ch.MinSeverity) {
 			d.log.Debug("channel skipped due to severity filter", "alert_id", a.ID, "channel_id", ch.ID, "alert_severity", a.Severity, "channel_min_severity", ch.MinSeverity)
@@ -377,10 +511,55 @@ func (d *Dispatcher) dispatchFlat(ctx context.Context, a Alert) {
 			d.enqueueDigest(ctx, a, ch)
 			continue
 		}
-		d.deliveriesInFlight++
-		d.deliver(ctx, a, ch)
-		d.deliveriesInFlight--
+		immediate = append(immediate, ch)
 	}
+	d.deliverChannelGroup(ctx, a, immediate)
+}
+
+func (d *Dispatcher) deliverChannelGroup(ctx context.Context, a Alert, channels []store.Channel) {
+	if len(channels) == 0 {
+		return
+	}
+	if len(channels) == 1 {
+		d.deliveriesInFlight.Add(1)
+		d.deliver(ctx, a, channels[0])
+		d.deliveriesInFlight.Add(-1)
+		return
+	}
+
+	var wsOrder []string
+	byWS := make(map[string][]store.Channel)
+	for _, ch := range channels {
+		ws := resolveWorkspaceID(ctx, ch)
+		if _, ok := byWS[ws]; !ok {
+			wsOrder = append(wsOrder, ws)
+		}
+		byWS[ws] = append(byWS[ws], ch)
+	}
+
+	if len(wsOrder) <= 1 {
+		for _, ch := range channels {
+			d.deliveriesInFlight.Add(1)
+			d.deliver(ctx, a, ch)
+			d.deliveriesInFlight.Add(-1)
+		}
+		return
+	}
+
+	var wg sync.WaitGroup
+	for _, ws := range wsOrder {
+		wsChannels := byWS[ws]
+		wg.Add(1)
+		go func(chs []store.Channel) {
+			defer wg.Done()
+			for _, ch := range chs {
+				d.deliveriesInFlight.Add(1)
+				d.deliver(ctx, a, ch)
+				d.deliveriesInFlight.Add(-1)
+			}
+		}(wsChannels)
+	}
+	wg.Wait()
 }
 
 // inhibited answers the delivery-time suppression check for one alert.
@@ -469,6 +648,12 @@ func (d *Dispatcher) FlushDigests(ctx context.Context, now time.Time) {
 		d.log.Error("list channels for digest flush", "err", err)
 		return
 	}
+	type dueDigest struct {
+		ch      store.Channel
+		pending []store.DigestAlert
+	}
+	var wsOrder []string
+	byWS := make(map[string][]dueDigest)
 	for _, ch := range channels {
 		if !digestEnabled(ch) {
 			continue
@@ -485,8 +670,33 @@ func (d *Dispatcher) FlushDigests(ctx context.Context, now time.Time) {
 		if now.Sub(pending[0].CreatedAt) < window {
 			continue
 		}
-		d.flushDigest(ctx, ch, pending)
+		ws := resolveWorkspaceID(ctx, ch)
+		if _, ok := byWS[ws]; !ok {
+			wsOrder = append(wsOrder, ws)
+		}
+		byWS[ws] = append(byWS[ws], dueDigest{ch: ch, pending: pending})
 	}
+	if len(wsOrder) == 0 {
+		return
+	}
+	if len(wsOrder) == 1 {
+		for _, item := range byWS[wsOrder[0]] {
+			d.flushDigest(ctx, item.ch, item.pending)
+		}
+		return
+	}
+	var wg sync.WaitGroup
+	for _, ws := range wsOrder {
+		items := byWS[ws]
+		wg.Add(1)
+		go func(list []dueDigest) {
+			defer wg.Done()
+			for _, item := range list {
+				d.flushDigest(ctx, item.ch, item.pending)
+			}
+		}(items)
+	}
+	wg.Wait()
 }
 
 // flushDigest renders and sends one channel's digest, then clears the rows it
@@ -519,9 +729,25 @@ func (d *Dispatcher) flushDigest(ctx context.Context, ch store.Channel, pending 
 		d.log.Error("build notifier for digest", "channel_id", ch.ID, "channel_type", ch.Type, "err", err)
 		return
 	}
+	wsID := resolveWorkspaceID(ctx, ch)
+	releaseSlot, slotErr := d.acquireDeliverySlot(ctx, wsID, ch.ID, 1)
+	if slotErr != nil {
+		if d.metrics != nil {
+			d.metrics.RecordDelivery(ch.Type, false)
+		}
+		d.recordWorkspaceNotification(ctx, ch, "throttled")
+		d.log.Warn("digest delivery deferred due to fairness queue saturation; keeping window for next flush",
+			"channel_id", ch.ID, "workspace", wsID, "count", len(alerts), "err", slotErr)
+		return
+	}
 	summary := RenderDigest(alerts, DefaultDigestMaxLen)
 	synthetic := Alert{MonitorID: alerts[0].MonitorID, MonitorName: alerts[0].MonitorName, Digest: summary}
-	if err := notifier.Send(ctx, synthetic); err != nil {
+	timeout := ch.TimeoutDuration()
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	err = d.sendWithRecovery(attemptCtx, synthetic, ch, notifier)
+	cancel()
+	releaseSlot()
+	if err != nil {
 		if d.metrics != nil {
 			d.metrics.RecordDelivery(ch.Type, false)
 		}
@@ -631,12 +857,31 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 
 	backoff := d.BaseBackoff
 	timeout := ch.TimeoutDuration()
+	wsID := resolveWorkspaceID(ctx, ch)
 	var lastErr error
 	permanent := false
 	for attempt := 1; ; attempt++ {
+		releaseSlot, slotErr := d.acquireDeliverySlot(ctx, wsID, ch.ID, attempt)
+		if slotErr != nil {
+			if errors.Is(slotErr, ErrFairnessQueueFull) {
+				if d.metrics != nil {
+					d.metrics.RecordDelivery(ch.Type, false)
+				}
+				d.recordWorkspaceNotification(ctx, ch, "throttled")
+				safeErr := sanitizeDeliveryError(slotErr)
+				d.record(ctx, a.ID, ch.ID, "failed", safeErr.Error())
+				telemetry.RecordError(span, safeErr)
+				d.recordHealth(ctx, ch.ID, store.ChannelHealthUpdate{Error: safeErr.Error(), Permanent: permanent})
+				d.deadLetter(ctx, a, ch, slotErr, attempt)
+				d.log.Warn("alert delivery shed due to fairness queue saturation",
+					"alert_id", a.ID, "channel_id", ch.ID, "workspace", wsID, "attempt", attempt, "err", safeErr)
+			}
+			return
+		}
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 		err = d.sendWithRecovery(attemptCtx, a, ch, notifier)
 		cancel()
+		releaseSlot()
 		if err == nil {
 			cb.RecordSuccess()
 			if d.metrics != nil {
@@ -742,6 +987,14 @@ func (d *Dispatcher) deadLetter(ctx context.Context, a Alert, ch store.Channel, 
 		ws, _ := workspace.From(ctx)
 		d.metrics.RecordDeadLetterFor(string(ws), ch.Name)
 	}
+}
+
+func (d *Dispatcher) acquireDeliverySlot(ctx context.Context, wsID string, channelID int64, attempt int) (func(), error) {
+	if d.fairness == nil {
+		return func() {}, nil
+	}
+	release, _, err := d.fairness.AcquireSlot(ctx, wsID, channelID, attempt)
+	return release, err
 }
 
 func (d *Dispatcher) sendWithRecovery(ctx context.Context, a Alert, ch store.Channel, notifier Notifier) (err error) {
@@ -983,6 +1236,11 @@ func (d *Dispatcher) Shutdown(ctx context.Context, gracePeriod time.Duration) er
 	// Record that shutdown has been initiated so in-flight deliveries
 	// know to stop marking permanent failures and instead just return.
 	d.log.Info("shutting down dispatcher", "grace_period", gracePeriod)
+	if d.fairness != nil {
+		waitCtx, cancel := context.WithTimeout(ctx, gracePeriod)
+		defer cancel()
+		_ = d.fairness.Wait(waitCtx)
+	}
 	return nil
 }
 
