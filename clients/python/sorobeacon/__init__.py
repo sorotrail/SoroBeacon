@@ -971,6 +971,8 @@ OPENAPI_OPERATIONS: tuple[dict[str, str], ...] = (
     {"method": "GET", "path": "/stats", "client_method": "get_stats", "summary": "Service statistics"},
     {"method": "GET", "path": "/stats/alerts-daily", "client_method": "get_daily_alert_counts", "summary": "Daily alert counts for the last 30 UTC days"},
     {"method": "GET", "path": "/usage", "client_method": "get_usage", "summary": "Per-workspace usage metering summary"},
+    {"method": "GET", "path": "/quotas", "client_method": "get_quotas", "summary": "Per-workspace resource quotas and query cost budget status"},
+    {"method": "PUT", "path": "/quotas", "client_method": "set_quotas", "summary": "Configure per-workspace resource quotas and query cost budget"},
     {"method": "GET", "path": "/audit", "client_method": "list_audit_logs", "summary": "Audit log of configuration changes"},
     {"method": "GET", "path": "/templates", "client_method": "list_templates", "summary": "List monitor templates"},
     {"method": "POST", "path": "/templates", "client_method": "create_template", "summary": "Create a monitor template"},
@@ -2034,6 +2036,30 @@ class SoroBeaconClient:
         headers: Mapping[str, str] | None = None,
     ) -> JsonObject:
         return self._request("GET", "/usage", query=params, headers=headers)
+
+    def get_quotas(
+        self,
+        params: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        return self._request("GET", "/quotas", query=params, headers=headers)
+
+    def set_quotas(
+        self,
+        input_data: Mapping[str, Any],
+        params: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        return self._request(
+            "PUT",
+            "/quotas",
+            query=params,
+            body=input_data,
+            has_body=True,
+            headers=headers,
+        )
 
     def list_audit_logs(
         self,

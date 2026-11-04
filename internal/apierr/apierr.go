@@ -197,6 +197,19 @@ func Classify(err error) Classified {
 			GRPCCode: codes.FailedPrecondition,
 		}
 	}
+	var quotaErr *store.QuotaExceededError
+	if errors.As(err, &quotaErr) || errors.Is(err, store.ErrQuotaExceeded) {
+		msg := "workspace quota exceeded"
+		if quotaErr != nil {
+			msg = quotaErr.Error()
+		}
+		return Classified{
+			Status:   http.StatusTooManyRequests,
+			Code:     CodeQuotaExceeded,
+			Message:  msg,
+			GRPCCode: codes.ResourceExhausted,
+		}
+	}
 	if errors.Is(err, store.ErrUnavailable) {
 		return Classified{
 			Status:   http.StatusServiceUnavailable,

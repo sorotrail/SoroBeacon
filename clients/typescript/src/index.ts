@@ -950,6 +950,8 @@ export const OPENAPI_OPERATIONS = [
   { method: "GET", path: "/stats", clientMethod: "getStats", summary: "Service statistics" },
   { method: "GET", path: "/stats/alerts-daily", clientMethod: "getDailyAlertCounts", summary: "Daily alert counts for the last 30 UTC days" },
   { method: "GET", path: "/usage", clientMethod: "getUsage", summary: "Per-workspace usage metering summary" },
+  { method: "GET", path: "/quotas", clientMethod: "getQuotas", summary: "Per-workspace resource quotas and query cost budget status" },
+  { method: "PUT", path: "/quotas", clientMethod: "setQuotas", summary: "Configure per-workspace resource quotas and query cost budget" },
   { method: "GET", path: "/audit", clientMethod: "listAuditLogs", summary: "Audit log of configuration changes" },
   { method: "GET", path: "/templates", clientMethod: "listTemplates", summary: "List monitor templates" },
   { method: "POST", path: "/templates", clientMethod: "createTemplate", summary: "Create a monitor template" },
@@ -1942,6 +1944,28 @@ export class SoroBeaconClient {
   ): Promise<JsonObject> {
     return this.request<JsonObject>("GET", "/usage", {
       query: params as Record<string, unknown>,
+      requestOptions: options,
+    });
+  }
+
+  async getQuotas(
+    params?: { workspace?: string },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>("GET", "/quotas", {
+      query: params as Record<string, unknown>,
+      requestOptions: options,
+    });
+  }
+
+  async setQuotas(
+    input: Record<string, unknown>,
+    params?: { workspace?: string },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>("PUT", "/quotas", {
+      query: params as Record<string, unknown>,
+      body: input,
       requestOptions: options,
     });
   }

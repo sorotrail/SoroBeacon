@@ -2030,6 +2030,105 @@
         }
       }
     },
+    "/quotas": {
+      "get": {
+        "summary": "Per-workspace resource quotas and query cost budget status",
+        "description": "Returns configured resource quotas (monitors, rules, channels, SSE subscriptions), live resource usage, and query cost budget status for the workspace.",
+        "parameters": [
+          {
+            "name": "workspace",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workspace quota and query cost budget status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "summary": "Configure per-workspace resource quotas and query cost budget",
+        "description": "Updates resource quotas (max_monitors, max_rules, max_channels, max_subscriptions) and query cost budget (query_cost_budget, query_cost_refill_per_sec) for a workspace.",
+        "parameters": [
+          {
+            "name": "workspace",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "workspace_id": {
+                    "type": "string"
+                  },
+                  "max_monitors": {
+                    "type": "integer"
+                  },
+                  "max_rules": {
+                    "type": "integer"
+                  },
+                  "max_channels": {
+                    "type": "integer"
+                  },
+                  "max_subscriptions": {
+                    "type": "integer"
+                  },
+                  "query_cost_budget": {
+                    "type": "number"
+                  },
+                  "query_cost_refill_per_sec": {
+                    "type": "number"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated workspace quota and query cost budget status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/stats/alerts-daily": {
       "get": {
         "summary": "Daily alert counts for the last 30 UTC days",

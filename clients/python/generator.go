@@ -193,6 +193,8 @@ var knownRouteBindings = []routeBinding{
 	{"GET", "/stats", "get_stats"},
 	{"GET", "/stats/alerts-daily", "get_daily_alert_counts"},
 	{"GET", "/usage", "get_usage"},
+	{"GET", "/quotas", "get_quotas"},
+	{"PUT", "/quotas", "set_quotas"},
 	{"GET", "/audit", "list_audit_logs"},
 	{"GET", "/templates", "list_templates"},
 	{"POST", "/templates", "create_template"},
@@ -2179,6 +2181,30 @@ func writeClientClass(b *bytes.Buffer) {
         headers: Mapping[str, str] | None = None,
     ) -> JsonObject:
         return self._request("GET", "/usage", query=params, headers=headers)
+
+    def get_quotas(
+        self,
+        params: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        return self._request("GET", "/quotas", query=params, headers=headers)
+
+    def set_quotas(
+        self,
+        input_data: Mapping[str, Any],
+        params: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        return self._request(
+            "PUT",
+            "/quotas",
+            query=params,
+            body=input_data,
+            has_body=True,
+            headers=headers,
+        )
 
     def list_audit_logs(
         self,

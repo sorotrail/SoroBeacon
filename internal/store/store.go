@@ -2150,6 +2150,83 @@ type Usage interface {
 	GetWorkspaceStorageCounts(ctx context.Context, workspaceID string) (WorkspaceStorageCounts, error)
 }
 
+// Quota resource names used in QuotaExceededError and metrics.
+const (
+	QuotaResourceMonitors        = "monitors"
+	QuotaResourceRules           = "rules"
+	QuotaResourceChannels        = "channels"
+	QuotaResourceSubscriptions   = "subscriptions"
+	QuotaResourceQueryCostBudget = "query_cost_budget"
+)
+
+// ErrQuotaExceeded is the sentinel matched by errors.Is for any workspace
+// resource quota or query cost budget rejection.
+var ErrQuotaExceeded = errors.New("store: workspace quota exceeded")
+
+// QuotaExceededError describes which workspace quota or budget was exceeded.
+type QuotaExceededError struct {
+	WorkspaceID string        `json:"workspace_id"`
+	Resource    string        `json:"resource"`
+	Limit       int64         `json:"limit"`
+	Current     int64         `json:"current"`
+	Requested   int64         `json:"requested,omitempty"`
+	Cost        float64       `json:"cost,omitempty"`
+	Budget      float64       `json:"budget,omitempty"`
+	Remaining   float64       `json:"remaining,omitempty"`
+	RetryAfter  time.Duration `json:"-"`
+}
+
+func (e *QuotaExceededError) Error() string {
+	if e == nil {
+		return ErrQuotaExceeded.Error()
+	}
+	if e.Resource == QuotaResourceQueryCostBudget {
+		return fmt.Sprintf("workspace %q query cost budget exceeded (cost=%.2f, remaining=%.2f, budget=%.2f)",
+			e.WorkspaceID, e.Cost, e.Remaining, e.Budget)
+	}
+	return fmt.Sprintf("workspace %q %s quota exceeded (limit=%d, current=%d)",
+		e.WorkspaceID, e.Resource, e.Limit, e.Current)
+}
+
+func (e *QuotaExceededError) Unwrap() error { return ErrQuotaExceeded }
+
+// WorkspaceQuota holds configurable resource limits and shared REST/GraphQL
+// query cost budget settings for a workspace. Zero values mean unlimited.
+type WorkspaceQuota struct {
+	WorkspaceID          string    `json:"workspace_id"`
+	MaxMonitors          int64     `json:"max_monitors"`
+	MaxRules             int64     `json:"max_rules"`
+	MaxChannels          int64     `json:"max_channels"`
+	MaxSubscriptions     int64     `json:"max_subscriptions"`
+	QueryCostBudget      float64   `json:"query_cost_budget"`
+	QueryCostRefillPerSec float64  `json:"query_cost_refill_per_sec"`
+	UpdatedAt            time.Time `json:"updated_at"`
+}
+
+// WorkspaceQueryBudgetDecision is the result of reserving or inspecting a
+// workspace's shared query cost budget.
+type WorkspaceQueryBudgetDecision struct {
+	WorkspaceID  string        `json:"workspace_id"`
+	Allowed      bool          `json:"allowed"`
+	Configured   bool          `json:"configured"`
+	Cost         float64       `json:"cost"`
+	Limit        float64       `json:"limit"`
+	Remaining    float64       `json:"remaining"`
+	RefillPerSec float64       `json:"refill_per_sec"`
+	RetryAfter   time.Duration `json:"-"`
+}
+
+// Quotas persists and enforces per-workspace resource quotas and shared
+// REST/GraphQL query cost budgets.
+type Quotas interface {
+	GetWorkspaceQuota(ctx context.Context, workspaceID string) (WorkspaceQuota, error)
+	SetWorkspaceQuota(ctx context.Context, q WorkspaceQuota) (WorkspaceQuota, error)
+	DeleteWorkspaceQuota(ctx context.Context, workspaceID string) error
+	ListWorkspaceQuotas(ctx context.Context) ([]WorkspaceQuota, error)
+	ConsumeWorkspaceQueryBudget(ctx context.Context, workspaceID string, cost float64, now time.Time) (WorkspaceQueryBudgetDecision, error)
+	ReconcileWorkspaceQueryBudget(ctx context.Context, workspaceID string, deltaCost float64, now time.Time) (float64, error)
+}
+
 // Store is everything the application needs from persistence.
 //
 // Tenancy: every method below is scoped to the workspace carried by ctx
@@ -2184,6 +2261,7 @@ type Store interface {
 	Escalations
 	PersistedOperations
 	Usage
+	Quotas
 	GetStats(ctx context.Context) (Stats, error)
 	// GetMonitorStats returns one monitor's alert, delivery and per-rule
 	// counts, or ErrNotFound when the monitor does not exist. It exists
