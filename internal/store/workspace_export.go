@@ -923,7 +923,7 @@ func (p *Postgres) exportPostgresChannels(ctx context.Context, ws string, includ
 	rows, err := p.pool.Query(ctx,
 		`SELECT id, workspace_id, name, type, config, enabled, created_at,
 		        digest_mode, digest_window_seconds, COALESCE(min_severity, ''),
-		        EXTRACT(EPOCH FROM timeout)::int,
+		        timeout,
 		        consecutive_failures, consecutive_permanent_failures, last_error,
 		        last_error_at, last_success_at, disabled_at
 		   FROM channels
