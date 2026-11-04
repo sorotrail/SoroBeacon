@@ -2227,6 +2227,60 @@ type Quotas interface {
 	ReconcileWorkspaceQueryBudget(ctx context.Context, workspaceID string, deltaCost float64, now time.Time) (float64, error)
 }
 
+const (
+	// DefaultIdempotencyTTL is the default retention window (24 hours) for a
+	// stored idempotency key record before it expires and may be reused as new.
+	DefaultIdempotencyTTL = 24 * time.Hour
+
+	// MaxIdempotencyKeyLength bounds the length of an Idempotency-Key header.
+	MaxIdempotencyKeyLength = 255
+)
+
+var (
+	// ErrIdempotencyKeyConflict indicates that an unexpired idempotency key was
+	// reused with a different HTTP method, path, or request body digest.
+	ErrIdempotencyKeyConflict = errors.New("store: idempotency key reused with a different request")
+
+	// ErrIdempotencyKeyInProgress indicates that an identical request with the
+	// same idempotency key is currently executing.
+	ErrIdempotencyKeyInProgress = errors.New("store: request with this idempotency key is already in progress")
+)
+
+// IdempotencyClaimOutcome describes the result of claiming an idempotency key.
+type IdempotencyClaimOutcome string
+
+const (
+	IdempotencyClaimed    IdempotencyClaimOutcome = "claimed"
+	IdempotencyReplayed   IdempotencyClaimOutcome = "replayed"
+	IdempotencyInProgress IdempotencyClaimOutcome = "in_progress"
+	IdempotencyConflict   IdempotencyClaimOutcome = "conflict"
+)
+
+// IdempotencyRecord holds the persisted request fingerprint and response for an
+// idempotent write operation scoped to one workspace.
+type IdempotencyRecord struct {
+	WorkspaceID    string    `json:"workspace_id"`
+	IdempotencyKey string    `json:"idempotency_key"`
+	Method         string    `json:"method"`
+	Path           string    `json:"path"`
+	RequestHash    string    `json:"request_hash"`
+	StatusCode     int       `json:"status_code"`
+	ContentType    string    `json:"content_type"`
+	ResponseBody   []byte    `json:"response_body"`
+	Completed      bool      `json:"completed"`
+	CreatedAt      time.Time `json:"created_at"`
+	ExpiresAt      time.Time `json:"expires_at"`
+}
+
+// Idempotency persists per-workspace idempotency keys and their responses.
+type Idempotency interface {
+	ClaimIdempotencyKey(ctx context.Context, key, method, path, requestHash string, now, expiresAt time.Time) (IdempotencyClaimOutcome, *IdempotencyRecord, error)
+	CompleteIdempotencyKey(ctx context.Context, key, requestHash string, statusCode int, contentType string, responseBody []byte, expiresAt time.Time) error
+	GetIdempotencyKey(ctx context.Context, key string, now time.Time) (*IdempotencyRecord, error)
+	DeleteIdempotencyKey(ctx context.Context, key string) error
+	PruneExpiredIdempotencyKeys(ctx context.Context, before time.Time) (int64, error)
+}
+
 // Store is everything the application needs from persistence.
 //
 // Tenancy: every method below is scoped to the workspace carried by ctx
@@ -2262,6 +2316,7 @@ type Store interface {
 	PersistedOperations
 	Usage
 	Quotas
+	Idempotency
 	GetStats(ctx context.Context) (Stats, error)
 	// GetMonitorStats returns one monitor's alert, delivery and per-rule
 	// counts, or ErrNotFound when the monitor does not exist. It exists

@@ -197,6 +197,22 @@ func Classify(err error) Classified {
 			GRPCCode: codes.FailedPrecondition,
 		}
 	}
+	if errors.Is(err, store.ErrIdempotencyKeyConflict) {
+		return Classified{
+			Status:   http.StatusConflict,
+			Code:     CodeConflict,
+			Message:  "idempotency key was already used with a different request payload",
+			GRPCCode: codes.FailedPrecondition,
+		}
+	}
+	if errors.Is(err, store.ErrIdempotencyKeyInProgress) {
+		return Classified{
+			Status:   http.StatusConflict,
+			Code:     CodeConflict,
+			Message:  "a request with this idempotency key is already in progress",
+			GRPCCode: codes.Aborted,
+		}
+	}
 	var quotaErr *store.QuotaExceededError
 	if errors.As(err, &quotaErr) || errors.Is(err, store.ErrQuotaExceeded) {
 		msg := "workspace quota exceeded"

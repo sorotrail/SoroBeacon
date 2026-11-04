@@ -23,6 +23,11 @@
       "post": {
         "description": "Required role: editor",
         "summary": "Create a monitor",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -3031,6 +3036,16 @@
         "description": "Opaque continuation cursor from a previous page",
         "schema": {
           "type": "string"
+        }
+      },
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": false,
+        "description": "Optional client-generated idempotency key (up to 255 characters) for safe retries on write endpoints (POST, PUT, PATCH, DELETE). Scoped to the caller's workspace and retained for 24 hours. Repeating the same key with the same method, path, and body replays the original HTTP status code and response body with Idempotency-Replayed: true; reusing the key with a different method, path, or body returns 409 CONFLICT.",
+        "schema": {
+          "type": "string",
+          "maxLength": 255
         }
       }
     },
