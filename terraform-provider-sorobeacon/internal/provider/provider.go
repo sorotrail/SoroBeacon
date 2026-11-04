@@ -27,6 +27,8 @@ package provider
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -113,47 +115,130 @@ func (p *SoroBeaconProvider) DataSources(_ context.Context) []func() datasource.
 
 // --- API client ---
 
+// IdempotencyKeyHeader is sent on mutating API calls so retries cannot create
+// duplicate resources or fail on a replayed delete.
+const IdempotencyKeyHeader = "Idempotency-Key"
+
+type idempotencyKeyCtxKey struct{}
+
+// WithIdempotencyKey attaches a caller-supplied idempotency key to ctx for the
+// next mutating provider API call. When unset, apiClient generates a fresh key
+// per logical operation and reuses it across any retry attempts of that call.
+func WithIdempotencyKey(ctx context.Context, key string) context.Context {
+	return context.WithValue(ctx, idempotencyKeyCtxKey{}, strings.TrimSpace(key))
+}
+
+// IdempotencyKeyFromContext returns any explicit idempotency key attached to ctx.
+func IdempotencyKeyFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(idempotencyKeyCtxKey{}).(string)
+	return v
+}
+
+func newIdempotencyKey() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("tf-%d", time.Now().UTC().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%s-%s-%s-%s-%s",
+		hex.EncodeToString(b[0:4]),
+		hex.EncodeToString(b[4:6]),
+		hex.EncodeToString(b[6:8]),
+		hex.EncodeToString(b[8:10]),
+		hex.EncodeToString(b[10:16]),
+	)
+}
+
+func isWriteMethod(method string) bool {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
 type apiClient struct {
 	endpoint   string
 	token      string
 	httpClient *http.Client
+	maxRetries int
 }
 
 func (c *apiClient) do(ctx context.Context, method, path string, body any) ([]byte, int, error) {
-	var reqBody io.Reader
+	var bodyBytes []byte
 	if body != nil {
-		b, err := json.Marshal(body)
+		var err error
+		bodyBytes, err = json.Marshal(body)
 		if err != nil {
 			return nil, 0, fmt.Errorf("marshal request: %w", err)
 		}
-		reqBody = bytes.NewReader(b)
+	}
+
+	var idempotencyKey string
+	if isWriteMethod(method) {
+		idempotencyKey = IdempotencyKeyFromContext(ctx)
+		if idempotencyKey == "" {
+			idempotencyKey = newIdempotencyKey()
+		}
+	}
+
+	attempts := 1
+	if isWriteMethod(method) && c.maxRetries > 0 {
+		attempts += c.maxRetries
 	}
 
 	url := c.endpoint + path
-	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
-	if err != nil {
-		return nil, 0, err
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
+	var lastData []byte
+	var lastStatus int
+	var lastErr error
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer func() {
+	for attempt := 0; attempt < attempts; attempt++ {
+		var reqBody io.Reader
+		if body != nil {
+			reqBody = bytes.NewReader(bodyBytes)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
+		if err != nil {
+			return nil, 0, err
+		}
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if c.token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+		}
+		if idempotencyKey != "" {
+			req.Header.Set(IdempotencyKeyHeader, idempotencyKey)
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			lastStatus = 0
+			lastData = nil
+			continue
+		}
+		data, readErr := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-	}()
+		if readErr != nil {
+			return nil, resp.StatusCode, readErr
+		}
+		lastData = data
+		lastStatus = resp.StatusCode
+		lastErr = nil
 
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, resp.StatusCode, err
+		if resp.StatusCode != http.StatusBadGateway &&
+			resp.StatusCode != http.StatusServiceUnavailable &&
+			resp.StatusCode != http.StatusGatewayTimeout {
+			return data, resp.StatusCode, nil
+		}
 	}
-	return data, resp.StatusCode, nil
+	return lastData, lastStatus, lastErr
 }
 
 // Stable machine-readable error codes matching the server API contract.
