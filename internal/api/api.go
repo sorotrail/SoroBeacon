@@ -918,12 +918,8 @@ func (s *Server) attachPoller(out map[string]any) {
 	out["last_successful_poll"] = pos.LastSuccessfulPoll.UTC().Format(time.RFC3339)
 }
 
-func (s *Server) version(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, buildinfo.Info{
-		Version: buildinfo.Version,
-		Commit:  buildinfo.Commit,
-		Date:    buildinfo.Date,
-	})
+func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, buildinfo.Current())
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {

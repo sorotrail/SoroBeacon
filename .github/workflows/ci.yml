@@ -106,6 +106,11 @@ jobs:
       - uses: docker/setup-buildx-action@v4.4.1
       # Same build arguments as the Makefile, so the ldflags stamping is
       # exercised rather than silently falling back to the Dockerfile defaults.
+      - name: Derive deterministic commit metadata
+        id: meta
+        run: |
+          echo "date=$(TZ=UTC git show -s --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ HEAD)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v7.4.0
         with:
           context: .
@@ -114,11 +119,30 @@ jobs:
           platforms: linux/amd64
           tags: sorobeacon:ci
           build-args: |
-            VERSION=ci-${{ github.sha }}
-            COMMIT=${{ github.sha }}
-            DATE=${{ github.event.head_commit.timestamp || github.event.pull_request.updated_at }}
+            VERSION=ci-${{ steps.meta.outputs.commit }}
+            COMMIT=${{ steps.meta.outputs.commit }}
+            DATE=${{ steps.meta.outputs.date }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Verifies that building the same commit twice in two deliberately different
+  # environments (different checkout directory paths/depths, different HOME,
+  # GOPATH, GOCACHE, TZ, and HOSTNAME) produces byte-for-byte identical binaries
+  # for both sorobeacon and terraform-provider-sorobeacon while preserving
+  # /api/v1/version buildinfo metadata.
+  reproducible-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            terraform-provider-sorobeacon/go.sum
+      - name: Verify byte-for-byte reproducible builds
+        run: bash ./scripts/verify-reproducible-build.sh
 
   # -race needs cgo, which ubuntu-latest provides. It runs without
   # TEST_DATABASE_URL: the detector is about this process's shared state, and

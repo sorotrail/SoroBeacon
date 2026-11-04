@@ -11,7 +11,8 @@ ARG COMMIT=none
 ARG DATE=unknown
 RUN CGO_ENABLED=0 go build \
     -trimpath \
-    -ldflags "-s -w -X github.com/sorotrail/sorobeacon/internal/buildinfo.Version=${VERSION} -X github.com/sorotrail/sorobeacon/internal/buildinfo.Commit=${COMMIT} -X github.com/sorotrail/sorobeacon/internal/buildinfo.Date=${DATE}" \
+    -buildvcs=false \
+    -ldflags "-s -w -buildid= -X github.com/sorotrail/sorobeacon/internal/buildinfo.Version=${VERSION} -X github.com/sorotrail/sorobeacon/internal/buildinfo.Commit=${COMMIT} -X github.com/sorotrail/sorobeacon/internal/buildinfo.Date=${DATE}" \
     -o /out/sorobeacon ./cmd/sorobeacon \
     && printf 'sorobeacon:x:10001:10001:SoroBeacon:/nonexistent:/sbin/nologin\n' > /out/passwd \
     && printf 'sorobeacon:x:10001:\n' > /out/group \
