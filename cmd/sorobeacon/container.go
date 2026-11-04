@@ -144,7 +144,7 @@ func resolveHealthcheckURL(explicitURL, addr, probePath string, tlsEnabled bool)
 	}
 
 	host := "127.0.0.1"
-	port := "8080"
+	var port string
 	if strings.HasPrefix(addr, ":") {
 		port = strings.TrimPrefix(addr, ":")
 		if port == "" {
@@ -228,7 +228,7 @@ func runMigrateWith(ctx context.Context, args []string, out io.Writer, deps migr
 	for attempt := 1; attempt <= attempts; attempt++ {
 		lastErr = applyAndVerifyMigrations(ctx, dbURL, timeout, deps)
 		if lastErr == nil {
-			fmt.Fprintln(out, "sorobeacon: schema is up to date")
+			_, _ = fmt.Fprintln(out, "sorobeacon: schema is up to date")
 			return nil
 		}
 		if attempt < attempts {
