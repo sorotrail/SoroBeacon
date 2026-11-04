@@ -1678,10 +1678,11 @@ func (p *Postgres) exportPostgresAlertDedupPaged(ctx context.Context, ws string,
 	)
 	for {
 		rows, err := p.pool.Query(ctx,
-			`SELECT ad.rule_id, ad.event_id, ad.alert_id, ad.created_at
+			`SELECT ad.rule_id, ad.event_id, ad.alert_id, ad.alert_created_at
 			   FROM alert_dedup ad
 			   JOIN alerts a ON a.id = ad.alert_id
 			  WHERE a.workspace_id = $1
+			    AND ad.rule_id IS NOT NULL
 			    AND (ad.alert_id > $2
 			         OR (ad.alert_id = $2 AND ad.rule_id > $3)
 			         OR (ad.alert_id = $2 AND ad.rule_id = $3 AND ad.event_id > $4))
