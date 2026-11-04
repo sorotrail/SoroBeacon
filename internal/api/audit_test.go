@@ -592,8 +592,9 @@ func TestAllowUnauthenticatedAuditWrite_RateLimits401BurstWhileRecording403(t *t
 
 	entries, err := st.ListAuditEntries(context.Background(), store.AuditFilter{Limit: 200})
 	require.NoError(t, err)
-	// 50 rate-limited 401 entries + 1 authenticated 403 entry = 51 total.
-	require.Len(t, entries, 51)
+	// 50 rate-limited 401 burst entries (+ up to 2 refilled tokens under -race) + 1 authenticated 403 entry.
+	require.GreaterOrEqual(t, len(entries), 51)
+	require.LessOrEqual(t, len(entries), 53)
 	assert.Equal(t, http.StatusForbidden, entries[0].StatusCode)
 	assert.Equal(t, http.StatusUnauthorized, entries[1].StatusCode)
 }
