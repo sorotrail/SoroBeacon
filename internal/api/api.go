@@ -328,6 +328,7 @@ func (s *Server) Routes() chi.Router {
 	mux.Use(middleware.Recoverer)
 	mux.Use(s.metricsContextMiddleware)
 	mux.Use(MaxBodyMiddlewareWithResolver(s.limitForRequest, s.metrics))
+	mux.Use(s.auditRejectedAuthMiddleware)
 	mux.Use(AuthMiddleware(s.auth, s.log))
 	mux.Use(auth.RoleCheck{
 		Authenticator: s.auth,
@@ -348,7 +349,7 @@ func (s *Server) Routes() chi.Router {
 	mux.Use(s.idempotencyMiddleware)
 	// Innermost, so only authenticated, rate-limited requests are audited
 	// and an audit failure never blocks the request.
-	mux.Use(AuditMiddleware(s.store, s.log))
+	mux.Use(AuditMiddlewareWithOptions(s.store, s.rateLimit.TrustForwarded, s.log))
 	// JSON clients hitting a typo'd path or the wrong method should get
 	// the same envelope as every other API error, not chi's plain-text
 	// 404/405. The dashboard mux is a different router and is untouched.

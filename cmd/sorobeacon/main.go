@@ -268,9 +268,10 @@ type server struct {
 	// Wiring decisions, set once here and used by run. Keeping them in one
 	// place means the branch that constructs a component and the loop that
 	// starts it cannot disagree about whether it is enabled.
-	prunerEnabled   bool
-	playground      bool
-	shutdownTimeout time.Duration
+	prunerEnabled      bool
+	auditPrunerEnabled bool
+	playground         bool
+	shutdownTimeout    time.Duration
 }
 
 // newServer builds the process from configuration: store and migrations,
@@ -702,6 +703,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	srv.archiver = archiver
 	srv.httpSrv = httpSrv
 	srv.prunerEnabled = cfg.AlertRetention > 0
+	srv.auditPrunerEnabled = cfg.AuditRetention > 0
 	srv.playground = cfg.GraphQL.EnablePlayground
 
 	var srvTLSReloader *tlsutil.Reloader
@@ -906,6 +908,13 @@ func (s *server) job(ctx context.Context) {
 				Log:           s.log,
 			})
 		})
+	}
+	if s.auditPrunerEnabled {
+		if ap, ok := s.store.(store.AuditPruner); ok {
+			start(func(ctx context.Context) {
+				store.RunAuditPruner(ctx, ap, s.cfg.AuditRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, s.log)
+			})
+		}
 	}
 	// The digest flusher and the escalation stepper are leader-gated for the
 	// same reason as the pruner: they send on a timer, and two instances

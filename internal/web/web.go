@@ -1582,6 +1582,7 @@ func (s *Server) toggleChannel(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionUpdate, store.AuditTargetChannel, id, "enabled")
 	http.Redirect(w, r, "/channels", http.StatusSeeOther)
 }
 
@@ -1653,6 +1654,7 @@ func (s *Server) duplicateChannel(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionCreate, store.AuditTargetChannel, dup.ID, "name", "type", "config")
 	http.Redirect(w, r, "/channels", http.StatusSeeOther)
 }
 
@@ -1744,6 +1746,7 @@ func (s *Server) createMaintenance(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionCreate, store.AuditTargetMaintenanceWindow, mw.ID, "reason", "scope", "start_at", "end_at")
 	http.Redirect(w, r, "/maintenance", http.StatusSeeOther)
 }
 
@@ -1757,6 +1760,7 @@ func (s *Server) deleteMaintenance(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionDelete, store.AuditTargetMaintenanceWindow, id)
 	http.Redirect(w, r, "/maintenance", http.StatusSeeOther)
 }
 

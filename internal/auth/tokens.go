@@ -255,6 +255,25 @@ type Principal struct {
 	// Name is the token's label, for log lines that identify *which* credential
 	// was used without containing any part of it.
 	Name string
+	// ActorType classifies the caller for administrative audit records
+	// ("person" vs "automation").
+	ActorType string
+}
+
+// EffectiveActorType returns the caller's actor classification ("person" or
+// "automation"), defaulting to "automation" for restricted tokens and "person"
+// otherwise.
+func (p *Principal) EffectiveActorType() string {
+	if p == nil {
+		return "anonymous"
+	}
+	if p.ActorType != "" {
+		return p.ActorType
+	}
+	if p.restricted {
+		return "automation"
+	}
+	return "person"
 }
 
 // RoleInWorkspace reports the role granted to this principal in ws, if any.
@@ -474,6 +493,7 @@ func principalFor(t *Token) *Principal {
 		scopes:     t.Scopes,
 		tokenID:    t.ID,
 		Name:       t.Name,
+		ActorType:  "automation",
 	}
 }
 

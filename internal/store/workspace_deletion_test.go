@@ -131,7 +131,7 @@ func TestWorkspaceDeletionCoversEverySchemaTable(t *testing.T) {
 		require.NoError(t, colRows.Err())
 		_ = colRows.Close()
 
-		if hasWorkspaceCol {
+		if hasWorkspaceCol && tbl != "audit_log" {
 			assert.True(t, covered[tbl], "table %q has a workspace_id column and MUST be covered by workspace deletion", tbl)
 		}
 

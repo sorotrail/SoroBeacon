@@ -93,6 +93,28 @@ func ServiceDesc() grpc.ServiceDesc {
 	return monitorServiceDesc
 }
 
+// AuditGRPCMethodSpec describes the administrative action and target entity
+// type a mutating gRPC method records in the audit log.
+type AuditGRPCMethodSpec struct {
+	Action     string
+	TargetType string
+}
+
+// AuditGRPCMethodTable maps mutating gRPC RPC method names on MonitorService
+// to their audit specification. MonitorService is currently read/stream-only;
+// adding a new RPC to monitorServiceDesc fails the mechanical audit coverage
+// test unless it is registered here or in AuditExemptGRPCMethods.
+var AuditGRPCMethodTable = map[string]AuditGRPCMethodSpec{}
+
+// AuditExemptGRPCMethods documents read-only and streaming RPCs on
+// MonitorService that do not mutate state and are exempt from audit logging.
+var AuditExemptGRPCMethods = map[string]string{
+	"GetMonitor":   "Read-only unary RPC fetching a single monitor by ID.",
+	"ListMonitors": "Read-only unary RPC listing monitors for the caller's workspace.",
+	"ListAlerts":   "Read-only unary RPC listing alerts for the caller's workspace.",
+	"StreamAlerts": "Read-only server-streaming RPC polling alerts for the caller's workspace.",
+}
+
 // Serve starts the gRPC server on the given address. It blocks until the
 // server stops or ctx is cancelled.
 func (s *Server) Serve(ctx context.Context, addr string) error {

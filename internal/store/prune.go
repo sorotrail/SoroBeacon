@@ -519,3 +519,108 @@ func RunDeadLetterPruner(ctx context.Context, st DeadLetters, retention, interva
 		}
 	}
 }
+
+// AuditPruner is the persistence slice the audit retention loop needs.
+// Audit retention is configured separately from ALERT_RETENTION via
+// AUDIT_RETENTION so operational alert pruning never erases the administrative
+// audit trail unless explicitly configured.
+type AuditPruner interface {
+	DeleteExpiredAuditEntries(ctx context.Context, cutoff time.Time, limit int) (int64, error)
+}
+
+// DeleteExpiredAuditEntries removes up to limit audit_log rows whose created_at
+// is strictly before cutoff, oldest first. limit is clamped to
+// DefaultPruneBatch when non-positive.
+func (p *Postgres) DeleteExpiredAuditEntries(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = DefaultPruneBatch
+	}
+	var deleted int64
+	err := p.pool.QueryRow(ctx, `
+		WITH expired AS (
+			SELECT id FROM audit_log
+			WHERE created_at < $1
+			ORDER BY created_at ASC, id ASC
+			LIMIT $2
+		),
+		deleted_audit AS (
+			DELETE FROM audit_log a
+			USING expired x
+			WHERE a.id = x.id
+			RETURNING a.id
+		)
+		SELECT count(*) FROM deleted_audit`, cutoff.UTC(), limit).Scan(&deleted)
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
+}
+
+// DeleteExpiredAuditEntries is the SQLite counterpart to Postgres.DeleteExpiredAuditEntries.
+func (s *SQLite) DeleteExpiredAuditEntries(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = DefaultPruneBatch
+	}
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM audit_log WHERE id IN (
+			SELECT id FROM audit_log WHERE created_at < ?
+			ORDER BY created_at ASC, id ASC LIMIT ?
+		)`, sqliteTimeString(cutoff.UTC()), limit)
+	if err != nil {
+		return 0, mapSQLiteErr(err)
+	}
+	return res.RowsAffected()
+}
+
+// RunAuditPruner deletes audit_log entries older than retention in batches
+// until ctx is cancelled. Non-positive retention is a no-op so audit records
+// are kept indefinitely unless AUDIT_RETENTION is explicitly set.
+func RunAuditPruner(ctx context.Context, st AuditPruner, retention, interval time.Duration, batch int, log *slog.Logger) {
+	if retention <= 0 {
+		return
+	}
+	if batch <= 0 {
+		batch = DefaultPruneBatch
+	}
+	if interval <= 0 {
+		interval = DefaultPruneInterval
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	log.Info("audit retention pruner started",
+		"retention", retention.String(),
+		"interval", interval.String(),
+		"batch", batch,
+	)
+
+	pruneOnce := func() {
+		cutoff := time.Now().UTC().Add(-retention)
+		var deleted int64
+		for {
+			n, err := st.DeleteExpiredAuditEntries(ctx, cutoff, batch)
+			if err != nil {
+				log.Error("audit retention prune failed", "error", err, "cutoff", cutoff)
+				return
+			}
+			deleted += n
+			if n < int64(batch) {
+				break
+			}
+		}
+		log.Info("audit retention prune", "deleted", deleted, "cutoff", cutoff)
+	}
+
+	pruneOnce()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("audit retention pruner stopped")
+			return
+		case <-t.C:
+			pruneOnce()
+		}
+	}
+}

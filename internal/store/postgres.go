@@ -3578,18 +3578,64 @@ func (p *Postgres) DeleteDigestAlerts(ctx context.Context, channelID int64, ids 
 // --- audit log ---
 
 func (p *Postgres) CreateAuditEntry(ctx context.Context, e *AuditEntry) error {
-	diff := e.Diff
-	if len(diff) == 0 {
-		diff = json.RawMessage(`{}`)
+	NormalizeAuditEntry(ctx, e)
+	if e.CreatedAt.IsZero() {
+		e.CreatedAt = time.Now().UTC().Truncate(time.Millisecond)
+	} else {
+		e.CreatedAt = e.CreatedAt.UTC().Truncate(time.Millisecond)
 	}
-	return p.pool.QueryRow(ctx,
-		`INSERT INTO audit_log (actor, action, target_type, target_id, diff) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
-		e.Actor, e.Action, e.TargetType, e.TargetID, diff).Scan(&e.ID, &e.CreatedAt)
+
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('audit_log:' || $1))`, e.WorkspaceID); err != nil {
+		return err
+	}
+	var prevHash string
+	if err := tx.QueryRow(ctx,
+		`SELECT COALESCE((SELECT record_hash FROM audit_log WHERE workspace_id = $1 ORDER BY id DESC LIMIT 1), '')`,
+		e.WorkspaceID).Scan(&prevHash); err != nil {
+		return err
+	}
+	e.PrevHash = prevHash
+	e.RecordHash = ComputeAuditRecordHash(*e)
+
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO audit_log (
+			workspace_id, actor, actor_type, action, target_type, target_id,
+			resource_id, surface, source_ip, outcome, status_code, reason,
+			diff, prev_hash, record_hash, created_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6,
+			$7, $8, $9, $10, $11, $12,
+			$13, $14, $15, $16
+		) RETURNING id, created_at`,
+		e.WorkspaceID, e.Actor, e.ActorType, e.Action, e.TargetType, e.TargetID,
+		e.ResourceID, e.Surface, e.SourceIP, e.Outcome, e.StatusCode, e.Reason,
+		e.Diff, e.PrevHash, e.RecordHash, e.CreatedAt,
+	).Scan(&e.ID, &e.CreatedAt); err != nil {
+		return err
+	}
+	e.CreatedAt = e.CreatedAt.UTC()
+	return tx.Commit(ctx)
 }
 
 func (p *Postgres) ListAuditEntries(ctx context.Context, f AuditFilter) ([]AuditEntry, error) {
 	where := []string{"TRUE"}
 	args := []any{}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		if f.WorkspaceID != "" && f.WorkspaceID != string(ws) {
+			return []AuditEntry{}, nil
+		}
+		args = append(args, string(ws))
+		where = append(where, fmt.Sprintf("workspace_id = $%d", len(args)))
+	} else if f.WorkspaceID != "" {
+		args = append(args, f.WorkspaceID)
+		where = append(where, fmt.Sprintf("workspace_id = $%d", len(args)))
+	}
 	if f.TargetType != "" {
 		args = append(args, f.TargetType)
 		where = append(where, fmt.Sprintf("target_type = $%d", len(args)))
@@ -3597,6 +3643,14 @@ func (p *Postgres) ListAuditEntries(ctx context.Context, f AuditFilter) ([]Audit
 	if f.TargetID != 0 {
 		args = append(args, f.TargetID)
 		where = append(where, fmt.Sprintf("target_id = $%d", len(args)))
+	}
+	if f.ResourceID != "" {
+		args = append(args, f.ResourceID)
+		where = append(where, fmt.Sprintf("resource_id = $%d", len(args)))
+	}
+	if f.Action != "" {
+		args = append(args, f.Action)
+		where = append(where, fmt.Sprintf("action = $%d", len(args)))
 	}
 	if !f.From.IsZero() {
 		args = append(args, f.From)
@@ -3610,6 +3664,18 @@ func (p *Postgres) ListAuditEntries(ctx context.Context, f AuditFilter) ([]Audit
 		args = append(args, f.Actor)
 		where = append(where, fmt.Sprintf("actor = $%d", len(args)))
 	}
+	if f.ActorType != "" {
+		args = append(args, f.ActorType)
+		where = append(where, fmt.Sprintf("actor_type = $%d", len(args)))
+	}
+	if f.Surface != "" {
+		args = append(args, f.Surface)
+		where = append(where, fmt.Sprintf("surface = $%d", len(args)))
+	}
+	if f.Outcome != "" {
+		args = append(args, f.Outcome)
+		where = append(where, fmt.Sprintf("outcome = $%d", len(args)))
+	}
 	if f.AfterID != 0 {
 		// The listing is id DESC, so the next page holds strictly smaller ids.
 		args = append(args, f.AfterID)
@@ -3617,7 +3683,10 @@ func (p *Postgres) ListAuditEntries(ctx context.Context, f AuditFilter) ([]Audit
 	}
 	limit := clampAuditLimit(f.Limit)
 	args = append(args, limit)
-	q := `SELECT id, actor, action, target_type, target_id, diff, created_at FROM audit_log WHERE ` +
+	q := `SELECT id, workspace_id, actor, actor_type, action, target_type, target_id,
+	             resource_id, surface, source_ip, outcome, status_code, reason,
+	             diff, prev_hash, record_hash, created_at
+	        FROM audit_log WHERE ` +
 		strings.Join(where, " AND ") + fmt.Sprintf(" ORDER BY id DESC LIMIT $%d", len(args))
 	rows, err := p.pool.Query(ctx, q, args...)
 	if err != nil {
@@ -3628,7 +3697,11 @@ func (p *Postgres) ListAuditEntries(ctx context.Context, f AuditFilter) ([]Audit
 	for rows.Next() {
 		var e AuditEntry
 		var diff []byte
-		if err := rows.Scan(&e.ID, &e.Actor, &e.Action, &e.TargetType, &e.TargetID, &diff, &e.CreatedAt); err != nil {
+		if err := rows.Scan(
+			&e.ID, &e.WorkspaceID, &e.Actor, &e.ActorType, &e.Action, &e.TargetType, &e.TargetID,
+			&e.ResourceID, &e.Surface, &e.SourceIP, &e.Outcome, &e.StatusCode, &e.Reason,
+			&diff, &e.PrevHash, &e.RecordHash, &e.CreatedAt,
+		); err != nil {
 			return nil, err
 		}
 		e.Diff = json.RawMessage(diff)

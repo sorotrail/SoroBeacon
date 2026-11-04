@@ -167,8 +167,9 @@ func testChannelDigest(t *testing.T, newStore conformanceFactory) {
 	assert.Empty(t, rows)
 }
 
-// testAuditLog proves the audit table is append-only, filters correctly, and
-// never carries the secret values a channel config holds.
+// testAuditLog proves the audit table is append-only, filters correctly,
+// maintains a tamper-evident per-workspace hash chain, and never carries
+// secret/config material even if passed in Diff.
 func testAuditLog(t *testing.T, newStore conformanceFactory) {
 	ctx := context.Background()
 	st := newStore(t)
@@ -181,18 +182,59 @@ func testAuditLog(t *testing.T, newStore conformanceFactory) {
 	}
 	require.NoError(t, st.CreateChannel(ctx, ch))
 
-	// The middleware records field names, never values; this mirrors what it
-	// writes so the store contract (and the absence of the secret) is pinned.
+	// Even if a caller accidentally passes channel config or secret keys in
+	// Diff, the store boundary strips them before writing.
 	entries := []*AuditEntry{
-		{Actor: "req-1", Action: AuditActionCreate, TargetType: "channel", TargetID: ch.ID, Diff: json.RawMessage(`{"fields":["config","name"]}`)},
-		{Actor: "req-2", Action: AuditActionUpdate, TargetType: "channel", TargetID: ch.ID, Diff: json.RawMessage(`{"fields":["config"]}`)},
-		{Actor: "req-3", Action: AuditActionDelete, TargetType: "monitor", TargetID: 42},
+		{
+			Actor:      "req-1",
+			ActorType:  AuditActorPerson,
+			Action:     AuditActionCreate,
+			TargetType: AuditTargetChannel,
+			TargetID:   ch.ID,
+			ResourceID: fmt.Sprintf("%d", ch.ID),
+			SourceIP:   "192.0.2.10",
+			Surface:    AuditSurfaceREST,
+			Outcome:    AuditOutcomeSucceeded,
+			StatusCode: 201,
+			Diff:       json.RawMessage(`{"fields":["config","name"],"config":{"webhook_url":"https://hooks.example/SECRET-TOKEN"},"token":"s3cr3t-value"}`),
+		},
+		{
+			Actor:      "req-2",
+			ActorType:  AuditActorAutomation,
+			Action:     AuditActionUpdate,
+			TargetType: AuditTargetChannel,
+			TargetID:   ch.ID,
+			ResourceID: fmt.Sprintf("%d", ch.ID),
+			SourceIP:   "198.51.100.5",
+			Surface:    AuditSurfaceREST,
+			Outcome:    AuditOutcomeSucceeded,
+			StatusCode: 200,
+			Diff:       json.RawMessage(`{"fields":["config"]}`),
+		},
+		{
+			Actor:      "req-3",
+			ActorType:  AuditActorAutomation,
+			Action:     AuditActionDelete,
+			TargetType: AuditTargetMonitor,
+			TargetID:   42,
+			ResourceID: "42",
+			SourceIP:   "203.0.113.9",
+			Surface:    AuditSurfaceDashboard,
+			Outcome:    AuditOutcomeFailed,
+			StatusCode: 403,
+			Reason:     "insufficient role: viewer cannot mutate monitor",
+		},
 	}
 	for _, e := range entries {
 		require.NoError(t, st.CreateAuditEntry(ctx, e))
 		assert.NotZero(t, e.ID)
 		assert.False(t, e.CreatedAt.IsZero())
+		assert.NotEmpty(t, e.RecordHash)
+		assert.Equal(t, "default", e.WorkspaceID)
 	}
+	assert.Empty(t, entries[0].PrevHash, "first entry in workspace starts the chain")
+	assert.Equal(t, entries[0].RecordHash, entries[1].PrevHash, "second entry links to first")
+	assert.Equal(t, entries[1].RecordHash, entries[2].PrevHash, "third entry links to second")
 
 	// Append-only: all three survive, newest first.
 	list, err := st.ListAuditEntries(ctx, AuditFilter{})
@@ -201,9 +243,30 @@ func testAuditLog(t *testing.T, newStore conformanceFactory) {
 	assert.Equal(t, entries[2].ID, list[0].ID)
 	for _, e := range list {
 		assert.NotContains(t, string(e.Diff), "SECRET-TOKEN")
+		assert.NotContains(t, string(e.Diff), "s3cr3t-value")
 	}
+	assert.JSONEq(t, `{"fields":["config","name"]}`, string(list[2].Diff))
 	// An entry with no diff is stored as an empty JSON object, never NULL.
 	assert.JSONEq(t, `{}`, string(list[0].Diff))
+	assert.Equal(t, AuditOutcomeFailed, list[0].Outcome)
+	assert.Equal(t, 403, list[0].StatusCode)
+	assert.Equal(t, "insufficient role: viewer cannot mutate monitor", list[0].Reason)
+	assert.Equal(t, "203.0.113.9", list[0].SourceIP)
+	assert.Equal(t, AuditSurfaceDashboard, list[0].Surface)
+	assert.Equal(t, AuditActorAutomation, list[0].ActorType)
+
+	// Verify tamper-evident hash chain on the returned slice (newest-first or oldest-first).
+	valid, brokenIdx, err := VerifyAuditHashChain(list)
+	require.NoError(t, err)
+	assert.True(t, valid)
+	assert.Equal(t, -1, brokenIdx)
+	tampered := make([]AuditEntry, len(list))
+	copy(tampered, list)
+	tampered[1].Actor = "evil-actor"
+	valid, brokenIdx, err = VerifyAuditHashChain(tampered)
+	require.Error(t, err, "tampering with an entry must break the hash chain")
+	assert.False(t, valid)
+	assert.Equal(t, 1, brokenIdx)
 
 	byType, err := st.ListAuditEntries(ctx, AuditFilter{TargetType: "channel"})
 	require.NoError(t, err)
@@ -212,6 +275,31 @@ func testAuditLog(t *testing.T, newStore conformanceFactory) {
 	byTarget, err := st.ListAuditEntries(ctx, AuditFilter{TargetType: "channel", TargetID: ch.ID})
 	require.NoError(t, err)
 	require.Len(t, byTarget, 2)
+
+	byOutcome, err := st.ListAuditEntries(ctx, AuditFilter{Outcome: AuditOutcomeFailed})
+	require.NoError(t, err)
+	require.Len(t, byOutcome, 1)
+	assert.Equal(t, entries[2].ID, byOutcome[0].ID)
+
+	byActorType, err := st.ListAuditEntries(ctx, AuditFilter{ActorType: AuditActorPerson})
+	require.NoError(t, err)
+	require.Len(t, byActorType, 1)
+	assert.Equal(t, entries[0].ID, byActorType[0].ID)
+
+	bySurface, err := st.ListAuditEntries(ctx, AuditFilter{Surface: AuditSurfaceDashboard})
+	require.NoError(t, err)
+	require.Len(t, bySurface, 1)
+	assert.Equal(t, entries[2].ID, bySurface[0].ID)
+
+	byAction, err := st.ListAuditEntries(ctx, AuditFilter{Action: AuditActionUpdate})
+	require.NoError(t, err)
+	require.Len(t, byAction, 1)
+	assert.Equal(t, entries[1].ID, byAction[0].ID)
+
+	byResource, err := st.ListAuditEntries(ctx, AuditFilter{ResourceID: "42"})
+	require.NoError(t, err)
+	require.Len(t, byResource, 1)
+	assert.Equal(t, entries[2].ID, byResource[0].ID)
 
 	limited, err := st.ListAuditEntries(ctx, AuditFilter{Limit: 1})
 	require.NoError(t, err)
@@ -240,6 +328,16 @@ func testAuditLog(t *testing.T, newStore conformanceFactory) {
 	none, err := st.ListAuditEntries(ctx, AuditFilter{From: time.Now().Add(time.Hour)})
 	require.NoError(t, err)
 	assert.Empty(t, none)
+
+	// Audit retention prunes entries older than cutoff.
+	pruner, ok := st.(AuditPruner)
+	require.True(t, ok, "both backends must implement AuditPruner")
+	deleted, err := pruner.DeleteExpiredAuditEntries(ctx, time.Now().Add(-time.Hour), 100)
+	require.NoError(t, err)
+	assert.Zero(t, deleted)
+	deleted, err = pruner.DeleteExpiredAuditEntries(ctx, time.Now().Add(time.Hour), 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), deleted)
 }
 
 // testAlertAcknowledgement is the dashboard acknowledge path at the store
@@ -2524,8 +2622,13 @@ func testWorkspaceRetentionPoliciesAndPruning(t *testing.T, newStore conformance
 	require.NoError(t, err)
 	assert.Equal(t, AlertCreated, outcome, "pruned alert's dedup entry must be cleared")
 
-	// 9. Audit trail recorded the retention policy updates.
-	audits, err := st.ListAuditEntries(ctxA, AuditFilter{TargetType: AuditTargetWorkspaceRetention})
+	// 9. Audit trail recorded the retention policy updates (workspace-scoped for tenants, all for system).
+	auditsA, err := st.ListAuditEntries(ctxA, AuditFilter{TargetType: AuditTargetWorkspaceRetention})
+	require.NoError(t, err)
+	require.Len(t, auditsA, 1)
+	assert.Equal(t, "admin-a", auditsA[0].Actor)
+
+	audits, err := st.ListAuditEntries(workspace.WithSystem(context.Background()), AuditFilter{TargetType: AuditTargetWorkspaceRetention})
 	require.NoError(t, err)
 	require.Len(t, audits, 2)
 	assert.Equal(t, "admin-b", audits[0].Actor)
