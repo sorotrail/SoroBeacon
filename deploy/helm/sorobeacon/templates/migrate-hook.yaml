@@ -82,12 +82,8 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          {{- /*
-          The runtime image is built FROM scratch with no shell or external
-          HTTP utilities; `sorobeacon migrate` applies embedded migrations and
-          verifies schema readiness (the same invariant /api/v1/livez gates on
-          startup) directly inside the binary.
-          */ -}}
+          # Applies embedded migrations and verifies schema readiness (the same
+          # invariant /api/v1/livez gates on startup) directly inside the binary.
           command: ["/usr/local/bin/sorobeacon"]
           args:
             - migrate
