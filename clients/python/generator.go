@@ -201,6 +201,8 @@ var knownRouteBindings = []routeBinding{
 	{"GET", "/retention", "get_retention"},
 	{"PUT", "/retention", "set_retention"},
 	{"DELETE", "/retention", "reset_retention"},
+	{"GET", "/workspace/export", "export_current_workspace"},
+	{"GET", "/workspaces/{id}/export", "export_workspace"},
 	{"GET", "/audit", "list_audit_logs"},
 	{"GET", "/templates", "list_templates"},
 	{"POST", "/templates", "create_template"},
@@ -2348,6 +2350,28 @@ func writeClientClass(b *bytes.Buffer) {
         headers: Mapping[str, str] | None = None,
     ) -> JsonObject:
         return self._request("DELETE", "/retention", query=params, headers=headers)
+
+    def export_current_workspace(
+        self,
+        params: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        return self._request("GET", "/workspace/export", query=params, headers=headers)
+
+    def export_workspace(
+        self,
+        workspace_id: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        return self._request(
+            "GET",
+            f"/workspaces/{urllib.parse.quote(str(workspace_id), safe='')}/export",
+            query=params,
+            headers=headers,
+        )
 
     def list_audit_logs(
         self,

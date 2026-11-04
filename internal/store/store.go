@@ -2149,6 +2149,9 @@ type Workspaces interface {
 	// GetWorkspaceDeletion returns the persisted deletion progress/tombstone for
 	// id, or ErrNotFound if no deletion has been initiated for id.
 	GetWorkspaceDeletion(ctx context.Context, id workspace.ID) (*WorkspaceDeletionResult, error)
+	// ExportWorkspace streams every record belonging to workspace id in a
+	// deterministic, versioned, self-describing order.
+	ExportWorkspace(ctx context.Context, id workspace.ID, opts WorkspaceExportOptions, emit func(WorkspaceExportRecord) error) error
 }
 
 // APITokens persists the scoped, database-backed API tokens. It is exactly

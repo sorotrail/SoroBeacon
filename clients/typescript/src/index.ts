@@ -976,6 +976,8 @@ export const OPENAPI_OPERATIONS = [
   { method: "GET", path: "/retention", clientMethod: "getRetention", summary: "Get effective workspace alert retention policy" },
   { method: "PUT", path: "/retention", clientMethod: "setRetention", summary: "Set workspace alert retention policy override" },
   { method: "DELETE", path: "/retention", clientMethod: "resetRetention", summary: "Reset workspace alert retention policy to instance default" },
+  { method: "GET", path: "/workspace/export", clientMethod: "exportCurrentWorkspace", summary: "Stream a single-workspace data export for the caller's workspace" },
+  { method: "GET", path: "/workspaces/{id}/export", clientMethod: "exportWorkspace", summary: "Stream a single-workspace data export by workspace ID" },
   { method: "GET", path: "/audit", clientMethod: "listAuditLogs", summary: "Audit log of configuration changes" },
   { method: "GET", path: "/templates", clientMethod: "listTemplates", summary: "List monitor templates" },
   { method: "POST", path: "/templates", clientMethod: "createTemplate", summary: "Create a monitor template" },
@@ -2088,6 +2090,27 @@ export class SoroBeaconClient {
     options?: RequestOptions,
   ): Promise<JsonObject> {
     return this.request<JsonObject>("DELETE", "/retention", {
+      query: params as Record<string, unknown>,
+      requestOptions: options,
+    });
+  }
+
+  async exportCurrentWorkspace(
+    params?: { workspace?: string; include_secrets?: boolean; include_alerts?: boolean; page_size?: number; format?: "json" | "ndjson" },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>("GET", "/workspace/export", {
+      query: params as Record<string, unknown>,
+      requestOptions: options,
+    });
+  }
+
+  async exportWorkspace(
+    id: string,
+    params?: { include_secrets?: boolean; include_alerts?: boolean; page_size?: number; format?: "json" | "ndjson" },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>("GET", `/workspaces/${encodeURIComponent(String(id))}/export`, {
       query: params as Record<string, unknown>,
       requestOptions: options,
     });

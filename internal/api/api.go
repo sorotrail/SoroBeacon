@@ -475,9 +475,11 @@ func (s *Server) Routes() chi.Router {
 	mux.Get("/retention", s.getRetention)
 	mux.Put("/retention", s.putRetention)
 	mux.Delete("/retention", s.deleteRetention)
+	mux.Get("/workspace/export", s.exportWorkspace)
 	mux.Get("/audit", s.listAudit)
 
 	mux.Route("/workspaces/{id}", func(r chi.Router) {
+		r.Get("/export", s.exportWorkspace)
 		r.Delete("/", s.deleteWorkspace)
 		r.Post("/delete", s.deleteWorkspace)
 		r.Get("/delete", s.getWorkspaceDeletion)

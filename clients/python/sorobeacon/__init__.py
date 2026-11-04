@@ -999,6 +999,8 @@ OPENAPI_OPERATIONS: tuple[dict[str, str], ...] = (
     {"method": "GET", "path": "/retention", "client_method": "get_retention", "summary": "Get effective workspace alert retention policy"},
     {"method": "PUT", "path": "/retention", "client_method": "set_retention", "summary": "Set workspace alert retention policy override"},
     {"method": "DELETE", "path": "/retention", "client_method": "reset_retention", "summary": "Reset workspace alert retention policy to instance default"},
+    {"method": "GET", "path": "/workspace/export", "client_method": "export_current_workspace", "summary": "Stream a single-workspace data export for the caller's workspace"},
+    {"method": "GET", "path": "/workspaces/{id}/export", "client_method": "export_workspace", "summary": "Stream a single-workspace data export by workspace ID"},
     {"method": "GET", "path": "/audit", "client_method": "list_audit_logs", "summary": "Audit log of configuration changes"},
     {"method": "GET", "path": "/templates", "client_method": "list_templates", "summary": "List monitor templates"},
     {"method": "POST", "path": "/templates", "client_method": "create_template", "summary": "Create a monitor template"},
@@ -2203,6 +2205,28 @@ class SoroBeaconClient:
         headers: Mapping[str, str] | None = None,
     ) -> JsonObject:
         return self._request("DELETE", "/retention", query=params, headers=headers)
+
+    def export_current_workspace(
+        self,
+        params: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        return self._request("GET", "/workspace/export", query=params, headers=headers)
+
+    def export_workspace(
+        self,
+        workspace_id: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        return self._request(
+            "GET",
+            f"/workspaces/{urllib.parse.quote(str(workspace_id), safe='')}/export",
+            query=params,
+            headers=headers,
+        )
 
     def list_audit_logs(
         self,

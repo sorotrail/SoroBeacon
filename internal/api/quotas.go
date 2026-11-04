@@ -38,12 +38,12 @@ type QuotasResponse struct {
 }
 
 type putQuotaRequest struct {
-	WorkspaceID          string   `json:"workspace_id"`
-	MaxMonitors          *int64   `json:"max_monitors"`
-	MaxRules             *int64   `json:"max_rules"`
-	MaxChannels          *int64   `json:"max_channels"`
-	MaxSubscriptions     *int64   `json:"max_subscriptions"`
-	QueryCostBudget      *float64 `json:"query_cost_budget"`
+	WorkspaceID           string   `json:"workspace_id"`
+	MaxMonitors           *int64   `json:"max_monitors"`
+	MaxRules              *int64   `json:"max_rules"`
+	MaxChannels           *int64   `json:"max_channels"`
+	MaxSubscriptions      *int64   `json:"max_subscriptions"`
+	QueryCostBudget       *float64 `json:"query_cost_budget"`
 	QueryCostRefillPerSec *float64 `json:"query_cost_refill_per_sec"`
 }
 
@@ -69,6 +69,13 @@ func isQuotaExemptPath(path string) bool {
 		trimmed == "/retention" || strings.HasPrefix(trimmed, "/retention/")
 }
 
+func isWorkspaceExportPath(trimmed string) bool {
+	if trimmed == "/workspace/export" {
+		return true
+	}
+	return strings.HasPrefix(trimmed, "/workspaces/") && strings.HasSuffix(trimmed, "/export")
+}
+
 func estimateRESTQueryCost(r *http.Request) float64 {
 	trimmed := strings.TrimPrefix(r.URL.Path, "/api/v1")
 	q := r.URL.Query()
@@ -81,6 +88,12 @@ func estimateRESTQueryCost(r *http.Request) float64 {
 	}
 
 	switch {
+	case isWorkspaceExportPath(trimmed):
+		if q.Get("include_alerts") == "true" || q.Get("include_alerts") == "1" {
+			return 40.0
+		}
+		return 20.0
+
 	case trimmed == "/alerts.csv" || trimmed == "/alerts/export":
 		eff := limit
 		if eff <= 0 || eff > 1000 {
@@ -124,7 +137,7 @@ func reconcileRESTQueryCost(r *http.Request, estimated float64, status int, byte
 	}
 	trimmed := strings.TrimPrefix(r.URL.Path, "/api/v1")
 	switch {
-	case trimmed == "/alerts.csv" || trimmed == "/alerts/export":
+	case trimmed == "/alerts.csv" || trimmed == "/alerts/export" || isWorkspaceExportPath(trimmed):
 		actual := 10.0 + float64(bytesWritten)/2048.0
 		if actual < 5.0 {
 			actual = 5.0

@@ -108,6 +108,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	// The tenancy suite. These are the assertions the workspace boundary rests
 	// on, so they run against both backends like everything else.
 	t.Run("WorkspaceIsolation", func(t *testing.T) { testWorkspaceIsolation(t, newStore) })
+	t.Run("WorkspaceExportIsolation", func(t *testing.T) { testWorkspaceExportIsolation(t, newStore) })
 	t.Run("DeleteByIDAllowlist", func(t *testing.T) { testDeleteByIDAllowlist(t, newStore) })
 	t.Run("APITokens", func(t *testing.T) { testAPITokens(t, newStore) })
 	// A constraint violation is the request's fault, and both backends have
