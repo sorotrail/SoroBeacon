@@ -47,10 +47,12 @@ Commands:
   channel list|create|delete|test                 notification channels
 
 Local commands (they read the environment or the database, not an instance):
-  validate   check the configuration and exit
-  backfill   replay a monitor's recent history
-  backup     dump the database
-  restore    load a dump
+  validate     check the configuration and exit
+  migrate      apply embedded database migrations and exit
+  healthcheck  probe the local HTTP health endpoint and exit
+  backfill     replay a monitor's recent history
+  backup       dump the database
+  restore      load a dump
 
 Global flags (accepted before or after the command):
   --url URL       instance base URL (default $SOROBEACON_URL, then ` +

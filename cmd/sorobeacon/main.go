@@ -74,6 +74,18 @@ func main() {
 	}
 	if len(args) > 0 {
 		switch args[0] {
+		case "healthcheck":
+			if err := runHealthcheck(context.Background(), args[1:], os.Stdout); err != nil {
+				reportCLIError(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		case "migrate":
+			if err := runMigrate(context.Background(), args[1:], os.Stdout); err != nil {
+				reportCLIError(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
 		case "backup":
 			if err := runBackup(args[1:]); err != nil {
 				slog.Error("backup failed", "err", err)

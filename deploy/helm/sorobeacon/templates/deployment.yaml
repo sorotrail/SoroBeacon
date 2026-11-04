@@ -32,6 +32,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "sorobeacon.serviceAccountName" . }}
+      automountServiceAccountToken: false
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -116,8 +117,9 @@ spec:
             failureThreshold: 3
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- if or .Values.tls.secretName .Values.tls.sorotrailSecretName .Values.database.tlsSecretName }}
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
             {{- if .Values.tls.secretName }}
             - name: tls-server
               mountPath: /etc/sorobeacon/tls/server
@@ -133,9 +135,10 @@ spec:
               mountPath: /etc/sorobeacon/tls/database
               readOnly: true
             {{- end }}
-          {{- end }}
-      {{- if or .Values.tls.secretName .Values.tls.sorotrailSecretName .Values.database.tlsSecretName }}
       volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
         {{- if .Values.tls.secretName }}
         - name: tls-server
           secret:
@@ -151,7 +154,6 @@ spec:
           secret:
             secretName: {{ .Values.database.tlsSecretName }}
         {{- end }}
-      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

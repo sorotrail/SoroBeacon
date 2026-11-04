@@ -73,6 +73,7 @@ spec:
         {{- include "sorobeacon.migrateSelectorLabels" . | nindent 8 }}
     spec:
       restartPolicy: Never
+      automountServiceAccountToken: false
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -81,43 +82,17 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["/bin/sh", "-c"]
+          # Applies embedded migrations and verifies schema readiness (the same
+          # invariant /api/v1/livez gates on startup) directly inside the binary.
+          command: ["/usr/local/bin/sorobeacon"]
           args:
-            - |
-              set -eu
-              # The app binds its listener only after store.Migrate returns,
-              # so a reachable /api/v1/livez proves every embedded migration is
-              # applied. The process is then stopped — this container exists
-              # only to run that startup path once.
-              attempt=1
-              while [ "$attempt" -le 3 ]; do
-                sorobeacon &
-                pid=$!
-                ready=0
-                waited=0
-                while [ "$waited" -lt 60 ]; do
-                  if wget -q -O- "http://127.0.0.1:8080/api/v1/livez" >/dev/null 2>&1; then
-                    ready=1
-                    break
-                  fi
-                  # A dead process (bad migration, database unreachable)
-                  # will never become ready: stop waiting and retry.
-                  kill -0 "$pid" 2>/dev/null || break
-                  waited=$((waited + 1))
-                  sleep 1
-                done
-                kill -TERM "$pid" 2>/dev/null || true
-                wait "$pid" 2>/dev/null || true
-                if [ "$ready" -eq 1 ]; then
-                  echo "sorobeacon: schema is up to date"
-                  exit 0
-                fi
-                echo "sorobeacon: migration attempt ${attempt} did not complete" >&2
-                attempt=$((attempt + 1))
-                sleep 2
-              done
-              echo "sorobeacon: migrations did not complete; see the pod logs above" >&2
-              exit 1
+            - migrate
+            - --attempts=3
+            - --retry-delay=2s
+            - --probe-path=/api/v1/livez
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           envFrom:
             - configMapRef:
                 name: {{ $migrateName }}
@@ -150,4 +125,8 @@ spec:
             # cannot affect monitor state while it is up.
             - name: POLL_INTERVAL
               value: "24h"
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
 {{- end }}

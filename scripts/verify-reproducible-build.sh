@@ -15,7 +15,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sorobeacon-repro.XXXXXX")"
-trap 'rm -rf "${WORK_ROOT}"' EXIT
+cleanup() { chmod -R u+w "${WORK_ROOT}" 2>/dev/null || true; rm -rf "${WORK_ROOT}"; }
+trap cleanup EXIT
 
 # Derive deterministic build metadata from the git commit (or SOURCE_DATE_EPOCH).
 VERSION="${VERSION:-$(git -C "${REPO_ROOT}" describe --tags --always --dirty 2>/dev/null || echo v0.0.0-repro)}"

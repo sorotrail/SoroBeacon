@@ -189,6 +189,33 @@ The Service exposes `/metrics` on the same port as the API; scrape it from
 inside the cluster (it is unauthenticated, so do not publish the port to the
 internet).
 
+## Hardened runtime image & debugging
+
+The container image is built as a multi-stage `FROM scratch` runtime image:
+
+- **Contents:** Only `/usr/local/bin/sorobeacon` (statically linked with `CGO_ENABLED=0` and `-trimpath`), `/etc/ssl/certs/ca-certificates.crt`, `/usr/share/zoneinfo`, and minimal `/etc/passwd` + `/etc/group` entries for `10001:10001`. There is **no shell** (`/bin/sh`), **no package manager** (`apk`), and **no external network utilities** (`wget`, `curl`).
+- **Numeric non-root UID/GID:** The image sets `USER 10001:10001` and the chart pins `runAsNonRoot: true`, `runAsUser: 10001`, `runAsGroup: 10001`, and `fsGroup: 10001`, so Kubernetes enforces `runAsNonRoot` without resolving a username inside the container.
+- **Self-contained probes and migration hook:** Container healthchecks invoke `sorobeacon healthcheck`, Kubernetes probes use `httpGet` against `/api/v1/livez` and `/api/v1/readyz`, and the optional Helm migration hook (`migrations.enabled=true`) invokes `/usr/local/bin/sorobeacon migrate` directly without needing `/bin/sh` or `wget`.
+- **Pod & Container Security Context:** Both `Deployment` and the migration `Job` set `automountServiceAccountToken: false`, `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`, and `seccompProfile.type: RuntimeDefault`.
+
+### Debugging a running pod without a shell (`kubectl debug`)
+
+Because the runtime image contains no shell or diagnostic utilities, `kubectl exec -it <pod> -- /bin/sh` will fail by design. To inspect the network, filesystem, or process state of a running pod, attach a Kubernetes [ephemeral debug container](https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/#ephemeral-container) targeting the `sorobeacon` container's namespaces:
+
+```sh
+kubectl debug -it <pod-name> -n sorobeacon \
+  --image=busybox:1.36 \
+  --target=sorobeacon
+```
+
+Inside the ephemeral container, the SoroBeacon process filesystem is visible at `/proc/1/root` (when process namespace sharing is active), and local loopback endpoints (`http://127.0.0.1:8080/api/v1/readyz`, `/metrics`) can be queried directly.
+
+### Read-only root filesystem & writable paths
+
+The chart runs with `readOnlyRootFilesystem: true` and mounts a bounded `64Mi` `emptyDir` at `/tmp` so any standard library temporary file (`os.TempDir()`) has ephemeral scratch space without making the root filesystem writable.
+
+If you enable a feature that writes to the local filesystem (for example, `config.archiveUrl` pointed at a `file://` or `dir://` path instead of `s3://`, or a custom writable directory), mount a dedicated `PersistentVolumeClaim` or `emptyDir` at that path rather than setting `securityContext.readOnlyRootFilesystem=false`.
+
 ## Tests
 
 `render_test.go` renders the chart with `helm template` and asserts the
