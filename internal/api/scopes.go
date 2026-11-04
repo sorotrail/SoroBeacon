@@ -82,6 +82,8 @@ var routeScopes = auth.NewRouteTable(map[string][]auth.Scope{
 	"GET /stats":              {auth.ScopeStatsRead},
 	"GET /stats/alerts-daily": {auth.ScopeAlertsRead},
 	"GET /usage":              {auth.ScopeStatsRead},
+	"GET /quotas":             {auth.ScopeStatsRead},
+	"PUT /quotas":             {auth.ScopeMonitorsWrite},
 
 	"POST /tokens":             {auth.ScopeTokensWrite},
 	"GET /tokens":              {auth.ScopeTokensRead},

@@ -889,6 +889,30 @@ func buildRESTIsolationChecks(fx *isolationFixture) map[string]func(t *testing.T
 			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodGet, "/usage?workspace=beta", "")
 			assert.Equal(t, http.StatusForbidden, crossCode)
 		},
+		"GET /quotas": func(t *testing.T) {
+			code, raw := fx.doREST(t, fx.alphaToken, http.MethodGet, "/quotas", "")
+			require.Equal(t, http.StatusOK, code)
+			var resp QuotasResponse
+			require.NoError(t, json.Unmarshal(raw, &resp))
+			assert.Equal(t, "alpha", resp.WorkspaceID)
+			assert.GreaterOrEqual(t, resp.Usage.Monitors, int64(1), "quotas usage.monitors must count alpha's monitors")
+			require.Len(t, resp.Workspaces, 1)
+			assert.Equal(t, "alpha", resp.Workspaces[0].WorkspaceID)
+
+			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodGet, "/quotas?workspace=beta", "")
+			assert.Equal(t, http.StatusForbidden, crossCode)
+		},
+		"PUT /quotas": func(t *testing.T) {
+			code, raw := fx.doREST(t, fx.alphaToken, http.MethodPut, "/quotas", `{"max_monitors":25}`)
+			require.Equal(t, http.StatusOK, code)
+			var resp WorkspaceQuotaUsageSummary
+			require.NoError(t, json.Unmarshal(raw, &resp))
+			assert.Equal(t, "alpha", resp.WorkspaceID)
+			assert.Equal(t, int64(25), resp.MaxMonitors)
+
+			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodPut, "/quotas?workspace=beta", `{"max_monitors":1}`)
+			assert.Equal(t, http.StatusForbidden, crossCode)
+		},
 	}
 }
 
