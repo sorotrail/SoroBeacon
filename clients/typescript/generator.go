@@ -199,6 +199,8 @@ var knownRouteBindings = []routeBinding{
 	{"GET", "/retention", "getRetention"},
 	{"PUT", "/retention", "setRetention"},
 	{"DELETE", "/retention", "resetRetention"},
+	{"GET", "/workspace/export", "exportCurrentWorkspace"},
+	{"GET", "/workspaces/{id}/export", "exportWorkspace"},
 	{"GET", "/audit", "listAuditLogs"},
 	{"GET", "/templates", "listTemplates"},
 	{"POST", "/templates", "createTemplate"},
@@ -2173,6 +2175,27 @@ export class SoroBeaconClient {
     options?: RequestOptions,
   ): Promise<JsonObject> {
     return this.request<JsonObject>("DELETE", "/retention", {
+      query: params as Record<string, unknown>,
+      requestOptions: options,
+    });
+  }
+
+  async exportCurrentWorkspace(
+    params?: { workspace?: string; include_secrets?: boolean; include_alerts?: boolean; page_size?: number; format?: "json" | "ndjson" },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>("GET", "/workspace/export", {
+      query: params as Record<string, unknown>,
+      requestOptions: options,
+    });
+  }
+
+  async exportWorkspace(
+    id: string,
+    params?: { include_secrets?: boolean; include_alerts?: boolean; page_size?: number; format?: "json" | "ndjson" },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>("GET", ` + "`/workspaces/${encodeURIComponent(String(id))}/export`" + `, {
       query: params as Record<string, unknown>,
       requestOptions: options,
     });

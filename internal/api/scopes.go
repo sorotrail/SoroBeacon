@@ -79,14 +79,16 @@ var routeScopes = auth.NewRouteTable(map[string][]auth.Scope{
 	// authentication altogether (isProbePath), so there is no credential to
 	// scope. The coverage test skips them for the same reason.
 
-	"GET /stats":              {auth.ScopeStatsRead},
-	"GET /stats/alerts-daily": {auth.ScopeAlertsRead},
-	"GET /usage":              {auth.ScopeStatsRead},
-	"GET /quotas":             {auth.ScopeStatsRead},
-	"PUT /quotas":             {auth.ScopeMonitorsWrite},
-	"GET /retention":          {auth.ScopeStatsRead},
-	"PUT /retention":          {auth.ScopeMonitorsWrite},
-	"DELETE /retention":       {auth.ScopeMonitorsWrite},
+	"GET /stats":                  {auth.ScopeStatsRead},
+	"GET /stats/alerts-daily":     {auth.ScopeAlertsRead},
+	"GET /usage":                  {auth.ScopeStatsRead},
+	"GET /quotas":                 {auth.ScopeStatsRead},
+	"PUT /quotas":                 {auth.ScopeMonitorsWrite},
+	"GET /retention":              {auth.ScopeStatsRead},
+	"PUT /retention":              {auth.ScopeMonitorsWrite},
+	"DELETE /retention":           {auth.ScopeMonitorsWrite},
+	"GET /workspace/export":       {auth.ScopeMonitorsRead},
+	"GET /workspaces/{id}/export": {auth.ScopeMonitorsRead},
 
 	"DELETE /workspaces/{id}": {
 		auth.ScopeMonitorsWrite,

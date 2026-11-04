@@ -2343,6 +2343,156 @@
         }
       }
     },
+    "/workspace/export": {
+      "get": {
+        "summary": "Stream a single-workspace data export for the caller's workspace",
+        "description": "Exports all tenant-owned configuration, operational state, and (optionally) alert history belonging to the authenticated workspace as a versioned, deterministic JSON bundle or NDJSON stream. Secrets are redacted by default unless include_secrets=true is supplied.",
+        "parameters": [
+          {
+            "name": "workspace",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "include_secrets",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "include_alerts",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "json",
+                "ndjson"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Streamed workspace export bundle (JSON or NDJSON)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/workspaces/{id}/export": {
+      "get": {
+        "summary": "Stream a single-workspace data export by workspace ID",
+        "description": "Exports all tenant-owned configuration, operational state, and (optionally) alert history belonging to the named workspace as a versioned, deterministic JSON bundle or NDJSON stream. Only credentials belonging to {id} or an instance operator with cross-workspace privileges may call this endpoint.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "include_secrets",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "include_alerts",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "json",
+                "ndjson"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Streamed workspace export bundle (JSON or NDJSON)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/stats/alerts-daily": {
       "get": {
         "summary": "Daily alert counts for the last 30 UTC days",

@@ -990,6 +990,26 @@ func buildRESTIsolationChecks(fx *isolationFixture) map[string]func(t *testing.T
 			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodDelete, "/retention?workspace=beta&confirm_shorten=true", "")
 			assert.Equal(t, http.StatusForbidden, crossCode)
 		},
+		"GET /workspace/export": func(t *testing.T) {
+			code, raw := fx.doREST(t, fx.alphaToken, http.MethodGet, "/workspace/export?include_alerts=true&include_secrets=true", "")
+			require.Equal(t, http.StatusOK, code)
+			var bundle store.WorkspaceExportBundle
+			require.NoError(t, json.Unmarshal(raw, &bundle))
+			assert.Equal(t, "alpha", bundle.Manifest.WorkspaceID)
+
+			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodGet, "/workspace/export?workspace=beta", "")
+			assert.Equal(t, http.StatusForbidden, crossCode)
+		},
+		"GET /workspaces/{id}/export": func(t *testing.T) {
+			code, raw := fx.doREST(t, fx.alphaToken, http.MethodGet, "/workspaces/alpha/export?include_alerts=true&include_secrets=true", "")
+			require.Equal(t, http.StatusOK, code)
+			var bundle store.WorkspaceExportBundle
+			require.NoError(t, json.Unmarshal(raw, &bundle))
+			assert.Equal(t, "alpha", bundle.Manifest.WorkspaceID)
+
+			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodGet, "/workspaces/beta/export", "")
+			assert.Equal(t, http.StatusForbidden, crossCode)
+		},
 		"GET /audit": func(t *testing.T) {
 			code, raw := fx.doREST(t, fx.alphaToken, http.MethodGet, "/audit", "")
 			require.Equal(t, http.StatusOK, code)

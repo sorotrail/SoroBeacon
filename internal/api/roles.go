@@ -106,14 +106,16 @@ var routeRoles = auth.NewRouteTable(map[string]auth.Role{
 	"DELETE /maintenance-windows/{id}":               auth.RoleEditor,
 
 	// Statistics are a view of the instance, not a change to it.
-	"GET /stats":              auth.RoleViewer,
-	"GET /stats/alerts-daily": auth.RoleViewer,
-	"GET /usage":              auth.RoleViewer,
-	"GET /quotas":             auth.RoleViewer,
-	"PUT /quotas":             auth.RoleAdmin,
-	"GET /retention":          auth.RoleViewer,
-	"PUT /retention":          auth.RoleAdmin,
-	"DELETE /retention":       auth.RoleAdmin,
+	"GET /stats":                  auth.RoleViewer,
+	"GET /stats/alerts-daily":     auth.RoleViewer,
+	"GET /usage":                  auth.RoleViewer,
+	"GET /quotas":                 auth.RoleViewer,
+	"PUT /quotas":                 auth.RoleAdmin,
+	"GET /retention":              auth.RoleViewer,
+	"PUT /retention":              auth.RoleAdmin,
+	"DELETE /retention":           auth.RoleAdmin,
+	"GET /workspace/export":       auth.RoleViewer,
+	"GET /workspaces/{id}/export": auth.RoleViewer,
 
 	// Workspace lifecycle operations are administrative and irreversible.
 	"DELETE /workspaces/{id}":      auth.RoleAdmin,
