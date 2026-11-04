@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -85,6 +86,8 @@ type Postgres struct {
 	retry RetryPolicy
 	// breaker protects against database stampedes when unavailable.
 	breaker *StoreBreaker
+	// alertRetention holds the instance-wide fallback ALERT_RETENTION in nanoseconds.
+	alertRetention atomic.Int64
 }
 
 // WithTelemetry attaches tracing to the store's write paths. Only ids go
@@ -2411,6 +2414,9 @@ func (p *Postgres) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	if err != nil {
 		return nil, mapErr(err)
 	}
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok && a.CreatedAt.Before(cutoff) {
+		return nil, ErrNotFound
+	}
 	a.Ledger = uint32(ledger)
 	if monitorID != nil {
 		a.MonitorID = *monitorID
@@ -2445,6 +2451,9 @@ func alertSort(s string) string {
 // replica exists to make. A caller that cannot tolerate it — the rules engine
 // rebuilding a match log — uses ListAlertsPrimary.
 func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok && (f.From.IsZero() || f.From.Before(cutoff)) {
+		f.From = cutoff
+	}
 	q, args := buildAlertQuery(ctx, f)
 	rows, err := p.queryRows(ctx, q, args...)
 	if err != nil {
@@ -2457,6 +2466,9 @@ func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, erro
 // REPLICA_DATABASE_URL says. It exists for readers that must see this
 // process's own writes — see PrimaryReader.
 func (p *Postgres) ListAlertsPrimary(ctx context.Context, f AlertFilter) ([]Alert, error) {
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok && (f.From.IsZero() || f.From.Before(cutoff)) {
+		f.From = cutoff
+	}
 	q, args := buildAlertQuery(ctx, f)
 	rows, err := p.pool.Query(ctx, q, args...)
 	if err != nil {
@@ -2468,6 +2480,12 @@ func (p *Postgres) ListAlertsPrimary(ctx context.Context, f AlertFilter) ([]Aler
 // AlertChangeKey returns the max alert ID and count for the caller's workspace.
 func (p *Postgres) AlertChangeKey(ctx context.Context) (maxID int64, count int64, err error) {
 	ws := workspaceID(ctx)
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok {
+		err = p.queryRowFallback(ctx, func(row pgx.Row) error {
+			return row.Scan(&maxID, &count)
+		}, `SELECT COALESCE(max(id), 0), count(*) FROM alerts WHERE workspace_id = $1 AND created_at >= $2`, ws, cutoff)
+		return maxID, count, err
+	}
 	err = p.queryRowFallback(ctx, func(row pgx.Row) error {
 		return row.Scan(&maxID, &count)
 	}, `SELECT COALESCE(max(id), 0), count(*) FROM alerts WHERE workspace_id = $1`, ws)
@@ -3679,6 +3697,14 @@ func (p *Postgres) UpsertBackfill(ctx context.Context, b *Backfill) error {
 // turn into a stale write.
 func (p *Postgres) GetStats(ctx context.Context) (Stats, error) {
 	var s Stats
+	cutoff, policy, hasCutoff := p.workspaceAlertCutoff(ctx)
+	var cutoffArg *time.Time
+	if hasCutoff {
+		c := cutoff.UTC()
+		cutoffArg = &c
+		s.PrunedBefore = &c
+		s.RetentionPolicySource = policy.PolicySource
+	}
 	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
 		return row.Scan(&s.Monitors, &s.Rules, &s.Channels, &s.Alerts, &s.AlertsLast24, &s.LastLedger, &s.LastPollAt)
 	}, `
@@ -3686,10 +3712,10 @@ func (p *Postgres) GetStats(ctx context.Context) (Stats, error) {
 			(SELECT count(*) FROM monitors WHERE workspace_id = $1),
 			(SELECT count(*) FROM rules r JOIN monitors m ON m.id = r.monitor_id WHERE m.workspace_id = $1),
 			(SELECT count(*) FROM channels WHERE workspace_id = $1),
-			(SELECT count(*) FROM alerts WHERE workspace_id = $1),
-			(SELECT count(*) FROM alerts WHERE workspace_id = $1 AND created_at > now() - interval '24 hours'),
+			(SELECT count(*) FROM alerts WHERE workspace_id = $1 AND ($2::timestamptz IS NULL OR created_at >= $2)),
+			(SELECT count(*) FROM alerts WHERE workspace_id = $1 AND created_at > now() - interval '24 hours' AND ($2::timestamptz IS NULL OR created_at >= $2)),
 			(SELECT last_ledger FROM ingest_state WHERE id = 1),
-			(SELECT updated_at FROM ingest_state WHERE id = 1)`, workspaceID(ctx))
+			(SELECT updated_at FROM ingest_state WHERE id = 1)`, workspaceID(ctx), cutoffArg)
 	if err != nil {
 		return s, err
 	}
@@ -3714,6 +3740,11 @@ func (p *Postgres) GetStats(ctx context.Context) (Stats, error) {
 // behind real time, and no decision is taken from the value.
 func (p *Postgres) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCount, error) {
 	days = ClampAlertSeriesDays(days)
+	var cutoffArg *time.Time
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok {
+		c := cutoff.UTC()
+		cutoffArg = &c
+	}
 	// generate_series fills every UTC calendar day in the window, including
 	// zeroes, so a quiet day is an explicit 0 rather than a missing bar.
 	// date_trunc / ::date run on (timestamptz AT TIME ZONE 'UTC') so the
@@ -3730,8 +3761,9 @@ func (p *Postgres) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCo
 		FROM days
 		LEFT JOIN alerts a ON (a.created_at AT TIME ZONE 'UTC')::date = days.day
 			AND a.workspace_id = $2
+			AND ($3::timestamptz IS NULL OR a.created_at >= $3)
 		GROUP BY days.day
-		ORDER BY days.day`, days, workspaceID(ctx))
+		ORDER BY days.day`, days, workspaceID(ctx), cutoffArg)
 	if err != nil {
 		return nil, err
 	}
@@ -3759,9 +3791,14 @@ func (p *Postgres) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCo
 // page of zeroes that looks like a healthy but quiet monitor.
 func (p *Postgres) GetMonitorStats(ctx context.Context, monitorID int64) (MonitorStats, error) {
 	var (
-		ms     MonitorStats
-		exists bool
+		ms        MonitorStats
+		exists    bool
+		cutoffArg *time.Time
 	)
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok {
+		c := cutoff.UTC()
+		cutoffArg = &c
+	}
 	ms.MonitorID = monitorID
 	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
 		return row.Scan(&exists, &ms.Alerts, &ms.AlertsLast24h, &ms.AlertsLast7d,
@@ -3769,15 +3806,15 @@ func (p *Postgres) GetMonitorStats(ctx context.Context, monitorID int64) (Monito
 	}, `
 		SELECT
 			(SELECT count(*) FROM monitors WHERE id = $1 AND workspace_id = $4) > 0,
-			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4),
-			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4 AND created_at > now() - interval '24 hours'),
-			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4 AND created_at > now() - interval '7 days'),
-			(SELECT max(created_at) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4 AND ($5::timestamptz IS NULL OR created_at >= $5)),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4 AND created_at > now() - interval '24 hours' AND ($5::timestamptz IS NULL OR created_at >= $5)),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4 AND created_at > now() - interval '7 days' AND ($5::timestamptz IS NULL OR created_at >= $5)),
+			(SELECT max(created_at) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4 AND ($5::timestamptz IS NULL OR created_at >= $5)),
 			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
-			   WHERE a.monitor_id = $1 AND a.workspace_id = $4 AND da.status = $2),
+			   WHERE a.monitor_id = $1 AND a.workspace_id = $4 AND da.status = $2 AND ($5::timestamptz IS NULL OR a.created_at >= $5)),
 			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
-			   WHERE a.monitor_id = $1 AND a.workspace_id = $4 AND da.status = $3)`,
-		monitorID, DeliveryStatusSuccess, DeliveryStatusFailed, workspaceID(ctx))
+			   WHERE a.monitor_id = $1 AND a.workspace_id = $4 AND da.status = $3 AND ($5::timestamptz IS NULL OR a.created_at >= $5))`,
+		monitorID, DeliveryStatusSuccess, DeliveryStatusFailed, workspaceID(ctx), cutoffArg)
 	if err != nil {
 		return ms, err
 	}
@@ -3788,10 +3825,10 @@ func (p *Postgres) GetMonitorStats(ctx context.Context, monitorID int64) (Monito
 	rows, err := p.queryRows(ctx, `
 		SELECT r.id, r.type, count(a.id)
 		FROM rules r
-		LEFT JOIN alerts a ON a.rule_id = r.id
+		LEFT JOIN alerts a ON a.rule_id = r.id AND a.workspace_id = $2 AND ($3::timestamptz IS NULL OR a.created_at >= $3)
 		WHERE r.monitor_id = $1
 		GROUP BY r.id, r.type
-		ORDER BY r.id`, monitorID)
+		ORDER BY r.id`, monitorID, workspaceID(ctx), cutoffArg)
 	if err != nil {
 		return ms, err
 	}

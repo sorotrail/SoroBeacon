@@ -12,10 +12,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	sqlite "modernc.org/sqlite"
 
+	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
@@ -59,7 +61,12 @@ type SQLite struct {
 	db *sql.DB
 	// cipher encrypts and decrypts channels.config at rest; nil keeps the
 	// plaintext behaviour, exactly as the Postgres store does.
-	cipher ConfigCipher
+	cipher  ConfigCipher
+	metrics *metrics.Metrics
+	// alertRetention holds the instance-default alert retention duration in
+	// nanoseconds so read-time visibility horizon checks can fall back to the
+	// global ALERT_RETENTION when a workspace has no custom policy.
+	alertRetention atomic.Int64
 }
 
 var _ Store = (*SQLite)(nil)
@@ -69,6 +76,12 @@ var _ Store = (*SQLite)(nil)
 // config as plaintext, matching the Postgres backend.
 func (s *SQLite) WithConfigCipher(c ConfigCipher) *SQLite {
 	s.cipher = c
+	return s
+}
+
+// WithMetrics attaches Prometheus instrumentation to the SQLite store.
+func (s *SQLite) WithMetrics(m *metrics.Metrics) *SQLite {
+	s.metrics = m
 	return s
 }
 
@@ -2548,6 +2561,9 @@ func (s *SQLite) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cutoff, _, ok := s.workspaceAlertCutoff(ctx); ok && a.CreatedAt.Before(cutoff.UTC().Truncate(time.Millisecond)) {
+		return nil, ErrNotFound
+	}
 	return &a, nil
 }
 
@@ -2762,6 +2778,9 @@ func (s *SQLite) DeleteExpiredDeadLetters(ctx context.Context, cutoff time.Time,
 }
 
 func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
+	if cutoff, _, ok := s.workspaceAlertCutoff(ctx); ok && (f.From.IsZero() || f.From.Before(cutoff)) {
+		f.From = cutoff
+	}
 	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version, runbook_url, response_guidance FROM alerts WHERE 1 = 1`
 	args := []any{}
 	// Conditional because ListAlerts serves two callers with different scopes:
@@ -2854,6 +2873,12 @@ func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
 // AlertChangeKey returns the max alert ID and count for the caller's workspace.
 func (s *SQLite) AlertChangeKey(ctx context.Context) (maxID int64, count int64, err error) {
 	ws := workspaceID(ctx)
+	if cutoff, _, ok := s.workspaceAlertCutoff(ctx); ok {
+		err = s.db.QueryRowContext(ctx,
+			`SELECT COALESCE(max(id), 0), count(*) FROM alerts WHERE workspace_id = ? AND created_at >= ?`, ws, sqliteTimeString(cutoff)).
+			Scan(&maxID, &count)
+		return maxID, count, err
+	}
 	err = s.db.QueryRowContext(ctx,
 		`SELECT COALESCE(max(id), 0), count(*) FROM alerts WHERE workspace_id = ?`, ws).
 		Scan(&maxID, &count)
@@ -3772,13 +3797,21 @@ func (s *SQLite) GetStats(ctx context.Context) (Stats, error) {
 	// timestamp format makes that a valid chronological comparison.
 	cutoff := sqliteTimeString(time.Now().UTC().Add(-24 * time.Hour))
 	ws := workspaceID(ctx)
+	retCutoffStr := ""
+	if retCutoff, policy, hasCutoff := s.workspaceAlertCutoff(ctx); hasCutoff {
+		c := retCutoff.UTC()
+		retCutoffStr = sqliteTimeString(c)
+		st.PrunedBefore = &c
+		st.RetentionPolicySource = policy.PolicySource
+	}
 	err := s.db.QueryRowContext(ctx, `
 		SELECT
 			(SELECT count(*) FROM monitors WHERE workspace_id = ?),
 			(SELECT count(*) FROM rules r JOIN monitors m ON m.id = r.monitor_id WHERE m.workspace_id = ?),
 			(SELECT count(*) FROM channels WHERE workspace_id = ?),
-			(SELECT count(*) FROM alerts WHERE workspace_id = ?),
-			(SELECT count(*) FROM alerts WHERE workspace_id = ? AND created_at > ?)`, ws, ws, ws, ws, ws, cutoff).
+			(SELECT count(*) FROM alerts WHERE workspace_id = ? AND (? = '' OR created_at >= ?)),
+			(SELECT count(*) FROM alerts WHERE workspace_id = ? AND created_at > ? AND (? = '' OR created_at >= ?))`,
+		ws, ws, ws, ws, retCutoffStr, retCutoffStr, ws, cutoff, retCutoffStr, retCutoffStr).
 		Scan(&st.Monitors, &st.Rules, &st.Channels, &st.Alerts, &st.AlertsLast24)
 	if err != nil {
 		return st, err
@@ -4068,6 +4101,10 @@ func (s *SQLite) AssignLegacyNetwork(ctx context.Context, network string) (int64
 // prevent.
 func (s *SQLite) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCount, error) {
 	days = ClampAlertSeriesDays(days)
+	retCutoffStr := ""
+	if retCutoff, _, ok := s.workspaceAlertCutoff(ctx); ok {
+		retCutoffStr = sqliteTimeString(retCutoff)
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		WITH RECURSIVE window(day) AS (
 			SELECT date('now')
@@ -4078,8 +4115,9 @@ func (s *SQLite) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCoun
 		FROM window
 		LEFT JOIN alerts a ON substr(a.created_at, 1, 10) = window.day
 			AND a.workspace_id = ?
+			AND (? = '' OR a.created_at >= ?)
 		GROUP BY window.day
-		ORDER BY window.day`, fmt.Sprintf("-%d days", days-1), workspaceID(ctx))
+		ORDER BY window.day`, fmt.Sprintf("-%d days", days-1), workspaceID(ctx), retCutoffStr, retCutoffStr)
 	if err != nil {
 		return nil, err
 	}
@@ -4115,24 +4153,28 @@ func (s *SQLite) GetMonitorStats(ctx context.Context, monitorID int64) (MonitorS
 	day := sqliteTimeString(time.Now().UTC().Add(-24 * time.Hour))
 	week := sqliteTimeString(time.Now().UTC().Add(-7 * 24 * time.Hour))
 	ws := workspaceID(ctx)
+	retCutoffStr := ""
+	if retCutoff, _, ok := s.workspaceAlertCutoff(ctx); ok {
+		retCutoffStr = sqliteTimeString(retCutoff)
+	}
 	err := s.db.QueryRowContext(ctx, `
 		SELECT
 			(SELECT count(*) FROM monitors WHERE id = ? AND workspace_id = ?),
-			(SELECT count(*) FROM alerts WHERE monitor_id = ? AND workspace_id = ?),
-			(SELECT count(*) FROM alerts WHERE monitor_id = ? AND workspace_id = ? AND created_at > ?),
-			(SELECT count(*) FROM alerts WHERE monitor_id = ? AND workspace_id = ? AND created_at > ?),
-			(SELECT max(created_at) FROM alerts WHERE monitor_id = ? AND workspace_id = ?),
+			(SELECT count(*) FROM alerts WHERE monitor_id = ? AND workspace_id = ? AND (? = '' OR created_at >= ?)),
+			(SELECT count(*) FROM alerts WHERE monitor_id = ? AND workspace_id = ? AND created_at > ? AND (? = '' OR created_at >= ?)),
+			(SELECT count(*) FROM alerts WHERE monitor_id = ? AND workspace_id = ? AND created_at > ? AND (? = '' OR created_at >= ?)),
+			(SELECT max(created_at) FROM alerts WHERE monitor_id = ? AND workspace_id = ? AND (? = '' OR created_at >= ?)),
 			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
-			   WHERE a.monitor_id = ? AND a.workspace_id = ? AND da.status = ?),
+			   WHERE a.monitor_id = ? AND a.workspace_id = ? AND da.status = ? AND (? = '' OR a.created_at >= ?)),
 			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
-			   WHERE a.monitor_id = ? AND a.workspace_id = ? AND da.status = ?)`,
+			   WHERE a.monitor_id = ? AND a.workspace_id = ? AND da.status = ? AND (? = '' OR a.created_at >= ?))`,
 		monitorID, ws,
-		monitorID, ws,
-		monitorID, ws, day,
-		monitorID, ws, week,
-		monitorID, ws,
-		monitorID, ws, DeliveryStatusSuccess,
-		monitorID, ws, DeliveryStatusFailed).
+		monitorID, ws, retCutoffStr, retCutoffStr,
+		monitorID, ws, day, retCutoffStr, retCutoffStr,
+		monitorID, ws, week, retCutoffStr, retCutoffStr,
+		monitorID, ws, retCutoffStr, retCutoffStr,
+		monitorID, ws, DeliveryStatusSuccess, retCutoffStr, retCutoffStr,
+		monitorID, ws, DeliveryStatusFailed, retCutoffStr, retCutoffStr).
 		Scan(&exists, &ms.Alerts, &ms.AlertsLast24h, &ms.AlertsLast7d,
 			&lastAt, &ms.DeliveriesOK, &ms.DeliveriesFail)
 	if err != nil {
@@ -4152,10 +4194,10 @@ func (s *SQLite) GetMonitorStats(ctx context.Context, monitorID int64) (MonitorS
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT r.id, r.type, count(a.id)
 		FROM rules r
-		LEFT JOIN alerts a ON a.rule_id = r.id
+		LEFT JOIN alerts a ON a.rule_id = r.id AND a.workspace_id = ? AND (? = '' OR a.created_at >= ?)
 		WHERE r.monitor_id = ?
 		GROUP BY r.id, r.type
-		ORDER BY r.id`, monitorID)
+		ORDER BY r.id`, ws, retCutoffStr, retCutoffStr, monitorID)
 	if err != nil {
 		return ms, err
 	}

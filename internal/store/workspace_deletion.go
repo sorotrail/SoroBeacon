@@ -22,6 +22,7 @@ func WorkspaceDeletionCoveredTables() []string {
 		"workspaces",
 		"workspace_deletions",
 		"workspace_quotas",
+		"workspace_retention_policies",
 		"workspace_query_budget_state",
 		"workspace_usage_rollups",
 		"workspace_notification_usage_rollups",

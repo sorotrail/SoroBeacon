@@ -196,6 +196,9 @@ var knownRouteBindings = []routeBinding{
 	{"DELETE", "/workspaces/{id}", "deleteWorkspace"},
 	{"POST", "/workspaces/{id}/delete", "postDeleteWorkspace"},
 	{"GET", "/workspaces/{id}/delete", "getWorkspaceDeletion"},
+	{"GET", "/retention", "getRetention"},
+	{"PUT", "/retention", "setRetention"},
+	{"DELETE", "/retention", "resetRetention"},
 	{"GET", "/audit", "listAuditLogs"},
 	{"GET", "/templates", "listTemplates"},
 	{"POST", "/templates", "createTemplate"},
@@ -2141,6 +2144,38 @@ export class SoroBeaconClient {
         requestOptions: options,
       },
     );
+  }
+
+  async getRetention(
+    params?: { workspace?: string },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>("GET", "/retention", {
+      query: params as Record<string, unknown>,
+      requestOptions: options,
+    });
+  }
+
+  async setRetention(
+    input: Record<string, unknown>,
+    params?: { workspace?: string; confirm_shorten?: boolean },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>("PUT", "/retention", {
+      query: params as Record<string, unknown>,
+      body: input,
+      requestOptions: options,
+    });
+  }
+
+  async resetRetention(
+    params?: { workspace?: string; confirm_shorten?: boolean },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>("DELETE", "/retention", {
+      query: params as Record<string, unknown>,
+      requestOptions: options,
+    });
   }
 
   async listAuditLogs(

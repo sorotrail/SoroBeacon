@@ -123,10 +123,11 @@ func rawChannelConfig(t *testing.T, st *Postgres, id int64) []byte {
 // SQLite backend is held to the identical contract.
 
 func (p *Postgres) resetConformance(ctx context.Context) error {
+	p.alertRetention.Store(0)
 	_, err := p.pool.Exec(ctx,
 		`TRUNCATE monitors, rules, channels, monitor_channels, alerts, delivery_attempts, contract_ingest_cursors, api_tokens,
 		         saved_searches, monitor_templates, audit_log, pending_digests, maintenance_windows,
-		         retention_gaps, event_archive RESTART IDENTITY CASCADE;
+		         retention_gaps, event_archive, workspace_retention_policies RESTART IDENTITY CASCADE;
 		 UPDATE ingest_state SET last_ledger = 0, last_cursor = '' WHERE id = 1`)
 	return err
 }

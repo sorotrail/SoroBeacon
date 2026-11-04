@@ -1,5 +1,10 @@
 package metrics
 
+import (
+	"strings"
+	"time"
+)
+
 // SetAlertPartitionRunway sets the gauge reporting how many consecutive future
 // monthly alert partitions currently exist beyond the current UTC month.
 func (m *Metrics) SetAlertPartitionRunway(months int) {
@@ -37,4 +42,38 @@ func (m *Metrics) RecordAlertPartitionsDropped(n int) {
 		return
 	}
 	m.alertPartitionsDroppedTotal.Add(float64(n))
+}
+
+// RecordWorkspaceAlertsPruned records expired alerts deleted by the retention
+// pruner for a workspace, labeled with the policy source ("workspace" or "instance").
+func (m *Metrics) RecordWorkspaceAlertsPruned(workspaceID, policySource string, n int64) {
+	if m == nil || m.alertPrunerDeletedTotal == nil || n < 0 {
+		return
+	}
+	ws := strings.TrimSpace(workspaceID)
+	if ws == "" {
+		ws = "default"
+	}
+	src := strings.TrimSpace(policySource)
+	if src == "" {
+		src = "instance"
+	}
+	m.alertPrunerDeletedTotal.WithLabelValues(ws, src).Add(float64(n))
+}
+
+// SetWorkspaceRetentionSeconds sets the effective alert retention duration in
+// seconds for a workspace and policy source ("workspace", "instance", or "none").
+func (m *Metrics) SetWorkspaceRetentionSeconds(workspaceID, policySource string, retention time.Duration) {
+	if m == nil || m.workspaceRetentionSeconds == nil {
+		return
+	}
+	ws := strings.TrimSpace(workspaceID)
+	if ws == "" {
+		ws = "default"
+	}
+	src := strings.TrimSpace(policySource)
+	if src == "" {
+		src = "none"
+	}
+	m.workspaceRetentionSeconds.WithLabelValues(ws, src).Set(retention.Seconds())
 }

@@ -973,6 +973,9 @@ export const OPENAPI_OPERATIONS = [
   { method: "DELETE", path: "/workspaces/{id}", clientMethod: "deleteWorkspace", summary: "Delete a workspace and everything belonging to it (or preview via dry-run)" },
   { method: "POST", path: "/workspaces/{id}/delete", clientMethod: "postDeleteWorkspace", summary: "Delete a workspace and everything belonging to it (or preview via dry-run)" },
   { method: "GET", path: "/workspaces/{id}/delete", clientMethod: "getWorkspaceDeletion", summary: "Inspect workspace deletion progress or completion tombstone" },
+  { method: "GET", path: "/retention", clientMethod: "getRetention", summary: "Get effective workspace alert retention policy" },
+  { method: "PUT", path: "/retention", clientMethod: "setRetention", summary: "Set workspace alert retention policy override" },
+  { method: "DELETE", path: "/retention", clientMethod: "resetRetention", summary: "Reset workspace alert retention policy to instance default" },
   { method: "GET", path: "/audit", clientMethod: "listAuditLogs", summary: "Audit log of configuration changes" },
   { method: "GET", path: "/templates", clientMethod: "listTemplates", summary: "List monitor templates" },
   { method: "POST", path: "/templates", clientMethod: "createTemplate", summary: "Create a monitor template" },
@@ -2056,6 +2059,38 @@ export class SoroBeaconClient {
         requestOptions: options,
       },
     );
+  }
+
+  async getRetention(
+    params?: { workspace?: string },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>("GET", "/retention", {
+      query: params as Record<string, unknown>,
+      requestOptions: options,
+    });
+  }
+
+  async setRetention(
+    input: Record<string, unknown>,
+    params?: { workspace?: string; confirm_shorten?: boolean },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>("PUT", "/retention", {
+      query: params as Record<string, unknown>,
+      body: input,
+      requestOptions: options,
+    });
+  }
+
+  async resetRetention(
+    params?: { workspace?: string; confirm_shorten?: boolean },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>("DELETE", "/retention", {
+      query: params as Record<string, unknown>,
+      requestOptions: options,
+    });
   }
 
   async listAuditLogs(

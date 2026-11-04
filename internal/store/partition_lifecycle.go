@@ -465,8 +465,21 @@ func (p *Postgres) MaintainAlertPartitions(ctx context.Context, opts PartitionLi
 		}
 	}
 
+	wsRetentions := opts.WorkspaceRetentions
+	if wsRetentions == nil {
+		policies, err := p.ListWorkspaceRetentionPolicies(ctx)
+		if err != nil {
+			p.metrics.RecordAlertPartitionError("inspect")
+			if opts.Metrics != nil && opts.Metrics != p.metrics {
+				opts.Metrics.RecordAlertPartitionError("inspect")
+			}
+			return nil, err
+		}
+		wsRetentions = WorkspaceRetentionMap(policies)
+	}
+
 	var toDrop []PartitionDropRecord
-	cutoff, canDrop := EffectiveRetentionCutoff(now, opts.Retention, opts.WorkspaceRetentions)
+	cutoff, canDrop := EffectiveRetentionCutoff(now, opts.Retention, wsRetentions)
 	if canDrop && opts.Archiver == nil {
 		toDrop = ExpiredAlertPartitions(existing, cutoff)
 		if maxDrops > 0 && len(toDrop) > maxDrops {
@@ -563,6 +576,13 @@ func (p *Postgres) MaintainAlertPartitions(ctx context.Context, opts PartitionLi
 // Backends without partitioning (such as SQLite) return a nil plan and nil error.
 func MaintainAlertPartitionsOnce(ctx context.Context, st any, opts PartitionLifecycleOptions) (*PartitionMaintenancePlan, error) {
 	log := opts.logger()
+	if opts.WorkspaceRetentions == nil {
+		if rp, ok := st.(RetentionPolicies); ok {
+			if policies, err := rp.ListWorkspaceRetentionPolicies(ctx); err == nil && len(policies) > 0 {
+				opts.WorkspaceRetentions = WorkspaceRetentionMap(policies)
+			}
+		}
+	}
 	if mgr, ok := st.(PartitionLifecycleManager); ok {
 		plan, err := mgr.MaintainAlertPartitions(ctx, opts)
 		if err != nil {

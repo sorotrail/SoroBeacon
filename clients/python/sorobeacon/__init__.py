@@ -996,6 +996,9 @@ OPENAPI_OPERATIONS: tuple[dict[str, str], ...] = (
     {"method": "DELETE", "path": "/workspaces/{id}", "client_method": "delete_workspace", "summary": "Delete a workspace and everything belonging to it (or preview via dry-run)"},
     {"method": "POST", "path": "/workspaces/{id}/delete", "client_method": "post_delete_workspace", "summary": "Delete a workspace and everything belonging to it (or preview via dry-run)"},
     {"method": "GET", "path": "/workspaces/{id}/delete", "client_method": "get_workspace_deletion", "summary": "Inspect workspace deletion progress or completion tombstone"},
+    {"method": "GET", "path": "/retention", "client_method": "get_retention", "summary": "Get effective workspace alert retention policy"},
+    {"method": "PUT", "path": "/retention", "client_method": "set_retention", "summary": "Set workspace alert retention policy override"},
+    {"method": "DELETE", "path": "/retention", "client_method": "reset_retention", "summary": "Reset workspace alert retention policy to instance default"},
     {"method": "GET", "path": "/audit", "client_method": "list_audit_logs", "summary": "Audit log of configuration changes"},
     {"method": "GET", "path": "/templates", "client_method": "list_templates", "summary": "List monitor templates"},
     {"method": "POST", "path": "/templates", "client_method": "create_template", "summary": "Create a monitor template"},
@@ -2168,6 +2171,38 @@ class SoroBeaconClient:
             query=query or None,
             headers=headers,
         )
+
+    def get_retention(
+        self,
+        params: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        return self._request("GET", "/retention", query=params, headers=headers)
+
+    def set_retention(
+        self,
+        input_data: Mapping[str, Any],
+        params: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        return self._request(
+            "PUT",
+            "/retention",
+            query=params,
+            body=input_data,
+            has_body=True,
+            headers=headers,
+        )
+
+    def reset_retention(
+        self,
+        params: Mapping[str, Any] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        return self._request("DELETE", "/retention", query=params, headers=headers)
 
     def list_audit_logs(
         self,

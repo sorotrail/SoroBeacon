@@ -75,6 +75,8 @@ func TestExportedMetricNamesMatchesRegistryForAlerts(t *testing.T) {
 	m.RecordAlertPartitionError("ensure")
 	m.RecordAlertPartitionsCreated(1)
 	m.RecordAlertPartitionsDropped(1)
+	m.RecordWorkspaceAlertsPruned("default", "instance", 1)
+	m.SetWorkspaceRetentionSeconds("default", "instance", 24*time.Hour)
 	m.httpDuration.WithLabelValues("/health", "GET", "200").Observe(0.01)
 
 	families, err := m.registry.Gather()

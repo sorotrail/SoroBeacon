@@ -120,6 +120,7 @@ type Server struct {
 	subMu               sync.Mutex
 	activeSubscriptions map[string]int64
 	quotaClock          func() time.Time
+	alertRetention      time.Duration
 
 	idempotencyTTL    time.Duration
 	idempotencyClock  func() time.Time
@@ -471,6 +472,9 @@ func (s *Server) Routes() chi.Router {
 	mux.Get("/usage", s.usage)
 	mux.Get("/quotas", s.getQuotas)
 	mux.Put("/quotas", s.putQuotas)
+	mux.Get("/retention", s.getRetention)
+	mux.Put("/retention", s.putRetention)
+	mux.Delete("/retention", s.deleteRetention)
 	mux.Get("/audit", s.listAudit)
 
 	mux.Route("/workspaces/{id}", func(r chi.Router) {
@@ -925,12 +929,15 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	setRetentionHorizonHeaders(w, st.PrunedBefore, st.RetentionPolicySource)
 	writeJSON(w, http.StatusOK, st)
 }
 
 type alertsDailyResponse struct {
-	Timezone string                `json:"timezone"`
-	Days     []store.AlertDayCount `json:"days"`
+	Timezone              string                `json:"timezone"`
+	Days                  []store.AlertDayCount `json:"days"`
+	PrunedBefore          *time.Time            `json:"pruned_before,omitempty"`
+	RetentionPolicySource string                `json:"retention_policy_source,omitempty"`
 }
 
 func (s *Server) alertsDaily(w http.ResponseWriter, r *http.Request) {
@@ -942,5 +949,12 @@ func (s *Server) alertsDaily(w http.ResponseWriter, r *http.Request) {
 	if days == nil {
 		days = []store.AlertDayCount{}
 	}
-	writeJSON(w, http.StatusOK, alertsDailyResponse{Timezone: "UTC", Days: days})
+	prunedBefore, policySource := s.workspaceRetentionHorizon(r.Context())
+	setRetentionHorizonHeaders(w, prunedBefore, policySource)
+	writeJSON(w, http.StatusOK, alertsDailyResponse{
+		Timezone:              "UTC",
+		Days:                  days,
+		PrunedBefore:          prunedBefore,
+		RetentionPolicySource: policySource,
+	})
 }

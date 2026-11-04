@@ -322,7 +322,7 @@ func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
 	f := store.AuditFilter{TargetType: strings.TrimSpace(q.Get("target_type"))}
 	if f.TargetType != "" {
 		switch f.TargetType {
-		case "monitor", "rule", "channel", "alert":
+		case "monitor", "rule", "channel", "alert", store.AuditTargetWorkspaceRetention, "retention_policy":
 		default:
 			writeErr(w, r, http.StatusBadRequest, "invalid target_type")
 			return

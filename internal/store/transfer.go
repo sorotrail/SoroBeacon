@@ -93,6 +93,7 @@ var transferTables = []transferTable{
 	{name: "workspace_notification_usage_rollups", key: []string{"workspace_id", "period_start", "channel_type", "outcome"}},
 	{name: "workspace_quotas", key: []string{"workspace_id"}},
 	{name: "workspace_query_budget_state", key: []string{"workspace_id"}},
+	{name: "workspace_retention_policies", key: []string{"workspace_id"}},
 	{name: "idempotency_keys", key: []string{"workspace_id", "idempotency_key"}},
 	{name: "workspace_deletions", key: []string{"workspace_id"}},
 }

@@ -376,6 +376,14 @@ func populateEveryCoveredTableForWorkspace(t *testing.T, st Store, ws workspace.
 	_, err = st.ConsumeWorkspaceQueryBudget(sysCtx, string(ws), 5.0, now)
 	require.NoError(t, err)
 
+	_, err = st.SetWorkspaceRetentionPolicy(sysCtx, SetWorkspaceRetentionInput{
+		WorkspaceID:    string(ws),
+		Retention:      30 * 24 * time.Hour,
+		ConfirmShorten: true,
+		Actor:          "schema-test",
+	})
+	require.NoError(t, err)
+
 	outcome, _, err := st.ClaimIdempotencyKey(wsCtx, "idem-"+string(ws), "POST", "/monitors", "reqhash", now, now.Add(time.Hour))
 	require.NoError(t, err)
 	require.Equal(t, IdempotencyClaimed, outcome)

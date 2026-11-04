@@ -151,7 +151,17 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 	if len(alerts) == effectiveLimit {
 		next = strconv.FormatInt(alerts[len(alerts)-1].ID, 10)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"alerts": alerts, "next_cursor": next})
+	prunedBefore, policySource := s.workspaceRetentionHorizon(r.Context())
+	setRetentionHorizonHeaders(w, prunedBefore, policySource)
+	resp := map[string]any{
+		"alerts":                  alerts,
+		"next_cursor":             next,
+		"retention_policy_source": policySource,
+	}
+	if prunedBefore != nil {
+		resp["pruned_before"] = prunedBefore.UTC().Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // maxAlertExportRows is the documented ceiling on a single CSV export when
@@ -206,6 +216,8 @@ func (s *Server) exportAlertsCSV(w http.ResponseWriter, r *http.Request) {
 		names[m.ID] = m.Name
 	}
 
+	prunedBefore, policySource := s.workspaceRetentionHorizon(r.Context())
+	setRetentionHorizonHeaders(w, prunedBefore, policySource)
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+alertExportFilename(f)+`"`)
 	w.Header().Set("Cache-Control", "no-store")

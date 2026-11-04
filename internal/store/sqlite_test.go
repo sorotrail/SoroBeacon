@@ -36,6 +36,7 @@ func newTestSQLite(t *testing.T) conformanceStore {
 // the same fixed-format helpers the store itself uses so the tests set exactly
 // what a real write would.
 func (s *SQLite) resetConformance(ctx context.Context) error {
+	s.alertRetention.Store(0)
 	if _, err := s.db.ExecContext(ctx,
 		`DELETE FROM delivery_attempts;
 		 DELETE FROM contract_ingest_cursors;
@@ -55,6 +56,7 @@ func (s *SQLite) resetConformance(ctx context.Context) error {
 		 DELETE FROM network_ingest_state;
 		 DELETE FROM retention_gaps;
 		 DELETE FROM event_archive;
+		 DELETE FROM workspace_retention_policies;
 		 UPDATE ingest_state SET last_ledger = 0, last_cursor = '' WHERE id = 1`); err != nil {
 		return err
 	}

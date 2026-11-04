@@ -424,6 +424,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	if p, ok := st.(*store.Postgres); ok {
 		p.WithTelemetry(tel)
 	}
+	store.SetInstanceAlertRetention(st, cfg.AlertRetention)
 	log.Info("database ready", "backend", store.BackendName(cfg.DatabaseURL))
 	if cfg.ReplicaDatabaseURL != "" {
 		// The URL itself stays out of the line: it carries credentials. The
@@ -623,6 +624,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 		WithMaxBodyBytes(cfg.HTTPMaxBodyBytes).
 		WithMetrics(m).
 		WithBroadcaster(liveAlerts).
+		WithAlertRetention(cfg.AlertRetention).
 		WithAuth(authn)
 	webSrv, err := web.New(st, registry, factory, log)
 	if err != nil {
