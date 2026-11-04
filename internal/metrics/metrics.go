@@ -92,6 +92,11 @@ type Metrics struct {
 	workspaceNotifications   *prometheus.CounterVec
 	workspaceAPIRequests     *prometheus.CounterVec
 	workspaceStoredRows      *prometheus.GaugeVec
+
+	alertPartitionRunwayMonths  prometheus.Gauge
+	alertPartitionErrorsTotal   *prometheus.CounterVec
+	alertPartitionsCreatedTotal prometheus.Counter
+	alertPartitionsDroppedTotal prometheus.Counter
 }
 
 // networkLabel is the Prometheus label every ingest metric carries.
@@ -313,6 +318,26 @@ func New() *Metrics {
 			Name: "sorobeacon_workspace_stored_rows",
 			Help: "Exact stored row count per workspace and resource kind (monitors|rules|channels|alerts|dead_letters).",
 		}, []string{"workspace", "resource"}),
+
+		alertPartitionRunwayMonths: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_alert_partition_runway_months",
+			Help: "Number of consecutive monthly alert partitions currently created beyond the current UTC month.",
+		}),
+
+		alertPartitionErrorsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_alert_partition_errors_total",
+			Help: "Total errors encountered during alert partition lifecycle operations, by operation (ensure|drop|inspect).",
+		}, []string{"operation"}),
+
+		alertPartitionsCreatedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_alert_partitions_created_total",
+			Help: "Total monthly alert partitions created by the automated partition lifecycle manager.",
+		}),
+
+		alertPartitionsDroppedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_alert_partitions_dropped_total",
+			Help: "Total expired monthly alert partitions dropped by the automated partition lifecycle manager.",
+		}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
 		m.upstreamLagLedger, m.upstreamFailures,
@@ -322,7 +347,8 @@ func New() *Metrics {
 		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.deadLetters, m.deadLettersByChannel, m.heartbeatLastSuccess,
 		m.ruleEvalsTotal, m.ruleMatchesTotal, m.ruleErrorsTotal, m.ruleDuration, m.requestBodyRejectionsTotal,
 		m.databaseDegraded, m.databaseUnavailableTotal, m.channelUnackFlagged, m.channelUnackRate,
-		m.workspaceAlertsRaised, m.workspaceRuleEvaluations, m.workspaceNotifications, m.workspaceAPIRequests, m.workspaceStoredRows)
+		m.workspaceAlertsRaised, m.workspaceRuleEvaluations, m.workspaceNotifications, m.workspaceAPIRequests, m.workspaceStoredRows,
+		m.alertPartitionRunwayMonths, m.alertPartitionErrorsTotal, m.alertPartitionsCreatedTotal, m.alertPartitionsDroppedTotal)
 	return m
 }
 
@@ -824,5 +850,9 @@ func ExportedMetricNames() []string {
 		"sorobeacon_workspace_notifications_total",
 		"sorobeacon_workspace_api_requests_total",
 		"sorobeacon_workspace_stored_rows",
+		"sorobeacon_alert_partition_runway_months",
+		"sorobeacon_alert_partition_errors_total",
+		"sorobeacon_alert_partitions_created_total",
+		"sorobeacon_alert_partitions_dropped_total",
 	}
 }

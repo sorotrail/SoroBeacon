@@ -893,6 +893,16 @@ func (s *server) job(ctx context.Context) {
 		start(func(ctx context.Context) {
 			store.RunAlertPruner(ctx, s.store, s.cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, s.archiver, s.log)
 		})
+	} else {
+		// Partition creation and runway monitoring must continue across month
+		// boundaries even when ALERT_RETENTION is unset.
+		start(func(ctx context.Context) {
+			store.RunAlertPartitionLifecycle(ctx, s.store, store.PartitionLifecycleOptions{
+				RunwayMonths:  store.DefaultPartitionRunwayMonths,
+				CheckInterval: store.DefaultPartitionCheckInterval,
+				Log:           s.log,
+			})
+		})
 	}
 	// The digest flusher and the escalation stepper are leader-gated for the
 	// same reason as the pruner: they send on a timer, and two instances
