@@ -719,6 +719,26 @@ class PersistedGraphQLOperation(TypedDict, total=False):
     created_at: ISODateTimeString
 
 
+class DeleteWorkspaceParams(TypedDict, total=False):
+    """Query and header parameters for DELETE /workspaces/{id}."""
+
+    dry_run: bool
+    confirm: str
+    batch_size: int
+    max_alert_batches: int
+    confirm_header: str
+
+
+class PostDeleteWorkspaceInput(TypedDict, total=False):
+    """Request payload and header parameters for POST /workspaces/{id}/delete."""
+
+    dry_run: bool
+    confirm: str
+    batch_size: int
+    max_alert_batches: int
+    confirm_header: str
+
+
 MAX_SAFE_INT = 9007199254740991
 MIN_SAFE_INT = -9007199254740991
 
@@ -973,6 +993,9 @@ OPENAPI_OPERATIONS: tuple[dict[str, str], ...] = (
     {"method": "GET", "path": "/usage", "client_method": "get_usage", "summary": "Per-workspace usage metering summary"},
     {"method": "GET", "path": "/quotas", "client_method": "get_quotas", "summary": "Per-workspace resource quotas and query cost budget status"},
     {"method": "PUT", "path": "/quotas", "client_method": "set_quotas", "summary": "Configure per-workspace resource quotas and query cost budget"},
+    {"method": "DELETE", "path": "/workspaces/{id}", "client_method": "delete_workspace", "summary": "Delete a workspace and everything belonging to it (or preview via dry-run)"},
+    {"method": "POST", "path": "/workspaces/{id}/delete", "client_method": "post_delete_workspace", "summary": "Delete a workspace and everything belonging to it (or preview via dry-run)"},
+    {"method": "GET", "path": "/workspaces/{id}/delete", "client_method": "get_workspace_deletion", "summary": "Inspect workspace deletion progress or completion tombstone"},
     {"method": "GET", "path": "/audit", "client_method": "list_audit_logs", "summary": "Audit log of configuration changes"},
     {"method": "GET", "path": "/templates", "client_method": "list_templates", "summary": "List monitor templates"},
     {"method": "POST", "path": "/templates", "client_method": "create_template", "summary": "Create a monitor template"},
@@ -2058,6 +2081,91 @@ class SoroBeaconClient:
             query=params,
             body=input_data,
             has_body=True,
+            headers=headers,
+        )
+
+    def delete_workspace(
+        self,
+        workspace_id: str,
+        params: DeleteWorkspaceParams | Mapping[str, Any] | None = None,
+        *,
+        dry_run: bool | None = None,
+        confirm: str | None = None,
+        batch_size: int | None = None,
+        max_alert_batches: int | None = None,
+        confirm_header: str | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        query: dict[str, Any] = dict(params) if params else {}
+        hdr_confirm = query.pop("confirm_header", None)
+        if dry_run is not None:
+            query["dry_run"] = dry_run
+        if confirm is not None:
+            query["confirm"] = confirm
+        if batch_size is not None:
+            query["batch_size"] = batch_size
+        if max_alert_batches is not None:
+            query["max_alert_batches"] = max_alert_batches
+        req_headers: dict[str, str] = dict(headers) if headers else {}
+        effective_confirm_hdr = confirm_header or hdr_confirm or query.get("confirm")
+        if effective_confirm_hdr and "X-Confirm-Workspace" not in req_headers:
+            req_headers["X-Confirm-Workspace"] = str(effective_confirm_hdr)
+        return self._request(
+            "DELETE",
+            f"/workspaces/{self._quote(workspace_id)}",
+            query=query or None,
+            headers=req_headers or None,
+        )
+
+    def post_delete_workspace(
+        self,
+        workspace_id: str,
+        input_data: PostDeleteWorkspaceInput | Mapping[str, Any] | None = None,
+        *,
+        dry_run: bool | None = None,
+        confirm: str | None = None,
+        batch_size: int | None = None,
+        max_alert_batches: int | None = None,
+        confirm_header: str | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        body: dict[str, Any] = dict(input_data) if input_data else {}
+        hdr_confirm = body.pop("confirm_header", None)
+        if dry_run is not None:
+            body["dry_run"] = dry_run
+        if confirm is not None:
+            body["confirm"] = confirm
+        if batch_size is not None:
+            body["batch_size"] = batch_size
+        if max_alert_batches is not None:
+            body["max_alert_batches"] = max_alert_batches
+        req_headers: dict[str, str] = dict(headers) if headers else {}
+        effective_confirm_hdr = confirm_header or hdr_confirm or body.get("confirm")
+        if effective_confirm_hdr and "X-Confirm-Workspace" not in req_headers:
+            req_headers["X-Confirm-Workspace"] = str(effective_confirm_hdr)
+        return self._request(
+            "POST",
+            f"/workspaces/{self._quote(workspace_id)}/delete",
+            body=body,
+            has_body=True,
+            headers=req_headers or None,
+        )
+
+    def get_workspace_deletion(
+        self,
+        workspace_id: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        dry_run: bool | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        query: dict[str, Any] = dict(params) if params else {}
+        if dry_run is not None:
+            query["dry_run"] = dry_run
+        return self._request(
+            "GET",
+            f"/workspaces/{self._quote(workspace_id)}/delete",
+            query=query or None,
             headers=headers,
         )
 

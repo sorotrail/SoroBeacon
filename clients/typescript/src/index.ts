@@ -681,6 +681,24 @@ export interface PersistedGraphQLOperation extends JsonObject {
   created_at?: ISODateTimeString;
 }
 
+/** Query and header parameters for DELETE /workspaces/{id}. */
+export interface DeleteWorkspaceParams {
+  dry_run?: boolean;
+  confirm?: string;
+  batch_size?: number;
+  max_alert_batches?: number;
+  confirm_header?: string;
+}
+
+/** Request payload and header parameters for POST /workspaces/{id}/delete. */
+export interface PostDeleteWorkspaceInput {
+  dry_run?: boolean;
+  confirm?: string;
+  batch_size?: number;
+  max_alert_batches?: number;
+  confirm_header?: string;
+}
+
 /**
  * Converts an Int64 value (number, bigint, or decimal string) into a native
  * `bigint` without IEEE-754 precision loss.
@@ -952,6 +970,9 @@ export const OPENAPI_OPERATIONS = [
   { method: "GET", path: "/usage", clientMethod: "getUsage", summary: "Per-workspace usage metering summary" },
   { method: "GET", path: "/quotas", clientMethod: "getQuotas", summary: "Per-workspace resource quotas and query cost budget status" },
   { method: "PUT", path: "/quotas", clientMethod: "setQuotas", summary: "Configure per-workspace resource quotas and query cost budget" },
+  { method: "DELETE", path: "/workspaces/{id}", clientMethod: "deleteWorkspace", summary: "Delete a workspace and everything belonging to it (or preview via dry-run)" },
+  { method: "POST", path: "/workspaces/{id}/delete", clientMethod: "postDeleteWorkspace", summary: "Delete a workspace and everything belonging to it (or preview via dry-run)" },
+  { method: "GET", path: "/workspaces/{id}/delete", clientMethod: "getWorkspaceDeletion", summary: "Inspect workspace deletion progress or completion tombstone" },
   { method: "GET", path: "/audit", clientMethod: "listAuditLogs", summary: "Audit log of configuration changes" },
   { method: "GET", path: "/templates", clientMethod: "listTemplates", summary: "List monitor templates" },
   { method: "POST", path: "/templates", clientMethod: "createTemplate", summary: "Create a monitor template" },
@@ -1968,6 +1989,73 @@ export class SoroBeaconClient {
       body: input,
       requestOptions: options,
     });
+  }
+
+  async deleteWorkspace(
+    id: string,
+    params?: DeleteWorkspaceParams,
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    const { confirm_header, ...queryParams } = params ?? {};
+    const confirmHdr = confirm_header ?? params?.confirm;
+    const reqOptions: RequestOptions | undefined = confirmHdr
+      ? {
+          ...options,
+          headers: {
+            "X-Confirm-Workspace": confirmHdr,
+            ...(options?.headers ?? {}),
+          },
+        }
+      : options;
+    return this.request<JsonObject>(
+      "DELETE",
+      `/workspaces/${encodeURIComponent(String(id))}`,
+      {
+        query: queryParams as Record<string, unknown>,
+        requestOptions: reqOptions,
+      },
+    );
+  }
+
+  async postDeleteWorkspace(
+    id: string,
+    input?: PostDeleteWorkspaceInput,
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    const { confirm_header, ...bodyFields } = input ?? {};
+    const confirmHdr = confirm_header ?? input?.confirm;
+    const reqOptions: RequestOptions | undefined = confirmHdr
+      ? {
+          ...options,
+          headers: {
+            "X-Confirm-Workspace": confirmHdr,
+            ...(options?.headers ?? {}),
+          },
+        }
+      : options;
+    return this.request<JsonObject>(
+      "POST",
+      `/workspaces/${encodeURIComponent(String(id))}/delete`,
+      {
+        body: bodyFields,
+        requestOptions: reqOptions,
+      },
+    );
+  }
+
+  async getWorkspaceDeletion(
+    id: string,
+    params?: { dry_run?: boolean },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>(
+      "GET",
+      `/workspaces/${encodeURIComponent(String(id))}/delete`,
+      {
+        query: params as Record<string, unknown>,
+        requestOptions: options,
+      },
+    );
   }
 
   async listAuditLogs(

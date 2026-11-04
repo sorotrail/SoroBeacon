@@ -4,8 +4,8 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -113,6 +113,9 @@ type Server struct {
 	// usageMeter buffers per-workspace API request counts in memory and
 	// flushes them to durable rollups.
 	usageMeter *usage.Meter
+	// dispatcher is the shared notification dispatcher, used to cancel
+	// in-flight deliveries and purge per-workspace queues on workspace deletion.
+	dispatcher *notify.Dispatcher
 
 	subMu               sync.Mutex
 	activeSubscriptions map[string]int64
@@ -206,6 +209,13 @@ func (s *Server) WithUsageMeter(um *usage.Meter) *Server {
 // UsageMeter returns the server's workspace usage meter.
 func (s *Server) UsageMeter() *usage.Meter {
 	return s.usageMeter
+}
+
+// WithDispatcher attaches the notification dispatcher so workspace deletion can
+// immediately cancel in-flight deliveries and purge per-workspace queues.
+func (s *Server) WithDispatcher(d *notify.Dispatcher) *Server {
+	s.dispatcher = d
+	return s
 }
 
 // WithPoller attaches the ingest-position source used by /health and /readyz.
@@ -462,6 +472,12 @@ func (s *Server) Routes() chi.Router {
 	mux.Get("/quotas", s.getQuotas)
 	mux.Put("/quotas", s.putQuotas)
 	mux.Get("/audit", s.listAudit)
+
+	mux.Route("/workspaces/{id}", func(r chi.Router) {
+		r.Delete("/", s.deleteWorkspace)
+		r.Post("/delete", s.deleteWorkspace)
+		r.Get("/delete", s.getWorkspaceDeletion)
+	})
 
 	return mux
 }

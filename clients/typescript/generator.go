@@ -193,6 +193,9 @@ var knownRouteBindings = []routeBinding{
 	{"GET", "/usage", "getUsage"},
 	{"GET", "/quotas", "getQuotas"},
 	{"PUT", "/quotas", "setQuotas"},
+	{"DELETE", "/workspaces/{id}", "deleteWorkspace"},
+	{"POST", "/workspaces/{id}/delete", "postDeleteWorkspace"},
+	{"GET", "/workspaces/{id}/delete", "getWorkspaceDeletion"},
 	{"GET", "/audit", "listAuditLogs"},
 	{"GET", "/templates", "listTemplates"},
 	{"POST", "/templates", "createTemplate"},
@@ -831,6 +834,24 @@ export interface PersistedGraphQLOperation extends JsonObject {
   name?: string;
   query?: string;
   created_at?: ISODateTimeString;
+}
+
+/** Query and header parameters for DELETE /workspaces/{id}. */
+export interface DeleteWorkspaceParams {
+  dry_run?: boolean;
+  confirm?: string;
+  batch_size?: number;
+  max_alert_batches?: number;
+  confirm_header?: string;
+}
+
+/** Request payload and header parameters for POST /workspaces/{id}/delete. */
+export interface PostDeleteWorkspaceInput {
+  dry_run?: boolean;
+  confirm?: string;
+  batch_size?: number;
+  max_alert_batches?: number;
+  confirm_header?: string;
 }
 
 `)
@@ -2053,6 +2074,73 @@ export class SoroBeaconClient {
       body: input,
       requestOptions: options,
     });
+  }
+
+  async deleteWorkspace(
+    id: string,
+    params?: DeleteWorkspaceParams,
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    const { confirm_header, ...queryParams } = params ?? {};
+    const confirmHdr = confirm_header ?? params?.confirm;
+    const reqOptions: RequestOptions | undefined = confirmHdr
+      ? {
+          ...options,
+          headers: {
+            "X-Confirm-Workspace": confirmHdr,
+            ...(options?.headers ?? {}),
+          },
+        }
+      : options;
+    return this.request<JsonObject>(
+      "DELETE",
+      ` + "`/workspaces/${encodeURIComponent(String(id))}`" + `,
+      {
+        query: queryParams as Record<string, unknown>,
+        requestOptions: reqOptions,
+      },
+    );
+  }
+
+  async postDeleteWorkspace(
+    id: string,
+    input?: PostDeleteWorkspaceInput,
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    const { confirm_header, ...bodyFields } = input ?? {};
+    const confirmHdr = confirm_header ?? input?.confirm;
+    const reqOptions: RequestOptions | undefined = confirmHdr
+      ? {
+          ...options,
+          headers: {
+            "X-Confirm-Workspace": confirmHdr,
+            ...(options?.headers ?? {}),
+          },
+        }
+      : options;
+    return this.request<JsonObject>(
+      "POST",
+      ` + "`/workspaces/${encodeURIComponent(String(id))}/delete`" + `,
+      {
+        body: bodyFields,
+        requestOptions: reqOptions,
+      },
+    );
+  }
+
+  async getWorkspaceDeletion(
+    id: string,
+    params?: { dry_run?: boolean },
+    options?: RequestOptions,
+  ): Promise<JsonObject> {
+    return this.request<JsonObject>(
+      "GET",
+      ` + "`/workspaces/${encodeURIComponent(String(id))}/delete`" + `,
+      {
+        query: params as Record<string, unknown>,
+        requestOptions: options,
+      },
+    );
   }
 
   async listAuditLogs(

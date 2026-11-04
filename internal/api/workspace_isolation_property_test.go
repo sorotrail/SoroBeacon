@@ -913,6 +913,35 @@ func buildRESTIsolationChecks(fx *isolationFixture) map[string]func(t *testing.T
 			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodPut, "/quotas?workspace=beta", `{"max_monitors":1}`)
 			assert.Equal(t, http.StatusForbidden, crossCode)
 		},
+		"DELETE /workspaces/{id}": func(t *testing.T) {
+			code, raw := fx.doREST(t, fx.alphaToken, http.MethodDelete, "/workspaces/alpha?dry_run=true", "")
+			require.Equal(t, http.StatusOK, code)
+			var resp store.WorkspaceDeletionResult
+			require.NoError(t, json.Unmarshal(raw, &resp))
+			assert.Equal(t, "alpha", resp.WorkspaceID)
+			assert.True(t, resp.DryRun)
+
+			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodDelete, "/workspaces/beta?confirm=beta", "")
+			assert.Equal(t, http.StatusForbidden, crossCode)
+		},
+		"POST /workspaces/{id}/delete": func(t *testing.T) {
+			code, raw := fx.doREST(t, fx.alphaToken, http.MethodPost, "/workspaces/alpha/delete", `{"dry_run":true}`)
+			require.Equal(t, http.StatusOK, code)
+			var resp store.WorkspaceDeletionResult
+			require.NoError(t, json.Unmarshal(raw, &resp))
+			assert.Equal(t, "alpha", resp.WorkspaceID)
+			assert.True(t, resp.DryRun)
+
+			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodPost, "/workspaces/beta/delete", `{"confirm":"beta"}`)
+			assert.Equal(t, http.StatusForbidden, crossCode)
+		},
+		"GET /workspaces/{id}/delete": func(t *testing.T) {
+			code, _ := fx.doREST(t, fx.alphaToken, http.MethodGet, "/workspaces/alpha/delete", "")
+			assert.Equal(t, http.StatusNotFound, code)
+
+			crossCode, _ := fx.doREST(t, fx.alphaToken, http.MethodGet, "/workspaces/beta/delete", "")
+			assert.Equal(t, http.StatusForbidden, crossCode)
+		},
 	}
 }
 
