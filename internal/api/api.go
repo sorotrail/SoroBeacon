@@ -117,6 +117,12 @@ type Server struct {
 	subMu               sync.Mutex
 	activeSubscriptions map[string]int64
 	quotaClock          func() time.Time
+
+	idempotencyTTL    time.Duration
+	idempotencyClock  func() time.Time
+	idempotencyMu     sync.Mutex
+	idempotencyFlight map[string]*inFlightIdempotency
+	idempotencyMem    map[string]*store.IdempotencyRecord
 }
 
 // New wires an API server. Rate limiting stays off until WithRateLimit, and
@@ -327,10 +333,11 @@ func (s *Server) Routes() chi.Router {
 	mux.Use(RateLimitMiddleware(s.rateLimit))
 	mux.Use(s.usageMiddleware)
 	mux.Use(s.queryBudgetMiddleware)
+	mux.Use(s.degradedMiddleware)
+	mux.Use(s.idempotencyMiddleware)
 	// Innermost, so only authenticated, rate-limited requests are audited
 	// and an audit failure never blocks the request.
 	mux.Use(AuditMiddleware(s.store, s.log))
-	mux.Use(s.degradedMiddleware)
 	// JSON clients hitting a typo'd path or the wrong method should get
 	// the same envelope as every other API error, not chi's plain-text
 	// 404/405. The dashboard mux is a different router and is untouched.
