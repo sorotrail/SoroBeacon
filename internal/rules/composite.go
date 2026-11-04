@@ -166,15 +166,34 @@ func (c *Composite) validate(params json.RawMessage, prefix string, depth int) F
 // Evaluate combines the child rules' results. It short-circuits: "and" returns
 // false at the first failing child, "or" returns true at the first matching
 // one, and neither evaluates the children after that point.
-func (c *Composite) Evaluate(ctx context.Context, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error) {
+func (c *Composite) Evaluate(ctx context.Context, ev *stellar.DecodedEvent, params json.RawMessage) (matched bool, evalErr error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	p, err := parseComposite(params)
 	if err != nil {
 		return false, err
 	}
+	ruleID := RuleID(ctx)
+	rootComposite := !isInCompositeEval(ctx)
+	var snaps map[string]any
+	if rootComposite && c.registry != nil && ruleID != 0 {
+		snaps = c.registry.snapshotRuleStates(ruleID)
+		defer func() {
+			if rec := recover(); rec != nil {
+				c.registry.restoreRuleStates(ruleID, snaps)
+				panic(rec)
+			}
+			if evalErr != nil {
+				c.registry.restoreRuleStates(ruleID, snaps)
+			}
+		}()
+	}
+	childCtx := withInCompositeEval(ctx)
 	switch p.Op {
 	case opAnd:
 		for _, child := range p.Rules {
-			ok, err := c.evalChild(ctx, ev, child)
+			ok, err := c.evalChild(childCtx, ev, child)
 			if err != nil {
 				return false, err
 			}
@@ -185,7 +204,7 @@ func (c *Composite) Evaluate(ctx context.Context, ev *stellar.DecodedEvent, para
 		return true, nil
 	case opOr:
 		for _, child := range p.Rules {
-			ok, err := c.evalChild(ctx, ev, child)
+			ok, err := c.evalChild(childCtx, ev, child)
 			if err != nil {
 				return false, err
 			}
@@ -198,7 +217,7 @@ func (c *Composite) Evaluate(ctx context.Context, ev *stellar.DecodedEvent, para
 		if len(p.Rules) != 1 {
 			return false, fmt.Errorf(`composite: op "not" requires exactly one child rule`)
 		}
-		ok, err := c.evalChild(ctx, ev, p.Rules[0])
+		ok, err := c.evalChild(childCtx, ev, p.Rules[0])
 		if err != nil {
 			return false, err
 		}
@@ -213,6 +232,9 @@ func (c *Composite) Evaluate(ctx context.Context, ev *stellar.DecodedEvent, para
 // have rejected it at create time, so reaching here means the registry changed
 // under a stored rule.
 func (c *Composite) evalChild(ctx context.Context, ev *stellar.DecodedEvent, child compositeChild) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	ok, err := c.registry.Evaluate(ctx, child.Type, ev, child.Params)
 	if err != nil {
 		return false, fmt.Errorf("composite: child %q: %w", child.Type, err)
