@@ -25,13 +25,13 @@ type AuditWebSpec struct {
 // ("METHOD /pattern") to the audit action and target type it records.
 var AuditWebRouteTable = auth.NewRouteTable(map[string]AuditWebSpec{
 	// Monitors
-	"POST /monitors":                    {Action: store.AuditActionCreate, TargetType: store.AuditTargetMonitor},
-	"POST /monitors/{id}/toggle":        {Action: store.AuditActionUpdate, TargetType: store.AuditTargetMonitor},
-	"POST /monitors/{id}/delete":        {Action: store.AuditActionDelete, TargetType: store.AuditTargetMonitor},
-	"POST /monitors/{id}/soft-delete":   {Action: store.AuditActionDelete, TargetType: store.AuditTargetMonitor},
-	"POST /monitors/{id}/restore":       {Action: store.AuditActionUpdate, TargetType: store.AuditTargetMonitor},
-	"POST /monitors/{id}/duplicate":     {Action: store.AuditActionCreate, TargetType: store.AuditTargetMonitor},
-	"POST /monitors/{id}/channels":      {Action: store.AuditActionUpdate, TargetType: store.AuditTargetMonitor},
+	"POST /monitors":                  {Action: store.AuditActionCreate, TargetType: store.AuditTargetMonitor},
+	"POST /monitors/{id}/toggle":      {Action: store.AuditActionUpdate, TargetType: store.AuditTargetMonitor},
+	"POST /monitors/{id}/delete":      {Action: store.AuditActionDelete, TargetType: store.AuditTargetMonitor},
+	"POST /monitors/{id}/soft-delete": {Action: store.AuditActionDelete, TargetType: store.AuditTargetMonitor},
+	"POST /monitors/{id}/restore":     {Action: store.AuditActionUpdate, TargetType: store.AuditTargetMonitor},
+	"POST /monitors/{id}/duplicate":   {Action: store.AuditActionCreate, TargetType: store.AuditTargetMonitor},
+	"POST /monitors/{id}/channels":    {Action: store.AuditActionUpdate, TargetType: store.AuditTargetMonitor},
 
 	// Rules
 	"POST /monitors/{id}/rules":                 {Action: store.AuditActionCreate, TargetType: store.AuditTargetRule},
@@ -64,11 +64,11 @@ var AuditWebRouteTable = auth.NewRouteTable(map[string]AuditWebSpec{
 // AuditExemptWebRoutes documents mutating HTTP routes on the dashboard router
 // that are intentionally excluded from the administrative audit log.
 var AuditExemptWebRoutes = map[string]string{
-	"POST /login":                                    "Session sign-in; pinned by TestNonConfigActionsWriteNoAuditEntry.",
-	"POST /logout":                                   "Session sign-out; pinned by TestNonConfigActionsWriteNoAuditEntry.",
-	"POST /theme":                                    "Browser theme cookie preference; pinned by TestNonConfigActionsWriteNoAuditEntry.",
-	"POST /timezone":                                 "Browser timezone cookie preference; pinned by TestNonConfigActionsWriteNoAuditEntry.",
-	"POST /channels/{id}/test":                       "Operational test notification send; pinned by TestNonConfigActionsWriteNoAuditEntry.",
+	"POST /login":              "Session sign-in; pinned by TestNonConfigActionsWriteNoAuditEntry.",
+	"POST /logout":             "Session sign-out; pinned by TestNonConfigActionsWriteNoAuditEntry.",
+	"POST /theme":              "Browser theme cookie preference; pinned by TestNonConfigActionsWriteNoAuditEntry.",
+	"POST /timezone":           "Browser timezone cookie preference; pinned by TestNonConfigActionsWriteNoAuditEntry.",
+	"POST /channels/{id}/test": "Operational test notification send; pinned by TestNonConfigActionsWriteNoAuditEntry.",
 	"POST /alerts/{id}/deliveries/{channelID}/retry": "Operational alert delivery retry; pinned by TestRetryDeliveryRecordsNewAttemptAndCallsNotifier.",
 	"POST /monitors/bulk":                            "Bulk UI enable/disable helper; pinned by TestBulkMonitorsAppliesKnownIDsAndRedirects.",
 	"POST /channels/bulk":                            "Bulk UI enable/disable helper for channels.",
@@ -224,7 +224,7 @@ func (s *Server) auditPage(w http.ResponseWriter, r *http.Request) {
 	}
 	if note == "" && len(entries) == f.Limit {
 		last := entries[len(entries)-1]
-		data["OlderHref"] = template.URL("/audit?" + auditFilterQuery(f) + "cursor=" + strconv.FormatInt(last.ID, 10))
+		data["OlderHref"] = template.URL("/audit?" + auditFilterQuery(f) + "cursor=" + strconv.FormatInt(last.ID, 10)) // #nosec G203 -- auditFilterQuery URL-encodes values via url.Values and last.ID is an int64
 	}
 	s.render(w, r, "audit", data)
 }

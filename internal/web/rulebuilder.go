@@ -264,7 +264,7 @@ func (s *Server) renderRuleBuilderError(
 	data["BuilderType"] = ruleType
 	// The fragment is markup, and every value in it was escaped when it was
 	// rendered, so it is marked as such rather than escaped a second time.
-	data["BuilderFields"] = template.HTML(builderFields(s.registry.ParamSchema(ruleType), values))
+	data["BuilderFields"] = template.HTML(builderFields(s.registry.ParamSchema(ruleType), values)) // #nosec G203 -- builderFields escapes every attribute and text node before returning markup
 	data["BuilderRawParams"] = r.FormValue("params")
 	data["BuilderRunbookURL"] = r.FormValue("runbook_url")
 	data["BuilderResponseGuidance"] = r.FormValue("response_guidance")

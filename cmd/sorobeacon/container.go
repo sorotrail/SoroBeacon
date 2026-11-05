@@ -105,7 +105,7 @@ func runHealthcheck(ctx context.Context, args []string, out io.Writer) error {
 	if insecure {
 		// Loopback container healthcheck against a self-signed or cluster-internal
 		// server certificate only verifies liveness of the local listener.
-		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true} //nolint:gosec // intentional loopback probe option
+		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true} // #nosec G402 -- intentional loopback healthcheck probe option
 	}
 	client := &http.Client{
 		Timeout:   timeout,

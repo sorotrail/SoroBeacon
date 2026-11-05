@@ -106,11 +106,11 @@ func ValidateFiles(cfg PeerConfig, now time.Time) (*LoadedBundle, error) {
 	}
 
 	if certFile != "" && keyFile != "" {
-		certPEM, err := os.ReadFile(certFile)
+		certPEM, err := os.ReadFile(certFile) // #nosec G304 -- certFile comes from operator-configured TLS settings
 		if err != nil {
 			return nil, fmt.Errorf("read certificate file %q: %w", certFile, err)
 		}
-		keyPEM, err := os.ReadFile(keyFile)
+		keyPEM, err := os.ReadFile(keyFile) // #nosec G304 -- keyFile comes from operator-configured TLS settings
 		if err != nil {
 			return nil, fmt.Errorf("read private key file %q: %w", keyFile, err)
 		}
@@ -137,7 +137,7 @@ func ValidateFiles(cfg PeerConfig, now time.Time) (*LoadedBundle, error) {
 	}
 
 	if caFile != "" {
-		caPEM, err := os.ReadFile(caFile)
+		caPEM, err := os.ReadFile(caFile) // #nosec G304 -- caFile comes from operator-configured TLS settings
 		if err != nil {
 			return nil, fmt.Errorf("read CA bundle %q: %w", caFile, err)
 		}

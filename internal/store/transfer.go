@@ -714,7 +714,7 @@ func (s *SQLite) transferAdvanceSequences(ctx context.Context, tables []string) 
 			continue
 		}
 		_, err := s.db.ExecContext(ctx,
-			"UPDATE sqlite_sequence SET seq = MAX(seq, COALESCE((SELECT MAX(id) FROM "+transferQuoteIdent(table)+"), 0)) WHERE name = ?",
+			"UPDATE sqlite_sequence SET seq = MAX(seq, COALESCE((SELECT MAX(id) FROM "+transferQuoteIdent(table)+"), 0)) WHERE name = ?", // #nosec G202 -- table is validated against present/autoIncrement and quoted with transferQuoteIdent
 			table)
 		if err != nil {
 			return fmt.Errorf("advance %s: %w", table, err)

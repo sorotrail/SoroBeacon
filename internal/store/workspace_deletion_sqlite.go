@@ -420,26 +420,26 @@ func (s *SQLite) sqliteDeleteWorkspaceAlertBatch(ctx context.Context, ws string,
 	}
 	idAndWSArgs := append(append([]any{}, idArgs...), ws)
 
-	res, err := tx.ExecContext(ctx, `DELETE FROM delivery_attempts WHERE alert_id IN (`+placeholders+`) AND EXISTS (SELECT 1 FROM alerts WHERE id = delivery_attempts.alert_id AND workspace_id = ?)`, idAndWSArgs...)
+	res, err := tx.ExecContext(ctx, `DELETE FROM delivery_attempts WHERE alert_id IN (`+placeholders+`) AND EXISTS (SELECT 1 FROM alerts WHERE id = delivery_attempts.alert_id AND workspace_id = ?)`, idAndWSArgs...) // #nosec G202 -- placeholders contains only ? markers; values are bound in idAndWSArgs
 	if err != nil {
 		return 0, fmt.Errorf("delete alert batch delivery attempts: %w", err)
 	}
 	delivDel, _ := res.RowsAffected()
 
-	res, err = tx.ExecContext(ctx, `DELETE FROM dead_letters WHERE alert_id IN (`+placeholders+`) AND EXISTS (SELECT 1 FROM alerts WHERE id = dead_letters.alert_id AND workspace_id = ?)`, idAndWSArgs...)
+	res, err = tx.ExecContext(ctx, `DELETE FROM dead_letters WHERE alert_id IN (`+placeholders+`) AND EXISTS (SELECT 1 FROM alerts WHERE id = dead_letters.alert_id AND workspace_id = ?)`, idAndWSArgs...) // #nosec G202 -- placeholders contains only ? markers; values are bound in idAndWSArgs
 	if err != nil {
 		return 0, fmt.Errorf("delete alert batch dead letters: %w", err)
 	}
 	deadDel, _ := res.RowsAffected()
 
-	res, err = tx.ExecContext(ctx, `DELETE FROM alert_escalations WHERE alert_id IN (`+placeholders+`) AND EXISTS (SELECT 1 FROM alerts WHERE id = alert_escalations.alert_id AND workspace_id = ?)`, idAndWSArgs...)
+	res, err = tx.ExecContext(ctx, `DELETE FROM alert_escalations WHERE alert_id IN (`+placeholders+`) AND EXISTS (SELECT 1 FROM alerts WHERE id = alert_escalations.alert_id AND workspace_id = ?)`, idAndWSArgs...) // #nosec G202 -- placeholders contains only ? markers; values are bound in idAndWSArgs
 	if err != nil {
 		return 0, fmt.Errorf("delete alert batch escalations: %w", err)
 	}
 	escDel, _ := res.RowsAffected()
 
 	wsAndIDArgs := append([]any{ws}, idArgs...)
-	res, err = tx.ExecContext(ctx, `DELETE FROM alerts WHERE workspace_id = ? AND id IN (`+placeholders+`)`, wsAndIDArgs...)
+	res, err = tx.ExecContext(ctx, `DELETE FROM alerts WHERE workspace_id = ? AND id IN (`+placeholders+`)`, wsAndIDArgs...) // #nosec G202 -- placeholders contains only ? markers; values are bound in wsAndIDArgs
 	if err != nil {
 		return 0, fmt.Errorf("delete workspace alert batch: %w", err)
 	}

@@ -111,7 +111,7 @@ func DefaultOutputPath() string {
 // GenerateFromFile reads internal/api/openapi.json and returns the deterministic
 // TypeScript source for clients/typescript/src/index.ts.
 func GenerateFromFile(specPath string) ([]byte, error) {
-	raw, err := os.ReadFile(specPath)
+	raw, err := os.ReadFile(specPath) // #nosec G304 -- specPath is a caller-supplied OpenAPI spec path in the offline SDK generator
 	if err != nil {
 		return nil, fmt.Errorf("read openapi spec %s: %w", specPath, err)
 	}

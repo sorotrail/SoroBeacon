@@ -78,21 +78,17 @@ func TestGosecRuleSetFailsIfRuleDropped(t *testing.T) {
 
 func TestSecurityJobRunsInCI(t *testing.T) {
 	ci := readSecurityFile(t, ".github", "workflows", "ci.yml")
-	require.Regexp(t, `(?m)^  security:\s*$`, ci)
-	job := ci[strings.Index(ci, "\n  security:\n"):]
-	if next := regexp.MustCompile(`\n  [a-z-]+:\n`).FindStringIndex(job[1:]); next != nil {
-		job = job[:next[0]+1]
-	}
+	job := requireJobBlock(t, ci, "security")
 	require.Contains(t, job, "--config=.golangci-security.yml")
 	require.Contains(t, job, "--config=../.golangci-security.yml", "the Terraform provider module must be scanned too")
 	require.NotContains(t, job, "only-new-issues", "existing findings are triaged inline, so every finding fails")
 }
 
 // TestGosecSuppressionsCarryAReason keeps the baseline honest: a bare
-// //nolint:gosec is a blanket ignore, which issue #570 rules out.
+// #nosec directive is a blanket ignore, which issue #570 rules out.
 func TestGosecSuppressionsCarryAReason(t *testing.T) {
 	root := repoRoot(t)
-	bare := regexp.MustCompile(`//\s*(nolint:gosec|#nosec)\b(\s*$|\s+[^/\s])`)
+	withReason := regexp.MustCompile(`//\s*(#nosec\s+G\d{3}\s+(--|//)\s+\S|nolint:gosec\s+//\s+\S)`)
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -118,9 +114,9 @@ func TestGosecSuppressionsCarryAReason(t *testing.T) {
 				continue
 			}
 			trimmed := strings.TrimRight(line, "\r")
-			if bare.MatchString(trimmed) || !strings.Contains(trimmed[strings.Index(trimmed, "//")+2:], "//") {
+			if !withReason.MatchString(trimmed) {
 				rel, _ := filepath.Rel(root, path)
-				t.Errorf("%s:%d: gosec suppression needs a `// reason` a later reader can evaluate", rel, i+1)
+				t.Errorf("%s:%d: gosec suppression must carry an inline reason", rel, i+1)
 			}
 		}
 		return nil
