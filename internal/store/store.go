@@ -2481,6 +2481,15 @@ type Store interface {
 	RetentionPolicies
 	Idempotency
 	GetStats(ctx context.Context) (Stats, error)
+	// GetAlertStatistics returns the pre-computed alert statistics by state,
+	// severity, monitor, and rule for the caller's workspace.
+	GetAlertStatistics(ctx context.Context) (AlertStatisticsSummary, error)
+	// RecomputeAlertStatistics rebuilds the pre-computed alert statistics from
+	// the raw alerts table for the caller's workspace.
+	RecomputeAlertStatistics(ctx context.Context) (AlertStatisticsSummary, error)
+	// VerifyAlertStatistics compares the maintained rollup against a full
+	// recomputation and repairs any drift.
+	VerifyAlertStatistics(ctx context.Context) (bool, error)
 	// GetMonitorStats returns one monitor's alert, delivery and per-rule
 	// counts, or ErrNotFound when the monitor does not exist. It exists
 	// because GetStats answers "how big is this instance" and says nothing

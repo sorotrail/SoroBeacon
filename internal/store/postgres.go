@@ -3766,7 +3766,11 @@ func (p *Postgres) GetStats(ctx context.Context) (Stats, error) {
 			(SELECT count(*) FROM monitors WHERE workspace_id = $1),
 			(SELECT count(*) FROM rules r JOIN monitors m ON m.id = r.monitor_id WHERE m.workspace_id = $1),
 			(SELECT count(*) FROM channels WHERE workspace_id = $1),
-			(SELECT count(*) FROM alerts WHERE workspace_id = $1 AND ($2::timestamptz IS NULL OR created_at >= $2)),
+			CASE WHEN $2::timestamptz IS NULL THEN
+				COALESCE((SELECT sum(total_count) FROM alert_stat_rollups WHERE workspace_id = $1), 0)
+			ELSE
+				(SELECT count(*) FROM alerts WHERE workspace_id = $1 AND created_at >= $2)
+			END,
 			(SELECT count(*) FROM alerts WHERE workspace_id = $1 AND created_at > now() - interval '24 hours' AND ($2::timestamptz IS NULL OR created_at >= $2)),
 			(SELECT last_ledger FROM ingest_state WHERE id = 1),
 			(SELECT updated_at FROM ingest_state WHERE id = 1)`, workspaceID(ctx), cutoffArg)

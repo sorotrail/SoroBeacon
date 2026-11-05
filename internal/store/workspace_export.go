@@ -100,6 +100,7 @@ var NonExportedInstanceTables = map[string]string{
 	"persisted_operations":    "instance-wide vetted GraphQL persisted operation registry",
 	"idempotency_keys":        "ephemeral HTTP transport idempotency response cache with 24h TTL",
 	"workspace_deletions":     "durable workspace deletion progress and completion tombstone log",
+	"alert_stat_rollups":      "derived trigger-maintained alert statistics rollup recomputed from alerts",
 }
 
 // WorkspaceExportTables returns the complete ordered list of schema tables

@@ -45,6 +45,7 @@ func WorkspaceDeletionCoveredTables() []string {
 		"maintenance_windows",
 		"backfills",
 		"alerts",
+		"alert_stat_rollups",
 		"alert_dedup",
 		"delivery_attempts",
 		"dead_letters",
@@ -653,6 +654,9 @@ func (p *Postgres) pgFinalizeWorkspaceDeletion(ctx context.Context, ws string) e
 		if err := execCount(st.dest, st.query); err != nil {
 			return fmt.Errorf("delete workspace %s: %w", st.name, err)
 		}
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM alert_stat_rollups WHERE workspace_id = $1`, ws); err != nil {
+		return fmt.Errorf("delete workspace alert_stat_rollups: %w", err)
 	}
 
 	now := time.Now().UTC()

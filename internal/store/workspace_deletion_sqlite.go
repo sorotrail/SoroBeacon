@@ -551,6 +551,9 @@ func (s *SQLite) sqliteFinalizeWorkspaceDeletion(ctx context.Context, ws string)
 			return fmt.Errorf("delete workspace %s: %w", st.name, err)
 		}
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM alert_stat_rollups WHERE workspace_id = ?`, ws); err != nil {
+		return fmt.Errorf("delete workspace alert_stat_rollups: %w", err)
+	}
 
 	nowStr := sqliteTimeString(time.Now().UTC())
 	if _, err := tx.ExecContext(ctx, `
