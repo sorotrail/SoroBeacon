@@ -129,6 +129,7 @@ func Setup(ctx context.Context, cfg Config) (*Provider, error) {
 	// ambient global tracer (the SDK's own HTTP instrumentation, future
 	// contributors) lands on the same trace.
 	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(Propagator())
 
 	return &Provider{
 		tp:      tp,

@@ -8,8 +8,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sorotrail/sorobeacon/internal/reqid"
+	"github.com/sorotrail/sorobeacon/internal/telemetry"
 )
 
 // RequestLog emits one structured slog line per request: method, the
@@ -42,6 +44,9 @@ func RequestLog(log *slog.Logger) func(http.Handler) http.Handler {
 				"duration", time.Since(start),
 				"bytes", ww.BytesWritten(),
 				"request_id", reqid.From(r),
+			}
+			if traceID := telemetry.SpanID(trace.SpanFromContext(r.Context())); traceID != "" {
+				attrs = append(attrs, "trace_id", traceID)
 			}
 			msg := "http request"
 			switch {
