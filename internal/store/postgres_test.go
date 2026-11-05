@@ -34,7 +34,7 @@ func newTestPostgres(t *testing.T) conformanceStore {
 	require.NoError(t, st.resetConformance(context.Background()))
 
 	_, err = st.pool.Exec(context.Background(),
-		`TRUNCATE monitors, rules, channels, monitor_channels, alerts, delivery_attempts, contract_ingest_cursors, api_tokens,
+		`TRUNCATE monitors, rules, channels, monitor_channels, alerts, alert_stat_rollups, delivery_attempts, contract_ingest_cursors, api_tokens,
 		        escalation_policies, escalation_steps, escalation_step_channels, alert_escalations,
 		        retention_gaps, event_archive
 		 RESTART IDENTITY CASCADE;
@@ -125,7 +125,7 @@ func rawChannelConfig(t *testing.T, st *Postgres, id int64) []byte {
 func (p *Postgres) resetConformance(ctx context.Context) error {
 	p.alertRetention.Store(0)
 	_, err := p.pool.Exec(ctx,
-		`TRUNCATE monitors, rules, channels, monitor_channels, alerts, delivery_attempts, contract_ingest_cursors, api_tokens,
+		`TRUNCATE monitors, rules, channels, monitor_channels, alerts, alert_stat_rollups, delivery_attempts, contract_ingest_cursors, api_tokens,
 		         saved_searches, monitor_templates, audit_log, pending_digests, maintenance_windows,
 		         retention_gaps, event_archive, workspace_retention_policies RESTART IDENTITY CASCADE;
 		 UPDATE ingest_state SET last_ledger = 0, last_cursor = '' WHERE id = 1`)

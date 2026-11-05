@@ -853,13 +853,13 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 		return nil, err
 	}
 	copy := Monitor{
-		Name:             CopyMonitorName(src.Name, names),
-		ContractIDs:      src.ContractIDs,
-		Enabled:          false,                     // never inherit enabled: a duplicate must be reviewed first
-		Priority:         src.Priority.Normalized(), // priority is queue position, not a safety switch, so the copy keeps it
+		Name:        CopyMonitorName(src.Name, names),
+		ContractIDs: src.ContractIDs,
+		Enabled:     false,                     // never inherit enabled: a duplicate must be reviewed first
+		Priority:    src.Priority.Normalized(), // priority is queue position, not a safety switch, so the copy keeps it
 		// The network is not a reviewable setting: the copy watches the same
 		// contract ids, which only exist on the source's chain.
-		Network:          src.Network,
+		Network: src.Network,
 		// Tags group related monitors, so a duplicate belongs in the same
 		// groups until an operator says otherwise.
 		Tags:             NormalizeTags(src.Tags),
@@ -3785,7 +3785,11 @@ func (p *Postgres) GetStats(ctx context.Context) (Stats, error) {
 			(SELECT count(*) FROM monitors WHERE workspace_id = $1),
 			(SELECT count(*) FROM rules r JOIN monitors m ON m.id = r.monitor_id WHERE m.workspace_id = $1),
 			(SELECT count(*) FROM channels WHERE workspace_id = $1),
-			(SELECT count(*) FROM alerts WHERE workspace_id = $1 AND ($2::timestamptz IS NULL OR created_at >= $2)),
+			CASE WHEN $2::timestamptz IS NULL THEN
+				COALESCE((SELECT sum(total_count) FROM alert_stat_rollups WHERE workspace_id = $1), 0)
+			ELSE
+				(SELECT count(*) FROM alerts WHERE workspace_id = $1 AND created_at >= $2)
+			END,
 			(SELECT count(*) FROM alerts WHERE workspace_id = $1 AND created_at > now() - interval '24 hours' AND ($2::timestamptz IS NULL OR created_at >= $2)),
 			(SELECT last_ledger FROM ingest_state WHERE id = 1),
 			(SELECT updated_at FROM ingest_state WHERE id = 1)`, workspaceID(ctx), cutoffArg)

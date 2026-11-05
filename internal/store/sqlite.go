@@ -3876,9 +3876,13 @@ func (s *SQLite) GetStats(ctx context.Context) (Stats, error) {
 			(SELECT count(*) FROM monitors WHERE workspace_id = ?),
 			(SELECT count(*) FROM rules r JOIN monitors m ON m.id = r.monitor_id WHERE m.workspace_id = ?),
 			(SELECT count(*) FROM channels WHERE workspace_id = ?),
-			(SELECT count(*) FROM alerts WHERE workspace_id = ? AND (? = '' OR created_at >= ?)),
+			CASE WHEN ? = '' THEN
+				COALESCE((SELECT sum(total_count) FROM alert_stat_rollups WHERE workspace_id = ?), 0)
+			ELSE
+				(SELECT count(*) FROM alerts WHERE workspace_id = ? AND created_at >= ?)
+			END,
 			(SELECT count(*) FROM alerts WHERE workspace_id = ? AND created_at > ? AND (? = '' OR created_at >= ?))`,
-		ws, ws, ws, ws, retCutoffStr, retCutoffStr, ws, cutoff, retCutoffStr, retCutoffStr).
+		ws, ws, ws, retCutoffStr, ws, ws, retCutoffStr, ws, cutoff, retCutoffStr, retCutoffStr).
 		Scan(&st.Monitors, &st.Rules, &st.Channels, &st.Alerts, &st.AlertsLast24)
 	if err != nil {
 		return st, err
