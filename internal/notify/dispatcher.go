@@ -750,7 +750,9 @@ func (d *Dispatcher) enqueueDigest(ctx context.Context, a Alert, ch store.Channe
 
 // RunDigestFlusher flushes due digests on a ticker until ctx is cancelled.
 // interval bounds how promptly a window is closed; a window that elapses
-// between ticks is flushed on the next one.
+// between ticks is flushed on the next one. Calling d.WithClock(fn) injects
+// the clock passed to FlushDigests on each tick so tests can advance the
+// window without waiting out a real digest_window_seconds duration.
 func (d *Dispatcher) RunDigestFlusher(ctx context.Context, interval time.Duration) {
 	if d.digest == nil {
 		return
@@ -764,7 +766,11 @@ func (d *Dispatcher) RunDigestFlusher(ctx context.Context, interval time.Duratio
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-ticker.C:
+		case tick := <-ticker.C:
+			now := tick
+			if d.now != nil {
+				now = d.now()
+			}
 			d.FlushDigests(ctx, now)
 		}
 	}
