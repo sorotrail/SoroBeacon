@@ -398,7 +398,7 @@ func (p *Poller) Run(ctx context.Context) {
 			baseDelay := min(delay*2, 10*p.Interval())
 			delay = baseDelay
 			if half := baseDelay / 2; half > 0 {
-				delay = half + time.Duration(rand.Int63n(int64(half)))
+				delay = half + time.Duration(rand.Int63n(int64(half))) // #nosec G404 -- retry backoff jitter is not security-sensitive; credentials use crypto/rand
 			}
 			p.recordBackoff(true)
 			p.log.Error("poll failed", "err", err, "retry_in", delay)

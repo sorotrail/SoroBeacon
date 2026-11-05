@@ -156,7 +156,7 @@ func (s *SQLite) ListWorkspaceUsage(ctx context.Context, f WorkspaceUsageFilter)
 		SELECT workspace_id, period_start, period_end, alerts_raised, rule_evaluations, api_requests, updated_at
 		FROM workspace_usage_rollups
 		WHERE workspace_id IN (`+wsPlaceholders+`)`+timeFilter+`
-		ORDER BY workspace_id ASC, period_start ASC`, baseArgs...)
+		ORDER BY workspace_id ASC, period_start ASC`, baseArgs...) // #nosec G202 -- wsPlaceholders and timeFilter contain only ? markers; values are bound in baseArgs
 	if err != nil {
 		return nil, mapSQLiteErr(err)
 	}
@@ -188,7 +188,7 @@ func (s *SQLite) ListWorkspaceUsage(ctx context.Context, f WorkspaceUsageFilter)
 		SELECT workspace_id, period_start, channel_type, outcome, count
 		FROM workspace_notification_usage_rollups
 		WHERE workspace_id IN (`+wsPlaceholders+`)`+timeFilter+`
-		ORDER BY workspace_id ASC, period_start ASC, channel_type ASC, outcome ASC`, baseArgs...)
+		ORDER BY workspace_id ASC, period_start ASC, channel_type ASC, outcome ASC`, baseArgs...) // #nosec G202 -- wsPlaceholders and timeFilter contain only ? markers; values are bound in baseArgs
 	if err != nil {
 		return nil, mapSQLiteErr(err)
 	}

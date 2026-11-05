@@ -123,6 +123,7 @@ func formatTime(t time.Time, tz string) template.HTML {
 	}
 	utc := t.UTC()
 	label := utc.Format(tsLayout) + " UTC"
+	// #nosec G203 -- every interpolated value is escaped via template.HTMLEscapeString
 	return template.HTML(fmt.Sprintf(
 		`<time datetime="%s" data-tz="%s">%s</time>`,
 		template.HTMLEscapeString(utc.Format(time.RFC3339)),
@@ -838,7 +839,7 @@ func alertChartSVG(days []store.AlertDayCount) template.HTML {
 	fmt.Fprintf(&b,
 		`<text x="0" y="%g" font-size="8">%s</text><text x="%g" y="%g" font-size="8" text-anchor="end">%s</text></svg>`,
 		height-4, first, width, height-4, last)
-	return template.HTML(b.String())
+	return template.HTML(b.String()) // #nosec G203 -- SVG attributes are numeric or escaped via html.EscapeString
 }
 
 func (s *Server) monitors(w http.ResponseWriter, r *http.Request) {
@@ -911,7 +912,7 @@ func (s *Server) monitors(w http.ResponseWriter, r *http.Request) {
 	}
 	if next != "" {
 		// template.URL so q/enabled/sort query separators are not %26-escaped.
-		data["OlderHref"] = template.URL("/monitors?" + monitorFilterQuery(f.Query, enabled, f.Sort, f.Network, f.Tags) + "cursor=" + next)
+		data["OlderHref"] = template.URL("/monitors?" + monitorFilterQuery(f.Query, enabled, f.Sort, f.Network, f.Tags) + "cursor=" + next) // #nosec G203 -- fixed relative path with url.Values.Encode query string and integer cursor
 	}
 	s.render(w, r, "monitors", data)
 }
@@ -1051,7 +1052,7 @@ func (s *Server) monitorPage(r *http.Request, id int64) (map[string]any, error) 
 		"RecentAlerts": recent,
 		// The alerts page already filters by monitor, so the panel is a summary
 		// with a way to see everything rather than a second, shorter list.
-		"AlertsHref": template.URL("/alerts?monitor_id=" + strconv.FormatInt(id, 10)),
+		"AlertsHref": template.URL("/alerts?monitor_id=" + strconv.FormatInt(id, 10)), // #nosec G203 -- fixed relative path with base-10 integer monitor ID
 		"Stats":      stats,
 		"LastAlert":  formatStatTime(stats.LastAlertAt, tz),
 		// The rule builder's own state. The page is also rendered after the
@@ -1237,9 +1238,9 @@ func (s *Server) listTrash(w http.ResponseWriter, r *http.Request) {
 		}
 		enc := v.Encode()
 		if enc != "" {
-			data["OlderHref"] = template.URL("/monitors/trash?" + enc + "cursor=" + next)
+			data["OlderHref"] = template.URL("/monitors/trash?" + enc + "cursor=" + next) // #nosec G203 -- fixed relative path with url.Values.Encode query string and integer cursor
 		} else {
-			data["OlderHref"] = template.URL("/monitors/trash?cursor=" + next)
+			data["OlderHref"] = template.URL("/monitors/trash?cursor=" + next) // #nosec G203 -- fixed relative path with integer cursor
 		}
 	}
 	s.render(w, r, "trash", data)
@@ -1985,7 +1986,7 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 	}
 	if next != "" {
 		// template.URL so filter query separators are not %26-escaped.
-		data["OlderHref"] = template.URL("/alerts?" + alertFilterQuery(f) + "cursor=" + next)
+		data["OlderHref"] = template.URL("/alerts?" + alertFilterQuery(f) + "cursor=" + next) // #nosec G203 -- fixed relative path with url.Values.Encode query string and integer cursor
 	}
 	s.render(w, r, "alerts", data)
 }
@@ -2009,7 +2010,7 @@ func alertExportHref(f store.AlertFilter) template.URL {
 	if q == "" {
 		return template.URL("/api/v1/alerts.csv")
 	}
-	return template.URL("/api/v1/alerts.csv?" + q)
+	return template.URL("/api/v1/alerts.csv?" + q) // #nosec G203 -- fixed relative path with url.Values.Encode query string
 }
 
 // alertFilterQuery is the filter prefix preserved on the Older paging link and

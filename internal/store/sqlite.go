@@ -599,7 +599,7 @@ func (s *SQLite) SetMonitorsEnabled(ctx context.Context, ids []int64, enabled bo
 	}
 	args = append(args, workspaceID(ctx))
 	rows, err := s.db.QueryContext(ctx,
-		`UPDATE monitors SET enabled = ? WHERE id IN (`+placeholders(len(uniq))+`) AND workspace_id = ? RETURNING id`, args...)
+		`UPDATE monitors SET enabled = ? WHERE id IN (`+placeholders(len(uniq))+`) AND workspace_id = ? RETURNING id`, args...) // #nosec G202 -- placeholders generates only ? markers; values are bound in args
 	if err != nil {
 		return 0, nil, err
 	}
@@ -782,7 +782,7 @@ func (s *SQLite) deleteByID(ctx context.Context, table string, id int64) error {
 	if !deletableTables[table] {
 		return errUnallowlistedTable
 	}
-	res, err := s.db.ExecContext(ctx, `DELETE FROM `+table+` WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx))
+	res, err := s.db.ExecContext(ctx, `DELETE FROM `+table+` WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx)) // #nosec G202 -- table is checked against deletableTables allowlist above
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -1676,7 +1676,7 @@ func (s *SQLite) SetChannelsEnabled(ctx context.Context, ids []int64, enabled bo
 		   last_error = CASE WHEN ?1 AND enabled = 0 THEN '' ELSE last_error END,
 		   last_error_at = CASE WHEN ?1 AND enabled = 0 THEN NULL ELSE last_error_at END,
 		   disabled_at = CASE WHEN ?1 AND enabled = 0 THEN NULL ELSE disabled_at END
-		 WHERE id IN (`+strings.Join(marks, ",")+`) AND workspace_id = ?`+strconv.Itoa(len(uniq)+2)+` RETURNING id`, args...)
+		 WHERE id IN (`+strings.Join(marks, ",")+`) AND workspace_id = ?`+strconv.Itoa(len(uniq)+2)+` RETURNING id`, args...) // #nosec G202 -- marks and index are integer-derived ?N placeholders; values are bound in args
 	if err != nil {
 		return 0, nil, mapSQLiteErr(err)
 	}
@@ -2653,7 +2653,7 @@ func (s *SQLite) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]Dea
 			placeholders[i] = "?"
 			args = append(args, id)
 		}
-		q += ` AND id IN (` + strings.Join(placeholders, ",") + `)`
+		q += ` AND id IN (` + strings.Join(placeholders, ",") + `)` // #nosec G202 -- placeholders contains only ? markers; ids are bound in args
 	}
 	q += ` ORDER BY id ASC LIMIT ?`
 	args = append(args, pageLimit(f.Limit))
@@ -2749,7 +2749,7 @@ func (s *SQLite) BulkDeleteDeadLetters(ctx context.Context, f DeadLetterFilter) 
 		args = append(args, dl.ID)
 	}
 
-	q := `DELETE FROM dead_letters WHERE id IN (` + strings.Join(placeholders, ",") + `)`
+	q := `DELETE FROM dead_letters WHERE id IN (` + strings.Join(placeholders, ",") + `)` // #nosec G202 -- placeholders contains only ? markers; ids are bound in args
 	if ws, scoped := tenantWorkspace(ctx); scoped {
 		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = ?)`
 		args = append(args, ws)
@@ -3660,7 +3660,7 @@ func (s *SQLite) DeleteDigestAlerts(ctx context.Context, channelID int64, ids []
 		args = append(args, id)
 	}
 	_, err := s.db.ExecContext(ctx,
-		`DELETE FROM pending_digests WHERE channel_id = ? AND id IN (`+placeholders+`)`, args...)
+		`DELETE FROM pending_digests WHERE channel_id = ? AND id IN (`+placeholders+`)`, args...) // #nosec G202 -- placeholders contains only ? markers; values are bound in args
 	return mapSQLiteErr(err)
 }
 
@@ -3775,7 +3775,7 @@ func (s *SQLite) ListAuditEntries(ctx context.Context, f AuditFilter) ([]AuditEn
 	             resource_id, surface, source_ip, outcome, status_code, reason,
 	             diff, prev_hash, record_hash, created_at
 	        FROM audit_log WHERE ` +
-		strings.Join(where, " AND ") + ` ORDER BY id DESC LIMIT ?`
+		strings.Join(where, " AND ") + ` ORDER BY id DESC LIMIT ?` // #nosec G202 -- where predicates are static column=? literals; values are bound in args
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
