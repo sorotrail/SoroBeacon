@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1772,29 +1771,11 @@ func (s *SQLite) DeleteChannel(ctx context.Context, id int64) error {
 }
 
 func (s *SQLite) encryptSigningSecret(secret string) (string, error) {
-	if s.cipher == nil || secret == "" {
-		return secret, nil
-	}
-	ciphertext, err := s.cipher.Encrypt([]byte(secret))
-	if err != nil {
-		return "", fmt.Errorf("encrypt signing key: %w", err)
-	}
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
+	return sealSigningSecret(s.cipher, secret)
 }
 
 func (s *SQLite) decryptSigningSecret(stored string) (string, error) {
-	if s.cipher == nil || stored == "" {
-		return stored, nil
-	}
-	data, err := base64.StdEncoding.DecodeString(stored)
-	if err != nil {
-		return stored, nil
-	}
-	plaintext, err := s.cipher.Decrypt(data)
-	if err != nil {
-		return stored, nil
-	}
-	return string(plaintext), nil
+	return openSigningSecret(s.cipher, stored)
 }
 
 func (s *SQLite) CreateChannelSigningKey(ctx context.Context, k *ChannelSigningKey) error {
