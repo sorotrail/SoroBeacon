@@ -470,6 +470,8 @@ var unscopedStoreMethods = map[string]string{
 	"transferAlertTimeRange":             "the SQLite/Postgres transfer spans every workspace: it reads the copied alerts' created_at range to size the target's partitions before any row arrives",
 	"transferDeriveTable":                "the SQLite/Postgres transfer spans every workspace: it rebuilds alert_dedup from the alerts the transfer just copied",
 	"DeleteExpiredAuditEntries":          "audit retention sweeps every workspace under AUDIT_RETENTION",
+	"ReencryptSensitiveColumns":          "key rotation re-encrypts sensitive columns across every workspace on the instance",
+	"VerifyEncryptionKey":                "startup key verification probes encrypted rows across every workspace on the instance",
 }
 
 // sqlSourceFiles lists every non-test Go source in the package directory.

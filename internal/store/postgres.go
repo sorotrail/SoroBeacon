@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1698,29 +1697,11 @@ func (p *Postgres) ChannelDeliveryChangeKey(ctx context.Context, channelID int64
 }
 
 func (p *Postgres) encryptSigningSecret(secret string) (string, error) {
-	if p.cipher == nil || secret == "" {
-		return secret, nil
-	}
-	ciphertext, err := p.cipher.Encrypt([]byte(secret))
-	if err != nil {
-		return "", fmt.Errorf("encrypt signing key: %w", err)
-	}
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
+	return sealSigningSecret(p.cipher, secret)
 }
 
 func (p *Postgres) decryptSigningSecret(stored string) (string, error) {
-	if p.cipher == nil || stored == "" {
-		return stored, nil
-	}
-	data, err := base64.StdEncoding.DecodeString(stored)
-	if err != nil {
-		return stored, nil
-	}
-	plaintext, err := p.cipher.Decrypt(data)
-	if err != nil {
-		return stored, nil
-	}
-	return string(plaintext), nil
+	return openSigningSecret(p.cipher, stored)
 }
 
 func (p *Postgres) CreateChannelSigningKey(ctx context.Context, k *ChannelSigningKey) error {
