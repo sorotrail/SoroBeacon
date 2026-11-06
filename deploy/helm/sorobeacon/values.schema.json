@@ -260,6 +260,10 @@
           "type": "string",
           "description": "How long to keep alerts, e.g. 90d or 24h. Empty keeps history forever."
         },
+        "auditRetention": {
+          "type": "string",
+          "description": "How long to keep audit log entries, e.g. 90d or 24h. Empty keeps history forever."
+        },
         "configFile": {
           "type": "string",
           "description": "Path to a config file read as a fallback for unset variables. Empty disables it; the chart mounts nothing."
@@ -406,6 +410,26 @@
           "type": "string",
           "minLength": 1,
           "description": "Base delay between startup connection attempts (Go duration), doubled after every failure with jitter. Defaults to 2s."
+        },
+        "sslMode": {
+          "type": "string",
+          "description": "DATABASE_SSL_MODE: disable, allow, prefer, require, verify-ca, or verify-full."
+        },
+        "sslCertFile": {
+          "type": "string",
+          "description": "DATABASE_SSL_CERT_FILE: path to the client certificate presented to Postgres."
+        },
+        "sslKeyFile": {
+          "type": "string",
+          "description": "DATABASE_SSL_KEY_FILE: path to the client private key presented to Postgres."
+        },
+        "sslRootCertFile": {
+          "type": "string",
+          "description": "DATABASE_SSL_ROOT_CERT_FILE: path to the CA bundle used to verify Postgres."
+        },
+        "tlsSecretName": {
+          "type": "string",
+          "description": "Optional Secret mounted read-only at /etc/sorobeacon/tls/database."
         }
       },
       "additionalProperties": false
@@ -481,6 +505,18 @@
           "type": "string",
           "description": "OIDC_ROLE_CLAIM: claim naming the user's role."
         },
+        "groupClaim": {
+          "type": "string",
+          "description": "OIDC_GROUP_CLAIM: claim naming the user's group memberships."
+        },
+        "groupMappings": {
+          "type": "string",
+          "description": "OIDC_GROUP_MAPPINGS: comma-separated group=workspace:role mappings."
+        },
+        "groupCacheTTL": {
+          "type": "string",
+          "description": "OIDC_GROUP_CACHE_TTL: how long resolved group mappings are cached."
+        },
         "loginStateTTL": {
           "type": "string",
           "pattern": "^[0-9]+(ms|s|m|h)$",
@@ -533,6 +569,58 @@
           "type": "integer",
           "minimum": 1,
           "description": "Upper bound on the hook, in seconds."
+        }
+      },
+      "additionalProperties": false
+    },
+    "tls": {
+      "type": "object",
+      "description": "Server and client TLS / mTLS settings.",
+      "properties": {
+        "secretName": {
+          "type": "string",
+          "description": "Optional Secret mounted read-only at /etc/sorobeacon/tls/server."
+        },
+        "certFile": {
+          "type": "string",
+          "description": "TLS_CERT_FILE: server TLS certificate path."
+        },
+        "keyFile": {
+          "type": "string",
+          "description": "TLS_KEY_FILE: server TLS private key path."
+        },
+        "clientCAFile": {
+          "type": "string",
+          "description": "TLS_CLIENT_CA_FILE: CA bundle used to verify client certificates."
+        },
+        "clientAuth": {
+          "type": "string",
+          "enum": ["", "none", "request", "require"],
+          "description": "TLS_CLIENT_AUTH: client certificate verification policy."
+        },
+        "principalMap": {
+          "type": "string",
+          "description": "MTLS_PRINCIPAL_MAP: comma-separated subject=workspace[:role] mappings."
+        },
+        "sorotrailSecretName": {
+          "type": "string",
+          "description": "Optional Secret mounted read-only at /etc/sorobeacon/tls/sorotrail."
+        },
+        "sorotrailCertFile": {
+          "type": "string",
+          "description": "SOROTRAIL_TLS_CERT_FILE: client certificate path for upstream SoroTrail."
+        },
+        "sorotrailKeyFile": {
+          "type": "string",
+          "description": "SOROTRAIL_TLS_KEY_FILE: client private key path for upstream SoroTrail."
+        },
+        "sorotrailCAFile": {
+          "type": "string",
+          "description": "SOROTRAIL_TLS_CA_FILE: CA bundle path for upstream SoroTrail."
+        },
+        "sorotrailServerName": {
+          "type": "string",
+          "description": "SOROTRAIL_TLS_SERVER_NAME: optional SNI / hostname override for upstream SoroTrail."
         }
       },
       "additionalProperties": false

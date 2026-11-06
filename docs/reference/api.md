@@ -75,6 +75,41 @@ the token bucket and does not send `Retry-After`; clients should treat
 
 Probes (`/health`, `/livez`, `/readyz`) are exempt from rate limiting.
 
+## Idempotent writes
+
+Every mutating endpoint (`POST`, `PUT`, `PATCH`, `DELETE`) accepts an optional
+`Idempotency-Key` request header (at most 255 characters) so clients and
+infrastructure automation can safely retry after network timeouts or lost
+responses:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
+  -d '{"name":"USDC Vault","contract_ids":["CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"]}'
+```
+
+* **Workspace-scoped and persistent**: Keys are stored in `idempotency_keys`
+  keyed by `(workspace_id, idempotency_key)` with a 24-hour retention window,
+  so two workspaces never collide on the same key and idempotency survives
+  process restarts.
+* **Exact replay**: Repeating a request with the same key, HTTP method, path,
+  and request body within the retention window returns the stored status code,
+  `Content-Type`, and response body without re-executing the write or writing a
+  duplicate audit entry, and sets `Idempotency-Replayed: true` on the response.
+  Replayed `DELETE` calls return the original `204 No Content` rather than
+  `404 Not Found`.
+* **Payload mismatch detection**: Reusing an unexpired `Idempotency-Key` with a
+  different HTTP method, URL path, or request body digest is rejected with
+  `409 Conflict` (`"code": "CONFLICT"`).
+* **Concurrent deduplication**: Concurrent requests arriving with the same
+  `(workspace_id, Idempotency-Key)` and identical payload coalesce onto the
+  single in-flight execution and return the same created/updated resource.
+* **Terraform provider**: `terraform-provider-sorobeacon` automatically sends
+  `Idempotency-Key` on all write requests (`POST`, `PATCH`, `DELETE`) and
+  reuses the same key across transient retry attempts.
+
 ## Conditional requests
 
 Read endpoints across the dominant polling surfaces — alert listings (`GET /alerts`), daily alert statistics (`GET /stats/alerts-daily`), per-channel delivery summaries (`GET /channels/{id}/stats`), and monitor/channel lists — set a strong entity tag (`ETag`) and respond to conditional requests (`If-None-Match`) with `304 Not Modified` and no body.
@@ -438,6 +473,17 @@ Three behaviours worth knowing before you script against this:
 | `GET /rule-types` | Machine-readable vocabulary of rule types: `200 {"rule_types": [{"type", "parameters": [{"name", "type", …}]}, …]}`, sorted by type — the schema `POST /monitors/{id}/rules` validates against. | `none` |
 | `GET /stats` | Counts (monitors, rules, channels, alerts, alerts last 24h), last ingested ledger, last poll time. | `stats:read` |
 | `GET /stats/alerts-daily` | Daily alert counts for the last 30 UTC calendar days. Quiet days are explicit zeroes. `{"timezone":"UTC","days":[{"day":"2026-09-01","count":0}, ...]}`. | `alerts:read` |
+| `GET /usage` | Per-workspace usage metering summary (`rule_evaluations`, `alerts_raised`, `notifications_by_type`, `storage`, and daily series). Query: `from`, `to` (`YYYY-MM-DD`, default last 30 UTC days), and optional `workspace` (`all` or workspace ID, admin-only). | `stats:read` |
+| `GET /quotas` | Per-workspace resource quotas (`max_monitors`, `max_rules`, `max_channels`, `max_subscriptions`), current live usage (`monitors`, `rules`, `channels`, `subscriptions`), and query cost budget (`query_cost_budget`, `query_cost_refill_per_sec`, `query_budget_remaining`). Optional `workspace` query parameter (admin-only across workspaces). | `stats:read` |
+| `PUT /quotas` | Configure per-workspace resource quotas and query cost budget (`max_monitors`, `max_rules`, `max_channels`, `max_subscriptions`, `query_cost_budget`, `query_cost_refill_per_sec`). Optional `workspace` query parameter (admin-only across workspaces). | `monitors:write` |
+| `DELETE /workspaces/{id}` | Permanently delete a workspace and every row belonging to it across all workspace-scoped tables, or preview exact counts when `dry_run=true`. Requires `confirm={id}` (query, `X-Confirm-Workspace` header, or JSON body) unless `dry_run=true`. Stops active evaluation and in-flight notification delivery before removing rows in bounded, resumable batches. | `*` (admin) |
+| `POST /workspaces/{id}/delete` | Action-route equivalent of `DELETE /workspaces/{id}` accepting JSON body `{"dry_run":true}` or `{"confirm":"<id>","batch_size":500,"max_alert_batches":0}`. Returns `200` on completion/preview or `202` when bounded alert batches remain. | `*` (admin) |
+| `GET /workspaces/{id}/delete` | Inspect in-progress or completed workspace deletion status and per-table deleted row counts (`workspace_deletions` tombstone). | `*` (admin) |
+| `GET /retention` | Inspect the effective per-workspace alert retention policy (`alert_retention_seconds`, `alert_retention`, `policy_source` as `workspace`, `instance`, or `unset`, `default_retention_seconds`, and `pruned_before` horizon). Optional `workspace` query parameter (admin-only across workspaces). | `stats:read` |
+| `PUT /retention` | Set or update a workspace's alert retention override (`alert_retention`, `alert_retention_seconds`, or `alert_retention_days`). Shortening an active retention window requires `confirm_shorten: true` (returns `409 CONFLICT` otherwise). Optional `workspace` query parameter (admin-only across workspaces). | `monitors:write` |
+| `DELETE /retention` | Reset a workspace's alert retention override back to the instance-wide `ALERT_RETENTION` default. If resetting shortens effective retention, `confirm_shorten=true` is required (`409 CONFLICT` otherwise). Optional `workspace` query parameter (admin-only across workspaces). | `monitors:write` |
+| `GET /workspace/export` | Stream a deterministic, versioned data export of the caller's workspace (all workspace-owned configuration, operational state, and rollups). Query: `include_secrets` (`true`\|`false`, default `false` redacts channel secrets, signing key secrets, and token hashes; `true` requires `admin` role / `*` scope), `include_alerts` (`true`\|`false`, default `false` omits alert history tables), `page_size` (`1..5000`, default `250`, keyset pagination batch size for alert history), `format` (`json`\|`ndjson`, default `json`), and optional `workspace` (instance operator only across workspaces). | `monitors:read` |
+| `GET /workspaces/{id}/export` | Stream a deterministic, versioned data export for workspace `{id}`. Allowed for `{id}`'s own credentials or an unrestricted instance operator; cross-workspace requests from another workspace return `403`. Query: `include_secrets` (`true`\|`false`, `true` requires `admin` role / `*` scope), `include_alerts` (`true`\|`false`), `page_size` (`1..5000`, default `250`), `format` (`json`\|`ndjson`). | `monitors:read` |
 | `GET /audit` | Append-only log of monitor, rule and channel changes, newest first. Query: `target_type` (`monitor`\|`rule`\|`channel`), `target_id`, `from`/`to` (RFC 3339), `limit` (≤500, default 50). Each entry has `actor` (the request ID), `action` (`create`\|`update`\|`delete`), `target_type`, `target_id`, `diff` and `created_at`. `diff` records the *names* of the fields that were sent, never their values — a channel's config holds webhook URLs and tokens and is never stored. There is no endpoint to update or delete entries. | `monitors:read` |
 
 ## Federation

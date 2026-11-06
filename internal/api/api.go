@@ -4,12 +4,13 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -27,6 +28,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/usage"
 )
 
 // Server holds the API's dependencies.
@@ -108,6 +110,23 @@ type Server struct {
 	tokens *auth.Manager
 	// breaker fast-fails requests when the database is unavailable.
 	breaker *store.StoreBreaker
+	// usageMeter buffers per-workspace API request counts in memory and
+	// flushes them to durable rollups.
+	usageMeter *usage.Meter
+	// dispatcher is the shared notification dispatcher, used to cancel
+	// in-flight deliveries and purge per-workspace queues on workspace deletion.
+	dispatcher *notify.Dispatcher
+
+	subMu               sync.Mutex
+	activeSubscriptions map[string]int64
+	quotaClock          func() time.Time
+	alertRetention      time.Duration
+
+	idempotencyTTL    time.Duration
+	idempotencyClock  func() time.Time
+	idempotencyMu     sync.Mutex
+	idempotencyFlight map[string]*inFlightIdempotency
+	idempotencyMem    map[string]*store.IdempotencyRecord
 }
 
 // New wires an API server. Rate limiting stays off until WithRateLimit, and
@@ -128,6 +147,7 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, rpc HealthCheck
 		broadcaster:        broadcast.New(broadcast.DefaultBuffer),
 		streamHeartbeat:    defaultStreamHeartbeat,
 		breaker:            b,
+		usageMeter:         usage.NewMeter(st, nil, log),
 	}
 }
 
@@ -170,6 +190,32 @@ func (s *Server) WithEndpointMaxBodyBytes(path string, n int64) *Server {
 // WithMetrics attaches Prometheus instrumentation so request body rejections are tracked.
 func (s *Server) WithMetrics(m *metrics.Metrics) *Server {
 	s.metrics = m
+	if s.usageMeter != nil {
+		s.usageMeter.WithMetrics(m)
+	}
+	return s
+}
+
+// WithUsageMeter attaches a shared workspace usage meter.
+func (s *Server) WithUsageMeter(um *usage.Meter) *Server {
+	if um != nil {
+		if s.metrics != nil {
+			um.WithMetrics(s.metrics)
+		}
+		s.usageMeter = um
+	}
+	return s
+}
+
+// UsageMeter returns the server's workspace usage meter.
+func (s *Server) UsageMeter() *usage.Meter {
+	return s.usageMeter
+}
+
+// WithDispatcher attaches the notification dispatcher so workspace deletion can
+// immediately cancel in-flight deliveries and purge per-workspace queues.
+func (s *Server) WithDispatcher(d *notify.Dispatcher) *Server {
+	s.dispatcher = d
 	return s
 }
 
@@ -282,6 +328,7 @@ func (s *Server) Routes() chi.Router {
 	mux.Use(middleware.Recoverer)
 	mux.Use(s.metricsContextMiddleware)
 	mux.Use(MaxBodyMiddlewareWithResolver(s.limitForRequest, s.metrics))
+	mux.Use(s.auditRejectedAuthMiddleware)
 	mux.Use(AuthMiddleware(s.auth, s.log))
 	mux.Use(auth.RoleCheck{
 		Authenticator: s.auth,
@@ -296,10 +343,13 @@ func (s *Server) Routes() chi.Router {
 		Deny: s.denyRole,
 	}.Middleware())
 	mux.Use(RateLimitMiddleware(s.rateLimit))
+	mux.Use(s.usageMiddleware)
+	mux.Use(s.queryBudgetMiddleware)
+	mux.Use(s.degradedMiddleware)
+	mux.Use(s.idempotencyMiddleware)
 	// Innermost, so only authenticated, rate-limited requests are audited
 	// and an audit failure never blocks the request.
-	mux.Use(AuditMiddleware(s.store, s.log))
-	mux.Use(s.degradedMiddleware)
+	mux.Use(AuditMiddlewareWithOptions(s.store, s.rateLimit.TrustForwarded, s.log))
 	// JSON clients hitting a typo'd path or the wrong method should get
 	// the same envelope as every other API error, not chi's plain-text
 	// 404/405. The dashboard mux is a different router and is untouched.
@@ -420,7 +470,21 @@ func (s *Server) Routes() chi.Router {
 	mux.Get("/rule-types", s.listRuleTypes)
 	mux.Get("/stats", s.stats)
 	mux.Get("/stats/alerts-daily", s.withConditionalETag(s.alertsDailyChangeKey, s.alertsDaily))
+	mux.Get("/usage", s.usage)
+	mux.Get("/quotas", s.getQuotas)
+	mux.Put("/quotas", s.putQuotas)
+	mux.Get("/retention", s.getRetention)
+	mux.Put("/retention", s.putRetention)
+	mux.Delete("/retention", s.deleteRetention)
+	mux.Get("/workspace/export", s.exportWorkspace)
 	mux.Get("/audit", s.listAudit)
+
+	mux.Route("/workspaces/{id}", func(r chi.Router) {
+		r.Get("/export", s.exportWorkspace)
+		r.Delete("/", s.deleteWorkspace)
+		r.Post("/delete", s.deleteWorkspace)
+		r.Get("/delete", s.getWorkspaceDeletion)
+	})
 
 	return mux
 }
@@ -633,7 +697,16 @@ func allowHeader(r *http.Request) string {
 
 // fail maps store errors to HTTP responses using the error taxonomy.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+	var quotaErr *store.QuotaExceededError
+	if errors.As(err, &quotaErr) {
+		s.writeQuotaExceeded(w, r, quotaErr)
+		return
+	}
 	c := apierr.Classify(err)
+	if c.Code == apierr.CodeQuotaExceeded {
+		s.writeQuotaExceeded(w, r, nil)
+		return
+	}
 	if c.Code == apierr.CodeInternalError {
 		s.log.Error("api error", "request_id", reqid.From(r), "err", err)
 	}
@@ -845,12 +918,8 @@ func (s *Server) attachPoller(out map[string]any) {
 	out["last_successful_poll"] = pos.LastSuccessfulPoll.UTC().Format(time.RFC3339)
 }
 
-func (s *Server) version(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, buildinfo.Info{
-		Version: buildinfo.Version,
-		Commit:  buildinfo.Commit,
-		Date:    buildinfo.Date,
-	})
+func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, buildinfo.Current())
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
@@ -859,12 +928,15 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	setRetentionHorizonHeaders(w, st.PrunedBefore, st.RetentionPolicySource)
 	writeJSON(w, http.StatusOK, st)
 }
 
 type alertsDailyResponse struct {
-	Timezone string                `json:"timezone"`
-	Days     []store.AlertDayCount `json:"days"`
+	Timezone              string                `json:"timezone"`
+	Days                  []store.AlertDayCount `json:"days"`
+	PrunedBefore          *time.Time            `json:"pruned_before,omitempty"`
+	RetentionPolicySource string                `json:"retention_policy_source,omitempty"`
 }
 
 func (s *Server) alertsDaily(w http.ResponseWriter, r *http.Request) {
@@ -876,5 +948,12 @@ func (s *Server) alertsDaily(w http.ResponseWriter, r *http.Request) {
 	if days == nil {
 		days = []store.AlertDayCount{}
 	}
-	writeJSON(w, http.StatusOK, alertsDailyResponse{Timezone: "UTC", Days: days})
+	prunedBefore, policySource := s.workspaceRetentionHorizon(r.Context())
+	setRetentionHorizonHeaders(w, prunedBefore, policySource)
+	writeJSON(w, http.StatusOK, alertsDailyResponse{
+		Timezone:              "UTC",
+		Days:                  days,
+		PrunedBefore:          prunedBefore,
+		RetentionPolicySource: policySource,
+	})
 }

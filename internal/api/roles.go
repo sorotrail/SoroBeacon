@@ -55,17 +55,17 @@ var routeRoles = auth.NewRouteTable(map[string]auth.Role{
 	// Channels: a channel is where alerts go, so changing one is an editor's
 	// decision. Testing one sends a real notification, which is a write even
 	// though nothing is stored.
-	"GET /channels":                 auth.RoleViewer,
-	"GET /channels/{id}":            auth.RoleViewer,
-	"GET /channels/{id}/stats":      auth.RoleViewer,
-	"POST /channels":                auth.RoleEditor,
-	"PATCH /channels/{id}":          auth.RoleEditor,
-	"DELETE /channels/{id}":         auth.RoleEditor,
-	"POST /channels/bulk":           auth.RoleEditor,
-	"POST /channels/{id}/duplicate": auth.RoleEditor,
-	"POST /channels/{id}/test":      auth.RoleEditor,
-	"GET /channels/{id}/keys":       auth.RoleViewer,
-	"POST /channels/{id}/keys/rotate": auth.RoleEditor,
+	"GET /channels":                           auth.RoleViewer,
+	"GET /channels/{id}":                      auth.RoleViewer,
+	"GET /channels/{id}/stats":                auth.RoleViewer,
+	"POST /channels":                          auth.RoleEditor,
+	"PATCH /channels/{id}":                    auth.RoleEditor,
+	"DELETE /channels/{id}":                   auth.RoleEditor,
+	"POST /channels/bulk":                     auth.RoleEditor,
+	"POST /channels/{id}/duplicate":           auth.RoleEditor,
+	"POST /channels/{id}/test":                auth.RoleEditor,
+	"GET /channels/{id}/keys":                 auth.RoleViewer,
+	"POST /channels/{id}/keys/rotate":         auth.RoleEditor,
 	"POST /channels/{id}/keys/{keyID}/retire": auth.RoleEditor,
 	"POST /channels/{id}/keys/{keyID}/revoke": auth.RoleEditor,
 
@@ -106,23 +106,36 @@ var routeRoles = auth.NewRouteTable(map[string]auth.Role{
 	"DELETE /maintenance-windows/{id}":               auth.RoleEditor,
 
 	// Statistics are a view of the instance, not a change to it.
-	"GET /stats":              auth.RoleViewer,
-	"GET /stats/alerts-daily": auth.RoleViewer,
+	"GET /stats":                  auth.RoleViewer,
+	"GET /stats/alerts-daily":     auth.RoleViewer,
+	"GET /usage":                  auth.RoleViewer,
+	"GET /quotas":                 auth.RoleViewer,
+	"PUT /quotas":                 auth.RoleAdmin,
+	"GET /retention":              auth.RoleViewer,
+	"PUT /retention":              auth.RoleAdmin,
+	"DELETE /retention":           auth.RoleAdmin,
+	"GET /workspace/export":       auth.RoleViewer,
+	"GET /workspaces/{id}/export": auth.RoleViewer,
+
+	// Workspace lifecycle operations are administrative and irreversible.
+	"DELETE /workspaces/{id}":      auth.RoleAdmin,
+	"POST /workspaces/{id}/delete": auth.RoleAdmin,
+	"GET /workspaces/{id}/delete":  auth.RoleAdmin,
 
 	// Credentials are administrative: minting one is minting authority, and
 	// the audit log is the instance's record of who has been doing what.
-	"GET /tokens":              auth.RoleAdmin,
-	"GET /tokens/{id}":         auth.RoleAdmin,
-	"POST /tokens":             auth.RoleAdmin,
+	"GET /tokens":               auth.RoleAdmin,
+	"GET /tokens/{id}":          auth.RoleAdmin,
+	"POST /tokens":              auth.RoleAdmin,
 	"POST /tokens/{id}/rotate":  auth.RoleAdmin,
 	"POST /tokens/{id}/abandon": auth.RoleAdmin,
-	"POST /tokens/{id}/revoke": auth.RoleAdmin,
-	"GET /audit":               auth.RoleAdmin,
+	"POST /tokens/{id}/revoke":  auth.RoleAdmin,
+	"GET /audit":                auth.RoleAdmin,
 
 	// Persisted GraphQL operations: viewing is a viewer's job, registration/deletion is an admin's.
-	"GET /graphql/operations":        auth.RoleViewer,
-	"GET /graphql/operations/{id}":   auth.RoleViewer,
-	"POST /graphql/operations":       auth.RoleAdmin,
+	"GET /graphql/operations":         auth.RoleViewer,
+	"GET /graphql/operations/{id}":    auth.RoleViewer,
+	"POST /graphql/operations":        auth.RoleAdmin,
 	"DELETE /graphql/operations/{id}": auth.RoleAdmin,
 
 	// Instance facts: the version, the poller's position and the rule

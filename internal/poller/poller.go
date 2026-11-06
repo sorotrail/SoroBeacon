@@ -5,6 +5,7 @@ package poller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -25,6 +26,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
 	"github.com/sorotrail/sorobeacon/internal/telemetry"
+	"github.com/sorotrail/sorobeacon/internal/usage"
 )
 
 // Position is a race-free snapshot of how far the poller has got relative
@@ -158,7 +160,9 @@ type Poller struct {
 	warnedOrphans bool
 	// slowRuleThreshold is the duration after which a rule evaluation is
 	// considered slow and logged. Zero disables slow rule logging.
-	slowRuleThreshold time.Duration
+	slowRuleThreshold   time.Duration
+	workspaceEvalBudget time.Duration
+	usageMeter          *usage.Meter
 }
 
 // Position returns the last successful poll snapshot. Safe to call from
@@ -205,18 +209,20 @@ func (p *Poller) recordBackoff(backingOff bool) {
 // Stellar RPC node, or the SoroTrail source for upstream mode.
 func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval time.Duration, log *slog.Logger) *Poller {
 	p := &Poller{
-		source:   src,
-		store:    st,
-		registry: reg,
-		log:      log,
-		now:      time.Now,
-		dispatch: d,
-		ing:      NewIngestor(st, reg, d, log),
-		sched:    NewScheduler(),
+		source:              src,
+		store:               st,
+		registry:            reg,
+		log:                 log,
+		now:                 time.Now,
+		dispatch:            d,
+		ing:                 NewIngestor(st, reg, d, log),
+		sched:               NewScheduler(),
+		workspaceEvalBudget: rules.DefaultWorkspaceEvalBudget,
 	}
 	// Written through the same atomic SetInterval uses, so construction and
 	// a later reload can never disagree about which value is live.
 	p.interval.Store(int64(interval))
+	p.bindRegistryHooks()
 	return p
 }
 
@@ -225,6 +231,14 @@ func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval 
 func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
 	p.metrics = m
 	p.ing = p.ing.WithMetrics(m)
+	return p
+}
+
+// WithUsageMeter attaches per-workspace usage metering to the poller and its
+// shared Ingestor.
+func (p *Poller) WithUsageMeter(um *usage.Meter) *Poller {
+	p.usageMeter = um
+	p.ing = p.ing.WithUsageMeter(um)
 	return p
 }
 
@@ -301,6 +315,65 @@ func (p *Poller) WithSlowRuleThreshold(d time.Duration) *Poller {
 	return p
 }
 
+// WithRuleTimeout configures the per-rule evaluation timeout (excluding
+// attributed database I/O). Zero disables the timeout.
+func (p *Poller) WithRuleTimeout(d time.Duration) *Poller {
+	if p.registry != nil {
+		p.registry.WithEvalTimeout(d)
+	}
+	return p
+}
+
+// WithRuleQuarantineThreshold configures how many consecutive rule-attributed
+// evaluation failures (timeouts, panics, or runtime errors) quarantine a rule.
+// Zero disables automatic quarantine.
+func (p *Poller) WithRuleQuarantineThreshold(threshold int) *Poller {
+	if p.registry != nil {
+		p.registry.WithQuarantineThreshold(threshold)
+	}
+	return p
+}
+
+// WithWorkspaceEvalBudget bounds how much total rule-evaluation time a single
+// workspace may consume on one event before its remaining rules are skipped
+// for that event. Zero disables the per-workspace budget.
+func (p *Poller) WithWorkspaceEvalBudget(d time.Duration) *Poller {
+	p.workspaceEvalBudget = d
+	if p.ing != nil {
+		p.ing.WithWorkspaceEvalBudget(d)
+	}
+	return p
+}
+
+// ReenableRule clears any quarantine and failure strikes for ruleID and resets
+// its stateful evaluator state so a fixed rule can resume evaluation cleanly.
+func (p *Poller) ReenableRule(ctx context.Context, ruleID int64) bool {
+	if p == nil || p.registry == nil {
+		return false
+	}
+	return p.registry.ReenableRule(ctx, ruleID)
+}
+
+// QuarantinedRules returns a snapshot of all currently quarantined rules.
+func (p *Poller) QuarantinedRules() []rules.RuleQuarantineState {
+	if p == nil || p.registry == nil {
+		return nil
+	}
+	return p.registry.QuarantinedRules()
+}
+
+func (p *Poller) bindRegistryHooks() {
+	if p == nil || p.registry == nil {
+		return
+	}
+	p.registry.WithQuarantineHook(func(ctx context.Context, state rules.RuleQuarantineState) {
+		handleQuarantineTransition(ctx, p.log, p.metrics, p.store, p.registry, state)
+	})
+	p.registry.WithEvalObserver(func(_ context.Context, obs rules.EvalObservation) {
+		handleEvalObservation(p.log, p.metrics, p.slowRuleThreshold, obs)
+	})
+}
+
 // Run polls until ctx is cancelled. RPC errors back off exponentially
 // (capped at 10x the poll interval) instead of hammering the node.
 func (p *Poller) Run(ctx context.Context) {
@@ -325,7 +398,7 @@ func (p *Poller) Run(ctx context.Context) {
 			baseDelay := min(delay*2, 10*p.Interval())
 			delay = baseDelay
 			if half := baseDelay / 2; half > 0 {
-				delay = half + time.Duration(rand.Int63n(int64(half)))
+				delay = half + time.Duration(rand.Int63n(int64(half))) // #nosec G404 -- retry backoff jitter is not security-sensitive; credentials use crypto/rand
 			}
 			p.recordBackoff(true)
 			p.log.Error("poll failed", "err", err, "retry_in", delay)
@@ -352,6 +425,7 @@ func (p *Poller) recordCycle(ok bool, took time.Duration) {
 	p.metrics.RecordPoll(ok, took)
 	p.metrics.RecordEvents(p.scanned, p.matched)
 	p.metrics.RecordRuleEvaluations(p.evaluations)
+	p.recordUpstreamMetrics()
 }
 
 // Poll runs one ingest cycle as a single trace. The root span
@@ -620,6 +694,10 @@ func (p *Poller) Poll(ctx context.Context) error {
 		groupCheckpoint := uint32(0)
 		failedLedger := make(map[string]uint32)
 		cursor := ""
+		if len(starts) == 1 && state.LastCursor != "" {
+			cursor = state.LastCursor
+		}
+		reanchoredCursor := false
 		for {
 			fetchCtx := ctx
 			fetchSpan := telemetry.NoopSpan()
@@ -635,15 +713,39 @@ func (p *Poller) Poll(ctx context.Context) error {
 			if err != nil {
 				telemetry.RecordError(fetchSpan, err)
 				fetchSpan.End()
+				if cursor != "" && !reanchoredCursor && errors.Is(err, ErrInvalidCursor) {
+					reanchoredCursor = true
+					p.log.Warn("upstream rejected cursor; re-anchoring from checkpoint",
+						"cursor", cursor, "start_ledger", groupStart, "err", err)
+					cursor = ""
+					if state.LastCursor != "" {
+						state.LastCursor = ""
+						_ = p.store.SetIngestState(ctx, p.network, state)
+					}
+					continue
+				}
+				p.recordUpstreamMetrics()
 				return err
 			}
 			fetchSpan.End()
 
+			if err := p.reconcileUpstreamRetractions(ctx, &state, monitors); err != nil {
+				p.log.Warn("upstream retraction reconciliation failed", "err", err)
+			}
+
 			if page.LatestLedger > 0 && (groupCheckpoint == 0 || page.LatestLedger < groupCheckpoint) {
 				groupCheckpoint = page.LatestLedger
 			}
+			if page.NextCursor == "" && page.LatestLedger > groupCheckpoint {
+				if _, isUpstream := p.source.(UpstreamStatusSource); isUpstream {
+					groupCheckpoint = page.LatestLedger
+				}
+			}
 			if page.LatestLedger > 0 && (checkpoint == 0 || page.LatestLedger < checkpoint) {
 				checkpoint = page.LatestLedger
+			}
+			if page.NextCursor == "" && len(starts) == 1 && groupCheckpoint > checkpoint {
+				checkpoint = groupCheckpoint
 			}
 			if page.LatestLedger > tip {
 				tip = page.LatestLedger
@@ -692,6 +794,11 @@ func (p *Poller) Poll(ctx context.Context) error {
 	if confirmActive && checkpoint > confirmedThrough {
 		checkpoint = confirmedThrough
 	}
+	chainHead := p.recordUpstreamMetrics()
+	chainTip := tip
+	if chainHead > chainTip {
+		chainTip = chainHead
+	}
 	p.metrics.SetPollLag(int64(tip) - int64(checkpoint))
 	for _, pr := range prioritiesInServiceOrder {
 		if tierCounts[pr] == 0 {
@@ -714,7 +821,7 @@ func (p *Poller) Poll(ctx context.Context) error {
 	if processed == 0 {
 		processed = state.LastLedger
 	}
-	p.recordPosition(processed, tip, time.Now())
+	p.recordPosition(processed, chainTip, time.Now())
 	return nil
 }
 
@@ -783,14 +890,17 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 		return true
 	}
 
+	orderedMonitors := orderMonitorsByWorkspaceFairness(monitors)
+	workspaceElapsed := make(map[string]time.Duration)
 	processed := true
-	for _, m := range monitors {
-		ruleList, err := p.store.ListRules(ctx, m.ID, true)
+	for _, m := range orderedMonitors {
+		ruleList, err := p.listRulesForCycle(ctx, byContract, m.ID)
 		if err != nil {
 			p.log.Error("list rules", "monitor_id", m.ID, "err", err)
 			processed = false
 			continue
 		}
+		var evals int64
 		for _, rule := range ruleList {
 			// An absence rule is re-armed by a matching event and fired by
 			// the sweep; evaluating it here would be asking the wrong
@@ -801,18 +911,42 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 				}
 				continue
 			}
+			if p.workspaceEvalBudget > 0 && workspaceElapsed[m.WorkspaceID] >= p.workspaceEvalBudget {
+				p.metrics.RecordWorkspaceRuleBudgetExhausted(m.WorkspaceID)
+				if p.log != nil {
+					p.log.Warn("workspace rule evaluation budget exceeded; skipping rule for event",
+						"workspace_id", m.WorkspaceID,
+						"monitor_id", m.ID,
+						"rule_id", rule.ID,
+						"rule_type", rule.Type,
+						"event_id", decoded.ID,
+						"budget", p.workspaceEvalBudget,
+						"elapsed", workspaceElapsed[m.WorkspaceID],
+					)
+				}
+				continue
+			}
 			// The rule id rides in the context so a stateful evaluator (the
 			// frequency rule) can key its per-rule state.
 			p.evaluations++
-			ruleCtx := rules.WithRuleID(ctx, rule.ID)
+			evals++
+			ruleCtx := rules.WithRuleVersion(rules.WithRuleID(ctx, rule.ID), rule.Version)
 			start := time.Now()
 			matched, err := p.registry.Evaluate(ruleCtx, rule.Type, decoded, rule.Params)
 			duration := time.Since(start)
+			workspaceElapsed[m.WorkspaceID] += duration
 			if p.metrics != nil {
 				p.metrics.RecordRuleEval(rule.Type, matched, err, duration)
 			}
 			if err != nil {
-				p.log.Warn("rule evaluation failed", "rule_id", rule.ID, "event_id", decoded.ID, "err", err)
+				if rules.IsRuleIsolatedFailure(err) {
+					logIsolatedRuleFailure(p.log, m, rule, decoded.ID, err)
+					continue
+				}
+				if p.log != nil {
+					p.log.Warn("rule evaluation failed due to storage error",
+						"rule_id", rule.ID, "monitor_id", m.ID, "event_id", decoded.ID, "err", err)
+				}
 				processed = false
 				continue
 			}
@@ -829,6 +963,9 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 					processed = false
 				}
 			}
+		}
+		if evals > 0 {
+			p.recordWorkspaceRuleEvaluations(ctx, m.WorkspaceID, evals)
 		}
 	}
 	return processed
@@ -876,15 +1013,21 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 		return false
 	}
 
+	runbookURL, responseGuidance := store.ResolveAlertGuidance(&rule, &m, "", "")
+	payload = store.WithGuidance(payload, runbookURL, responseGuidance)
+
 	alert := &store.Alert{
-		MonitorID:      m.ID,
-		RuleID:         rule.ID,
-		EventID:        eventID,
-		Payload:        payload,
-		Ledger:         ev.Ledger,
-		LedgerClosedAt: ev.LedgerClosedAt,
-		Cooldown:       ruleCooldown(rule),
-		Severity:       rule.Severity,
+		MonitorID:        m.ID,
+		RuleID:           rule.ID,
+		EventID:          eventID,
+		Payload:          payload,
+		Ledger:           ev.Ledger,
+		LedgerClosedAt:   ev.LedgerClosedAt,
+		Cooldown:         ruleCooldown(rule),
+		Severity:         rule.Severity,
+		RuleVersion:      rule.Version,
+		RunbookURL:       runbookURL,
+		ResponseGuidance: responseGuidance,
 	}
 	outcome, err := p.store.CreateAlert(ctx, alert)
 	if err != nil {
@@ -901,6 +1044,7 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 			"rule_id", rule.ID, "event_id", ev.ID, "cooldown", alert.Cooldown)
 		return true
 	}
+	p.recordWorkspaceAlertRaised(ctx, m.WorkspaceID)
 	logAttrs := []any{"alert_id", alert.ID, "monitor", m.Name, "rule_id", rule.ID, "event_id", ev.ID}
 	if alert.SuppressedSinceLast > 0 {
 		logAttrs = append(logAttrs, "suppressed_since_last", alert.SuppressedSinceLast)
@@ -940,9 +1084,11 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 		CreatedAt: alert.CreatedAt,
 		// GroupCount is 1 for the first alert in a window (the one
 		// we are delivering now) and 0 when grouping is disabled.
-		GroupCount:  1,
-		WindowStart: time.Time{},
-		WindowEnd:   time.Time{},
+		GroupCount:       1,
+		WindowStart:      time.Time{},
+		WindowEnd:        time.Time{},
+		RunbookURL:       alert.RunbookURL,
+		ResponseGuidance: alert.ResponseGuidance,
 	})
 	return true
 }
@@ -1078,11 +1224,17 @@ func (p *Poller) fireAbsence(ctx context.Context, m store.Monitor, rule store.Ru
 		return
 	}
 
+	runbookURL, responseGuidance := store.ResolveAlertGuidance(&rule, &m, "", "")
+	payload = store.WithGuidance(payload, runbookURL, responseGuidance)
+
 	alert := &store.Alert{
-		MonitorID: m.ID,
-		RuleID:    rule.ID,
-		EventID:   AbsenceEventID(lastSeen),
-		Payload:   payload,
+		MonitorID:        m.ID,
+		RuleID:           rule.ID,
+		EventID:          AbsenceEventID(lastSeen),
+		Payload:          payload,
+		RuleVersion:      rule.Version,
+		RunbookURL:       runbookURL,
+		ResponseGuidance: responseGuidance,
 	}
 	outcome, err := p.store.CreateAlert(ctx, alert)
 	if err != nil {
@@ -1101,21 +1253,24 @@ func (p *Poller) fireAbsence(ctx context.Context, m store.Monitor, rule store.Ru
 		return
 	}
 	p.metrics.RecordAlert()
+	p.recordWorkspaceAlertRaised(ctx, m.WorkspaceID)
 	p.log.Info("absence alert created",
 		"alert_id", alert.ID, "monitor", m.Name, "rule_id", rule.ID,
 		"event_name", spec.EventName, "silent_for", silent)
 
 	p.dispatch.Dispatch(ctx, notify.Alert{
-		ID:          alert.ID,
-		MonitorID:   m.ID,
-		MonitorName: m.Name,
-		RuleID:      rule.ID,
-		RuleType:    rule.Type,
-		EventID:     alert.EventID,
-		EventName:   spec.EventName,
-		Silence:     silent,
-		Payload:     payload,
-		CreatedAt:   alert.CreatedAt,
+		ID:               alert.ID,
+		MonitorID:        m.ID,
+		MonitorName:      m.Name,
+		RuleID:           rule.ID,
+		RuleType:         rule.Type,
+		EventID:          alert.EventID,
+		EventName:        spec.EventName,
+		Silence:          silent,
+		Payload:          alert.Payload,
+		CreatedAt:        alert.CreatedAt,
+		RunbookURL:       alert.RunbookURL,
+		ResponseGuidance: alert.ResponseGuidance,
 	})
 }
 
@@ -1131,4 +1286,37 @@ func (p *Poller) fireAbsence(ctx context.Context, m store.Monitor, rule store.Ru
 // built from lives in the database.
 func AbsenceEventID(lastSeen time.Time) string {
 	return "absence-" + strconv.FormatInt(lastSeen.UTC().UnixNano(), 10)
+}
+
+func (p *Poller) recordWorkspaceRuleEvaluations(ctx context.Context, workspaceID string, n int64) {
+	if n <= 0 {
+		return
+	}
+	if p.usageMeter != nil {
+		p.usageMeter.RecordRuleEvaluations(workspaceID, n)
+		return
+	}
+	if p.metrics != nil {
+		p.metrics.RecordWorkspaceRuleEvaluations(workspaceID, n)
+	}
+	if uStore, ok := p.store.(store.Usage); ok {
+		_ = store.SafeRecordWorkspaceUsageBatch(ctx, uStore, []store.WorkspaceUsageDelta{
+			{WorkspaceID: workspaceID, RuleEvaluations: n},
+		})
+	}
+}
+
+func (p *Poller) recordWorkspaceAlertRaised(ctx context.Context, workspaceID string) {
+	if p.usageMeter != nil {
+		p.usageMeter.RecordAlertRaised(workspaceID, 1)
+		return
+	}
+	if p.metrics != nil {
+		p.metrics.RecordWorkspaceAlertRaised(workspaceID, 1)
+	}
+	if uStore, ok := p.store.(store.Usage); ok {
+		_ = store.SafeRecordWorkspaceUsageBatch(ctx, uStore, []store.WorkspaceUsageDelta{
+			{WorkspaceID: workspaceID, AlertsRaised: 1},
+		})
+	}
 }

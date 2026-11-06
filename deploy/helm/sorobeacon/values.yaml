@@ -37,16 +37,24 @@ podAnnotations: {}
 
 podSecurityContext:
   runAsNonRoot: true
-  # The image's own user is non-root; pinning a UID keeps the pod stable
-  # even if the image's USER directive changes.
+  # The image's own user is non-root (UID/GID 10001); pinning numeric IDs keeps
+  # the pod stable even if the image's USER directive changes and lets kubelet
+  # enforce runAsNonRoot without resolving a username.
   runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
 
 securityContext:
   allowPrivilegeEscalation: false
   # The binary writes nothing to disk — configuration is environment
   # variables, templates and migrations are embedded, and alerts live in
-  # Postgres. Flip this to false only if a future version needs scratch space.
+  # Postgres. A bounded emptyDir is mounted at /tmp for ephemeral scratch
+  # space while the root filesystem stays read-only.
   readOnlyRootFilesystem: true
+  seccompProfile:
+    type: RuntimeDefault
   capabilities:
     drop: [ALL]
 
@@ -181,6 +189,9 @@ config:
   # or 24h. Empty keeps history forever, so an upgrade never starts deleting
   # anything by accident.
   alertRetention: ""
+  # How long to keep audit log entries, e.g. 90d or 24h. Empty keeps audit
+  # history forever.
+  auditRetention: ""
   # Comma-separated RPC endpoints to fail over between. Empty uses rpcUrl
   # alone. The first entry is the primary.
   rpcUrls: ""
@@ -255,6 +266,13 @@ database:
   # failure with jitter. Empty keeps the application defaults (5 and 2s).
   connectAttempts: 5
   connectDelay: "2s"
+  # Optional PostgreSQL TLS / mTLS settings (DATABASE_SSL_*).
+  sslMode: ""
+  sslCertFile: ""
+  sslKeyFile: ""
+  sslRootCertFile: ""
+  # Optional Secret mounted read-only at /etc/sorobeacon/tls/database.
+  tlsSecretName: ""
 
 # ── Credentials (Secret) ─────────────────────────────────────────────────────
 auth:
@@ -343,5 +361,29 @@ oidc:
   # Claim naming the user's role (viewer, editor or admin), for an issuer that
   # carries one. Empty makes every SSO user an admin.
   roleClaim: ""
+  # Claim naming the user's group memberships, and mappings from provider
+  # groups to SoroBeacon roles/workspaces.
+  groupClaim: ""
+  groupMappings: ""
+  groupCacheTTL: ""
   # How long a started login may take to come back.
   loginStateTTL: "10m"
+
+# ── Mutual TLS (mTLS) and component TLS ─────────────────────────────────────
+tls:
+  # Optional Secret mounted read-only at /etc/sorobeacon/tls/server.
+  secretName: ""
+  # Server TLS certificate, private key, client CA bundle, client auth mode
+  # (none | request | require), and client-cert subject -> workspace[:role] map.
+  certFile: ""
+  keyFile: ""
+  clientCAFile: ""
+  clientAuth: ""
+  principalMap: ""
+  # Optional Secret mounted read-only at /etc/sorobeacon/tls/sorotrail for
+  # outbound mTLS to an upstream SoroTrail indexer.
+  sorotrailSecretName: ""
+  sorotrailCertFile: ""
+  sorotrailKeyFile: ""
+  sorotrailCAFile: ""
+  sorotrailServerName: ""

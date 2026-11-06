@@ -312,6 +312,12 @@ func validateBackup(data *BackupData) error {
 				return fmt.Errorf("monitor %d has an empty contract id", m.ID)
 			}
 		}
+		if _, err := store.ValidateRunbookURL(m.RunbookURL); err != nil {
+			return fmt.Errorf("monitor %d has invalid runbook_url: %w", m.ID, err)
+		}
+		if _, err := store.ValidateResponseGuidance(m.ResponseGuidance); err != nil {
+			return fmt.Errorf("monitor %d has invalid response_guidance: %w", m.ID, err)
+		}
 	}
 
 	channels := make(map[int64]struct{}, len(data.Channels))
@@ -390,6 +396,12 @@ func validateBackup(data *BackupData) error {
 			if _, ok := store.ParseSeverity(string(r.Severity)); !ok {
 				return fmt.Errorf("rule %d has unknown severity %q", r.ID, r.Severity)
 			}
+		}
+		if _, err := store.ValidateRunbookURL(r.RunbookURL); err != nil {
+			return fmt.Errorf("rule %d has invalid runbook_url: %w", r.ID, err)
+		}
+		if _, err := store.ValidateResponseGuidance(r.ResponseGuidance); err != nil {
+			return fmt.Errorf("rule %d has invalid response_guidance: %w", r.ID, err)
 		}
 	}
 
@@ -651,12 +663,14 @@ func importAll(ctx context.Context, st store.Store, data *BackupData, log *slog.
 	monitorIDs := make(map[int64]int64, len(data.Monitors))
 	for _, om := range data.Monitors {
 		m := &store.Monitor{
-			Name:        om.Name,
-			ContractIDs: om.ContractIDs,
-			Enabled:     om.Enabled,
-			Priority:    om.Priority,
-			Network:     om.Network,
-			CreatedAt:   om.CreatedAt,
+			Name:             om.Name,
+			ContractIDs:      om.ContractIDs,
+			Enabled:          om.Enabled,
+			Priority:         om.Priority,
+			Network:          om.Network,
+			RunbookURL:       om.RunbookURL,
+			ResponseGuidance: om.ResponseGuidance,
+			CreatedAt:        om.CreatedAt,
 		}
 		if err := st.CreateMonitor(ctx, m); err != nil {
 			return fmt.Errorf("restore monitor %q: %w", m.Name, err)
@@ -675,11 +689,13 @@ func importAll(ctx context.Context, st store.Store, data *BackupData, log *slog.
 	ruleIDs := make(map[int64]int64, len(data.Rules))
 	for _, r := range data.Rules {
 		rule := &store.Rule{
-			MonitorID: monitorIDs[r.MonitorID],
-			Type:      r.Type,
-			Params:    r.Params,
-			Enabled:   r.Enabled,
-			Severity:  r.Severity,
+			MonitorID:        monitorIDs[r.MonitorID],
+			Type:             r.Type,
+			Params:           r.Params,
+			Enabled:          r.Enabled,
+			Severity:         r.Severity,
+			RunbookURL:       r.RunbookURL,
+			ResponseGuidance: r.ResponseGuidance,
 		}
 		if err := st.CreateRule(ctx, rule); err != nil {
 			return fmt.Errorf("restore rule %d for monitor %d: %w", r.ID, r.MonitorID, err)

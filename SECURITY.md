@@ -27,6 +27,62 @@ unrelated change cannot fail on the day the vulnerability database updates.
 from compiled code fail the build; an advisory against an unused path is
 reported by the database but is not treated as a release blocker here.
 
+## Static security analysis
+
+Dependency scanning answers whether a third-party library carries a known
+advisory; static analysis answers whether **this repository's own Go code**
+introduces an exploitable pattern. Two complementary gates run on every pull
+request and every push to `main`, across both the root module and
+`terraform-provider-sorobeacon`:
+
+1. **CodeQL (`.github/workflows/codeql.yml`, `.github/codeql/codeql-config.yml`).**
+   Runs GitHub's `security-extended` Go query suite in `manual` build mode so
+   both modules are compiled and extracted. Results are uploaded to GitHub Code
+   Scanning (`security-events: write`) and posted inline on the pull request
+   diff. Because the workflow reads no secrets and uses `pull_request` rather
+   than `pull_request_target`, pull requests from forks run the exact same
+   analysis safely. A weekly scheduled run catches newly added upstream queries
+   against `main`.
+2. **Tuned `gosec` CI gate (`security` job in `.github/workflows/ci.yml`, `.golangci-security.yml`).**
+   Runs `golangci-lint` with `default: none` and only `gosec` enabled, scoped
+   to the rule classes that match SoroBeacon's attack surface:
+   - **SQL construction (`G201`, `G202`):** SQL built by `fmt.Sprintf` or string
+     concatenation across the Postgres and SQLite store backends.
+   - **Server-side request forgery (`G107`):** Outbound HTTP requests constructed
+     from variable URLs on the notification delivery, enrichment, heartbeat, and
+     federation paths.
+   - **Path traversal & archive extraction (`G304`, `G305`):** Variable file
+     paths in config loading, TLS certificate reloaders, and alert archive
+     tiering (`file://`, `dir://`).
+   - **Decompression bounds (`G110`):** Request body `gzip`/`deflate`
+     decompression.
+   - **Template escaping (`G203`):** Unescaped data passed to `html/template` in
+     the dashboard or notification templates.
+   - **Weak randomness & cryptography (`G402`, `G404`, `G501`, `G505`):** Use of
+     `math/rand` where `crypto/rand` is required, weak TLS settings, or broken
+     hashes (`md5`, `sha1`).
+   - **Unsafe memory/reflection (`G103`):** Use of package `unsafe`.
+
+### Handling findings
+
+- **New findings fail the pull request** and appear as inline annotations on the
+  changed lines.
+- **True positives** become dedicated issues (or targeted fixes) rather than
+  being quietly suppressed. In particular, outbound notification and webhook
+  senders fetch operator-configured URLs by design; any architectural egress
+  control change is tracked as its own issue.
+- **False positives and intentional patterns** (for example, jittered retry
+  backoff using `math/rand/v2`, or SQL query builders that interpolate only
+  internal column/table constants alongside `$1` placeholders) must be
+  suppressed **next to the code they excuse** with an explicit rationale:
+  ```go
+  //nolint:gosec // G404: retry jitter is not security-sensitive; tokens use crypto/rand
+  ```
+- **No blanket ignores.** `.golangci-security.yml` defines no rule-level text
+  exclusions, and `TestGosecSuppressionsCarryAReason` (`internal/ci/security_test.go`)
+  fails the test suite if any `//nolint:gosec` or `//#nosec` directive in
+  non-test code omits an explanatory `// <reason>` comment.
+
 ## Scope
 
 In scope:

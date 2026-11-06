@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/secrets"
 )
 
@@ -206,6 +207,11 @@ type Config struct {
 	// are kept. Zero (the default, when ALERT_RETENTION is unset) keeps
 	// everything forever so upgrades never start deleting history.
 	AlertRetention time.Duration
+	// AuditRetention is how long administrative audit_log records are kept
+	// (AUDIT_RETENTION). It is configured separately from ALERT_RETENTION
+	// because audit records and alerts age under different operational and
+	// compliance policies. Zero (the default) keeps audit records forever.
+	AuditRetention time.Duration
 	// AlertEnrichmentURL is an optional operator-supplied HTTP JSON source.
 	AlertEnrichmentURL      string
 	AlertEnrichmentTimeout  time.Duration
@@ -292,6 +298,25 @@ type Config struct {
 	// channel types without a specific limit (NOTIFY_RATE_LIMIT_DEFAULT_RPS).
 	// Zero keeps the built-in notifier default; see notify.RateLimits.
 	NotifyRateLimitDefaultRPS float64
+
+	// Server TLS / mTLS (HTTP API + dashboard + gRPC server).
+	TLSCertFile     string
+	TLSKeyFile      string
+	TLSClientCAFile string
+	TLSClientAuth   string
+	MTLSBindings    []auth.MTLSBinding
+
+	// Upstream SoroTrail client TLS / mTLS.
+	SoroTrailTLSCertFile   string
+	SoroTrailTLSKeyFile    string
+	SoroTrailTLSCAFile     string
+	SoroTrailTLSServerName string
+
+	// Database client TLS / mTLS (PostgreSQL).
+	DatabaseSSLMode         string
+	DatabaseSSLCertFile     string
+	DatabaseSSLKeyFile      string
+	DatabaseSSLRootCertFile string
 }
 
 // OTLPConfig is the tracing slice of the configuration. It is a struct so a
@@ -792,6 +817,14 @@ func LoadProblems() (Config, []Problem) {
 			cfg.AlertRetention = d
 		}
 	}
+	if v := lookupConfigValue("AUDIT_RETENTION", fileValues); v != "" {
+		d, err := ParseRetention(v)
+		if err != nil {
+			ps.add("AUDIT_RETENTION", fmt.Errorf("invalid AUDIT_RETENTION %q: %w", v, err))
+		} else {
+			cfg.AuditRetention = d
+		}
+	}
 	if v := lookupConfigValue("FLAPPING_EPISODES", fileValues); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 {
@@ -953,6 +986,8 @@ func LoadProblems() (Config, []Problem) {
 			cfg.NotifyRateLimitDefaultRPS = rps
 		}
 	}
+
+	loadMTLS(&cfg, fileValues, sqliteBackend, &ps)
 
 	return cfg, ps.list
 }

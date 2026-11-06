@@ -1,0 +1,20 @@
+name: SoroBeacon CodeQL config
+
+# security-extended rather than the default suite: it adds the lower-precision
+# queries that matter for this codebase specifically, among them
+# go/insecure-randomness (math/rand where crypto/rand is needed) alongside the
+# default go/sql-injection, go/request-forgery (SSRF on the notification and
+# archive paths), go/path-injection and go/zipslip (path traversal), and
+# go/unsafe-quoting. The maintainability/quality suites are deliberately not
+# enabled: golangci-lint already answers those questions, and duplicating them
+# here would bury security findings in noise.
+queries:
+  - uses: security-extended
+
+# Test helpers build SQL and URLs from fixtures on purpose; a finding there is
+# not reachable from a deployed binary. The nested Terraform provider is
+# scanned, because it is a shipped artifact.
+paths-ignore:
+  - "**/*_test.go"
+  - "internal/oidctest/**"
+  - "internal/notify/faultinject/**"

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math/big"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -263,7 +264,7 @@ func TestRegistry(t *testing.T) {
 	// rather than derived from the registry, so adding a rule type without
 	// noticing cannot pass unremarked — which does mean a PR that adds one
 	// has to extend this line.
-	assert.ElementsMatch(t, []string{TypeEventEmitted, TypeValueThreshold, TypeTokenEvent, TypeSelfTransfer, TypeTimeWindow, TypeFrequencyThreshold, TypeTopicRegex, TypeAddressWatchlist, TypeTopicPosition, TypeNumericRange, TypeEventNameGlob, TypeContractAllowlist, TypeTokenSupplyChange, TypeComposite, TypeAbsenceOfEvent}, r.Types())
+	assert.ElementsMatch(t, []string{TypeEventEmitted, TypeValueThreshold, TypeTokenEvent, TypeSelfTransfer, TypeTimeWindow, TypeFrequencyThreshold, TypeTopicRegex, TypeAddressWatchlist, TypeTopicPosition, TypeNumericRange, TypeEventNameGlob, TypeContractAllowlist, TypeTokenSupplyChange, TypeComposite, TypeBaselineDeviation, TypeAbsenceOfEvent}, r.Types())
 
 	_, err := r.Evaluate(context.Background(), "unknown", transferEvent(1), json.RawMessage(`{}`))
 	assert.Error(t, err)
@@ -342,4 +343,68 @@ func BenchmarkValueThreshold(b *testing.B) {
 			}
 		})
 	}
+}
+
+func TestFrequencyThresholdResetsOnVersionOrParamsChangeAndFiltersSeed(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	ev := transferEvent(1)
+	f := NewFrequencyThreshold().WithClock(clk.now)
+
+	// Under version 1 with count=3, two matches accumulate without firing.
+	ctxV1 := WithRuleVersion(WithRuleID(context.Background(), 42), 1)
+	paramsV1 := json.RawMessage(`{"event_name":"transfer","count":3,"window":"5m"}`)
+	for i := 0; i < 2; i++ {
+		clk.advance(time.Second)
+		got, err := f.Evaluate(ctxV1, ev, paramsV1)
+		require.NoError(t, err)
+		require.False(t, got)
+	}
+
+	// Bumping the rule version to 2 resets the partial window so a single match
+	// under v2 does not combine with v1's two matches to cross count=3.
+	ctxV2 := WithRuleVersion(WithRuleID(context.Background(), 42), 2)
+	clk.advance(time.Second)
+	got, err := f.Evaluate(ctxV2, ev, paramsV1)
+	require.NoError(t, err)
+	assert.False(t, got, "v1 matches must not carry over after rule version bump")
+
+	// Two more matches under v2 reach count=3 and fire.
+	clk.advance(time.Second)
+	got, err = f.Evaluate(ctxV2, ev, paramsV1)
+	require.NoError(t, err)
+	require.False(t, got)
+	clk.advance(time.Second)
+	got, err = f.Evaluate(ctxV2, ev, paramsV1)
+	require.NoError(t, err)
+	assert.True(t, got, "third match under v2 crosses threshold")
+
+	// Changing params (e.g. count=2) while armed resets the armed state and window.
+	paramsChanged := json.RawMessage(`{"event_name":"transfer","count":2,"window":"5m"}`)
+	clk.advance(time.Second)
+	got, err = f.Evaluate(ctxV2, ev, paramsChanged)
+	require.NoError(t, err)
+	assert.False(t, got, "first match after params change starts fresh")
+	clk.advance(time.Second)
+	got, err = f.Evaluate(ctxV2, ev, paramsChanged)
+	require.NoError(t, err)
+	assert.True(t, got, "second match after params change crosses new count=2")
+
+	// Registry.ResetRuleState clears the evaluator's state for rule 42.
+	reg := NewRegistry()
+	reg.Register(TypeFrequencyThreshold, f)
+	reg.ResetRuleState(42)
+	assert.Empty(t, f.AlertEventID(ctxV2, ev, paramsChanged))
+
+	// After a restart, seed ignores stored alerts from older rule versions.
+	oldEpisode := frequencyEventPrefix + clk.t.Add(-10*time.Second).UTC().Format(time.RFC3339Nano)
+	restarted := NewFrequencyThreshold().WithClock(clk.now).WithMatchLog(
+		MatchLogFunc(func(context.Context, int64, time.Time) ([]MatchRecord, error) {
+			return []MatchRecord{
+				{At: clk.t.Add(-5 * time.Second), EventID: oldEpisode, RuleVersion: 1},
+			}, nil
+		}))
+	clk.advance(time.Second)
+	got, err = restarted.Evaluate(ctxV2, ev, json.RawMessage(`{"event_name":"transfer","count":1,"window":"5m"}`))
+	require.NoError(t, err)
+	assert.True(t, got, "v1 episode in MatchLog must not suppress v2 after restart")
 }

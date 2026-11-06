@@ -10,6 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 // conformanceStore is a Store plus the small test-only hooks a backend must
@@ -106,6 +108,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	// The tenancy suite. These are the assertions the workspace boundary rests
 	// on, so they run against both backends like everything else.
 	t.Run("WorkspaceIsolation", func(t *testing.T) { testWorkspaceIsolation(t, newStore) })
+	t.Run("WorkspaceExportIsolation", func(t *testing.T) { testWorkspaceExportIsolation(t, newStore) })
 	t.Run("DeleteByIDAllowlist", func(t *testing.T) { testDeleteByIDAllowlist(t, newStore) })
 	t.Run("APITokens", func(t *testing.T) { testAPITokens(t, newStore) })
 	// A constraint violation is the request's fault, and both backends have
@@ -117,6 +120,8 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("FederatedAlerts", func(t *testing.T) { testFederatedAlerts(t, newStore) })
 	t.Run("FederatedAlertsFollowTheDeliveringWorkspace", func(t *testing.T) { testFederatedAlertFollowsTheDeliveringWorkspace(t, newStore) })
 	t.Run("PersistedOperations", func(t *testing.T) { testPersistedOperations(t, newStore) })
+	t.Run("RuleChangeSafety", func(t *testing.T) { testRuleChangeSafety(t, newStore) })
+	t.Run("WorkspaceRetentionPoliciesAndPruning", func(t *testing.T) { testWorkspaceRetentionPoliciesAndPruning(t, newStore) })
 }
 
 // testChannelDigest pins the digest settings round trip and the pending
@@ -163,8 +168,9 @@ func testChannelDigest(t *testing.T, newStore conformanceFactory) {
 	assert.Empty(t, rows)
 }
 
-// testAuditLog proves the audit table is append-only, filters correctly, and
-// never carries the secret values a channel config holds.
+// testAuditLog proves the audit table is append-only, filters correctly,
+// maintains a tamper-evident per-workspace hash chain, and never carries
+// secret/config material even if passed in Diff.
 func testAuditLog(t *testing.T, newStore conformanceFactory) {
 	ctx := context.Background()
 	st := newStore(t)
@@ -177,18 +183,59 @@ func testAuditLog(t *testing.T, newStore conformanceFactory) {
 	}
 	require.NoError(t, st.CreateChannel(ctx, ch))
 
-	// The middleware records field names, never values; this mirrors what it
-	// writes so the store contract (and the absence of the secret) is pinned.
+	// Even if a caller accidentally passes channel config or secret keys in
+	// Diff, the store boundary strips them before writing.
 	entries := []*AuditEntry{
-		{Actor: "req-1", Action: AuditActionCreate, TargetType: "channel", TargetID: ch.ID, Diff: json.RawMessage(`{"fields":["config","name"]}`)},
-		{Actor: "req-2", Action: AuditActionUpdate, TargetType: "channel", TargetID: ch.ID, Diff: json.RawMessage(`{"fields":["config"]}`)},
-		{Actor: "req-3", Action: AuditActionDelete, TargetType: "monitor", TargetID: 42},
+		{
+			Actor:      "req-1",
+			ActorType:  AuditActorPerson,
+			Action:     AuditActionCreate,
+			TargetType: AuditTargetChannel,
+			TargetID:   ch.ID,
+			ResourceID: fmt.Sprintf("%d", ch.ID),
+			SourceIP:   "192.0.2.10",
+			Surface:    AuditSurfaceREST,
+			Outcome:    AuditOutcomeSucceeded,
+			StatusCode: 201,
+			Diff:       json.RawMessage(`{"fields":["config","name"],"config":{"webhook_url":"https://hooks.example/SECRET-TOKEN"},"token":"s3cr3t-value"}`),
+		},
+		{
+			Actor:      "req-2",
+			ActorType:  AuditActorAutomation,
+			Action:     AuditActionUpdate,
+			TargetType: AuditTargetChannel,
+			TargetID:   ch.ID,
+			ResourceID: fmt.Sprintf("%d", ch.ID),
+			SourceIP:   "198.51.100.5",
+			Surface:    AuditSurfaceREST,
+			Outcome:    AuditOutcomeSucceeded,
+			StatusCode: 200,
+			Diff:       json.RawMessage(`{"fields":["config"]}`),
+		},
+		{
+			Actor:      "req-3",
+			ActorType:  AuditActorAutomation,
+			Action:     AuditActionDelete,
+			TargetType: AuditTargetMonitor,
+			TargetID:   42,
+			ResourceID: "42",
+			SourceIP:   "203.0.113.9",
+			Surface:    AuditSurfaceDashboard,
+			Outcome:    AuditOutcomeFailed,
+			StatusCode: 403,
+			Reason:     "insufficient role: viewer cannot mutate monitor",
+		},
 	}
 	for _, e := range entries {
 		require.NoError(t, st.CreateAuditEntry(ctx, e))
 		assert.NotZero(t, e.ID)
 		assert.False(t, e.CreatedAt.IsZero())
+		assert.NotEmpty(t, e.RecordHash)
+		assert.Equal(t, "default", e.WorkspaceID)
 	}
+	assert.Empty(t, entries[0].PrevHash, "first entry in workspace starts the chain")
+	assert.Equal(t, entries[0].RecordHash, entries[1].PrevHash, "second entry links to first")
+	assert.Equal(t, entries[1].RecordHash, entries[2].PrevHash, "third entry links to second")
 
 	// Append-only: all three survive, newest first.
 	list, err := st.ListAuditEntries(ctx, AuditFilter{})
@@ -197,9 +244,30 @@ func testAuditLog(t *testing.T, newStore conformanceFactory) {
 	assert.Equal(t, entries[2].ID, list[0].ID)
 	for _, e := range list {
 		assert.NotContains(t, string(e.Diff), "SECRET-TOKEN")
+		assert.NotContains(t, string(e.Diff), "s3cr3t-value")
 	}
+	assert.JSONEq(t, `{"fields":["config","name"]}`, string(list[2].Diff))
 	// An entry with no diff is stored as an empty JSON object, never NULL.
 	assert.JSONEq(t, `{}`, string(list[0].Diff))
+	assert.Equal(t, AuditOutcomeFailed, list[0].Outcome)
+	assert.Equal(t, 403, list[0].StatusCode)
+	assert.Equal(t, "insufficient role: viewer cannot mutate monitor", list[0].Reason)
+	assert.Equal(t, "203.0.113.9", list[0].SourceIP)
+	assert.Equal(t, AuditSurfaceDashboard, list[0].Surface)
+	assert.Equal(t, AuditActorAutomation, list[0].ActorType)
+
+	// Verify tamper-evident hash chain on the returned slice (newest-first or oldest-first).
+	valid, brokenIdx, err := VerifyAuditHashChain(list)
+	require.NoError(t, err)
+	assert.True(t, valid)
+	assert.Equal(t, -1, brokenIdx)
+	tampered := make([]AuditEntry, len(list))
+	copy(tampered, list)
+	tampered[1].Actor = "evil-actor"
+	valid, brokenIdx, err = VerifyAuditHashChain(tampered)
+	require.Error(t, err, "tampering with an entry must break the hash chain")
+	assert.False(t, valid)
+	assert.Equal(t, 1, brokenIdx)
 
 	byType, err := st.ListAuditEntries(ctx, AuditFilter{TargetType: "channel"})
 	require.NoError(t, err)
@@ -208,6 +276,31 @@ func testAuditLog(t *testing.T, newStore conformanceFactory) {
 	byTarget, err := st.ListAuditEntries(ctx, AuditFilter{TargetType: "channel", TargetID: ch.ID})
 	require.NoError(t, err)
 	require.Len(t, byTarget, 2)
+
+	byOutcome, err := st.ListAuditEntries(ctx, AuditFilter{Outcome: AuditOutcomeFailed})
+	require.NoError(t, err)
+	require.Len(t, byOutcome, 1)
+	assert.Equal(t, entries[2].ID, byOutcome[0].ID)
+
+	byActorType, err := st.ListAuditEntries(ctx, AuditFilter{ActorType: AuditActorPerson})
+	require.NoError(t, err)
+	require.Len(t, byActorType, 1)
+	assert.Equal(t, entries[0].ID, byActorType[0].ID)
+
+	bySurface, err := st.ListAuditEntries(ctx, AuditFilter{Surface: AuditSurfaceDashboard})
+	require.NoError(t, err)
+	require.Len(t, bySurface, 1)
+	assert.Equal(t, entries[2].ID, bySurface[0].ID)
+
+	byAction, err := st.ListAuditEntries(ctx, AuditFilter{Action: AuditActionUpdate})
+	require.NoError(t, err)
+	require.Len(t, byAction, 1)
+	assert.Equal(t, entries[1].ID, byAction[0].ID)
+
+	byResource, err := st.ListAuditEntries(ctx, AuditFilter{ResourceID: "42"})
+	require.NoError(t, err)
+	require.Len(t, byResource, 1)
+	assert.Equal(t, entries[2].ID, byResource[0].ID)
 
 	limited, err := st.ListAuditEntries(ctx, AuditFilter{Limit: 1})
 	require.NoError(t, err)
@@ -236,6 +329,16 @@ func testAuditLog(t *testing.T, newStore conformanceFactory) {
 	none, err := st.ListAuditEntries(ctx, AuditFilter{From: time.Now().Add(time.Hour)})
 	require.NoError(t, err)
 	assert.Empty(t, none)
+
+	// Audit retention prunes entries older than cutoff.
+	pruner, ok := st.(AuditPruner)
+	require.True(t, ok, "both backends must implement AuditPruner")
+	deleted, err := pruner.DeleteExpiredAuditEntries(ctx, time.Now().Add(-time.Hour), 100)
+	require.NoError(t, err)
+	assert.Zero(t, deleted)
+	deleted, err = pruner.DeleteExpiredAuditEntries(ctx, time.Now().Add(time.Hour), 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), deleted)
 }
 
 // testAlertAcknowledgement is the dashboard acknowledge path at the store
@@ -2265,4 +2368,270 @@ func testDeadLetters(t *testing.T, newStore conformanceFactory) {
 	// otherwise point at nothing and never be cleaned up by the cascade.
 	orphan := &DeadLetter{AlertID: 999999, ChannelID: chA.ID, AttemptCount: 1}
 	assert.Error(t, st.CreateDeadLetter(ctx, orphan))
+}
+
+func testRuleChangeSafety(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	m := &Monitor{Name: "m-rule-safety", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+
+	r := &Rule{
+		MonitorID: m.ID,
+		Type:      "absence_of_event",
+		Params:    json.RawMessage(`{"event_name":"heartbeat","window":"5m","cooldown":"10m"}`),
+		Enabled:   true,
+	}
+	require.NoError(t, st.CreateRule(ctx, r))
+	assert.Equal(t, 1, r.Version, "newly created rule starts at version 1")
+
+	gotRule, err := st.GetRule(ctx, r.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, gotRule.Version)
+
+	// Record an absence clock and fire an alert under v1 with a long cooldown.
+	now := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "heartbeat", now))
+
+	alertV1 := &Alert{
+		MonitorID: m.ID,
+		RuleID:    r.ID,
+		EventID:   "ev-v1",
+		Payload:   json.RawMessage(`{"event_name":"heartbeat"}`),
+		Cooldown:  10 * time.Minute,
+	}
+	outcome, err := st.CreateAlert(ctx, alertV1)
+	require.NoError(t, err)
+	require.Equal(t, AlertCreated, outcome)
+	assert.Equal(t, 1, alertV1.RuleVersion, "CreateAlert stamps the current rule version")
+
+	// A second alert inside the cooldown window is suppressed and increments suppressed_since_last.
+	suppressed := &Alert{
+		MonitorID: m.ID,
+		RuleID:    r.ID,
+		EventID:   "ev-v1-suppressed",
+		Payload:   json.RawMessage(`{"event_name":"heartbeat"}`),
+		Cooldown:  10 * time.Minute,
+	}
+	outcome, err = st.CreateAlert(ctx, suppressed)
+	require.NoError(t, err)
+	require.Equal(t, AlertSuppressed, outcome)
+
+	// Attach an in-flight escalation to the v1 alert.
+	ch := &Channel{Name: "pager", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateChannel(ctx, ch))
+	pol, err := st.SetEscalationPolicy(ctx, m.ID, []EscalationStep{{DelaySeconds: 60, ChannelIDs: []int64{ch.ID}}})
+	require.NoError(t, err)
+	require.NoError(t, st.ScheduleEscalation(ctx, alertV1.ID, pol.ID, json.RawMessage(`{}`), 0, now.Add(-time.Minute)))
+
+	due, err := st.DueEscalations(ctx, now, 10)
+	require.NoError(t, err)
+	require.Len(t, due, 1, "escalation is due before the rule is edited")
+
+	// Editing the rule's condition increments version to 2, clears absence state,
+	// completes in-flight escalations, and resets the cooldown window while
+	// keeping the v1 alert row intact.
+	r.Params = json.RawMessage(`{"event_name":"heartbeat","window":"15m","cooldown":"10m"}`)
+	require.NoError(t, st.UpdateRule(ctx, r))
+	assert.Equal(t, 2, r.Version)
+
+	gotRule, err = st.GetRule(ctx, r.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 2, gotRule.Version)
+
+	states, err := st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, states, "changing rule params must clear stored absence state")
+
+	due, err = st.DueEscalations(ctx, now, 10)
+	require.NoError(t, err)
+	assert.Empty(t, due, "changing rule params must stop in-flight escalations")
+
+	// Because cooldown was reset on condition change, a new match under v2 fires
+	// immediately and carries SuppressedSinceLast == 0 and RuleVersion == 2.
+	alertV2 := &Alert{
+		MonitorID: m.ID,
+		RuleID:    r.ID,
+		EventID:   "ev-v2",
+		Payload:   json.RawMessage(`{"event_name":"heartbeat"}`),
+		Cooldown:  10 * time.Minute,
+	}
+	outcome, err = st.CreateAlert(ctx, alertV2)
+	require.NoError(t, err)
+	require.Equal(t, AlertCreated, outcome, "cooldown from v1 must not suppress v2")
+	assert.Equal(t, 2, alertV2.RuleVersion)
+	assert.Zero(t, alertV2.SuppressedSinceLast, "suppressed count from v1 must not carry into v2")
+
+	// Disabling the rule also increments version, clears absence state, and stops escalations.
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "heartbeat", now))
+	require.NoError(t, st.ScheduleEscalation(ctx, alertV2.ID, pol.ID, json.RawMessage(`{}`), 0, now.Add(-time.Minute)))
+	r.Enabled = false
+	require.NoError(t, st.UpdateRule(ctx, r))
+	assert.Equal(t, 3, r.Version)
+
+	states, err = st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, states, "disabling a rule must clear stored absence state")
+
+	due, err = st.DueEscalations(ctx, now, 10)
+	require.NoError(t, err)
+	assert.Empty(t, due, "disabling a rule must stop in-flight escalations")
+
+	// Historical alerts from v1 and v2 remain intact with their respective rule versions.
+	listed, err := st.ListAlerts(ctx, AlertFilter{RuleID: r.ID, Sort: "created_at_asc"})
+	require.NoError(t, err)
+	require.Len(t, listed, 2)
+	assert.Equal(t, 1, listed[0].RuleVersion)
+	assert.Equal(t, 2, listed[1].RuleVersion)
+
+	gotV1, err := st.GetAlert(ctx, alertV1.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, gotV1.RuleVersion)
+	gotV2, err := st.GetAlert(ctx, alertV2.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 2, gotV2.RuleVersion)
+
+	// Direct DeleteAbsenceStateForRule removes only the target rule's clocks.
+	r2 := &Rule{MonitorID: m.ID, Type: "absence_of_event", Params: json.RawMessage(`{"event_name":"ping","window":"5m"}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, r2))
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r.ID, "heartbeat", now))
+	require.NoError(t, st.RecordAbsenceSeen(ctx, r2.ID, "ping", now))
+	require.NoError(t, st.DeleteAbsenceStateForRule(ctx, r.ID))
+	states, err = st.ListAbsenceState(ctx)
+	require.NoError(t, err)
+	require.Len(t, states, 1)
+	assert.Equal(t, r2.ID, states[0].RuleID)
+}
+
+func testWorkspaceRetentionPoliciesAndPruning(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	SetInstanceAlertRetention(st, 30*24*time.Hour)
+	t.Cleanup(func() { SetInstanceAlertRetention(st, 0) })
+
+	wsA := workspace.ID("ws-short")
+	wsB := workspace.ID("ws-long")
+	ctxA := workspace.With(context.Background(), wsA)
+	ctxB := workspace.With(context.Background(), wsB)
+
+	// 1. Default policy inherits instance ALERT_RETENTION (30d).
+	polA, err := st.GetWorkspaceRetentionPolicy(ctxA, wsA)
+	require.NoError(t, err)
+	assert.False(t, polA.Configured)
+	assert.Equal(t, RetentionPolicySourceInstance, polA.PolicySource)
+	assert.Equal(t, int64(30*86400), polA.EffectiveRetentionSeconds)
+
+	// 2. Shortening from 30d instance default to 7d without ConfirmShorten fails.
+	_, err = st.SetWorkspaceRetentionPolicy(ctxA, SetWorkspaceRetentionInput{
+		WorkspaceID:    string(wsA),
+		Retention:      7 * 24 * time.Hour,
+		ConfirmShorten: false,
+		Actor:          "admin-a",
+	})
+	require.ErrorIs(t, err, ErrRetentionShortenUnconfirmed)
+
+	// 3. Shortening with ConfirmShorten: true succeeds and records an audit entry.
+	polA, err = st.SetWorkspaceRetentionPolicy(ctxA, SetWorkspaceRetentionInput{
+		WorkspaceID:    string(wsA),
+		Retention:      7 * 24 * time.Hour,
+		ConfirmShorten: true,
+		Actor:          "admin-a",
+	})
+	require.NoError(t, err)
+	assert.True(t, polA.Configured)
+	assert.Equal(t, RetentionPolicySourceWorkspace, polA.PolicySource)
+	assert.Equal(t, int64(7*86400), polA.EffectiveRetentionSeconds)
+
+	// 4. Extending wsB from 30d default to 90d does not require ConfirmShorten.
+	polB, err := st.SetWorkspaceRetentionPolicy(ctxB, SetWorkspaceRetentionInput{
+		WorkspaceID:    string(wsB),
+		Retention:      90 * 24 * time.Hour,
+		ConfirmShorten: false,
+		Actor:          "admin-b",
+	})
+	require.NoError(t, err)
+	assert.True(t, polB.Configured)
+	assert.Equal(t, int64(90*86400), polB.EffectiveRetentionSeconds)
+
+	// 5. Resetting wsB (90d -> 30d default) shortens retention and requires ConfirmShorten.
+	_, err = st.DeleteWorkspaceRetentionPolicy(ctxB, wsB, false, "admin-b")
+	require.ErrorIs(t, err, ErrRetentionShortenUnconfirmed)
+
+	// 6. Seed 10-day-old and 2-day-old alerts in both workspaces.
+	now := time.Now().UTC()
+	monA := &Monitor{Name: "mon-a", ContractIDs: []string{"CA"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctxA, monA))
+	ruleA := &Rule{MonitorID: monA.ID, Type: "event_emitted", Params: json.RawMessage(`{"event_name":"transfer"}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctxA, ruleA))
+	chA := &Channel{Name: "ch-a", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateChannel(ctxA, chA))
+
+	oldAlertA := &Alert{MonitorID: monA.ID, RuleID: ruleA.ID, EventID: "a-old", Payload: json.RawMessage(`{}`)}
+	recentAlertA := &Alert{MonitorID: monA.ID, RuleID: ruleA.ID, EventID: "a-recent", Payload: json.RawMessage(`{}`)}
+	_, err = st.CreateAlert(ctxA, oldAlertA)
+	require.NoError(t, err)
+	_, err = st.CreateAlert(ctxA, recentAlertA)
+	require.NoError(t, err)
+	require.NoError(t, st.setAlertCreatedAt(ctxA, oldAlertA.ID, now.Add(-10*24*time.Hour)))
+	require.NoError(t, st.setAlertCreatedAt(ctxA, recentAlertA.ID, now.Add(-2*24*time.Hour)))
+	require.NoError(t, st.RecordDeliveryAttempt(ctxA, &DeliveryAttempt{
+		AlertID:   oldAlertA.ID,
+		ChannelID: chA.ID,
+		Status:    DeliveryStatusSuccess,
+	}))
+
+	monB := &Monitor{Name: "mon-b", ContractIDs: []string{"CB"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctxB, monB))
+	ruleB := &Rule{MonitorID: monB.ID, Type: "event_emitted", Params: json.RawMessage(`{"event_name":"transfer"}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctxB, ruleB))
+
+	oldAlertB := &Alert{MonitorID: monB.ID, RuleID: ruleB.ID, EventID: "b-old", Payload: json.RawMessage(`{}`)}
+	_, err = st.CreateAlert(ctxB, oldAlertB)
+	require.NoError(t, err)
+	require.NoError(t, st.setAlertCreatedAt(ctxB, oldAlertB.ID, now.Add(-10*24*time.Hour)))
+
+	// 7. Read-time visibility horizon hides wsA's 10-day-old alert even before pruning,
+	// while wsB's 10-day-old alert remains visible under its 90-day policy.
+	alertsA, err := st.ListAlerts(ctxA, AlertFilter{})
+	require.NoError(t, err)
+	require.Len(t, alertsA, 1, "wsA 10d alert must be hidden by 7d retention horizon")
+	assert.Equal(t, recentAlertA.ID, alertsA[0].ID)
+
+	_, err = st.GetAlert(ctxA, oldAlertA.ID)
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	statsA, err := st.GetStats(ctxA)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), statsA.Alerts)
+	assert.Equal(t, RetentionPolicySourceWorkspace, statsA.RetentionPolicySource)
+	assert.NotNil(t, statsA.PrunedBefore)
+
+	alertsB, err := st.ListAlerts(ctxB, AlertFilter{})
+	require.NoError(t, err)
+	require.Len(t, alertsB, 1, "wsB 10d alert must remain visible under 90d retention")
+	assert.Equal(t, oldAlertB.ID, alertsB[0].ID)
+
+	// 8. Per-workspace pruning removes wsA's expired alert and cascades delivery_attempts + alert_dedup,
+	// without touching wsB's 10-day-old alert.
+	deletedA, err := st.DeleteExpiredAlertsForWorkspace(ctxA, wsA, now.Add(-7*24*time.Hour), 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deletedA)
+
+	// Because alert_dedup was cleared for oldAlertA, re-inserting EventID "a-old" creates a fresh alert.
+	reinsertA := &Alert{MonitorID: monA.ID, RuleID: ruleA.ID, EventID: "a-old", Payload: json.RawMessage(`{}`)}
+	outcome, err := st.CreateAlert(ctxA, reinsertA)
+	require.NoError(t, err)
+	assert.Equal(t, AlertCreated, outcome, "pruned alert's dedup entry must be cleared")
+
+	// 9. Audit trail recorded the retention policy updates (workspace-scoped for tenants, all for system).
+	auditsA, err := st.ListAuditEntries(ctxA, AuditFilter{TargetType: AuditTargetWorkspaceRetention})
+	require.NoError(t, err)
+	require.Len(t, auditsA, 1)
+	assert.Equal(t, "admin-a", auditsA[0].Actor)
+
+	audits, err := st.ListAuditEntries(workspace.WithSystem(context.Background()), AuditFilter{TargetType: AuditTargetWorkspaceRetention})
+	require.NoError(t, err)
+	require.Len(t, audits, 2)
+	assert.Equal(t, "admin-b", audits[0].Actor)
+	assert.Equal(t, "admin-a", audits[1].Actor)
 }

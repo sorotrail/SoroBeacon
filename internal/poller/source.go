@@ -2,9 +2,24 @@ package poller
 
 import (
 	"context"
+	"errors"
 
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 )
+
+// ErrInvalidCursor is returned by an EventSource when the upstream server
+// rejects a continuation cursor as expired, malformed, or stuck. The poller
+// recovers by clearing the cursor and re-fetching from the durable ledger
+// checkpoint.
+var ErrInvalidCursor = errors.New("sorotrail: invalid or expired cursor")
+
+// UpstreamStatusSource is an optional interface implemented by upstream
+// indexers (such as SoroTrail) that report their own lag behind the chain
+// head, consecutive request failures, and upstream reorg retractions.
+type UpstreamStatusSource interface {
+	UpstreamStatus() (chainHead uint32, upstreamLag uint32, consecutiveFailures int)
+	ConsumeRetractions() (retractedFromLedger uint32, retractedEventIDs []string)
+}
 
 // Watch is one contract the poller asked for, plus the server-side topic
 // filter derived from that contract's enabled rules. A nil Topics means no

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 	"time"
 )
@@ -48,6 +47,17 @@ func monthStart(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
 }
 
+// addUTCMonths returns the first instant of the UTC month that is `months`
+// calendar months offset from the month containing `t`. Anchoring on day 1 of
+// the UTC month before applying the month offset avoids Go's time.AddDate day
+// normalization overflow across months of unequal length (for example,
+// Jan 31 + 1 month overflowing Feb 28/29 into March) as well as DST and
+// non-UTC timezone shifts.
+func addUTCMonths(t time.Time, months int) time.Time {
+	start := monthStart(t)
+	return time.Date(start.Year(), start.Month()+time.Month(months), 1, 0, 0, 0, 0, time.UTC)
+}
+
 // alertPartitionName is the partition holding the month that contains t.
 func alertPartitionName(t time.Time) string {
 	m := monthStart(t)
@@ -70,7 +80,7 @@ func alertPartitionBounds(name string) (from, to time.Time, ok bool) {
 		return time.Time{}, time.Time{}, false
 	}
 	from = time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
-	return from, from.AddDate(0, 1, 0), true
+	return from, addUTCMonths(from, 1), true
 }
 
 // alertPartitions lists the child partitions currently attached to alerts.
@@ -106,8 +116,11 @@ func (p *Postgres) CheckAlertPartitionRunway(ctx context.Context, from time.Time
 	}
 	existing, err := p.alertPartitions(ctx)
 	if err != nil {
+		p.metrics.RecordAlertPartitionError("inspect")
 		return err
 	}
+	runway := ComputePartitionRunway(existing, from)
+	p.metrics.SetAlertPartitionRunway(runway)
 	have := make(map[string]bool, len(existing))
 	for _, name := range existing {
 		have[name] = true
@@ -119,16 +132,19 @@ func (p *Postgres) CheckAlertPartitionRunway(ctx context.Context, from time.Time
 		}
 	}
 	if len(missing) > 0 {
+		p.metrics.RecordAlertPartitionError("runway")
 		return fmt.Errorf("missing alert partitions: %s", strings.Join(missing, ", "))
 	}
 	return nil
 }
 
 func requiredAlertPartitions(from time.Time, months int) []string {
+	if months <= 0 {
+		return nil
+	}
 	names := make([]string, 0, months)
-	start := monthStart(from)
 	for i := 0; i < months; i++ {
-		names = append(names, alertPartitionName(start.AddDate(0, i, 0)))
+		names = append(names, alertPartitionName(addUTCMonths(from, i)))
 	}
 	return names
 }
@@ -140,75 +156,8 @@ func requiredAlertPartitions(from time.Time, months int) []string {
 // reattached — Postgres refuses to create a partition that would overlap rows
 // already in the default, so this is the one correct order.
 func (p *Postgres) EnsureAlertPartitions(ctx context.Context, from time.Time, months int) error {
-	if months <= 0 {
-		return nil
-	}
-	existing, err := p.alertPartitions(ctx)
-	if err != nil {
-		return err
-	}
-	have := make(map[string]bool, len(existing))
-	hasDefault := false
-	for _, name := range existing {
-		have[name] = true
-		if name == alertDefaultPartition {
-			hasDefault = true
-		}
-	}
-
-	tx, err := p.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
-
-	for _, name := range requiredAlertPartitions(from, months) {
-		begin, _, _ := alertPartitionBounds(name)
-		end := begin.AddDate(0, 1, 0)
-		if have[name] {
-			continue
-		}
-
-		inDefault := false
-		if hasDefault {
-			if err := tx.QueryRow(ctx,
-				`SELECT EXISTS (SELECT 1 FROM `+alertDefaultPartition+` WHERE created_at >= $1 AND created_at < $2)`,
-				begin, end).Scan(&inDefault); err != nil {
-				return err
-			}
-		}
-
-		if !inDefault {
-			if _, err := tx.Exec(ctx, createPartitionSQL(name, begin, end)); err != nil {
-				return err
-			}
-			continue
-		}
-
-		if _, err := tx.Exec(ctx, `ALTER TABLE `+alertPartitionTable+` DETACH PARTITION `+alertDefaultPartition); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, createPartitionSQL(name, begin, end)); err != nil {
-			return err
-		}
-		move := fmt.Sprintf(`
-			INSERT INTO %s (id, monitor_id, rule_id, event_id, payload, ledger, retracted_at, created_at)
-			SELECT id, monitor_id, rule_id, event_id, payload, ledger, retracted_at, created_at
-			  FROM %s WHERE created_at >= '%s' AND created_at < '%s'`,
-			name, alertDefaultPartition, begin.Format("2006-01-02"), end.Format("2006-01-02"))
-		if _, err := tx.Exec(ctx, move); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, fmt.Sprintf(
-			`DELETE FROM %s WHERE created_at >= '%s' AND created_at < '%s'`,
-			alertDefaultPartition, begin.Format("2006-01-02"), end.Format("2006-01-02"))); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `ALTER TABLE `+alertPartitionTable+` ATTACH PARTITION `+alertDefaultPartition+` DEFAULT`); err != nil {
-			return err
-		}
-	}
-	return tx.Commit(ctx)
+	_, err := p.ensureAlertPartitions(ctx, from, months, DefaultPartitionLockTimeout)
+	return err
 }
 
 // createPartitionSQL builds a CREATE TABLE ... PARTITION statement. Names are
@@ -222,7 +171,8 @@ func createPartitionSQL(name string, from, to time.Time) string {
 }
 
 // DropExpiredPartitions drops every monthly alerts partition whose whole range
-// is older than cutoff, oldest first.
+// is older than cutoff, oldest first, and records an audit_log entry for each
+// dropped partition.
 //
 // Dropping a partition does not fire ON DELETE CASCADE, so the delivery
 // attempts and dedup keys that referenced the dropped alerts are removed
@@ -230,70 +180,10 @@ func createPartitionSQL(name string, from, to time.Time) string {
 // parent/child relationship: retention owns both sides of it here rather than
 // relying on the FK, which a DROP cannot trigger.
 func (p *Postgres) DropExpiredPartitions(ctx context.Context, cutoff time.Time) (int64, error) {
-	names, err := p.alertPartitions(ctx)
-	if err != nil {
-		return 0, err
-	}
-	type expiredPartition struct {
-		name     string
-		from, to time.Time
-	}
-	var drops []expiredPartition
-	for _, name := range names {
-		from, to, ok := alertPartitionBounds(name)
-		if !ok {
-			continue
-		}
-		if !to.After(cutoff) {
-			drops = append(drops, expiredPartition{name: name, from: from, to: to})
-		}
-	}
-	if len(drops) == 0 {
-		return 0, nil
-	}
-	sort.Slice(drops, func(i, j int) bool { return drops[i].from.Before(drops[j].from) })
-
-	tx, err := p.pool.Begin(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
-
-	var dropped int64
-	for _, d := range drops {
-		var n int64
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM `+d.name).Scan(&n); err != nil {
-			return 0, err
-		}
-		// Delete by the dropped partition's own alert ids rather than by a
-		// timestamp window: ids are globally unique, so this is exact even if
-		// an alert's created_at was rewritten (which relocates the row but not
-		// necessarily its dedup key).
-		if _, err := tx.Exec(ctx,
-			`DELETE FROM delivery_attempts WHERE alert_id IN (SELECT id FROM `+d.name+`)`); err != nil {
-			return 0, err
-		}
-		if _, err := tx.Exec(ctx,
-			`DELETE FROM alert_dedup WHERE alert_id IN (SELECT id FROM `+d.name+`)`); err != nil {
-			return 0, err
-		}
-		// DETACH first: Postgres keeps a per-partition foreign-key constraint
-		// on delivery_attempts for every child, so a bare DROP is refused.
-		// Detaching removes that dependency, and the detached table is then a
-		// plain table that can be dropped.
-		if _, err := tx.Exec(ctx, `ALTER TABLE `+alertPartitionTable+` DETACH PARTITION `+d.name); err != nil {
-			return 0, err
-		}
-		if _, err := tx.Exec(ctx, `DROP TABLE `+d.name); err != nil {
-			return 0, err
-		}
-		dropped += n
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, err
-	}
-	return dropped, nil
+	dropped, _, err := p.dropExpiredPartitions(ctx, cutoff, 0, DefaultPartitionAuditActor, DefaultPartitionLockTimeout)
+	return dropped, err
 }
 
 var _ PartitionEnsurer = (*Postgres)(nil)
+var _ PartitionRunwayChecker = (*Postgres)(nil)
 var _ PartitionPruner = (*Postgres)(nil)

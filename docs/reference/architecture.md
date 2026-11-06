@@ -39,6 +39,38 @@ so the ingest loop is identical regardless of backend:
 Contributors: a new backend is an implementation of the interface plus one
 line in `cmd/sorobeacon`'s mode switch. Nothing in the poller changes.
 
+### Upstream mode (`sorotrail`) guarantees and trade-offs
+
+Running with `SOURCE_MODE=sorotrail` delegates chain ingestion and XDR decoding
+to an upstream SoroTrail indexer while keeping rule evaluation, deduplication,
+cooldowns, and alert delivery inside SoroBeacon:
+
+* **Startup & network verification** — SoroBeacon verifies `/api/v1/stats` (and
+  `/api/v1/health`) against the configured `NETWORK` / `NETWORK_PASSPHRASE` at
+  startup and on the first poll, refusing to evaluate events from a wrong-chain
+  or non-SoroTrail HTTP endpoint. If SoroTrail is temporarily unreachable at
+  boot, SoroBeacon logs a warning, backs off, and verifies identity on the
+  first reachable cycle.
+* **End-to-end lag & readiness** — SoroBeacon tracks both its own poll lag
+  behind SoroTrail (`sorobeacon_poll_lag_ledgers`) and SoroTrail's lag behind
+  the Stellar chain head (`sorobeacon_upstream_lag_ledgers`, plus
+  `sorobeacon_upstream_consecutive_failures`). Readiness (`/api/v1/readyz`) and
+  the external heartbeat check total lag against the chain head, so a stalled
+  upstream indexer cannot masquerade as a caught-up SoroBeacon.
+* **Short pages & cursor recovery** — On short or empty final pages, SoroBeacon
+  advances its checkpoint to SoroTrail's ingested tip (`last_ingested_ledger` /
+  `last_ledger`) rather than re-polling the same range. If an opaque pagination
+  cursor expires or is rejected across an upstream restart, SoroBeacon logs a
+  warning and re-anchors from its durable ledger checkpoint (`last_ledger + 1`),
+  relying on `(rule_id, event_id)` deduplication to prevent duplicate alerts.
+* **Upstream reorgs & retractions** — SoroBeacon does not maintain a duplicate
+  ledger-hash window in upstream mode; instead it consumes SoroTrail's
+  retraction signals (`retracted` event flags, `retracted_from_ledger`,
+  `retracted_event_ids`, and `verified_through_ledger` regressions), marks
+  affected alerts as `retracted_at` in its store, stops pending escalations,
+  and dispatches a `[RETRACTED]` notice for any alert that had already been
+  delivered.
+
 ## Ingestion (`internal/poller`)
 
 * Every `POLL_INTERVAL`, the poller collects the contract IDs of all **enabled** monitors and pages its event source from the checkpoint.

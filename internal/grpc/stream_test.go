@@ -34,6 +34,10 @@ func (s *streamAlertStore) ListAlerts(_ context.Context, f store.AlertFilter) ([
 	return out, nil
 }
 
+func (s *streamAlertStore) GetMonitor(_ context.Context, id int64) (*store.Monitor, error) {
+	return &store.Monitor{ID: id}, nil
+}
+
 func (s *streamAlertStore) add(a store.Alert) {
 	s.mu.Lock()
 	s.alerts = append(s.alerts, a)

@@ -151,7 +151,17 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 	if len(alerts) == effectiveLimit {
 		next = strconv.FormatInt(alerts[len(alerts)-1].ID, 10)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"alerts": alerts, "next_cursor": next})
+	prunedBefore, policySource := s.workspaceRetentionHorizon(r.Context())
+	setRetentionHorizonHeaders(w, prunedBefore, policySource)
+	resp := map[string]any{
+		"alerts":                  alerts,
+		"next_cursor":             next,
+		"retention_policy_source": policySource,
+	}
+	if prunedBefore != nil {
+		resp["pruned_before"] = prunedBefore.UTC().Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // maxAlertExportRows is the documented ceiling on a single CSV export when
@@ -206,6 +216,8 @@ func (s *Server) exportAlertsCSV(w http.ResponseWriter, r *http.Request) {
 		names[m.ID] = m.Name
 	}
 
+	prunedBefore, policySource := s.workspaceRetentionHorizon(r.Context())
+	setRetentionHorizonHeaders(w, prunedBefore, policySource)
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+alertExportFilename(f)+`"`)
 	w.Header().Set("Cache-Control", "no-store")
@@ -338,6 +350,10 @@ func (s *Server) listDeliveries(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, r, http.StatusBadRequest, "invalid status")
 		return
 	}
+	if _, err := s.store.GetAlert(r.Context(), id); err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	list, err := s.store.ListDeliveryAttempts(r.Context(), id, status)
 	if err != nil {
 		s.fail(w, r, err)
@@ -423,23 +439,46 @@ func notifyAlertFromStore(ctx context.Context, st store.Store, a store.Alert) no
 		// the rule need the instance it came from to tell two peers' alerts
 		// apart.
 		FederationOrigin: a.FederationOrigin,
+		RunbookURL:       a.RunbookURL,
+		ResponseGuidance: a.ResponseGuidance,
 	}
 	var p struct {
-		ContractID string `json:"contract_id"`
-		EventName  string `json:"event_name"`
-		Ledger     uint32 `json:"ledger"`
-		TxHash     string `json:"tx_hash"`
+		ContractID       string `json:"contract_id"`
+		EventName        string `json:"event_name"`
+		Ledger           uint32 `json:"ledger"`
+		TxHash           string `json:"tx_hash"`
+		RunbookURL       string `json:"runbook_url"`
+		ResponseGuidance string `json:"response_guidance"`
 	}
 	_ = json.Unmarshal(a.Payload, &p)
 	na.ContractID = p.ContractID
 	na.EventName = p.EventName
 	na.Ledger = p.Ledger
 	na.TxHash = p.TxHash
+	if na.RunbookURL == "" {
+		na.RunbookURL = p.RunbookURL
+	}
+	if na.ResponseGuidance == "" {
+		na.ResponseGuidance = p.ResponseGuidance
+	}
+	var mon *store.Monitor
 	if m, err := st.GetMonitor(ctx, a.MonitorID); err == nil && m != nil {
 		na.MonitorName = m.Name
+		mon = m
 	}
+	var rl *store.Rule
 	if rule, err := st.GetRule(ctx, a.RuleID); err == nil && rule != nil {
 		na.RuleType = rule.Type
+		rl = rule
+	}
+	if na.RunbookURL == "" || na.ResponseGuidance == "" {
+		rURL, rGuidance := store.ResolveAlertGuidance(rl, mon, "", "")
+		if na.RunbookURL == "" {
+			na.RunbookURL = rURL
+		}
+		if na.ResponseGuidance == "" {
+			na.ResponseGuidance = rGuidance
+		}
 	}
 	return na
 }

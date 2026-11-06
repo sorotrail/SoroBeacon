@@ -34,8 +34,8 @@ type promRule struct {
 }
 
 var (
-	promRawMetricRegex      = regexp.MustCompile(`\bsorobeacon_[a-z0-9_]+\b`)
-	promRecordingMetricRgx  = regexp.MustCompile(`\bsorobeacon:sli_[a-z0-9_:]+\b`)
+	promRawMetricRegex     = regexp.MustCompile(`\bsorobeacon_[a-z0-9_]+\b`)
+	promRecordingMetricRgx = regexp.MustCompile(`\bsorobeacon:sli_[a-z0-9_:]+\b`)
 )
 
 func TestExportedMetricNamesMatchesRegistryForAlerts(t *testing.T) {
@@ -44,6 +44,8 @@ func TestExportedMetricNamesMatchesRegistryForAlerts(t *testing.T) {
 
 	m.RecordPoll(true, 10*time.Millisecond)
 	m.SetPollLag(1)
+	m.SetUpstreamLag(1)
+	m.SetUpstreamFailures(0)
 	m.SetPriorityContracts("high", 1)
 	m.SetPollLagByPriority("high", 1)
 	m.RecordReorg(1)
@@ -61,9 +63,21 @@ func TestExportedMetricNamesMatchesRegistryForAlerts(t *testing.T) {
 	m.RecordStoreRead("primary")
 	m.RecordReplicaFallback()
 	m.SetReplicaEnabled(true)
+	m.SetReplicaLag(0)
 	m.SetDeadLetters(0)
 	m.SetDeadLettersFor("default", "slack", 0)
 	m.RecordBodyRejection("max_body")
+	m.RecordWorkspaceAlertRaised("default", 1)
+	m.RecordWorkspaceRuleEvaluations("default", 1)
+	m.RecordWorkspaceNotification("default", "slack", "ok", 1)
+	m.RecordWorkspaceAPIRequest("default", 1)
+	m.SetWorkspaceStoredRows("default", "monitors", 1)
+	m.SetAlertPartitionRunway(3)
+	m.RecordAlertPartitionError("ensure")
+	m.RecordAlertPartitionsCreated(1)
+	m.RecordAlertPartitionsDropped(1)
+	m.RecordWorkspaceAlertsPruned("default", "instance", 1)
+	m.SetWorkspaceRetentionSeconds("default", "instance", 24*time.Hour)
 	m.httpDuration.WithLabelValues("/health", "GET", "200").Observe(0.01)
 
 	families, err := m.registry.Gather()
@@ -213,9 +227,9 @@ func TestSyntheticBurnRateAndDeadManEvaluation(t *testing.T) {
 		{
 			name:        "brief 5m spike that recovers before 1h threshold does not page",
 			errorBudget: 0.005,
-			ratio5m:     0.20,  // > 14.4 * 0.005 (0.072)
+			ratio5m:     0.20, // > 14.4 * 0.005 (0.072)
 			ratio30m:    0.02,
-			ratio1h:     0.02,  // < 0.072
+			ratio1h:     0.02, // < 0.072
 			ratio6h:     0.004,
 			wantPage:    false,
 			wantTicket:  false,
@@ -233,7 +247,7 @@ func TestSyntheticBurnRateAndDeadManEvaluation(t *testing.T) {
 		{
 			name:        "resolved outage where 1h is still high but 5m recovered stops paging",
 			errorBudget: 0.005,
-			ratio5m:     0.0,  // recovered
+			ratio5m:     0.0, // recovered
 			ratio30m:    0.01,
 			ratio1h:     0.12, // still > 0.072 from earlier spike
 			ratio6h:     0.02,
@@ -242,10 +256,10 @@ func TestSyntheticBurnRateAndDeadManEvaluation(t *testing.T) {
 		},
 		{
 			name:        "slow burn across 6h and 30m opens ticket without paging",
-			errorBudget: 0.01, // 99.0% Evaluation Freshness
-			ratio5m:     0.07, // < 14.4 * 0.01 (0.144)
-			ratio30m:    0.07, // > 6.0 * 0.01 (0.06)
-			ratio1h:     0.07, // < 0.144
+			errorBudget: 0.01,  // 99.0% Evaluation Freshness
+			ratio5m:     0.07,  // < 14.4 * 0.01 (0.144)
+			ratio30m:    0.07,  // > 6.0 * 0.01 (0.06)
+			ratio1h:     0.07,  // < 0.144
 			ratio6h:     0.065, // > 0.06
 			wantPage:    false,
 			wantTicket:  true,

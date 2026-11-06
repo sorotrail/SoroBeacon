@@ -89,6 +89,13 @@ var transferTables = []transferTable{
 	{name: "audit_log", key: []string{"id"}},
 	{name: "api_tokens", key: []string{"id"}},
 	{name: "persisted_operations", key: []string{"id"}},
+	{name: "workspace_usage_rollups", key: []string{"workspace_id", "period_start"}},
+	{name: "workspace_notification_usage_rollups", key: []string{"workspace_id", "period_start", "channel_type", "outcome"}},
+	{name: "workspace_quotas", key: []string{"workspace_id"}},
+	{name: "workspace_query_budget_state", key: []string{"workspace_id"}},
+	{name: "workspace_retention_policies", key: []string{"workspace_id"}},
+	{name: "idempotency_keys", key: []string{"workspace_id", "idempotency_key"}},
+	{name: "workspace_deletions", key: []string{"workspace_id"}},
 }
 
 // transferDerived marks plan tables that only one backend physically has,
@@ -707,7 +714,7 @@ func (s *SQLite) transferAdvanceSequences(ctx context.Context, tables []string) 
 			continue
 		}
 		_, err := s.db.ExecContext(ctx,
-			"UPDATE sqlite_sequence SET seq = MAX(seq, COALESCE((SELECT MAX(id) FROM "+transferQuoteIdent(table)+"), 0)) WHERE name = ?",
+			"UPDATE sqlite_sequence SET seq = MAX(seq, COALESCE((SELECT MAX(id) FROM "+transferQuoteIdent(table)+"), 0)) WHERE name = ?", // #nosec G202 -- table is validated against present/autoIncrement and quoted with transferQuoteIdent
 			table)
 		if err != nil {
 			return fmt.Errorf("advance %s: %w", table, err)

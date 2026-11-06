@@ -34,6 +34,12 @@ type Metrics struct {
 	pollDuration  *prometheus.HistogramVec
 	pollLagLedger *prometheus.GaugeVec
 
+	// Upstream mode (SoroTrail) health gauges: how far the upstream indexer
+	// itself trails the chain head, and how many consecutive upstream HTTP
+	// requests have failed.
+	upstreamLagLedger *prometheus.GaugeVec
+	upstreamFailures  *prometheus.GaugeVec
+
 	// Priority tier gauges: how many contracts each tier carries, and how
 	// far behind the tip the freshest event seen for that tier is. The lag
 	// gauge is labelled by the closed tier set, so cardinality is bounded.
@@ -49,24 +55,25 @@ type Metrics struct {
 	eventsMatched   *prometheus.CounterVec
 	ruleEvaluations *prometheus.CounterVec
 	// Per-rule-type metrics (cardinality bounded by rule type names)
-	ruleEvalsTotal   *prometheus.CounterVec
-	ruleMatchesTotal *prometheus.CounterVec
-	ruleErrorsTotal  *prometheus.CounterVec
-	ruleDuration     *prometheus.HistogramVec
-	alertsFired      *prometheus.CounterVec
-	deliveries       *prometheus.CounterVec
-	throttles        *prometheus.CounterVec
-	httpDuration     *prometheus.HistogramVec
+	ruleEvalsTotal       *prometheus.CounterVec
+	ruleMatchesTotal     *prometheus.CounterVec
+	ruleErrorsTotal      *prometheus.CounterVec
+	ruleDuration         *prometheus.HistogramVec
+	alertsFired          *prometheus.CounterVec
+	deliveries           *prometheus.CounterVec
+	throttles            *prometheus.CounterVec
+	httpDuration         *prometheus.HistogramVec
 	httpNotModifiedTotal *prometheus.CounterVec
-	lastPollAgoSec   *prometheus.GaugeVec
-	pollPanics       *prometheus.CounterVec
-	breakerStates    *prometheus.GaugeVec
-	channelUnackFlagged *prometheus.GaugeVec
-	channelUnackRate    *prometheus.GaugeVec
+	lastPollAgoSec       *prometheus.GaugeVec
+	pollPanics           *prometheus.CounterVec
+	breakerStates        *prometheus.GaugeVec
+	channelUnackFlagged  *prometheus.GaugeVec
+	channelUnackRate     *prometheus.GaugeVec
 
 	storeReads           *prometheus.CounterVec
 	storeFallbacks       prometheus.Counter
 	replicaEnabled       prometheus.Gauge
+	replicaLagSeconds    prometheus.Gauge
 	deadLetters          prometheus.Gauge
 	deadLettersByChannel *prometheus.GaugeVec
 	// heartbeatLastSuccess is the unix time of the last heartbeat ping that
@@ -79,6 +86,20 @@ type Metrics struct {
 
 	databaseDegraded         prometheus.Gauge
 	databaseUnavailableTotal prometheus.Counter
+
+	workspaceTracker         *workspaceLabelTracker
+	workspaceAlertsRaised    *prometheus.CounterVec
+	workspaceRuleEvaluations *prometheus.CounterVec
+	workspaceNotifications   *prometheus.CounterVec
+	workspaceAPIRequests     *prometheus.CounterVec
+	workspaceStoredRows      *prometheus.GaugeVec
+
+	alertPartitionRunwayMonths  prometheus.Gauge
+	alertPartitionErrorsTotal   *prometheus.CounterVec
+	alertPartitionsCreatedTotal prometheus.Counter
+	alertPartitionsDroppedTotal prometheus.Counter
+	alertPrunerDeletedTotal     *prometheus.CounterVec
+	workspaceRetentionSeconds   *prometheus.GaugeVec
 }
 
 // networkLabel is the Prometheus label every ingest metric carries.
@@ -106,6 +127,16 @@ func New() *Metrics {
 		pollLagLedger: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "sorobeacon_poll_lag_ledgers",
 			Help: "How far a network's poller resume point trails that chain's tip, in ledgers.",
+		}, networks),
+
+		upstreamLagLedger: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_upstream_lag_ledgers",
+			Help: "How far the upstream SoroTrail indexer trails the chain head, in ledgers, by network.",
+		}, networks),
+
+		upstreamFailures: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_upstream_consecutive_failures",
+			Help: "Consecutive failed requests against the upstream event source, by network.",
 		}, networks),
 
 		pollPriorityContracts: prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -224,6 +255,11 @@ func New() *Metrics {
 			Help: "1 when a read replica is configured and routing, 0 when every read goes to the primary.",
 		}),
 
+		replicaLagSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_store_replica_lag_seconds",
+			Help: "Observed replication lag in seconds on the Postgres read replica (from pg_last_xact_replay_timestamp); 0 when no replica is configured.",
+		}),
+
 		deadLetters: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "sorobeacon_dead_letters_total",
 			Help: "Current number of dead-lettered delivery attempts waiting for review or re-drive.",
@@ -263,14 +299,75 @@ func New() *Metrics {
 			Name: "sorobeacon_channel_unacknowledged_delivery_rate",
 			Help: "Share of delivered alerts that were never acknowledged within the SLA window [0.0 - 1.0].",
 		}, []string{"channel_id", "channel_type"}),
+
+		workspaceTracker: newWorkspaceLabelTracker(MaxTrackedWorkspaces),
+
+		workspaceAlertsRaised: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_workspace_alerts_raised_total",
+			Help: "Alerts raised per workspace (opaque hashed workspace label, bounded with overflow).",
+		}, []string{"workspace"}),
+
+		workspaceRuleEvaluations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_workspace_rule_evaluations_total",
+			Help: "Rule evaluations executed per workspace (opaque hashed workspace label, bounded with overflow).",
+		}, []string{"workspace"}),
+
+		workspaceNotifications: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_workspace_notifications_total",
+			Help: "Notification attempts per workspace by channel_type and outcome (ok|error|throttled).",
+		}, []string{"workspace", "channel_type", "outcome"}),
+
+		workspaceAPIRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_workspace_api_requests_total",
+			Help: "Authenticated HTTP API requests served per workspace.",
+		}, []string{"workspace"}),
+
+		workspaceStoredRows: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_workspace_stored_rows",
+			Help: "Exact stored row count per workspace and resource kind (monitors|rules|channels|alerts|dead_letters).",
+		}, []string{"workspace", "resource"}),
+
+		alertPartitionRunwayMonths: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_alert_partition_runway_months",
+			Help: "Number of consecutive monthly alert partitions currently created beyond the current UTC month.",
+		}),
+
+		alertPartitionErrorsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_alert_partition_errors_total",
+			Help: "Total errors encountered during alert partition lifecycle operations, by operation (ensure|drop|inspect).",
+		}, []string{"operation"}),
+
+		alertPartitionsCreatedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_alert_partitions_created_total",
+			Help: "Total monthly alert partitions created by the automated partition lifecycle manager.",
+		}),
+
+		alertPartitionsDroppedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_alert_partitions_dropped_total",
+			Help: "Total expired monthly alert partitions dropped by the automated partition lifecycle manager.",
+		}),
+
+		alertPrunerDeletedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_alert_pruner_deleted_total",
+			Help: "Total expired alerts deleted by the retention pruner, by workspace_id and policy_source (workspace|instance).",
+		}, []string{"workspace_id", "policy_source"}),
+
+		workspaceRetentionSeconds: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_workspace_retention_seconds",
+			Help: "Effective alert retention duration in seconds per workspace_id and policy_source (workspace|instance|none).",
+		}, []string{"workspace_id", "policy_source"}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
+		m.upstreamLagLedger, m.upstreamFailures,
 		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired, m.deliveries, m.throttles,
 		m.httpDuration, m.httpNotModifiedTotal, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
 		m.reorgsTotal, m.lastReorgLedger, m.breakerStates, m.pollPanics,
-		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.deadLetters, m.deadLettersByChannel, m.heartbeatLastSuccess,
+		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.replicaLagSeconds, m.deadLetters, m.deadLettersByChannel, m.heartbeatLastSuccess,
 		m.ruleEvalsTotal, m.ruleMatchesTotal, m.ruleErrorsTotal, m.ruleDuration, m.requestBodyRejectionsTotal,
-		m.databaseDegraded, m.databaseUnavailableTotal, m.channelUnackFlagged, m.channelUnackRate)
+		m.databaseDegraded, m.databaseUnavailableTotal, m.channelUnackFlagged, m.channelUnackRate,
+		m.workspaceAlertsRaised, m.workspaceRuleEvaluations, m.workspaceNotifications, m.workspaceAPIRequests, m.workspaceStoredRows,
+		m.alertPartitionRunwayMonths, m.alertPartitionErrorsTotal, m.alertPartitionsCreatedTotal, m.alertPartitionsDroppedTotal,
+		m.alertPrunerDeletedTotal, m.workspaceRetentionSeconds)
 	return m
 }
 
@@ -336,6 +433,31 @@ func (m *Metrics) SetPollLag(ledgersBehind int64) {
 		return
 	}
 	m.pollLagLedger.WithLabelValues(m.lv()...).Set(float64(ledgersBehind))
+}
+
+// SetUpstreamLag records how far behind the chain head the upstream SoroTrail
+// indexer is. Clamped at zero so clock skew between upstream and chain head
+// never reports negative lag.
+func (m *Metrics) SetUpstreamLag(ledgersBehind int64) {
+	if m == nil || m.upstreamLagLedger == nil {
+		return
+	}
+	if ledgersBehind < 0 {
+		ledgersBehind = 0
+	}
+	m.upstreamLagLedger.WithLabelValues(m.lv()...).Set(float64(ledgersBehind))
+}
+
+// SetUpstreamFailures records consecutive failed requests against the upstream
+// SoroTrail source. Resets to zero on the next successful request.
+func (m *Metrics) SetUpstreamFailures(count int) {
+	if m == nil || m.upstreamFailures == nil {
+		return
+	}
+	if count < 0 {
+		count = 0
+	}
+	m.upstreamFailures.WithLabelValues(m.lv()...).Set(float64(count))
 }
 
 // SetPriorityContracts records how many contracts the cycle scheduled in each
@@ -483,6 +605,19 @@ func (m *Metrics) SetReplicaEnabled(enabled bool) {
 		return
 	}
 	m.replicaEnabled.Set(0)
+}
+
+// SetReplicaLag records the latest sampled replication lag in seconds on the
+// Postgres read replica. Negative values (from minor clock skew between primary
+// and replica) are clamped to 0.
+func (m *Metrics) SetReplicaLag(seconds float64) {
+	if m == nil {
+		return
+	}
+	if seconds < 0 {
+		seconds = 0
+	}
+	m.replicaLagSeconds.Set(seconds)
 }
 
 // SetDeadLetters sets the current total number of dead letters.
@@ -711,6 +846,8 @@ func ExportedMetricNames() []string {
 		"sorobeacon_polls_total",
 		"sorobeacon_poll_duration_seconds",
 		"sorobeacon_poll_lag_ledgers",
+		"sorobeacon_upstream_lag_ledgers",
+		"sorobeacon_upstream_consecutive_failures",
 		"sorobeacon_poll_priority_contracts",
 		"sorobeacon_poll_lag_ledgers_by_priority",
 		"sorobeacon_reorgs_total",
@@ -732,6 +869,7 @@ func ExportedMetricNames() []string {
 		"sorobeacon_store_reads_total",
 		"sorobeacon_store_replica_fallbacks_total",
 		"sorobeacon_store_replica_enabled",
+		"sorobeacon_store_replica_lag_seconds",
 		"sorobeacon_dead_letters_total",
 		"sorobeacon_dead_letters",
 		"sorobeacon_alerts_stream_dropped_total",
@@ -740,6 +878,16 @@ func ExportedMetricNames() []string {
 		"sorobeacon_database_unavailable_total",
 		"sorobeacon_channel_unacknowledged_flagged",
 		"sorobeacon_channel_unacknowledged_delivery_rate",
+		"sorobeacon_workspace_alerts_raised_total",
+		"sorobeacon_workspace_rule_evaluations_total",
+		"sorobeacon_workspace_notifications_total",
+		"sorobeacon_workspace_api_requests_total",
+		"sorobeacon_workspace_stored_rows",
+		"sorobeacon_alert_partition_runway_months",
+		"sorobeacon_alert_partition_errors_total",
+		"sorobeacon_alert_partitions_created_total",
+		"sorobeacon_alert_partitions_dropped_total",
+		"sorobeacon_alert_pruner_deleted_total",
+		"sorobeacon_workspace_retention_seconds",
 	}
 }
-

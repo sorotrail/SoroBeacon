@@ -102,6 +102,25 @@ func TestRender_ProbesPointAtTheRealEndpoints(t *testing.T) {
 	assert.NotContains(t, dep, "livenessProbe:\n            httpGet:\n              path: /api/v1/readyz")
 }
 
+func TestRender_HardenedSecurityContext(t *testing.T) {
+	dep := manifest(t, renderChart(t), "Deployment")
+
+	for _, want := range []string{
+		"automountServiceAccountToken: false",
+		"runAsNonRoot: true",
+		"runAsUser: 10001",
+		"runAsGroup: 10001",
+		"fsGroup: 10001",
+		"allowPrivilegeEscalation: false",
+		"readOnlyRootFilesystem: true",
+		"type: RuntimeDefault",
+		"- ALL",
+		"mountPath: /tmp",
+	} {
+		assert.Contains(t, dep, want, "the Deployment must enforce hardened Pod/Container security defaults")
+	}
+}
+
 func TestRender_HTTPPortMatchesTheService(t *testing.T) {
 	rendered := renderChart(t)
 	dep := manifest(t, rendered, "Deployment")
@@ -194,6 +213,7 @@ func TestRender_ConfigDefaultsMatchTheApplication(t *testing.T) {
 		"RATE_LIMIT_TRUST_FORWARDED":  "false",
 		"CORS_ALLOWED_ORIGINS":        "",
 		"ALERT_RETENTION":             "",
+		"AUDIT_RETENTION":             "",
 		"DATABASE_MAX_CONNS":          "0",
 		"DATABASE_MIN_CONNS":          "0",
 		"DATABASE_MAX_CONN_LIFETIME":  "",
@@ -220,6 +240,11 @@ func TestRender_MigrationHook(t *testing.T) {
 		assert.Contains(t, job, "/api/v1/livez",
 			"the hook must wait for the endpoint that only answers after migrations are applied")
 		assert.Contains(t, job, "POLL_INTERVAL")
+		assert.Contains(t, job, "/usr/local/bin/sorobeacon",
+			"the hook must invoke the binary directly without needing /bin/sh or wget")
+		assert.NotContains(t, job, "/bin/sh")
+		assert.NotContains(t, job, "wget")
+		assert.Contains(t, job, "automountServiceAccountToken: false")
 	})
 
 	t.Run("pod is not selectable by the Service", func(t *testing.T) {

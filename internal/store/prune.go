@@ -5,6 +5,9 @@ import (
 	"errors"
 	"log/slog"
 	"time"
+
+	"github.com/sorotrail/sorobeacon/internal/metrics"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 // DefaultPruneBatch is the number of expired alerts deleted per SQL
@@ -78,17 +81,178 @@ type AlertArchiver interface {
 	Archive(ctx context.Context, alerts []Alert) error
 }
 
+func storeMetrics(st any) *metrics.Metrics {
+	switch s := st.(type) {
+	case *Postgres:
+		return s.metrics
+	case *SQLite:
+		return s.metrics
+	default:
+		return nil
+	}
+}
+
+// PruneWorkspaceAlertsOnce executes one per-workspace alert retention pass
+// across all workspaces on a store implementing RetentionPolicies.
+//
+// Whole monthly partitions are dropped only when every workspace's effective
+// retention horizon has passed (via EffectiveRetentionCutoff). Expired rows
+// belonging to workspaces with shorter retention policies are deleted in
+// bounded batches per workspace, emitting structured slog records and
+// Prometheus metrics that report which workspace policy applied.
+func PruneWorkspaceAlertsOnce(ctx context.Context, st AlertPruner, retention time.Duration, batch int, arch AlertArchiver, log *slog.Logger) (int64, error) {
+	if batch <= 0 {
+		batch = DefaultPruneBatch
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	rp, ok := st.(RetentionPolicies)
+	if !ok {
+		return 0, errors.New("store does not implement RetentionPolicies")
+	}
+
+	now := time.Now().UTC()
+	policies, err := rp.ListWorkspaceRetentionPolicies(ctx)
+	if err != nil {
+		log.Error("list workspace retention policies failed", "error", err)
+		return 0, err
+	}
+
+	wsRetentions := make(map[string]time.Duration, len(policies))
+	for _, pol := range policies {
+		effDur := pol.EffectiveDuration()
+		if !pol.Configured && retention > 0 {
+			effDur = retention
+		}
+		wsRetentions[pol.WorkspaceID] = effDur
+	}
+
+	var deleted int64
+	if mgr, ok := st.(PartitionLifecycleManager); ok {
+		plan, err := mgr.MaintainAlertPartitions(ctx, PartitionLifecycleOptions{
+			Now:                 now,
+			Retention:           retention,
+			WorkspaceRetentions: wsRetentions,
+			Archiver:            arch,
+			Log:                 log,
+		})
+		if err != nil {
+			log.Error("alert partition maintenance failed", "error", err)
+			return 0, err
+		}
+		if plan != nil {
+			deleted += plan.AlertsDropped
+		}
+	} else {
+		if pe, ok := st.(PartitionEnsurer); ok {
+			if err := pe.EnsureAlertPartitions(ctx, now, DefaultPartitionRunwayMonths); err != nil {
+				log.Error("ensure alert partitions failed", "error", err)
+				return 0, err
+			}
+		}
+		if arch == nil {
+			if effCutoff, canDrop := EffectiveRetentionCutoff(now, retention, wsRetentions); canDrop {
+				if pp, ok := st.(PartitionPruner); ok {
+					n, err := pp.DropExpiredPartitions(ctx, effCutoff)
+					if err != nil {
+						log.Error("drop expired alert partitions failed", "error", err, "cutoff", effCutoff)
+						return 0, err
+					}
+					deleted += n
+				}
+			}
+		}
+	}
+
+	m := storeMetrics(st)
+	for _, pol := range policies {
+		effDur := pol.EffectiveDuration()
+		policySource := pol.PolicySource
+		if !pol.Configured && retention > 0 {
+			effDur = retention
+			policySource = RetentionPolicySourceInstance
+		}
+		m.SetWorkspaceRetentionSeconds(pol.WorkspaceID, policySource, effDur)
+		if effDur <= 0 {
+			continue
+		}
+		wsCutoff := now.Add(-effDur)
+		var wsDeleted int64
+		for {
+			if arch != nil {
+				expired, err := rp.ExpiredAlertsForWorkspace(ctx, workspace.ID(pol.WorkspaceID), wsCutoff, batch)
+				if err != nil {
+					log.Error("alert retention read failed",
+						"error", err,
+						"workspace_id", pol.WorkspaceID,
+						"policy_source", policySource,
+						"cutoff", wsCutoff,
+					)
+					return deleted, err
+				}
+				if len(expired) == 0 {
+					break
+				}
+				if err := arch.Archive(ctx, expired); err != nil {
+					log.Error("alert archive failed; retention delete skipped",
+						"error", err,
+						"workspace_id", pol.WorkspaceID,
+						"policy_source", policySource,
+						"cutoff", wsCutoff,
+						"batch", len(expired),
+					)
+					return deleted, err
+				}
+			}
+			n, err := rp.DeleteExpiredAlertsForWorkspace(ctx, workspace.ID(pol.WorkspaceID), wsCutoff, batch)
+			if err != nil {
+				log.Error("alert retention prune failed",
+					"error", err,
+					"workspace_id", pol.WorkspaceID,
+					"policy_source", policySource,
+					"cutoff", wsCutoff,
+				)
+				return deleted, err
+			}
+			wsDeleted += n
+			deleted += n
+			if n < int64(batch) {
+				break
+			}
+		}
+		m.RecordWorkspaceAlertsPruned(pol.WorkspaceID, policySource, wsDeleted)
+		log.Info("workspace alert retention prune",
+			"workspace_id", pol.WorkspaceID,
+			"policy_source", policySource,
+			"retention", effDur.String(),
+			"deleted", wsDeleted,
+			"cutoff", wsCutoff,
+			"archiving", arch != nil,
+		)
+	}
+
+	var summaryCutoff time.Time
+	if retention > 0 {
+		summaryCutoff = now.Add(-retention)
+	}
+	log.Info("alert retention prune", "deleted", deleted, "cutoff", summaryCutoff, "archiving", arch != nil)
+	return deleted, nil
+}
+
 // RunAlertPruner deletes alerts older than retention in batches until
-// ctx is cancelled. Unset/zero retention is a no-op so upgrades never
-// start deleting history. One pass runs immediately, then on interval
-// (DefaultPruneInterval when interval is not positive).
+// ctx is cancelled. Unset/zero retention is a no-op unless at least one
+// workspace has configured a per-workspace retention policy. One pass runs
+// immediately, then on interval (DefaultPruneInterval when interval is not
+// positive).
 //
 // arch, when non-nil, is asked to persist each batch first; the delete for
 // that batch is skipped if the archive fails, so archiving turns retention
 // from destruction into tiering. A nil arch is byte-for-byte the previous
 // behaviour.
 func RunAlertPruner(ctx context.Context, st AlertPruner, retention, interval time.Duration, batch int, arch AlertArchiver, log *slog.Logger) {
-	if retention <= 0 {
+	_, hasWorkspacePolicies := st.(RetentionPolicies)
+	if retention <= 0 && !hasWorkspacePolicies {
 		return
 	}
 	if batch <= 0 {
@@ -108,30 +272,45 @@ func RunAlertPruner(ctx context.Context, st AlertPruner, retention, interval tim
 	)
 
 	pruneOnce := func() {
-		cutoff := time.Now().UTC().Add(-retention)
+		if hasWorkspacePolicies {
+			_, _ = PruneWorkspaceAlertsOnce(ctx, st, retention, batch, arch, log)
+			return
+		}
+		now := time.Now().UTC()
+		cutoff := now.Add(-retention)
+		var deleted int64
 		// Keep the upcoming partition window open before anything is written
-		// into it; on a partitioned backend this is what stops rows landing in
-		// the default partition.
-		if pe, ok := st.(PartitionEnsurer); ok {
-			if err := pe.EnsureAlertPartitions(ctx, time.Now().UTC(), 3); err != nil {
-				log.Error("ensure alert partitions failed", "error", err)
+		// into it, and drop whole expired partitions when archiving is off.
+		if mgr, ok := st.(PartitionLifecycleManager); ok {
+			plan, err := mgr.MaintainAlertPartitions(ctx, PartitionLifecycleOptions{
+				Now:       now,
+				Retention: retention,
+				Archiver:  arch,
+				Log:       log,
+			})
+			if err != nil {
+				log.Error("alert partition maintenance failed", "error", err, "cutoff", cutoff)
 				return
 			}
-		}
-
-		var deleted int64
-		// A partitioned backend drops whole expired partitions first, which is
-		// effectively free. It is skipped when archiving is on: a DROP cannot
-		// archive, so those rows must go through the batched archive-then-delete
-		// path above instead.
-		if arch == nil {
-			if pp, ok := st.(PartitionPruner); ok {
-				n, err := pp.DropExpiredPartitions(ctx, cutoff)
-				if err != nil {
-					log.Error("drop expired alert partitions failed", "error", err, "cutoff", cutoff)
+			if plan != nil {
+				deleted += plan.AlertsDropped
+			}
+		} else {
+			if pe, ok := st.(PartitionEnsurer); ok {
+				if err := pe.EnsureAlertPartitions(ctx, now, DefaultPartitionRunwayMonths); err != nil {
+					log.Error("ensure alert partitions failed", "error", err)
 					return
 				}
-				deleted += n
+			}
+			if arch == nil {
+				if pp, ok := st.(PartitionPruner); ok {
+					n, err := pp.DropExpiredPartitions(ctx, cutoff)
+					if err != nil {
+						log.Error("drop expired alert partitions failed", "error", err, "cutoff", cutoff)
+						return
+					}
+					deleted += n
+				}
 			}
 		}
 		for {
@@ -334,6 +513,111 @@ func RunDeadLetterPruner(ctx context.Context, st DeadLetters, retention, interva
 		select {
 		case <-ctx.Done():
 			log.Info("dead letter pruner stopped")
+			return
+		case <-t.C:
+			pruneOnce()
+		}
+	}
+}
+
+// AuditPruner is the persistence slice the audit retention loop needs.
+// Audit retention is configured separately from ALERT_RETENTION via
+// AUDIT_RETENTION so operational alert pruning never erases the administrative
+// audit trail unless explicitly configured.
+type AuditPruner interface {
+	DeleteExpiredAuditEntries(ctx context.Context, cutoff time.Time, limit int) (int64, error)
+}
+
+// DeleteExpiredAuditEntries removes up to limit audit_log rows whose created_at
+// is strictly before cutoff, oldest first. limit is clamped to
+// DefaultPruneBatch when non-positive.
+func (p *Postgres) DeleteExpiredAuditEntries(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = DefaultPruneBatch
+	}
+	var deleted int64
+	err := p.pool.QueryRow(ctx, `
+		WITH expired AS (
+			SELECT id FROM audit_log
+			WHERE created_at < $1
+			ORDER BY created_at ASC, id ASC
+			LIMIT $2
+		),
+		deleted_audit AS (
+			DELETE FROM audit_log a
+			USING expired x
+			WHERE a.id = x.id
+			RETURNING a.id
+		)
+		SELECT count(*) FROM deleted_audit`, cutoff.UTC(), limit).Scan(&deleted)
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
+}
+
+// DeleteExpiredAuditEntries is the SQLite counterpart to Postgres.DeleteExpiredAuditEntries.
+func (s *SQLite) DeleteExpiredAuditEntries(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = DefaultPruneBatch
+	}
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM audit_log WHERE id IN (
+			SELECT id FROM audit_log WHERE created_at < ?
+			ORDER BY created_at ASC, id ASC LIMIT ?
+		)`, sqliteTimeString(cutoff.UTC()), limit)
+	if err != nil {
+		return 0, mapSQLiteErr(err)
+	}
+	return res.RowsAffected()
+}
+
+// RunAuditPruner deletes audit_log entries older than retention in batches
+// until ctx is cancelled. Non-positive retention is a no-op so audit records
+// are kept indefinitely unless AUDIT_RETENTION is explicitly set.
+func RunAuditPruner(ctx context.Context, st AuditPruner, retention, interval time.Duration, batch int, log *slog.Logger) {
+	if retention <= 0 {
+		return
+	}
+	if batch <= 0 {
+		batch = DefaultPruneBatch
+	}
+	if interval <= 0 {
+		interval = DefaultPruneInterval
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	log.Info("audit retention pruner started",
+		"retention", retention.String(),
+		"interval", interval.String(),
+		"batch", batch,
+	)
+
+	pruneOnce := func() {
+		cutoff := time.Now().UTC().Add(-retention)
+		var deleted int64
+		for {
+			n, err := st.DeleteExpiredAuditEntries(ctx, cutoff, batch)
+			if err != nil {
+				log.Error("audit retention prune failed", "error", err, "cutoff", cutoff)
+				return
+			}
+			deleted += n
+			if n < int64(batch) {
+				break
+			}
+		}
+		log.Info("audit retention prune", "deleted", deleted, "cutoff", cutoff)
+	}
+
+	pruneOnce()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("audit retention pruner stopped")
 			return
 		case <-t.C:
 			pruneOnce()

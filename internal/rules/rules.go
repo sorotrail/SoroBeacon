@@ -10,6 +10,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -76,6 +78,29 @@ func RuleID(ctx context.Context) int64 {
 	return id
 }
 
+// ruleVersionKey carries the rule revision under evaluation in the context.
+type ruleVersionKey struct{}
+
+// WithRuleVersion returns a context carrying the revision of the rule under
+// evaluation, so stateful evaluators can detect rule changes and reset any
+// cached state from a previous version.
+func WithRuleVersion(ctx context.Context, version int) context.Context {
+	return context.WithValue(ctx, ruleVersionKey{}, version)
+}
+
+// RuleVersion returns the rule version carried by ctx, or 0 when none is set.
+func RuleVersion(ctx context.Context) int {
+	v, _ := ctx.Value(ruleVersionKey{}).(int)
+	return v
+}
+
+// StatefulRuleEvaluator is implemented by evaluators that maintain in-memory
+// state keyed by rule ID, so the registry can clear that state when a rule is
+// updated, disabled, or deleted.
+type StatefulRuleEvaluator interface {
+	ResetRule(ruleID int64)
+}
+
 // EventNamer is implemented by evaluators that can name the events they
 // match. The poller uses it to compile server-side getEvents topic filters,
 // which is purely a bandwidth optimisation: client-side evaluation stays the
@@ -97,11 +122,17 @@ type EventNamer interface {
 // the API validating params, the dashboard listing types — do not have to know
 // the difference; only the poller does, via Absence.
 type Registry struct {
-	evaluators map[string]RuleEvaluator
-	absences   map[string]AbsenceEvaluator
+	mu                  sync.RWMutex
+	evaluators          map[string]RuleEvaluator
+	absences            map[string]AbsenceEvaluator
 	// telemetry is optional tracing; a nil Registry.telemetry (tests construct
 	// registries directly) just means no spans.
-	telemetry *telemetry.Provider
+	telemetry           *telemetry.Provider
+	evalTimeout         time.Duration
+	quarantineThreshold int
+	isolation           map[int64]*ruleIsolationEntry
+	quarantineHook      QuarantineTransitionFunc
+	evalObserver        func(context.Context, EvalObservation)
 }
 
 // WithTelemetry attaches tracing to every evaluation this registry runs.
@@ -116,8 +147,11 @@ func (r *Registry) WithTelemetry(t *telemetry.Provider) *Registry {
 // NewRegistry returns a Registry with the built-in rule types registered.
 func NewRegistry() *Registry {
 	r := &Registry{
-		evaluators: map[string]RuleEvaluator{},
-		absences:   map[string]AbsenceEvaluator{},
+		evaluators:          map[string]RuleEvaluator{},
+		absences:            map[string]AbsenceEvaluator{},
+		evalTimeout:         DefaultEvalTimeout,
+		quarantineThreshold: DefaultQuarantineThreshold,
+		isolation:           map[int64]*ruleIsolationEntry{},
 	}
 	r.Register(TypeEventEmitted, EventEmitted{})
 	r.Register(TypeValueThreshold, ValueThreshold{})
@@ -136,6 +170,7 @@ func NewRegistry() *Registry {
 	r.Register(TypeTopicRegex, &TopicRegex{})
 	r.Register(TypeAddressWatchlist, &AddressWatchlist{})
 	r.Register(TypeTopicPosition, TopicPosition{})
+	r.Register(TypeBaselineDeviation, NewBaselineDeviation())
 	r.RegisterAbsence(TypeAbsenceOfEvent, Absence{})
 	return r
 }
@@ -172,10 +207,12 @@ func (r *Registry) Types() []string {
 	return out
 }
 
-// Evaluate runs the evaluator registered for ruleType.
+// Evaluate runs the evaluator registered for ruleType inside the per-rule
+// isolation boundary (timeout, panic recovery, atomic state rollback, and
+// quarantine tracking).
 func (r *Registry) Evaluate(ctx context.Context, ruleType string, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error) {
 	ctx, span := r.startEvalSpan(ctx, ruleType, ev)
-	matched, err := r.evaluate(ctx, ruleType, ev, params)
+	matched, err := r.evaluateIsolated(ctx, ruleType, ev, params)
 	if err != nil {
 		telemetry.RecordError(span, err)
 	}
@@ -260,7 +297,10 @@ func (r *Registry) Validate(ruleType string, params json.RawMessage) error {
 			if err := a.Validate(params); err != nil {
 				return err
 			}
-			_, err := ParseCooldown(params)
+			if _, err := ParseCooldown(params); err != nil {
+				return err
+			}
+			_, _, err := ParseGuidance(params)
 			return err
 		}
 		return fmt.Errorf("unknown rule type %q (registered: %v)", ruleType, r.Types())
@@ -268,9 +308,12 @@ func (r *Registry) Validate(ruleType string, params json.RawMessage) error {
 	if err := e.Validate(params); err != nil {
 		return err
 	}
-	// The cooldown applies to every rule type, so it is validated once here
-	// rather than duplicated in each evaluator's Validate.
-	_, err := ParseCooldown(params)
+	// The cooldown and guidance fields apply to every rule type, so they are
+	// validated once here rather than duplicated in each evaluator's Validate.
+	if _, err := ParseCooldown(params); err != nil {
+		return err
+	}
+	_, _, err := ParseGuidance(params)
 	return err
 }
 
@@ -348,4 +391,18 @@ func (r *Registry) DryRun(ctx context.Context, ruleType string, events []*stella
 		}
 	}
 	return matches, nil
+}
+
+// ResetRuleState clears any in-memory state and quarantine strikes held for
+// ruleID. Safe to call on a nil receiver.
+func (r *Registry) ResetRuleState(ruleID int64) {
+	if r == nil || ruleID == 0 {
+		return
+	}
+	for _, e := range r.evaluators {
+		if sr, ok := e.(StatefulRuleEvaluator); ok {
+			sr.ResetRule(ruleID)
+		}
+	}
+	r.clearIsolationState(context.Background(), ruleID)
 }

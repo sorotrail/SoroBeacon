@@ -1,4 +1,4 @@
-.PHONY: build run test test-db test-race vulncheck cover lint fmt up down clean migrate-new bench
+.PHONY: build build-tf run test test-db test-race vulncheck cover lint fmt up down clean migrate-new bench verify-reproducible
 
 MIGRATIONS_DIR := internal/store/migrations
 # SQLite keeps its own DDL at the same version numbers; migrate-new scaffolds
@@ -12,24 +12,23 @@ SQLITE_MIGRATIONS_DIR := internal/store/migrations/sqlite
 TF_DIR := terraform-provider-sorobeacon
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
-DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+COMMIT  ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo none)
+# Derive DATE deterministically from the commit timestamp (or SOURCE_DATE_EPOCH
+# when set) rather than the wall clock (`date -u`) so two builds of the same
+# commit on different hosts or at different times produce byte-for-byte
+# identical binaries while still stamping /api/v1/version.
+SOURCE_DATE_EPOCH ?= $(shell git show -s --format=%ct HEAD 2>/dev/null || echo 0)
+DATE ?= $(shell TZ=UTC git show -s --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ HEAD 2>/dev/null || echo 1970-01-01T00:00:00Z)
 
-TF_DIR := terraform-provider-sorobeacon
+GO_BUILD_FLAGS ?= -trimpath -buildvcs=false
+LDFLAGS ?= -s -w -buildid= -X github.com/sorotrail/sorobeacon/internal/buildinfo.Version=$(VERSION) -X github.com/sorotrail/sorobeacon/internal/buildinfo.Commit=$(COMMIT) -X github.com/sorotrail/sorobeacon/internal/buildinfo.Date=$(DATE)
+TF_LDFLAGS ?= -s -w -buildid=
 
 build:
-	go build -ldflags "-X github.com/sorotrail/sorobeacon/internal/buildinfo.Version=$(VERSION) -X github.com/sorotrail/sorobeacon/internal/buildinfo.Commit=$(COMMIT) -X github.com/sorotrail/sorobeacon/internal/buildinfo.Date=$(DATE)" -o bin/sorobeacon ./cmd/sorobeacon
+	CGO_ENABLED=0 go build $(GO_BUILD_FLAGS) -ldflags "$(LDFLAGS)" -o bin/sorobeacon ./cmd/sorobeacon
 
-build-tf:
-	cd $(TF_DIR) && go build -o ../bin/terraform-provider-sorobeacon ./...
-
-test-tf:
-	cd $(TF_DIR) && go test ./...
-\lint-tf:
-	cd $(TF_DIR) && golangci-lint run
-
-tidy-tf:
-	cd $(TF_DIR) && go mod tidy
+verify-reproducible:
+	./scripts/verify-reproducible-build.sh
 
 run: build
 	./bin/sorobeacon
@@ -104,7 +103,7 @@ fmt:
 # result is reproducible on a laptop. The binary lands beside the server's in
 # bin/ rather than next to the provider source.
 build-tf:
-	cd $(TF_DIR) && go build -o ../bin/terraform-provider-sorobeacon .
+	cd $(TF_DIR) && CGO_ENABLED=0 go build $(GO_BUILD_FLAGS) -ldflags "$(TF_LDFLAGS)" -o ../bin/terraform-provider-sorobeacon .
 
 test-tf:
 	cd $(TF_DIR) && go test ./... -count=1

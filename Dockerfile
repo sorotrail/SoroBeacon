@@ -1,4 +1,5 @@
 FROM golang:1.27-alpine AS build
+RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -9,17 +10,29 @@ ARG VERSION=dev
 ARG COMMIT=none
 ARG DATE=unknown
 RUN CGO_ENABLED=0 go build \
-    -ldflags "-X github.com/sorotrail/sorobeacon/internal/buildinfo.Version=${VERSION} -X github.com/sorotrail/sorobeacon/internal/buildinfo.Commit=${COMMIT} -X github.com/sorotrail/sorobeacon/internal/buildinfo.Date=${DATE}" \
-    -o /out/sorobeacon ./cmd/sorobeacon
+    -trimpath \
+    -buildvcs=false \
+    -ldflags "-s -w -buildid= -X github.com/sorotrail/sorobeacon/internal/buildinfo.Version=${VERSION} -X github.com/sorotrail/sorobeacon/internal/buildinfo.Commit=${COMMIT} -X github.com/sorotrail/sorobeacon/internal/buildinfo.Date=${DATE}" \
+    -o /out/sorobeacon ./cmd/sorobeacon \
+    && printf 'sorobeacon:x:10001:10001:SoroBeacon:/nonexistent:/sbin/nologin\n' > /out/passwd \
+    && printf 'sorobeacon:x:10001:\n' > /out/group \
+    && mkdir -p -m 0750 /out/tmp
 
-FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
-RUN adduser -D -H sorobeacon && apk add --no-cache ca-certificates
-USER sorobeacon
+# Hardened runtime stage: FROM scratch carries only the statically linked
+# binary, root CA bundle, timezone database, and minimal non-root passwd/group
+# entries. No shell (/bin/sh), no package manager (apk), and no external
+# network utilities (wget, curl).
+FROM scratch
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=build /out/passwd /etc/passwd
+COPY --from=build /out/group /etc/group
+COPY --from=build --chown=10001:10001 /out/tmp /tmp
 COPY --from=build /out/sorobeacon /usr/local/bin/sorobeacon
+# Numeric UID/GID so Kubernetes can enforce runAsNonRoot without resolving a
+# username inside the container. Matches deploy/helm/sorobeacon/values.yaml.
+USER 10001:10001
 EXPOSE 8080
-# wget is busybox's, present in the base alpine image; -q -O- discards the
-# body and relies on wget's own exit code, which is non-zero on anything
-# but a 2xx response.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -q -O- http://localhost:8080/api/v1/health || exit 1
-ENTRYPOINT ["sorobeacon"]
+    CMD ["/usr/local/bin/sorobeacon", "healthcheck"]
+ENTRYPOINT ["/usr/local/bin/sorobeacon"]

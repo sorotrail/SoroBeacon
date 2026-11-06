@@ -236,3 +236,27 @@ groups:
           summary: "A notification channel accepts deliveries but alerts are never acknowledged"
           description: "Channel has accepted deliveries but 0 alerts have been acknowledged within the evaluation window."
           runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconchannelneveracknowledged"
+
+      - alert: SoroBeaconAlertPartitionRunwayLow
+        expr: sorobeacon_alert_partition_runway_months < 2
+        for: 15m
+        labels:
+          severity: ticket
+          component: store
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "PostgreSQL alert partition runway is below 2 future months"
+          description: "Fewer than 2 future monthly alert partitions exist beyond the current UTC month. Investigate automated partition creation before the next month boundary."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconalertpartitionrunwaylow"
+
+      - alert: SoroBeaconAlertPartitionMaintenanceFailed
+        expr: sum(increase(sorobeacon_alert_partition_errors_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: ticket
+          component: store
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "Automated PostgreSQL alert partition maintenance encountered an error"
+          description: "One or more alert partition creation, inspection, or drop operations failed in the last 15 minutes."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconalertpartitionmaintenancefailed"

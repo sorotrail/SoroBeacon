@@ -23,6 +23,11 @@
       "post": {
         "description": "Required role: editor",
         "summary": "Create a monitor",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -1980,6 +1985,514 @@
         }
       }
     },
+    "/usage": {
+      "get": {
+        "summary": "Per-workspace usage metering summary",
+        "description": "Returns durable per-period usage rollups (alerts raised, rule evaluations, notifications by channel type and outcome, API requests) and live stored row counts. Scoped to the caller's workspace for workspace-bound credentials, or available across workspaces to an unrestricted operator.",
+        "parameters": [
+          {
+            "name": "workspace",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workspace usage summary and per-period rollups",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/quotas": {
+      "get": {
+        "summary": "Per-workspace resource quotas and query cost budget status",
+        "description": "Returns configured resource quotas (monitors, rules, channels, SSE subscriptions), live resource usage, and query cost budget status for the workspace.",
+        "parameters": [
+          {
+            "name": "workspace",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workspace quota and query cost budget status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "summary": "Configure per-workspace resource quotas and query cost budget",
+        "description": "Updates resource quotas (max_monitors, max_rules, max_channels, max_subscriptions) and query cost budget (query_cost_budget, query_cost_refill_per_sec) for a workspace.",
+        "parameters": [
+          {
+            "name": "workspace",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "workspace_id": {
+                    "type": "string"
+                  },
+                  "max_monitors": {
+                    "type": "integer"
+                  },
+                  "max_rules": {
+                    "type": "integer"
+                  },
+                  "max_channels": {
+                    "type": "integer"
+                  },
+                  "max_subscriptions": {
+                    "type": "integer"
+                  },
+                  "query_cost_budget": {
+                    "type": "number"
+                  },
+                  "query_cost_refill_per_sec": {
+                    "type": "number"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated workspace quota and query cost budget status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/workspaces/{id}": {
+      "delete": {
+        "summary": "Delete a workspace and everything belonging to it (or preview via dry-run)",
+        "description": "Permanently deletes a workspace and all tenant-owned monitors, rules, channels, signing keys, alerts, delivery attempts, dead letters, escalations, maintenance windows, backfills, saved searches, templates, API tokens, usage rollups, quotas, and idempotency keys. Requires confirm={id} unless dry_run=true.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "confirm",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "batch_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "max_alert_batches",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "X-Confirm-Workspace",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workspace deletion result or dry-run preview counts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Bounded deletion batch completed; additional alert batches remain",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/workspaces/{id}/delete": {
+      "get": {
+        "summary": "Inspect workspace deletion progress or completion tombstone",
+        "description": "Returns the persisted status and row counts for an in-progress or completed workspace deletion (or a read-only preview when dry_run=true).",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workspace deletion progress or tombstone",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "summary": "Delete a workspace and everything belonging to it (or preview via dry-run)",
+        "description": "Permanently deletes a workspace and all tenant-owned data, or returns a read-only count preview when dry_run=true. Requires confirm matching the target workspace ID when dry_run is false.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Confirm-Workspace",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "dry_run": {
+                    "type": "boolean"
+                  },
+                  "confirm": {
+                    "type": "string"
+                  },
+                  "batch_size": {
+                    "type": "integer"
+                  },
+                  "max_alert_batches": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Workspace deletion result or dry-run preview counts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Bounded deletion batch completed; additional alert batches remain",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/workspace/export": {
+      "get": {
+        "summary": "Stream a single-workspace data export for the caller's workspace",
+        "description": "Exports all tenant-owned configuration, operational state, and (optionally) alert history belonging to the authenticated workspace as a versioned, deterministic JSON bundle or NDJSON stream. Secrets are redacted by default unless include_secrets=true is supplied.",
+        "parameters": [
+          {
+            "name": "workspace",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "include_secrets",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "include_alerts",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "json",
+                "ndjson"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Streamed workspace export bundle (JSON or NDJSON)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/workspaces/{id}/export": {
+      "get": {
+        "summary": "Stream a single-workspace data export by workspace ID",
+        "description": "Exports all tenant-owned configuration, operational state, and (optionally) alert history belonging to the named workspace as a versioned, deterministic JSON bundle or NDJSON stream. Only credentials belonging to {id} or an instance operator with cross-workspace privileges may call this endpoint.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "include_secrets",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "include_alerts",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "json",
+                "ndjson"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Streamed workspace export bundle (JSON or NDJSON)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/stats/alerts-daily": {
       "get": {
         "summary": "Daily alert counts for the last 30 UTC days",
@@ -2790,6 +3303,44 @@
           }
         }
       }
+    },
+    "/retention": {
+      "get": {
+        "summary": "Get effective workspace alert retention policy",
+        "description": "Required role: viewer. Returns the workspace's effective alert retention policy, its policy_source (workspace, instance, or unset), and the current pruned_before horizon.",
+        "responses": {
+          "200": {
+            "description": "Workspace retention policy summary"
+          }
+        }
+      },
+      "put": {
+        "summary": "Set workspace alert retention policy override",
+        "description": "Required role: admin. Configures a per-workspace alert retention override. Shortening an active retention window requires confirm_shorten=true.",
+        "responses": {
+          "200": {
+            "description": "Updated workspace retention policy summary"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Reset workspace alert retention policy to instance default",
+        "description": "Required role: admin. Deletes the workspace's retention override so it falls back to the instance-wide ALERT_RETENTION default. If resetting shortens effective retention, confirm_shorten=true is required.",
+        "responses": {
+          "200": {
+            "description": "Effective workspace retention policy after reset"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -2826,6 +3377,72 @@
         "schema": {
           "type": "integer",
           "format": "int64"
+        }
+      },
+      "Query": {
+        "name": "q",
+        "in": "query",
+        "description": "Case-insensitive substring match against the monitor name",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "Enabled": {
+        "name": "enabled",
+        "in": "query",
+        "description": "Tri-state: omitted = all, true = enabled only, false = disabled only",
+        "schema": {
+          "type": "boolean"
+        }
+      },
+      "Sort": {
+        "name": "sort",
+        "in": "query",
+        "description": "Allowlisted order: name (default), id (newest first), created_at",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "name",
+            "id",
+            "created_at"
+          ],
+          "default": "name"
+        }
+      },
+      "Network": {
+        "name": "network",
+        "in": "query",
+        "description": "Only monitors watching this Stellar chain. Omitted means every chain this instance polls.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "Limit": {
+        "name": "limit",
+        "in": "query",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "default": 50
+        }
+      },
+      "Cursor": {
+        "name": "cursor",
+        "in": "query",
+        "description": "Opaque continuation cursor from a previous page",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": false,
+        "description": "Optional client-generated idempotency key (up to 255 characters) for safe retries on write endpoints (POST, PUT, PATCH, DELETE). Scoped to the caller's workspace and retained for 24 hours. Repeating the same key with the same method, path, and body replays the original HTTP status code and response body with Idempotency-Replayed: true; reusing the key with a different method, path, or body returns 409 CONFLICT.",
+        "schema": {
+          "type": "string",
+          "maxLength": 255
         }
       }
     },
@@ -3352,9 +3969,6 @@
               "webhook",
               "ntfy"
             ]
-          },
-          "config": {
-            "type": "object"
           },
           "enabled": {
             "type": "boolean"
@@ -4046,6 +4660,145 @@
           "note": {
             "type": "string",
             "description": "Corpus bias and window documentation"
+          }
+        }
+      },
+      "TokenInput": {
+        "type": "object",
+        "required": [
+          "name",
+          "scopes"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "expires_in": {
+            "type": "string",
+            "description": "Go duration string (e.g. 168h); omit for a token that never expires"
+          }
+        }
+      },
+      "APIToken": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "prefix",
+          "scopes",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "prefix": {
+            "type": "string"
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_used_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "revoked_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "rotated_from_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "successor_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "rotated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CreatedAPIToken": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "prefix",
+          "scopes",
+          "created_at",
+          "token"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "prefix": {
+            "type": "string"
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_used_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "revoked_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "rotated_from_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "successor_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "rotated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "token": {
+            "type": "string",
+            "description": "Plaintext token secret, returned only once on creation or rotation"
           }
         }
       }

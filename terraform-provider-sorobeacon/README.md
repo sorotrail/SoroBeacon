@@ -71,11 +71,14 @@ terraform import sorobeacon_rule.transfer 42/15   # monitor_id/rule_id
 
 ## Resources
 
-| Resource                | Description                  |
-|-------------------------|------------------------------|
-| `sorobeacon_monitor`    | A contract event monitor     |
-| `sorobeacon_rule`       | A rule on a monitor          |
-| `sorobeacon_channel`    | A notification channel       |
+| Resource                        | Description                              |
+|---------------------------------|------------------------------------------|
+| `sorobeacon_monitor`            | A contract event monitor                 |
+| `sorobeacon_rule`               | A rule on a monitor                      |
+| `sorobeacon_channel`            | A notification channel                   |
+| `sorobeacon_escalation_policy`  | A tiered escalation policy on a monitor  |
+| `sorobeacon_maintenance_window` | A scheduled maintenance silence window   |
+| `sorobeacon_inhibition`         | An alert inhibition pair between rules   |
 
 ## Data Sources
 

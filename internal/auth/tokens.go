@@ -191,9 +191,9 @@ func SplitScopes(s string) []Scope {
 // the plaintext exists only inside Mint's return value, so no code path here can
 // hand it to a log line or a response body by accident.
 type Token struct {
-	ID                   int64
-	Name                 string
-	Prefix               string
+	ID     int64
+	Name   string
+	Prefix string
 	// Hash is the hex SHA-256 of the secret. Never serialised.
 	Hash string `json:"-"`
 	// Workspace is the tenant the token belongs to, read from its row. The
@@ -237,6 +237,12 @@ func (t *Token) Live(now time.Time) bool {
 // acts on, and what it is allowed to do there.
 type Principal struct {
 	Workspace workspace.ID
+	// Role is the resolved role for this caller (e.g. from a static token,
+	// session, or OIDC claim/group mapping).
+	Role Role
+	// Grants holds all (Workspace, Role) pairs resolved for a multi-group OIDC
+	// identity, in declared mapping order with highest role per workspace.
+	Grants []WorkspaceGrant
 	// restricted is true for a database token, for which scopes is the whole
 	// grant. It is a flag rather than "scopes is nil" because the list is
 	// stored as a comma-separated string: a token minted with no scopes
@@ -249,6 +255,41 @@ type Principal struct {
 	// Name is the token's label, for log lines that identify *which* credential
 	// was used without containing any part of it.
 	Name string
+	// ActorType classifies the caller for administrative audit records
+	// ("person" vs "automation").
+	ActorType string
+}
+
+// EffectiveActorType returns the caller's actor classification ("person" or
+// "automation"), defaulting to "automation" for restricted tokens and "person"
+// otherwise.
+func (p *Principal) EffectiveActorType() string {
+	if p == nil {
+		return "anonymous"
+	}
+	if p.ActorType != "" {
+		return p.ActorType
+	}
+	if p.restricted {
+		return "automation"
+	}
+	return "person"
+}
+
+// RoleInWorkspace reports the role granted to this principal in ws, if any.
+func (p *Principal) RoleInWorkspace(ws workspace.ID) (Role, bool) {
+	if p == nil {
+		return RoleUnknown, false
+	}
+	for _, g := range p.Grants {
+		if g.Workspace == ws {
+			return g.Role, true
+		}
+	}
+	if p.Workspace == ws && p.Role != RoleUnknown {
+		return p.Role, true
+	}
+	return RoleUnknown, false
 }
 
 // Allowed reports whether this caller may perform the action a route asks for.
@@ -452,6 +493,7 @@ func principalFor(t *Token) *Principal {
 		scopes:     t.Scopes,
 		tokenID:    t.ID,
 		Name:       t.Name,
+		ActorType:  "automation",
 	}
 }
 

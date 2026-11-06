@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log/slog"
 	"strings"
 	"text/template"
@@ -71,6 +72,12 @@ type Alert struct {
 	// from a local one in the channels that key on the alert's identity: a
 	// forwarded alert has no local rule id to key on.
 	FederationOrigin string `json:"federation_origin,omitempty"`
+	// RunbookURL is the resolved http/https runbook link for this alert
+	// (rule -> monitor -> workspace default).
+	RunbookURL string `json:"runbook_url,omitempty"`
+	// ResponseGuidance is the resolved triage instruction note for this alert
+	// (rule -> monitor -> workspace default).
+	ResponseGuidance string `json:"response_guidance,omitempty"`
 }
 
 // Notifier sends one alert to one destination. Implementations should
@@ -241,6 +248,10 @@ Ledger: {{.Ledger}}{{end}}
 Tx: {{.TxHash}}{{end}}
 Event ID: {{.EventID}}
 At: {{.CreatedAt.UTC.Format "2006-01-02 15:04:05"}} UTC
+{{- if .RunbookURL}}
+Runbook: {{.RunbookURL}}{{end}}
+{{- if .ResponseGuidance}}
+Guidance: {{.ResponseGuidance}}{{end}}
 {{- if gt .GroupCount 0}}
 Group: {{.GroupCount}} alert(s) in window {{.WindowStart.UTC.Format "2006-01-02T15:04:05Z"}} to {{.WindowEnd.UTC.Format "2006-01-02T15:04:05Z"}}
 {{- end}}
@@ -350,6 +361,56 @@ type channelTemplate struct {
 	tpl *template.Template
 }
 
+// EscapeSlackMrkdwn escapes &, <, and > per Slack's mrkdwn rules so untrusted
+// or operator-provided text cannot inject <!channel> mentions or link syntax.
+func EscapeSlackMrkdwn(s string) string {
+	r := strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+	)
+	return r.Replace(s)
+}
+
+// EscapeHTML escapes &, <, >, ", and ' for safe embedding in HTML bodies.
+func EscapeHTML(s string) string {
+	return html.EscapeString(s)
+}
+
+// EscapeJSONString returns s escaped as a JSON string body without surrounding
+// double quotes, suitable for interpolation inside a JSON template literal.
+func EscapeJSONString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil || len(b) < 2 {
+		return ""
+	}
+	return string(b[1 : len(b)-1])
+}
+
+// EscapeMarkdown escapes common Markdown formatting and link-control characters.
+func EscapeMarkdown(s string) string {
+	r := strings.NewReplacer(
+		`\`, `\\`,
+		"`", "\\`",
+		"*", `\*`,
+		"_", `\_`,
+		"[", `\[`,
+		"]", `\]`,
+		"(", `\(`,
+		")", `\)`,
+		"<", `&lt;`,
+		">", `&gt;`,
+	)
+	return r.Replace(s)
+}
+
+var channelTemplateFuncs = template.FuncMap{
+	"slackEscape":    EscapeSlackMrkdwn,
+	"htmlEscape":     EscapeHTML,
+	"jsonEscape":     EscapeJSONString,
+	"markdownEscape": EscapeMarkdown,
+}
+
 // parseChannelTemplate compiles a channel's optional template. An empty (or
 // whitespace-only) string means no override. The error wraps the parser's
 // message so the API can return it to the operator.
@@ -357,7 +418,7 @@ func parseChannelTemplate(raw string) (channelTemplate, error) {
 	if strings.TrimSpace(raw) == "" {
 		return channelTemplate{}, nil
 	}
-	tpl, err := template.New("alert").Parse(raw)
+	tpl, err := template.New("alert").Funcs(channelTemplateFuncs).Parse(raw)
 	if err != nil {
 		return channelTemplate{}, fmt.Errorf("invalid template: %w", err)
 	}

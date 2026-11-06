@@ -76,7 +76,15 @@ column; see [Channel config encryption](#channel-config-encryption).
 
 | Variable | Type | Default | Required | What it does |
 | --- | --- | --- | --- | --- |
+| `CONFIG_FILE` | file path | empty (environment only) | optional | Optional YAML configuration file whose keys supply defaults beneath environment variables. Malformed or unreadable files fail startup without echoing secret values. |
 | `DATABASE_URL` | URL string | _(none)_ | **required** | Connection string whose scheme selects the backend. `postgres` / `postgresql` → a Postgres server (pgx pool), e.g. `postgres://user:pass@host:5432/sorobeacon?sslmode=disable`. `sqlite` → a single database file, e.g. `sqlite:///var/lib/sorobeacon/sorobeacon.db`, with no server to run. Load fails if it is empty; a Postgres URL must carry a host and a SQLite URL a file path. Errors never echo a password. |
+| `DATABASE_MAX_CONNS` | integer | `0` (pgx driver default) | optional | Maximum Postgres pool size (`MaxConns`). Must not be below `DATABASE_MIN_CONNS` when both are set; rejected on SQLite. |
+| `DATABASE_MIN_CONNS` | integer | `0` (pgx driver default) | optional | Minimum Postgres pool size (`MinConns`). Rejected on SQLite. |
+| `DATABASE_MAX_CONN_LIFETIME` | Go duration | `0s` (pgx driver default) | optional | Maximum lifetime of a connection in the Postgres pool (`MaxConnLifetime`). Rejected on SQLite. |
+| `DATABASE_MAX_CONN_IDLE_TIME` | Go duration | `0s` (pgx driver default) | optional | Maximum idle time of a connection in the Postgres pool (`MaxConnIdleTime`). Rejected on SQLite. |
+| `DATABASE_CONNECT_ATTEMPTS` | integer (`1`–`100`) | `0` (store default) | optional | Number of startup connection attempts to Postgres before giving up, including the first attempt. |
+| `DATABASE_CONNECT_DELAY` | Go duration | `0s` (store default) | optional | Base delay between startup connection attempts to Postgres; doubles after each failure with jitter. Must be greater than `0` when set. |
+| `REPLICA_DATABASE_URL` | URL string | empty (no replica) | optional | Postgres read-replica connection string used for read-only queries. Must differ from `DATABASE_URL`; rejected on SQLite. |
 
 ### SQLite backend
 
@@ -206,6 +214,10 @@ tenant data; only the rows you create through the API or dashboard are scoped.
 | `OIDC_SCOPES` | space- or comma-separated list | `openid profile email` | optional | Scopes to ask for. `openid` is always included, with or without it being written; `email` only matters when `OIDC_ALLOWED_DOMAINS` is set. |
 | `OIDC_WORKSPACE` | workspace id | `default` | optional | Which workspace a signed-in user lands in. Seeded into the workspace list at startup like a `WORKSPACE_TOKENS` entry, so the tenant exists before its first user arrives. |
 | `OIDC_WORKSPACE_CLAIM` | claim name | empty (no claim mapping) | optional | Read the workspace from this ID-token claim instead, for one instance serving several teams from one provider. A value outside `[a-z0-9_-]`, or a token without the claim, falls back to `OIDC_WORKSPACE` rather than becoming a workspace of its own. A tenant named this way is not in the `workspaces` registry — startup cannot know its names — which is harmless because the scoping predicate matches the `workspace_id` column directly and 0012 deliberately adds no foreign key to it. |
+| `OIDC_ROLE_CLAIM` | claim name | empty (`admin`) | optional | Read the session role (`viewer`, `editor` or `admin`) from this ID-token claim when `OIDC_GROUP_MAPPINGS` is not set. |
+| `OIDC_GROUP_CLAIM` | claim name | `groups` (when `OIDC_GROUP_MAPPINGS` is set) | optional | Name of the ID-token claim holding group memberships (supports top-level or dot-separated claim paths, string arrays or a single string). |
+| `OIDC_GROUP_MAPPINGS` | comma-separated `<group>=<workspace>:<role>` list | empty (group mapping off) | optional | Declarative mapping from provider group claims to a `(workspace, role)` pair. When set, group resolution is **fail-closed**: a token whose claims do not match any configured mapping is denied (`403 Forbidden` on the API, rejected on the OIDC callback) and never defaults to `OIDC_WORKSPACE` or `admin`. |
+| `OIDC_GROUP_CACHE_TTL` | Go duration | `5m` | optional | Bounded lifetime for cached OIDC group resolutions and session group grants before re-evaluation against reloaded mappings or the provider. Must be greater than 0. |
 | `OIDC_ALLOWED_DOMAINS` | comma- or space-separated list | empty (every account the provider admits) | optional | E-mail domain allow-list, compared case-insensitively after the ID token is verified. Refusing an account is deliberate configuration, not a default: a provider that only admits your own users needs no list. |
 | `OIDC_LOGIN_STATE_TTL` | Go duration | `10m` | optional | How long an unfinished login stays completable. A login in flight is a nonce, a PKCE verifier and a redirect target sitting in this process's memory, so this bounds how long they can wait to be used. Must be greater than 0. |
 
@@ -309,8 +321,9 @@ which network it is on and **refuses to start on a mismatch**.
 
 | Variable | Type | Default | Required | What it does |
 | --- | --- | --- | --- | --- |
-| `SOURCE_MODE` | enum | `rpc` | optional | `rpc` — poll a Stellar RPC node (standalone). `sorotrail` — read a [SoroTrail](https://github.com/sorotrail/SoroTrail) indexer (upstream). Any other value is a startup error. |
+| `SOURCE_MODE` | enum | `rpc` | optional | `rpc` — poll a Stellar RPC node (standalone). `sorotrail` — read a [SoroTrail](https://github.com/sorotrail/SoroTrail) indexer (upstream). `horizon` — read contract events from a Horizon server. Any other value is a startup error. |
 | `SOROTRAIL_URL` | URL string | _(none)_ | **required when `SOURCE_MODE=sorotrail`**; ignored in `rpc` mode | Base URL of the SoroTrail indexer. Load fails if this is empty in sorotrail mode. |
+| `HORIZON_URL` | URL string | _(none)_ | **required when `SOURCE_MODE=horizon`**; ignored otherwise | Base URL of the Horizon server when `SOURCE_MODE=horizon`. |
 | `NETWORK` | enum | `testnet` | optional | `testnet` \| `mainnet` \| `futurenet` \| `custom`. Selects the preset RPC endpoint and passphrase. |
 | `NETWORKS` | comma-separated list of `NETWORK` names | _(none — only `NETWORK` is polled)_ | optional | Poll several Stellar chains from one instance, primary first. Each chain after the first reads its own suffixed variables (`RPC_URL_MAINNET`, `RPC_URLS_MAINNET`, `NETWORK_PASSPHRASE_MAINNET`). See [Polling several networks](#polling-several-networks). |
 | `RPC_URL` | URL string | per `NETWORK` (testnet: `https://soroban-testnet.stellar.org`) | required when `NETWORK=custom`; optional override otherwise | Stellar RPC endpoint (JSON-RPC 2.0 over HTTP/HTTPS). Must be an absolute `http` or `https` URL when set. |
@@ -427,12 +440,22 @@ strands its alert history outside every filter.
 | `HTTP_MAX_BODY_BYTES` | integer (bytes) | `1048576` (1 MiB) | optional | Maximum accepted request body size for write endpoints (`POST`/`PATCH`/`PUT`). Bulk endpoints default to 10 MiB. Decompression (`gzip`/`deflate`) is bounded by decompressed size. |
 | `CORS_ALLOWED_ORIGINS` | comma-separated origins | empty (CORS disabled) | optional | Browser Origins allowed to call the API cross-origin. Empty disables CORS. The dashboard is same-origin and never needs this. Do not allow origins you do not control: whatever credential their users hold can act through their browser. |
 | `GRPC_ADDR` | listen address | empty (gRPC disabled) | optional | Bind address for the [gRPC API](reference/grpc.md). Empty binds nothing, so an existing deployment opens no new port until it opts in. Cleartext HTTP/2 only — there is no TLS option — so anything that can reach the port reads the traffic in the clear; terminate TLS in front of it. |
+| `RATE_LIMIT_RPS` | float | `0` (rate limiter off) | optional | Per-client API token-bucket refill rate (requests per second). `0` disables the limiter; negative, NaN or infinite values fail startup. |
+| `RATE_LIMIT_BURST` | integer | `ceil(RATE_LIMIT_RPS)` when `RATE_LIMIT_RPS > 0`, else `0` | optional | Per-client token-bucket burst capacity. Must be a non-negative integer. |
+| `RATE_LIMIT_TRUST_FORWARDED` | boolean | `false` | optional | Key rate-limit buckets by the first `X-Forwarded-For` address instead of `RemoteAddr`. Only enable behind a trusted proxy that overwrites the header. |
+| `GRAPHQL_PLAYGROUND` | boolean | `false` | optional | Serve the interactive GraphQL playground at `/graphql/playground`. Disabled by default for security. |
+| `GRAPHQL_MAX_DEPTH` | integer (`1`–`50`) | `10` | optional | Maximum allowed nesting depth for GraphQL queries. |
+| `GRAPHQL_MAX_COMPLEXITY` | integer (`1`–`10000`) | `1000` | optional | Maximum allowed query complexity score for GraphQL queries. |
+| `GRAPHQL_ALLOWLIST_ONLY` | boolean | `false` | optional | Require all executed GraphQL queries to match a registered persisted operation. |
 
 ## Polling
 
 | Variable | Type | Default | Required | What it does |
 | --- | --- | --- | --- | --- |
 | `POLL_INTERVAL` | Go duration | `5s` | optional | How often the poller calls `getEvents`. Parsed with `time.ParseDuration`. **Minimum `1s`** — a smaller value is a startup error. |
+| `READYZ_LAG_THRESHOLD` | uint32 (ledgers) | `0` (lag check disabled) | optional | Ledger lag threshold at which `GET /readyz` reports not ready. `0` disables the lag gate. |
+| `MONITOR_SILENT_AFTER` | Go duration | `24h` | optional | Duration since `last_matched_at` after which the dashboard marks a monitor as silent. Must be greater than `0`. |
+| `SHUTDOWN_GRACE_PERIOD` | Go duration | `30s` | optional | How long shutdown waits for in-flight alert deliveries to complete before persisting them as retries and exiting. Must be greater than `0`. |
 
 Only applies to `SOURCE_MODE=rpc` in practice (the standalone poller).
 Upstream (`sorotrail`) reads the indexer; this interval is still loaded
@@ -486,6 +509,7 @@ being fed (see the [metrics reference](reference/metrics.md)).
 | Variable | Type | Default | Required | What it does |
 | --- | --- | --- | --- | --- |
 | `ALERT_RETENTION` | duration or `<n>d` | empty (keep forever) | optional | How long alerts (and their delivery attempts) are kept. Unset keeps history forever, so an upgrade never starts deleting. On Postgres, retention first drops whole expired monthly partitions (effectively free) and then deletes the ragged edge in batches of 1000. |
+| `AUDIT_RETENTION` | duration or `<n>d` | empty (keep forever) | optional | How long administrative `audit_log` records are kept. Configured separately from `ALERT_RETENTION` so compliance trails and alert history can age on independent schedules. |
 | `ARCHIVE_URL` | URL or path | empty (archiving off) | optional | Where retention copies a batch of expired alerts before deleting them. A local directory path, `file://`, `dir://`, or `s3://bucket/prefix` (region from `?region=` or `AWS_REGION`; credentials from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`; `?endpoint=` for MinIO or a test server). A failed archive blocks that batch's delete, so nothing is dropped un-archived. Requires `ALERT_RETENTION` to have any effect. Archive objects are NDJSON, one alert per line, keyed by the batch's own id range so re-running is idempotent. |
 
 Archive objects contain only alert rows (contract id, event, payload, ledger); channel `config` — the webhook URLs, bot tokens and SMTP credentials — is never read by the archiver and can never appear in one.
@@ -578,6 +602,26 @@ when one is present.
 | Variable | Type | Default | Required | What it does |
 | --- | --- | --- | --- | --- |
 | `INSTANCE_NAME` | string | empty | optional | Stable identity for this deployment, stamped as the `origin` on every federated alert. It must be unique across instances that federate with each other. Empty is fine for a standalone instance, but creating a `federation` channel then fails with an actionable error; the process still starts. |
+
+## Mutual TLS (mTLS) and component TLS
+
+SoroBeacon supports TLS 1.2+ (preferring TLS 1.3) and mutual TLS (mTLS) across the HTTP API and dashboard, the gRPC server, the upstream SoroTrail client, and PostgreSQL connections. Certificates, private keys, and CA bundles are validated at startup (failing fast on mismatched, unreadable, or expired files) and hot-reloaded on `SIGHUP` without dropping active connections. The operational runbook for certificate generation, rotation, and principal mapping is in [Mutual TLS (mTLS) Operations](operations/mtls.md).
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `TLS_CERT_FILE` | file path | empty (HTTP plaintext) | optional | PEM-encoded server certificate chain served by the HTTP API, dashboard, and gRPC server. Must be paired with `TLS_KEY_FILE`. |
+| `TLS_KEY_FILE` | file path | empty | optional | PEM-encoded private key matching `TLS_CERT_FILE`. |
+| `TLS_CLIENT_CA_FILE` | file path | empty | optional | PEM-encoded CA bundle used to verify client certificates presented to the HTTP API and gRPC server. |
+| `TLS_CLIENT_AUTH` | enum | `none` (`require` when `TLS_CLIENT_CA_FILE` is set) | optional | Client certificate verification mode: `none` \| `request` \| `require`. |
+| `MTLS_PRINCIPAL_MAP` | comma-separated list | empty | optional | Maps verified client certificate identities (SPIFFE URI SANs, DNS SANs, email SANs, or `cn:<CommonName>`) to `<workspace>[:<role>]` (e.g. `spiffe://cluster.local/ns/prod/sa/ingestor=acme:editor,cn:ops=default:admin`). |
+| `SOROTRAIL_TLS_CERT_FILE` | file path | empty | optional | PEM-encoded client certificate presented when polling an upstream SoroTrail indexer over HTTPS. Must be paired with `SOROTRAIL_TLS_KEY_FILE`. |
+| `SOROTRAIL_TLS_KEY_FILE` | file path | empty | optional | PEM-encoded private key matching `SOROTRAIL_TLS_CERT_FILE`. |
+| `SOROTRAIL_TLS_CA_FILE` | file path | empty | optional | PEM-encoded root CA bundle used to verify the upstream SoroTrail server certificate. |
+| `SOROTRAIL_TLS_SERVER_NAME` | string | empty (derived from URL host) | optional | Optional SNI / server hostname override used when verifying the upstream SoroTrail certificate. |
+| `DATABASE_SSL_MODE` | enum | empty (URL query default) | optional | PostgreSQL SSL mode (`disable` \| `allow` \| `prefer` \| `require` \| `verify-ca` \| `verify-full`) applied to `DATABASE_URL` and `REPLICA_DATABASE_URL`. Rejected on SQLite. |
+| `DATABASE_SSL_CERT_FILE` | file path | empty | optional | PEM-encoded client certificate presented to PostgreSQL (`sslcert`). Must be paired with `DATABASE_SSL_KEY_FILE`. |
+| `DATABASE_SSL_KEY_FILE` | file path | empty | optional | PEM-encoded private key matching `DATABASE_SSL_CERT_FILE` (`sslkey`). |
+| `DATABASE_SSL_ROOT_CERT_FILE` | file path | empty | optional | PEM-encoded CA bundle used to verify the PostgreSQL server certificate (`sslrootcert`). |
 
 ## Channel health
 

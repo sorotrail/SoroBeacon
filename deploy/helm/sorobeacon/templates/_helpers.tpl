@@ -134,12 +134,16 @@ OIDC_ALLOWED_DOMAINS: {{ .Values.oidc.allowedDomains | quote }}
 OIDC_WORKSPACE: {{ .Values.oidc.workspace | quote }}
 OIDC_WORKSPACE_CLAIM: {{ .Values.oidc.workspaceClaim | quote }}
 OIDC_ROLE_CLAIM: {{ .Values.oidc.roleClaim | quote }}
+OIDC_GROUP_CLAIM: {{ .Values.oidc.groupClaim | quote }}
+OIDC_GROUP_MAPPINGS: {{ .Values.oidc.groupMappings | quote }}
+OIDC_GROUP_CACHE_TTL: {{ .Values.oidc.groupCacheTTL | quote }}
 OIDC_LOGIN_STATE_TTL: {{ .Values.oidc.loginStateTTL | quote }}
 RATE_LIMIT_RPS: {{ .Values.config.rateLimitRps | quote }}
 RATE_LIMIT_BURST: {{ .Values.config.rateLimitBurst | int64 | quote }}
 RATE_LIMIT_TRUST_FORWARDED: {{ .Values.config.rateLimitTrustForwarded | toString | quote }}
 CORS_ALLOWED_ORIGINS: {{ .Values.config.corsAllowedOrigins | quote }}
 ALERT_RETENTION: {{ .Values.config.alertRetention | quote }}
+AUDIT_RETENTION: {{ .Values.config.auditRetention | quote }}
 DATABASE_MAX_CONNS: {{ .Values.database.maxConns | int64 | quote }}
 DATABASE_MIN_CONNS: {{ .Values.database.minConns | int64 | quote }}
 DATABASE_MAX_CONN_LIFETIME: {{ .Values.database.maxConnLifetime | quote }}
@@ -165,4 +169,17 @@ SECRETS_PROVIDER: {{ .Values.secrets.provider | quote }}
 SECRETS_CACHE_TTL: {{ .Values.secrets.cacheTtl | quote }}
 VAULT_ADDR: {{ .Values.secrets.vaultAddr | quote }}
 VAULT_NAMESPACE: {{ .Values.secrets.vaultNamespace | quote }}
+TLS_CERT_FILE: {{ .Values.tls.certFile | quote }}
+TLS_KEY_FILE: {{ .Values.tls.keyFile | quote }}
+TLS_CLIENT_CA_FILE: {{ .Values.tls.clientCAFile | quote }}
+TLS_CLIENT_AUTH: {{ .Values.tls.clientAuth | quote }}
+MTLS_PRINCIPAL_MAP: {{ .Values.tls.principalMap | quote }}
+SOROTRAIL_TLS_CERT_FILE: {{ .Values.tls.sorotrailCertFile | quote }}
+SOROTRAIL_TLS_KEY_FILE: {{ .Values.tls.sorotrailKeyFile | quote }}
+SOROTRAIL_TLS_CA_FILE: {{ .Values.tls.sorotrailCAFile | quote }}
+SOROTRAIL_TLS_SERVER_NAME: {{ .Values.tls.sorotrailServerName | quote }}
+DATABASE_SSL_MODE: {{ .Values.database.sslMode | quote }}
+DATABASE_SSL_CERT_FILE: {{ .Values.database.sslCertFile | quote }}
+DATABASE_SSL_KEY_FILE: {{ .Values.database.sslKeyFile | quote }}
+DATABASE_SSL_ROOT_CERT_FILE: {{ .Values.database.sslRootCertFile | quote }}
 {{- end }}
