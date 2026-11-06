@@ -22,6 +22,7 @@ const (
 	storeReadsName         = "sorobeacon_store_reads_total"
 	storeFallbacksName     = "sorobeacon_store_replica_fallbacks_total"
 	replicaEnabledName     = "sorobeacon_store_replica_enabled"
+	replicaLagName         = "sorobeacon_store_replica_lag_seconds"
 	pollsName              = "sorobeacon_polls_total"
 	pollDurationName       = "sorobeacon_poll_duration_seconds"
 	pollLagName            = "sorobeacon_poll_lag_ledgers"
@@ -264,6 +265,16 @@ func TestSetReplicaEnabledTracksBothDirections(t *testing.T) {
 	assert.Equal(t, float64(0), m.sampleValue(t, replicaEnabledName, nil))
 }
 
+func TestSetReplicaLagTracksSecondsAndClampsNegative(t *testing.T) {
+	m := New()
+
+	require.Equal(t, float64(0), m.sampleValue(t, replicaLagName, nil))
+	m.SetReplicaLag(4.25)
+	assert.InDelta(t, 4.25, m.sampleValue(t, replicaLagName, nil), 0.0001)
+	m.SetReplicaLag(-1.5)
+	assert.Equal(t, float64(0), m.sampleValue(t, replicaLagName, nil))
+}
+
 // TestReadMetricsAreNilSafe pins the package contract that a nil *Metrics
 // records nothing rather than panicking. The store holds a *Metrics it was
 // handed without a nil check, so this is load-bearing for every embedder and
@@ -277,6 +288,7 @@ func TestReadMetricsAreNilSafe(t *testing.T) {
 		m.RecordReplicaFallback()
 		m.SetReplicaEnabled(true)
 		m.SetReplicaEnabled(false)
+		m.SetReplicaLag(1.5)
 	})
 }
 

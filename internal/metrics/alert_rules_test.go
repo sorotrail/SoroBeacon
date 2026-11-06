@@ -63,6 +63,7 @@ func TestExportedMetricNamesMatchesRegistryForAlerts(t *testing.T) {
 	m.RecordStoreRead("primary")
 	m.RecordReplicaFallback()
 	m.SetReplicaEnabled(true)
+	m.SetReplicaLag(0)
 	m.SetDeadLetters(0)
 	m.SetDeadLettersFor("default", "slack", 0)
 	m.RecordBodyRejection("max_body")

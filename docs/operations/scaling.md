@@ -156,6 +156,14 @@ What to expect:
 - **Readiness follows the primary only.** `/readyz` stays green while the
   replica is down, because the instance can still serve traffic through the
   fallback. Watch the replica with the metrics below instead of with readiness.
+- **Bounded staleness and cursor safety.** Replication lag is sampled from the
+  replica via `pg_last_xact_replay_timestamp()`. When observed lag exceeds the
+  configured bound (`DefaultMaxReplicaLag` = `30s`), routed reads automatically
+  fall back to the primary pool until the replica catches up. For keyset
+  pagination on `ListAlerts`, if a cursor ID minted against the primary has not
+  yet replicated to the replica, `ListAlerts` detects the missing cursor anchor
+  and replays the page against the primary so pagination never skips or
+  truncates rows.
 - **The replica must be at least as new as the primary's schema.** Migrations
   run against `DATABASE_URL`; a replica created from a base backup taken before
   a migration will answer routed queries with `column does not exist`, which is
@@ -166,10 +174,14 @@ Metrics on `/metrics`:
 - `sorobeacon_store_reads_total{pool="primary|replica"}` — where routed reads
   actually landed. If the `replica` series stays flat, routing is not happening.
 - `sorobeacon_store_replica_fallbacks_total` — reads that had to be replayed on
-  the primary. A steady rate means the replica is unreachable or too far behind
-  to be worth routing to.
+  the primary (because the replica was unreachable, exceeded the `30s` lag
+  bound, or lacked a newly minted pagination cursor anchor). A steady rate means
+  the replica is unreachable or too far behind to be worth routing to.
 - `sorobeacon_store_replica_enabled` — `1` when a replica is configured, `0`
   when everything reads from the primary.
+- `sorobeacon_store_replica_lag_seconds` — observed replication lag in seconds
+  on the read replica (`now() - pg_last_xact_replay_timestamp()`); `0` when no
+  replica is configured.
 
 ## Multi-instance deployment
 
