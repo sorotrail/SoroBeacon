@@ -104,6 +104,9 @@ func (p *SoroBeaconProvider) Resources(_ context.Context) []func() resource.Reso
 		NewMonitorResource,
 		NewRuleResource,
 		NewChannelResource,
+		NewEscalationPolicyResource,
+		NewMaintenanceWindowResource,
+		NewInhibitionResource,
 	}
 }
 
@@ -354,6 +357,17 @@ func (c *apiClient) create(ctx context.Context, path string, body any, result an
 
 func (c *apiClient) update(ctx context.Context, path string, body any, result any) error {
 	data, status, err := c.do(ctx, http.MethodPatch, path, body)
+	if err != nil {
+		return err
+	}
+	if status < 200 || status > 299 {
+		return decodeAPIError(status, data)
+	}
+	return json.Unmarshal(data, result)
+}
+
+func (c *apiClient) put(ctx context.Context, path string, body any, result any) error {
+	data, status, err := c.do(ctx, http.MethodPut, path, body)
 	if err != nil {
 		return err
 	}
