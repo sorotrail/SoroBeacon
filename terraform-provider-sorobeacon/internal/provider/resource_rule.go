@@ -51,7 +51,10 @@ func (r *RuleResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 			},
 			"monitor_id": schema.Int64Attribute{
 				Required:    true,
-				Description: "Parent monitor ID.",
+				Description: "Parent monitor ID. Changing this forces replacement.",
+				PlanModifiers: []planmodifier.Int64{
+					int64planmodifier.RequiresReplace(),
+				},
 			},
 			"type": schema.StringAttribute{
 				Required:    true,
