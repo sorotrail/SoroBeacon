@@ -73,6 +73,7 @@ type Metrics struct {
 	storeReads           *prometheus.CounterVec
 	storeFallbacks       prometheus.Counter
 	replicaEnabled       prometheus.Gauge
+	replicaLagSeconds    prometheus.Gauge
 	deadLetters          prometheus.Gauge
 	deadLettersByChannel *prometheus.GaugeVec
 	// heartbeatLastSuccess is the unix time of the last heartbeat ping that
@@ -254,6 +255,11 @@ func New() *Metrics {
 			Help: "1 when a read replica is configured and routing, 0 when every read goes to the primary.",
 		}),
 
+		replicaLagSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_store_replica_lag_seconds",
+			Help: "Observed replication lag in seconds on the Postgres read replica (from pg_last_xact_replay_timestamp); 0 when no replica is configured.",
+		}),
+
 		deadLetters: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "sorobeacon_dead_letters_total",
 			Help: "Current number of dead-lettered delivery attempts waiting for review or re-drive.",
@@ -356,7 +362,7 @@ func New() *Metrics {
 		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired, m.deliveries, m.throttles,
 		m.httpDuration, m.httpNotModifiedTotal, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
 		m.reorgsTotal, m.lastReorgLedger, m.breakerStates, m.pollPanics,
-		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.deadLetters, m.deadLettersByChannel, m.heartbeatLastSuccess,
+		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.replicaLagSeconds, m.deadLetters, m.deadLettersByChannel, m.heartbeatLastSuccess,
 		m.ruleEvalsTotal, m.ruleMatchesTotal, m.ruleErrorsTotal, m.ruleDuration, m.requestBodyRejectionsTotal,
 		m.databaseDegraded, m.databaseUnavailableTotal, m.channelUnackFlagged, m.channelUnackRate,
 		m.workspaceAlertsRaised, m.workspaceRuleEvaluations, m.workspaceNotifications, m.workspaceAPIRequests, m.workspaceStoredRows,
@@ -599,6 +605,19 @@ func (m *Metrics) SetReplicaEnabled(enabled bool) {
 		return
 	}
 	m.replicaEnabled.Set(0)
+}
+
+// SetReplicaLag records the latest sampled replication lag in seconds on the
+// Postgres read replica. Negative values (from minor clock skew between primary
+// and replica) are clamped to 0.
+func (m *Metrics) SetReplicaLag(seconds float64) {
+	if m == nil {
+		return
+	}
+	if seconds < 0 {
+		seconds = 0
+	}
+	m.replicaLagSeconds.Set(seconds)
 }
 
 // SetDeadLetters sets the current total number of dead letters.
@@ -850,6 +869,7 @@ func ExportedMetricNames() []string {
 		"sorobeacon_store_reads_total",
 		"sorobeacon_store_replica_fallbacks_total",
 		"sorobeacon_store_replica_enabled",
+		"sorobeacon_store_replica_lag_seconds",
 		"sorobeacon_dead_letters_total",
 		"sorobeacon_dead_letters",
 		"sorobeacon_alerts_stream_dropped_total",

@@ -61,6 +61,10 @@ type PoolSettings struct {
 	// ConnectDelay is the base delay between those attempts; it doubles
 	// after every failure, with jitter. Zero means DefaultConnectDelay.
 	ConnectDelay time.Duration
+	// MaxReplicaLag bounds how far behind the primary the read replica may
+	// drift (sampled via pg_last_xact_replay_timestamp) before routed reads
+	// fall back to the primary. Zero defaults to DefaultMaxReplicaLag (30s).
+	MaxReplicaLag time.Duration
 }
 
 // Postgres implements Store on top of a pgx connection pool.
@@ -71,6 +75,11 @@ type Postgres struct {
 	// write — runs on pool, which is the behaviour of every deployment that
 	// predates replica routing.
 	replica *pgxpool.Pool
+	// maxReplicaLag is the replica lag threshold beyond which routed reads
+	// fall back to the primary pool.
+	maxReplicaLag time.Duration
+	// replicaLagNanos stores the most recently sampled replica lag in nanoseconds.
+	replicaLagNanos atomic.Int64
 	// cipher encrypts and decrypts channels.config at rest. Nil (the
 	// default) keeps the pre-encryption plaintext behaviour.
 	cipher ConfigCipher
@@ -2440,7 +2449,23 @@ func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, erro
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, scanAlert)
+	alerts, err := pgx.CollectRows(rows, scanAlert)
+	if err != nil {
+		return nil, err
+	}
+	// If a cursor minted against the primary has not yet replicated to the
+	// replica, the subquery `(SELECT created_at, id FROM alerts WHERE id = $N)`
+	// returns NULL on the replica and produces an empty page. Detect when the
+	// cursor anchor is absent on the replica and replay the page on the primary
+	// so pagination never skips or truncates rows (#572).
+	if f.AfterID > 0 && len(alerts) == 0 && p.replica != nil && !p.replicaLagExceeded() {
+		if !p.cursorAnchorExistsOnReplica(ctx, f.AfterID) {
+			p.metrics.RecordStoreRead(poolPrimary)
+			p.metrics.RecordReplicaFallback()
+			return p.ListAlertsPrimary(ctx, f)
+		}
+	}
+	return alerts, nil
 }
 
 // ListAlertsPrimary is ListAlerts served by the primary, whatever
