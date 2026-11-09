@@ -5,7 +5,10 @@ metadata:
   labels:
     {{- include "sorobeacon.labels" . | nindent 4 }}
 spec:
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  minReadySeconds: {{ .Values.minReadySeconds | default 5 }}
   selector:
     matchLabels:
       {{- include "sorobeacon.selectorLabels" . | nindent 6 }}
@@ -27,6 +30,7 @@ spec:
       labels:
         {{- include "sorobeacon.selectorLabels" . | nindent 8 }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 60 }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -41,6 +45,10 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.worker.enabled }}
+          args:
+            - "--role=api"
+          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.service.targetPort }}
@@ -52,6 +60,10 @@ spec:
             - configMapRef:
                 name: {{ include "sorobeacon.fullname" . }}
           env:
+            {{- if .Values.worker.enabled }}
+            - name: WORKLOAD_ROLE
+              value: "api"
+            {{- end }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -158,9 +170,12 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- if .Values.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if and .Values.podAntiAffinity .Values.podAntiAffinity.enabled }}
+      affinity:
+        {{- include "sorobeacon.renderPodAntiAffinity" (dict "antiAffinity" .Values.podAntiAffinity "selectorLabels" (include "sorobeacon.selectorLabels" .)) | nindent 8 }}
       {{- end }}
       {{- with .Values.tolerations }}
       tolerations:

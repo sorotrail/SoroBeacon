@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sorotrail/sorobeacon/internal/config"
 	"github.com/sorotrail/sorobeacon/internal/sorotrail"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 )
@@ -227,4 +228,30 @@ func TestVerifySoroTrailEndpoint(t *testing.T) {
 			t.Fatalf("expected startup warning, got: %s", buf.String())
 		}
 	})
+}
+
+func TestParseServerRoleArgsAndLeaderRoleGating(t *testing.T) {
+	ok, role, err := parseServerRoleArgs([]string{"--role=api"})
+	if !ok || err != nil || role != "api" {
+		t.Fatalf("parseServerRoleArgs(--role=api) = (%v, %q, %v), want (true, \"api\", nil)", ok, role, err)
+	}
+	ok, role, err = parseServerRoleArgs([]string{"--role=worker"})
+	if !ok || err != nil || role != "worker" {
+		t.Fatalf("parseServerRoleArgs(--role=worker) = (%v, %q, %v), want (true, \"worker\", nil)", ok, role, err)
+	}
+	ok, _, _ = parseServerRoleArgs([]string{"monitor", "list"})
+	if ok {
+		t.Fatal("parseServerRoleArgs must not intercept CLI subcommands")
+	}
+
+	t.Setenv("WORKLOAD_ROLE", "api")
+	deps := defaultStartupDeps()
+	leader, err := deps.newLeader(config.Config{DatabaseURL: "postgres://user:pass@localhost:5432/db"}, slog.Default())
+	if err != nil {
+		t.Fatalf("newLeader(WORKLOAD_ROLE=api) failed: %v", err)
+	}
+	st := leader.Status()
+	if st.Leader || !st.Disabled || st.Role() != "api-only" {
+		t.Fatalf("api-only leader status = %+v (role %q), want Disabled=true and role=api-only", st, st.Role())
+	}
 }

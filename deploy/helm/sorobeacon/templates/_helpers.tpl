@@ -88,6 +88,44 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Labels for the dedicated background worker Deployment (worker.enabled=true).
+Deliberately distinct from sorobeacon.selectorLabels so the Service never
+routes external API or dashboard traffic to worker pods.
+*/}}
+{{- define "sorobeacon.workerSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "sorobeacon.name" . }}-worker
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: worker
+{{- end }}
+
+{{/*
+Renders podAntiAffinity for either the API Deployment or the Worker Deployment
+when podAntiAffinity.enabled is true and raw affinity is unset.
+Accepts a dict with "antiAffinity" and "selectorLabels".
+*/}}
+{{- define "sorobeacon.renderPodAntiAffinity" -}}
+{{- $aa := .antiAffinity -}}
+{{- $labels := .selectorLabels -}}
+{{- $topologyKey := default "kubernetes.io/hostname" $aa.topologyKey -}}
+podAntiAffinity:
+  {{- if eq (default "soft" $aa.type) "hard" }}
+  requiredDuringSchedulingIgnoredDuringExecution:
+    - topologyKey: {{ $topologyKey }}
+      labelSelector:
+        matchLabels:
+          {{- $labels | nindent 10 }}
+  {{- else }}
+  preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        topologyKey: {{ $topologyKey }}
+        labelSelector:
+          matchLabels:
+            {{- $labels | nindent 12 }}
+  {{- end }}
+{{- end }}
+
+{{/*
 sorobeacon.configData is the application's non-secret configuration as
 ConfigMap data. It is defined once and included by both the release ConfigMap
 and the migration hook's own ConfigMap, so the two cannot drift: adding a new

@@ -357,6 +357,45 @@ func TestSingleNodeRunsTheJobWithoutElection(t *testing.T) {
 	}
 }
 
+func TestDisabledServesWithoutElectionOrPolling(t *testing.T) {
+	l := Disabled(testLogger())
+	job := &jobRecorder{}
+	cancel, done := runLease(t, l, job.run)
+
+	st := l.Status()
+	if st.Leader || !st.Enabled || !st.Disabled {
+		t.Fatalf("disabled lease status = %+v, want Enabled=true, Disabled=true, Leader=false", st)
+	}
+	if role := st.Role(); role != "api-only" {
+		t.Fatalf("disabled lease role = %q, want \"api-only\"", role)
+	}
+	time.Sleep(5 * fastInterval)
+	if starts, _, _ := job.counts(); starts != 0 {
+		t.Fatalf("job started %d times on an api-only disabled lease, want 0", starts)
+	}
+	cancel()
+	waitClosed(t, done)
+}
+
+func TestParseWorkloadRole(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want WorkloadRole
+		ok   bool
+	}{
+		{"", RoleAll, true},
+		{"all", RoleAll, true},
+		{"api", RoleAPI, true},
+		{"worker", RoleWorker, true},
+		{"invalid", "", false},
+	} {
+		got, ok := ParseWorkloadRole(tc.raw)
+		if got != tc.want || ok != tc.ok {
+			t.Fatalf("ParseWorkloadRole(%q) = (%q, %v), want (%q, %v)", tc.raw, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
 func TestStatusRole(t *testing.T) {
 	tests := []struct {
 		name string
@@ -365,6 +404,7 @@ func TestStatusRole(t *testing.T) {
 	}{
 		{"leader", Status{Enabled: true, Leader: true}, "leader"},
 		{"follower", Status{Enabled: true}, "follower"},
+		{"api-only", Status{Enabled: true, Disabled: true}, "api-only"},
 		{"single node", Status{Leader: true}, "single node"},
 	}
 	for _, tt := range tests {

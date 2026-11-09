@@ -21,8 +21,11 @@ well). Migrations are handled by the application itself — see
 
 | Resource | Notes |
 | --- | --- |
-| `Deployment` | The SoroBeacon process. Probes, resources, security context. |
-| `Service` | ClusterIP in front of the HTTP port (API + dashboard + `/metrics`). |
+| `Deployment` (`<fullname>`) | Stateless JSON API, GraphQL, and web dashboard (`WORKLOAD_ROLE=api` when `worker.enabled=true`, or combined when `worker.enabled=false`). |
+| `Deployment` (`<fullname>-worker`, optional) | Dedicated background worker (`worker.enabled=true`, `WORKLOAD_ROLE=worker`): runs the event poller, notification dispatcher, digest flusher, escalation stepper, retention pruners, and heartbeat under the PostgreSQL leader lease. |
+| `HorizontalPodAutoscaler` (optional) | Scales only the stateless API `Deployment` (`autoscaling.enabled=true`). |
+| `PodDisruptionBudget` (optional) | Separate drain-safe disruption budgets for the API (`podDisruptionBudget.enabled=true`) and worker (`worker.podDisruptionBudget.enabled=true`). |
+| `Service` | ClusterIP in front of the HTTP port (API + dashboard + `/metrics`), selecting only API pods. |
 | `ConfigMap` | Every non-secret environment variable, so the effective configuration is readable with `kubectl describe configmap`. |
 | `Secret` | `DATABASE_URL`, and `API_TOKEN` / `CONFIG_ENCRYPTION_KEY` when set. Skipped in favour of your own Secret when `database.existingSecret` / `auth.existingSecret` is set. |
 | `ServiceAccount` | Optional; SoroBeacon calls no Kubernetes API, so it has no RBAC. |
@@ -161,10 +164,33 @@ helm upgrade --install sorobeacon deploy/helm/sorobeacon \
   --namespace sorobeacon --create-namespace -f production.yaml
 ```
 
-with a `production.yaml` such as:
+with a high-availability `production.yaml` such as:
 
 ```yaml
+# Scale the stateless API horizontally (or via autoscaling below)
 replicaCount: 3
+podAntiAffinity:
+  enabled: true
+  type: soft
+podDisruptionBudget:
+  enabled: true
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetMemoryUtilizationPercentage: 75
+  targetCPUUtilizationPercentage: 80
+
+# Separate the lease-gated background worker (1 active leader + 1 warm standby)
+worker:
+  enabled: true
+  replicaCount: 2
+  podAntiAffinity:
+    enabled: true
+    type: soft
+  podDisruptionBudget:
+    enabled: true
+
 config:
   network: mainnet
   rpcUrl: https://your-provider.example/soroban
@@ -181,6 +207,8 @@ resources:
   requests: { cpu: 250m, memory: 256Mi }
   limits:   { cpu: 1000m, memory: 512Mi }
 ```
+
+See [`docs/operations/ha-topology.md`](../../../docs/operations/ha-topology.md) for the full operator guide on separating API and worker workloads, leader-lease constraints, autoscaling signals, drain-safe `PodDisruptionBudget`s, and rollout timing.
 
 `values.schema.json` fails the release on structural mistakes — a non-numeric
 `replicaCount`, or a `database` block with neither `url` nor `existingSecret`.

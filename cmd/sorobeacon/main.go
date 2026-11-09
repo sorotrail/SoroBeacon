@@ -73,6 +73,18 @@ func main() {
 		return
 	}
 	if len(args) > 0 {
+		if ok, roleArg, err := parseServerRoleArgs(args); ok {
+			if err != nil {
+				reportCLIError(os.Stderr, err)
+				os.Exit(1)
+			}
+			_ = os.Setenv("WORKLOAD_ROLE", string(roleArg))
+			if err := run(); err != nil {
+				slog.Error("fatal", "err", err)
+				os.Exit(1)
+			}
+			return
+		}
 		switch args[0] {
 		case "healthcheck":
 			if err := runHealthcheck(context.Background(), args[1:], os.Stdout); err != nil {
@@ -115,6 +127,38 @@ func main() {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
+}
+
+// parseServerRoleArgs recognises `sorobeacon --role=all|api|worker` (and
+// `sorobeacon serve [--role=all|api|worker]`) so the HA Helm chart can start
+// dedicated API and background-worker Deployments from the same binary.
+func parseServerRoleArgs(args []string) (bool, lease.WorkloadRole, error) {
+	if len(args) == 0 {
+		return false, lease.RoleAll, nil
+	}
+	rest := args
+	isServe := false
+	if rest[0] == "serve" {
+		isServe = true
+		rest = rest[1:]
+	}
+	if !isServe && len(rest) > 0 && rest[0] != "--role" && rest[0] != "-role" &&
+		!(len(rest[0]) > 7 && (rest[0][:7] == "--role=" || rest[0][:6] == "-role=")) {
+		return false, "", nil
+	}
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	roleFlag := fs.String("role", os.Getenv("WORKLOAD_ROLE"), "workload role: all | api | worker")
+	if err := fs.Parse(rest); err != nil {
+		return true, "", err
+	}
+	if fs.NArg() > 0 {
+		return true, "", fmt.Errorf("unexpected argument %q for server role", fs.Arg(0))
+	}
+	role, ok := lease.ParseWorkloadRole(*roleFlag)
+	if !ok {
+		return true, "", fmt.Errorf("invalid --role %q: expected all, api, or worker", *roleFlag)
+	}
+	return true, role, nil
 }
 
 func run() error {
@@ -233,6 +277,17 @@ func defaultStartupDeps() startupDeps {
 			return buildSource(ctx, log, cfg)
 		},
 		newLeader: func(cfg config.Config, log *slog.Logger) (leaderLease, error) {
+			role, ok := lease.ParseWorkloadRole(os.Getenv("WORKLOAD_ROLE"))
+			if !ok {
+				return nil, fmt.Errorf("invalid WORKLOAD_ROLE %q: expected all, api, or worker", os.Getenv("WORKLOAD_ROLE"))
+			}
+			// In a split HA topology (worker.enabled=true in the Helm chart),
+			// API pods run with WORKLOAD_ROLE=api and never campaign for the
+			// poller lease, keeping advisory-lock sessions bounded to the
+			// dedicated worker Deployment regardless of API autoscaling.
+			if role == lease.RoleAPI {
+				return lease.Disabled(log), nil
+			}
 			// Leadership. Every instance serves the API and the dashboard, but
 			// only the one holding the lease runs the ingest loop: two pollers
 			// ingest the same events and race the same checkpoint, so alerts

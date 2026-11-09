@@ -100,6 +100,39 @@ type Dialer interface {
 	Dial(ctx context.Context) (Session, error)
 }
 
+// WorkloadRole selects whether a SoroBeacon process participates in leader
+// election for background polling and delivery ("all" or "worker") or serves
+// only the stateless HTTP/gRPC API and dashboard ("api").
+type WorkloadRole string
+
+const (
+	// RoleAll is the default single-deployment mode: the process serves the API
+	// and also campaigns for the leader lease to run the poller and dispatcher.
+	RoleAll WorkloadRole = "all"
+	// RoleAPI runs only the stateless API and dashboard without campaigning for
+	// the leader lease or opening an advisory-lock session against Postgres.
+	RoleAPI WorkloadRole = "api"
+	// RoleWorker campaigns for the leader lease to run the poller, dispatcher,
+	// retention pruners, and heartbeat while serving health/metrics probes.
+	RoleWorker WorkloadRole = "worker"
+)
+
+// ParseWorkloadRole normalises a workload role from WORKLOAD_ROLE or --role.
+// An empty string defaults to RoleAll so existing deployments behave
+// identically when unset.
+func ParseWorkloadRole(raw string) (WorkloadRole, bool) {
+	switch WorkloadRole(raw) {
+	case "", RoleAll:
+		return RoleAll, true
+	case RoleAPI:
+		return RoleAPI, true
+	case RoleWorker:
+		return RoleWorker, true
+	default:
+		return "", false
+	}
+}
+
 // Status is a race-free view of this instance's leadership, safe to read from
 // an HTTP handler while the election loop runs.
 type Status struct {
@@ -108,15 +141,21 @@ type Status struct {
 	Enabled bool
 	// Leader reports whether this instance holds the lease right now.
 	Leader bool
+	// Disabled reports that this instance is an API-only replica (RoleAPI)
+	// that intentionally does not campaign for the poller lease.
+	Disabled bool
 	// Since is when the current leadership began; zero when not the leader.
 	Since time.Time
 }
 
 // Role is the operator-facing label for a status: "leader", "follower" (this
-// instance is serving without polling) or "single node" (no election, so this
-// instance is the only poller there can be).
+// instance is serving without polling), "api-only" (this instance is dedicated
+// to the stateless API and never campaigns for the lease), or "single node"
+// (no election, so this instance is the only poller there can be).
 func (s Status) Role() string {
 	switch {
+	case s.Disabled:
+		return "api-only"
 	case !s.Enabled:
 		return "single node"
 	case s.Leader:
@@ -137,6 +176,9 @@ type Lease struct {
 	// enabled is false for SingleNode: no lock to take, no follower to wait
 	// for, so Run simply runs the job.
 	enabled bool
+	// disabled is true for Disabled (API-only replicas in a split HA chart):
+	// the process never dials a lease session or runs the poller job.
+	disabled bool
 	// loggedFailure records that the current run of failures has already been
 	// reported, so a database that stays down is logged once per outage rather
 	// than once per retry — /api/v1/health already reports it as degraded. Only
@@ -158,6 +200,20 @@ func SingleNode(log *slog.Logger) *Lease {
 	return &Lease{log: withLogger(log), enabled: false}
 }
 
+// Disabled returns a lease for an API-only replica in a split HA topology.
+// Scaling the stateless API horizontally must not open one advisory-lock
+// session per API pod or contend for the poller lease: only worker replicas
+// campaign for leadership, while API replicas serve HTTP/gRPC traffic with
+// Leader=false and Enabled=true.
+func Disabled(log *slog.Logger) *Lease {
+	return &Lease{
+		log:      withLogger(log),
+		enabled:  true,
+		disabled: true,
+		status:   Status{Enabled: true, Disabled: true},
+	}
+}
+
 // newLease builds an election-backed lease. It stays unexported because
 // callers pick their dialer by choosing a constructor (NewPostgres for
 // Postgres, SingleNode for a backend that has no election at all).
@@ -175,6 +231,12 @@ func newLease(d Dialer, opts Options, log *slog.Logger) *Lease {
 // holds, is a normal follower state rather than a failure of the process — the
 // API and dashboard keep serving either way — so both are logged and retried.
 func (l *Lease) Run(ctx context.Context, job func(context.Context)) {
+	if l.disabled {
+		l.log.Info("leader election disabled for api-only workload; serving the API without polling")
+		l.set(Status{Enabled: true, Disabled: true})
+		<-ctx.Done()
+		return
+	}
 	if !l.enabled {
 		l.log.Info("leader election is not available for this backend; this instance is the only poller")
 		l.set(Status{Leader: true, Since: time.Now()})
@@ -200,7 +262,7 @@ func (l *Lease) Status() Status {
 func (l *Lease) set(next Status) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	changed := l.status.Leader != next.Leader || l.status.Enabled != next.Enabled
+	changed := l.status.Leader != next.Leader || l.status.Enabled != next.Enabled || l.status.Disabled != next.Disabled
 	l.status = next
 	return changed
 }
