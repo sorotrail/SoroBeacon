@@ -1,0 +1,64 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- $apiReplicas := int .Values.replicaCount }}
+{{- if .Values.autoscaling.enabled }}
+{{- $apiReplicas = int .Values.autoscaling.minReplicas }}
+{{- end }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "sorobeacon.fullname" . }}
+  labels:
+    {{- include "sorobeacon.labels" . | nindent 4 }}
+spec:
+  {{- /*
+  Drain safety: on a single-replica deployment (replicas <= 1), requiring
+  minAvailable: 1 or maxUnavailable: 0 prevents kubelet from ever evicting the
+  sole pod during `kubectl drain`. Clamp single-replica budgets to
+  maxUnavailable: 1; for multi-replica deployments, honour explicit overrides
+  or default to minAvailable: 1.
+  */ -}}
+  {{- if le $apiReplicas 1 }}
+  maxUnavailable: 1
+  {{- else if ne .Values.podDisruptionBudget.maxUnavailable nil }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- else if ne .Values.podDisruptionBudget.minAvailable nil }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- else }}
+  minAvailable: 1
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "sorobeacon.selectorLabels" . | nindent 6 }}
+{{- end }}
+{{- if and .Values.worker.enabled .Values.worker.podDisruptionBudget.enabled }}
+{{- if .Values.podDisruptionBudget.enabled }}
+---
+{{- end }}
+{{- $workerReplicas := int .Values.worker.replicaCount }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "sorobeacon.fullname" . }}-worker
+  labels:
+    {{- include "sorobeacon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  {{- /*
+  Single-replica worker guard: when worker.replicaCount is 1, an aggressive
+  budget (minAvailable: 1 or maxUnavailable: 0) blocks node drains entirely.
+  Always emit maxUnavailable: 1 when worker.replicaCount <= 1, and default to
+  minAvailable: 1 when worker.replicaCount >= 2 (active leader + standby).
+  */ -}}
+  {{- if le $workerReplicas 1 }}
+  maxUnavailable: 1
+  {{- else if ne .Values.worker.podDisruptionBudget.maxUnavailable nil }}
+  maxUnavailable: {{ .Values.worker.podDisruptionBudget.maxUnavailable }}
+  {{- else if ne .Values.worker.podDisruptionBudget.minAvailable nil }}
+  minAvailable: {{ .Values.worker.podDisruptionBudget.minAvailable }}
+  {{- else }}
+  minAvailable: 1
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "sorobeacon.workerSelectorLabels" . | nindent 6 }}
+{{- end }}

@@ -6,10 +6,33 @@
 # running the binary with an empty environment (plus DATABASE_URL). The
 # operator reference for what each variable does is docs/configuration.md.
 
-# Number of pod replicas. Alert ingestion is safe to run on more than one:
-# per-rule state (cooldowns, frequency windows) is enforced in Postgres and
-# alert creation is deduplicated on (rule_id, event_id).
+# Number of API pod replicas (or combined replicas when worker.enabled is false).
+#
+# Workload scaling properties:
+# - The JSON API, GraphQL endpoint, and web dashboard are stateless and scale
+#   horizontally with request and SSE subscriber load.
+# - The event poller, notification dispatcher, digest flusher, escalation
+#   stepper, and retention pruners are gated by a single PostgreSQL session
+#   advisory lock (0x534F4245434F4E in internal/lease). Running multiple
+#   background workers does not increase ingestion or rule-evaluation
+#   throughput; only the single lease holder evaluates events, while one standby
+#   replica provides sub-3-second failover on node drain or rollout.
+#
+# Set worker.enabled=true below in multi-replica / HA deployments so API pods
+# run with WORKLOAD_ROLE=api (never contending for the leader lease) and a
+# dedicated worker Deployment manages background evaluation and lease failover.
 replicaCount: 1
+
+# Minimum seconds a newly ready pod must stay ready without crashing before
+# Kubernetes treats it as available during a RollingUpdate.
+minReadySeconds: 5
+
+# Kubernetes pod termination grace period in seconds. Must be strictly greater
+# than config.shutdownGracePeriod (30s) plus the HTTP server drain timeout (10s)
+# and advisory-lock release timeout (5s) so in-flight webhook/email deliveries
+# and open /alerts/stream SSE connections finish cleanly instead of being
+# SIGKILLed mid-flight.
+terminationGracePeriodSeconds: 60
 
 image:
   # Container image repository.
@@ -64,7 +87,15 @@ service:
   # Container port. Must match config.httpAddr below (the app's HTTP_ADDR).
   targetPort: 8080
 
-# CPU/memory requests and limits.
+# CPU/memory requests and limits for the API (or combined) Deployment.
+# Sizing basis:
+# - Base resident footprint (Go runtime + pgx pool + embedded templates/migrations): ~35 MiB.
+# - Each active /alerts/stream SSE subscriber and concurrent HTTP/GraphQL query
+#   allocates bounded request/response buffers (HTTP_MAX_BODY_BYTES = 1 MiB);
+#   128Mi request / 256Mi limit accommodates ~500 concurrent SSE clients and
+#   burst read queries with >2x headroom.
+# - 100m CPU request guarantees scheduling share for TLS handshakes and JSON/HTML
+#   serialization; 500m limit bounds bursts during large CSV/NDJSON exports.
 # ref: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
 resources:
   requests:
@@ -77,6 +108,104 @@ resources:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# Opt-in pod anti-affinity to spread API replicas across failure domains.
+# Off by default so multi-replica test renders and single-node clusters (Kind,
+# Minikube) never leave pods unschedulable.
+podAntiAffinity:
+  enabled: false
+  # "soft" (preferredDuringSchedulingIgnoredDuringExecution) or
+  # "hard" (requiredDuringSchedulingIgnoredDuringExecution).
+  type: "soft"
+  topologyKey: "kubernetes.io/hostname"
+
+# HorizontalPodAutoscaler for the stateless API Deployment.
+# Off by default so the chart never assumes metrics-server or a custom metrics
+# adapter is installed in the cluster.
+#
+# Signal choice for an I/O-bound API:
+# SoroBeacon's API spends most of its wall time waiting on PostgreSQL queries
+# and holding open /alerts/stream SSE connections. Waiting goroutines consume
+# memory (stack + per-request / per-subscriber buffers) rather than CPU, so
+# memory utilization (75% default) is paired with CPU (80%) as the built-in
+# signal, and customMetrics allows plugging in Pod-level request/stream metrics
+# (e.g. sorobeacon_http_requests_per_second via Prometheus Adapter) when
+# available. Never autoscale the worker Deployment: polling is singleton-gated
+# by the Postgres advisory lock.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetMemoryUtilizationPercentage: 75
+  targetCPUUtilizationPercentage: 80
+  # Optional autoscaling/v2 MetricSpec entries (e.g. Pods custom metrics).
+  customMetrics: []
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+    scaleUp:
+      stabilizationWindowSeconds: 0
+
+# PodDisruptionBudget for the API Deployment.
+# When enabled on a single-replica deployment (replicaCount=1 and autoscaling
+# off), the template automatically renders maxUnavailable: 1 rather than
+# minAvailable: 1 so node drains (kubectl drain) are never blocked. When
+# effective replicas >= 2, it defaults to minAvailable: 1.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: null
+  maxUnavailable: null
+
+# Dedicated background worker Deployment (poller, notification dispatcher,
+# digest flusher, escalation stepper, retention pruners, and heartbeat).
+#
+# Lease constraint:
+# SoroBeacon elects a single active leader using a PostgreSQL session advisory
+# lock (0x534F4245434F4E in internal/lease). Only the leader pod runs the
+# ingest and delivery loops. Setting worker.enabled=true separates the
+# background worker into its own Deployment (WORKLOAD_ROLE=worker) and switches
+# the main Deployment to API-only mode (WORKLOAD_ROLE=api) so scaling API pods
+# does not create idle advisory-lock contenders.
+# - worker.replicaCount: 1 runs a single active worker (pod restart recovery via kubelet).
+# - worker.replicaCount: 2 runs 1 active leader + 1 warm standby follower that
+#   promotes within lease.DefaultInterval (3s) when the leader pod drains.
+# - Setting worker.replicaCount > 2 adds no throughput and only increases
+#   advisory-lock polling against PostgreSQL.
+worker:
+  enabled: false
+  replicaCount: 1
+  minReadySeconds: 5
+  terminationGracePeriodSeconds: 60
+  podAnnotations: {}
+  # Sizing basis for the background worker:
+  # - Evaluates rules across up to 1,000 events per poll batch and dispatches
+  #   outbound webhooks/emails with bounded in-memory state windows.
+  # - 100m CPU / 128Mi RAM request and 500m CPU / 256Mi RAM limit cover steady
+  #   multi-network polling and alert bursts without OOM risk.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAntiAffinity:
+    enabled: false
+    type: "soft"
+    topologyKey: "kubernetes.io/hostname"
+  # Worker PodDisruptionBudget.
+  # Drain safety: when worker.replicaCount is 1, the template always enforces
+  # maxUnavailable: 1 (even if minAvailable is set) because a PDB requiring 1
+  # available pod on a 1-replica worker blocks node drains indefinitely. When
+  # worker.replicaCount >= 2 (active + warm standby), it defaults to
+  # minAvailable: 1 so one worker stays online to hold the lease during drains.
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: null
+    maxUnavailable: null
 
 # ── Application configuration (ConfigMap) ────────────────────────────────────
 #
