@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -142,8 +143,9 @@ func parseServerRoleArgs(args []string) (bool, lease.WorkloadRole, error) {
 		isServe = true
 		rest = rest[1:]
 	}
-	if !isServe && len(rest) > 0 && rest[0] != "--role" && rest[0] != "-role" &&
-		!(len(rest[0]) > 7 && (rest[0][:7] == "--role=" || rest[0][:6] == "-role=")) {
+	if !isServe && len(rest) > 0 &&
+		rest[0] != "--role" && rest[0] != "-role" &&
+		!strings.HasPrefix(rest[0], "--role=") && !strings.HasPrefix(rest[0], "-role=") {
 		return false, "", nil
 	}
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
