@@ -10,6 +10,8 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -178,4 +180,45 @@ func TestDispatcherWithoutTelemetryNilSafe(t *testing.T) {
 
 	d.Dispatch(context.Background(), Alert{ID: 15, MonitorID: 2})
 	assert.Len(t, st.attempts, 1)
+}
+
+func TestWebhookDeliveryInjectsW3CTraceParentHeader(t *testing.T) {
+	var receivedTraceparent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedTraceparent = r.Header.Get("Traceparent")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	exp := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(exp))
+	t.Cleanup(func() { require.NoError(t, tp.Shutdown(context.Background())) })
+	tel := telemetry.New(tp.Tracer("test"))
+
+	cfgJSON, err := json.Marshal(map[string]string{
+		"url":    srv.URL,
+		"secret": "webhook-signing-secret",
+	})
+	require.NoError(t, err)
+
+	st := &fakeDispatchStore{
+		channels: []store.Channel{{
+			ID:      9,
+			Type:    TypeWebhook,
+			Config:  cfgJSON,
+			Enabled: true,
+		}},
+	}
+	d := NewDispatcher(st, DefaultFactory(), slog.New(slog.DiscardHandler)).WithTelemetry(tel)
+
+	ctx, rootSpan := tel.StartSpan(context.Background(), "poller.create_alert")
+	d.Dispatch(ctx, Alert{ID: 88, MonitorID: 4})
+	rootSpan.End()
+
+	spans := exp.Ended()
+	deliver := findSpan(spans, "notify.deliver")
+	require.NotNil(t, deliver)
+	require.NotEmpty(t, receivedTraceparent, "outbound webhook request must carry W3C Traceparent header")
+	assert.Contains(t, receivedTraceparent, deliver.SpanContext().TraceID().String())
+	assert.Contains(t, receivedTraceparent, deliver.SpanContext().SpanID().String())
 }
