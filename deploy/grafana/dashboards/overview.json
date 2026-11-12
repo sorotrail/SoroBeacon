@@ -1,0 +1,88 @@
+{
+  "uid": "sorobeacon-overview",
+  "title": "SoroBeacon — Overview (SLO & Health)",
+  "description": "Top-level operator view answering 'is it working, and if not, where?' built on SLO recording indicators and core health signals.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "tags": ["sorobeacon", "overview", "slo"],
+  "links": [
+    { "title": "Evaluation Dashboard", "type": "link", "url": "/d/sorobeacon-evaluation" },
+    { "title": "Delivery Dashboard", "type": "link", "url": "/d/sorobeacon-delivery" },
+    { "title": "Channels Dashboard", "type": "link", "url": "/d/sorobeacon-channels" },
+    { "title": "Store & Retention Dashboard", "type": "link", "url": "/d/sorobeacon-store" },
+    { "title": "Operations Runbook", "type": "link", "url": "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/dashboards.md" }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "network",
+        "type": "query",
+        "query": "label_values(sorobeacon_polls_total, network)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "selected": true, "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Evaluation Freshness (Seconds Since Last Poll)",
+      "type": "stat",
+      "description": "Good: < 15s (SLO target: 99.5% of cycles complete within 30s). If > 30s, open the Evaluation Dashboard and docs/operations/health-checks.md.",
+      "targets": [
+        { "refId": "A", "expr": "max by (network) (sorobeacon_seconds_since_last_poll{network=~\"$network\"})" },
+        { "refId": "B", "expr": "max by (network) (sorobeacon:slo:evaluation_freshness_seconds{network=~\"$network\"})" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Chain Tip Lag (Ledgers Behind)",
+      "type": "timeseries",
+      "description": "Good: <= 3 ledgers on steady-state polling. Growing lag indicates RPC slowness or heavy rule evaluation.",
+      "targets": [
+        { "refId": "A", "expr": "max by (network) (sorobeacon_poll_lag_ledgers{network=~\"$network\"})" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Delivery Success Ratio (5m)",
+      "type": "gauge",
+      "description": "Good: >= 99.0% successful deliveries across channels. If degraded, drill down into the Delivery and Channels dashboards.",
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(sorobeacon_alert_deliveries_total{outcome=\"ok\"}[5m])) / clamp_min(sum(rate(sorobeacon_alert_deliveries_total[5m])), 1e-9)" },
+        { "refId": "B", "expr": "sorobeacon:slo:delivery_success_ratio_5m" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Dead-Letter Backlog",
+      "type": "stat",
+      "description": "Good: 0 dead-lettered deliveries awaiting review. Any non-zero value means retries exhausted; see docs/operations/delivery-failures.md.",
+      "targets": [
+        { "refId": "A", "expr": "sorobeacon_dead_letters_total" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "API Read Availability & P95 Latency",
+      "type": "timeseries",
+      "description": "Good: >= 99.9% non-5xx responses and p95 < 250ms. See Store & Retention dashboard if latency climbs.",
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.95, sum by (le, route) (rate(sorobeacon_http_request_duration_seconds_bucket[5m])))" },
+        { "refId": "B", "expr": "sorobeacon:slo:http_read_availability_ratio_5m" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Poller Panics & Chain Reorgs (Last 1h)",
+      "type": "stat",
+      "description": "Good: 0 panics and 0 reorgs. Non-zero panics indicate a recovered crash in the poll loop; see docs/operations/retention-and-reorg.md.",
+      "targets": [
+        { "refId": "A", "expr": "sum(increase(sorobeacon_poll_panics_total{network=~\"$network\"}[1h]))" },
+        { "refId": "B", "expr": "sum(increase(sorobeacon_reorgs_total{network=~\"$network\"}[1h]))" }
+      ]
+    }
+  ]
+}
