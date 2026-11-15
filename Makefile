@@ -50,11 +50,12 @@ test-race:
 #
 # The scan runs on a patched toolchain even though the module's go directive
 # is the minimum the project builds with: the standard library is part of the
-# attack surface, and 1.26.0 carries advisories that 1.27.3 fixes. Builds and
-# tests stay on whatever `go-version-file: go.mod` installs; only the scanner
-# is pinned, so its answer does not change with the reviewer's local Go.
+# attack surface, and the 1.26.0 directive carries advisories that a current
+# 1.27 patch fixes (GO-2026-6859 was fixed in 1.27.4). Builds and tests stay
+# on whatever `go-version-file: go.mod` installs; only the scanner is pinned,
+# so its answer does not change with the reviewer's local Go.
 VULNCHECK_VERSION ?= v1.9.0
-VULNCHECK_TOOLCHAIN ?= go1.27.3
+VULNCHECK_TOOLCHAIN ?= go1.27.4
 vulncheck:
 	GOTOOLCHAIN=$(VULNCHECK_TOOLCHAIN) go run golang.org/x/vuln/cmd/govulncheck@$(VULNCHECK_VERSION) ./...
 	cd terraform-provider-sorobeacon && GOTOOLCHAIN=$(VULNCHECK_TOOLCHAIN) go run golang.org/x/vuln/cmd/govulncheck@$(VULNCHECK_VERSION) ./...
