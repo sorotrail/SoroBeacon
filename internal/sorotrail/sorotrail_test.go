@@ -501,3 +501,26 @@ func TestStatsOldestLedger(t *testing.T) {
 		})
 	}
 }
+
+func TestStatsUpstreamLag(t *testing.T) {
+	u32 := func(v uint32) *uint32 { return &v }
+	i64 := func(v int64) *int64 { return &v }
+	tests := []struct {
+		name  string
+		stats Stats
+		want  uint32
+	}{
+		{"reported ingest lag", Stats{LastIngestedLedger: 100, IngestLagLedgers: i64(5)}, 5},
+		{"negative ingest lag clamps to zero", Stats{LastIngestedLedger: 100, IngestLagLedgers: i64(-5)}, 0},
+		{"derived from chain head minus tip", Stats{LastIngestedLedger: 100, ChainHeadLedger: u32(112)}, 12},
+		{"chain head behind tip gives zero", Stats{LastIngestedLedger: 100, ChainHeadLedger: u32(90)}, 0},
+		{"empty stats give zero", Stats{}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.stats.UpstreamLag(); got != tt.want {
+				t.Fatalf("UpstreamLag() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
