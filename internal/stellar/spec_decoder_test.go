@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/strkey"
@@ -38,6 +39,12 @@ func (s *countingSource) callCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.calls
+}
+
+type specFetchFunc func(context.Context, string) (*ContractSpec, error)
+
+func (f specFetchFunc) ContractSpec(ctx context.Context, id string) (*ContractSpec, error) {
+	return f(ctx, id)
 }
 
 func transferJSONEvent() Event {
@@ -106,6 +113,52 @@ func TestSpecDecoderFallsBackOnFetchError(t *testing.T) {
 	want, err := DefaultDecoder{}.DecodeEvent(context.Background(), transferJSONEvent())
 	require.NoError(t, err)
 	assert.Equal(t, want, decoded)
+}
+
+func TestSpecDecoderWithFetchTimeout(t *testing.T) {
+	const timeout = 2 * time.Second
+	cases := []struct {
+		name  string
+		delay time.Duration
+	}{
+		{"spec arrives before its deadline", time.Second},
+		{"spec exceeds its deadline", 3 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				spec := transferSpec(t)
+				start := time.Now()
+				source := specFetchFunc(func(ctx context.Context, _ string) (*ContractSpec, error) {
+					deadline, ok := ctx.Deadline()
+					require.True(t, ok)
+					assert.Equal(t, timeout, deadline.Sub(start))
+					timer := time.NewTimer(tc.delay)
+					defer timer.Stop()
+					select {
+					case <-timer.C:
+						return spec, nil
+					case <-ctx.Done():
+						require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+						return nil, ctx.Err()
+					}
+				})
+				base := DefaultDecoder{}
+				event := transferJSONEvent()
+				decoder := NewSpecDecoder(base, source, slog.New(slog.DiscardHandler)).WithFetchTimeout(timeout)
+				decoded, err := decoder.DecodeEvent(t.Context(), event)
+				require.NoError(t, err)
+				assert.Equal(t, min(tc.delay, timeout), time.Since(start))
+				if tc.delay < timeout {
+					assert.Equal(t, big.NewInt(42), decoded.Fields["amount"])
+					return
+				}
+				fallback, err := base.DecodeEvent(t.Context(), event)
+				require.NoError(t, err)
+				assert.Equal(t, fallback, decoded)
+			})
+		})
+	}
 }
 
 func TestSpecDecoderCachesSpec(t *testing.T) {
