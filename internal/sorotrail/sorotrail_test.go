@@ -481,3 +481,23 @@ func TestStatsChainHead(t *testing.T) {
 		})
 	}
 }
+
+func TestStatsOldestLedger(t *testing.T) {
+	tests := []struct {
+		name  string
+		stats Stats
+		want  uint32
+	}{
+		{"oldest_stored_ledger preferred", Stats{OldestStoredLedger: 10, FirstLedger: 20}, 10},
+		{"legacy first_ledger fallback", Stats{FirstLedger: 20}, 20},
+		{"empty stats give zero", Stats{}, 0},
+		{"negative first_ledger gives zero", Stats{FirstLedger: -5}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.stats.OldestLedger(); got != tt.want {
+				t.Fatalf("OldestLedger() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
