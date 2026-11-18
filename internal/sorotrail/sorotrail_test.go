@@ -457,3 +457,70 @@ func TestEventsResponseShape(t *testing.T) {
 		t.Fatal("next_cursor not decoded")
 	}
 }
+
+func TestStatsChainHead(t *testing.T) {
+	u32 := func(v uint32) *uint32 { return &v }
+	i64 := func(v int64) *int64 { return &v }
+	tests := []struct {
+		name  string
+		stats Stats
+		want  uint32
+	}{
+		{"chain head ahead of tip", Stats{LastIngestedLedger: 100, ChainHeadLedger: u32(110)}, 110},
+		{"chain head behind tip falls back to tip", Stats{LastIngestedLedger: 100, ChainHeadLedger: u32(90)}, 100},
+		{"positive ingest lag added to tip", Stats{LastIngestedLedger: 100, IngestLagLedgers: i64(7)}, 107},
+		{"negative ingest lag ignored", Stats{LastIngestedLedger: 100, IngestLagLedgers: i64(-3)}, 100},
+		{"legacy last_ledger used as tip", Stats{LastLedger: 50}, 50},
+		{"empty stats give zero", Stats{}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.stats.ChainHead(); got != tt.want {
+				t.Fatalf("ChainHead() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStatsOldestLedger(t *testing.T) {
+	tests := []struct {
+		name  string
+		stats Stats
+		want  uint32
+	}{
+		{"oldest_stored_ledger preferred", Stats{OldestStoredLedger: 10, FirstLedger: 20}, 10},
+		{"legacy first_ledger fallback", Stats{FirstLedger: 20}, 20},
+		{"empty stats give zero", Stats{}, 0},
+		{"negative first_ledger gives zero", Stats{FirstLedger: -5}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.stats.OldestLedger(); got != tt.want {
+				t.Fatalf("OldestLedger() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStatsUpstreamLag(t *testing.T) {
+	u32 := func(v uint32) *uint32 { return &v }
+	i64 := func(v int64) *int64 { return &v }
+	tests := []struct {
+		name  string
+		stats Stats
+		want  uint32
+	}{
+		{"reported ingest lag", Stats{LastIngestedLedger: 100, IngestLagLedgers: i64(5)}, 5},
+		{"negative ingest lag clamps to zero", Stats{LastIngestedLedger: 100, IngestLagLedgers: i64(-5)}, 0},
+		{"derived from chain head minus tip", Stats{LastIngestedLedger: 100, ChainHeadLedger: u32(112)}, 12},
+		{"chain head behind tip gives zero", Stats{LastIngestedLedger: 100, ChainHeadLedger: u32(90)}, 0},
+		{"empty stats give zero", Stats{}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.stats.UpstreamLag(); got != tt.want {
+				t.Fatalf("UpstreamLag() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
