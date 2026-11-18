@@ -70,6 +70,7 @@ const (
 // an unknown flag, an unexpected argument, or a restore that needs --force.
 type usageError struct{ err error }
 
+// Error returns the message of the wrapped usage error.
 func (e *usageError) Error() string { return e.err.Error() }
 func (e *usageError) Unwrap() error { return e.err }
 
@@ -78,6 +79,7 @@ func (e *usageError) Unwrap() error { return e.err }
 // into a database.
 type invalidBackupError struct{ err error }
 
+// Error returns the message of the wrapped invalid-backup error.
 func (e *invalidBackupError) Error() string { return e.err.Error() }
 func (e *invalidBackupError) Unwrap() error { return e.err }
 
