@@ -97,6 +97,9 @@ type Dispatcher struct {
 	// that parent chain, not any attribute, is what joins the delivery to
 	// the poll cycle that produced it.
 	telemetry *telemetry.Provider
+	// alertLinks remembers each alert's detection span, so an escalation
+	// step delivered minutes later can link back to it.
+	alertLinks *telemetry.AlertLinks
 
 	// MaxAttempts per channel (default 3) and BaseBackoff between attempts
 	// (default 1s, doubled each retry: 1s, 2s, 4s...).
@@ -494,6 +497,7 @@ func (d *Dispatcher) WithUsageMeter(um *usage.Meter) *Dispatcher {
 // retries issued from the API and dashboard.
 func (d *Dispatcher) WithTelemetry(t *telemetry.Provider) *Dispatcher {
 	d.telemetry = t
+	d.alertLinks = telemetry.NewAlertLinks(telemetry.DefaultAlertLinkCapacity)
 	return d
 }
 
@@ -523,6 +527,9 @@ func digestEnabled(ch store.Channel) bool {
 // come first either way, so a silenced alert never starts an escalation that
 // would page on its next step.
 func (d *Dispatcher) Dispatch(ctx context.Context, a Alert) {
+	// The detecting span (the poller's alert span) is what every delivery
+	// and escalation step links back to.
+	d.alertLinks.Remember(a.ID, trace.SpanContextFromContext(ctx))
 	if d.fairness != nil && d.fairness.cfg.AsyncDispatch {
 		d.Submit(ctx, a)
 		return
@@ -943,15 +950,16 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 	defer endActive()
 
 	// One span per channel covers the whole delivery: notifier construction
-	// plus every retried attempt. The span's parent is whatever ctx carries
-	// — the alert's span when called from Dispatch — which is the whole
-	// point: a delivery must never be a root span. Channel identity rides
-	// only as the row id and static type; the config (webhook URLs, bot
-	// tokens, SMTP credentials) never enters a span, an attribute or an
-	// event, here or anywhere.
+	// plus every retried attempt. It is a new root *linked* to the span that
+	// caused it (the alert's span from Dispatch, or the escalation step):
+	// delivery runs on another goroutine and can outlive detection, so a
+	// parent-child edge would hold the detection trace open; the link keeps
+	// the causality without that. Channel identity rides only as the row id
+	// and static type; the config (webhook URLs, bot tokens, SMTP
+	// credentials) never enters a span, an attribute or an event.
 	var span trace.Span
 	if d.telemetry != nil {
-		ctx, span = d.telemetry.WithRequestID(ctx, "notify.deliver",
+		ctx, span = d.telemetry.StartLinked(ctx, "notify.deliver", trace.SpanContextFromContext(ctx),
 			trace.WithAttributes(
 				attribute.Int64(telemetry.AttrAlertID, a.ID),
 				attribute.Int64(telemetry.AttrChannelID, ch.ID),

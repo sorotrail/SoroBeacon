@@ -31,6 +31,10 @@ import (
 // serves reads and writes from the same file handle, so there is no replica to
 // route to.
 type PoolSettings struct {
+	// Tracer, when set, records one span per statement (telemetry's pgx
+	// tracer): the statement's verb and a hash identifying it, never the
+	// SQL's parameter values.
+	Tracer pgx.QueryTracer
 	MaxConns        int32
 	MinConns        int32
 	MaxConnLifetime time.Duration
@@ -186,6 +190,9 @@ func buildPoolConfig(databaseURL string, settings PoolSettings) (*pgxpool.Config
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, err
+	}
+	if settings.Tracer != nil {
+		cfg.ConnConfig.Tracer = settings.Tracer
 	}
 	if settings.MaxConns > 0 {
 		cfg.MaxConns = settings.MaxConns

@@ -8,7 +8,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/telemetry"
 )
 
 // DefaultEscalationInterval is how often the scheduler looks for due
@@ -46,6 +50,18 @@ func (d *Dispatcher) startEscalation(ctx context.Context, a Alert, policy *store
 // the policy was written is skipped rather than erroring, matching the flat
 // fan-out's ListChannelsForMonitor behaviour.
 func (d *Dispatcher) deliverStep(ctx context.Context, a Alert, step store.EscalationStep) {
+	// Escalation steps fire minutes after detection, from the scheduler, so
+	// each gets its own root span linked to the alert's detection span — the
+	// relationship that is hardest to reconstruct from logs. After a restart
+	// the detection span is no longer remembered and the step span stands
+	// alone, still carrying the alert id.
+	if d.telemetry != nil {
+		cause, _ := d.alertLinks.Lookup(a.ID)
+		var span trace.Span
+		ctx, span = d.telemetry.StartLinked(ctx, "notify.escalate", cause,
+			trace.WithAttributes(attribute.Int64(telemetry.AttrAlertID, a.ID)))
+		defer span.End()
+	}
 	if len(step.ChannelIDs) == 0 {
 		return
 	}
