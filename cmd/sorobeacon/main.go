@@ -762,7 +762,14 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 		if err != nil {
 			return nil, err
 		}
-		archiver = pruner
+		// The same backend also serves whole-partition archives (verified
+		// before a drop) and the opt-in archived reads behind GET /alerts.
+		parts, err := archive.NewStoreFromURL(cfg.ArchiveURL)
+		if err != nil {
+			return nil, err
+		}
+		archiver = &archive.Tiered{Pruner: pruner, Store: parts}
+		apiSrv.WithArchiveReader(parts)
 		// Never log the URL: an operator may embed an endpoint or token in a
 		// query string. The scheme is enough to confirm what was selected.
 		log.Info("alert archiving enabled")

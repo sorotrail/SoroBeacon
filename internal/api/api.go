@@ -73,14 +73,16 @@ const MaxChannelConfigBytes int = 64 << 10
 const MaxTemplateBytes int = 32 << 10
 
 type Server struct {
-	store        store.Store
-	registry     *rules.Registry
-	factory      *notify.Factory
-	rpc          HealthChecker
-	log          *slog.Logger
-	poller       PositionReader
-	leader       LeaderReader
-	networkState NetworkStatusReader
+	store store.Store
+	// archiveReader serves opt-in archived alert history; nil disables it.
+	archiveReader store.ArchiveReader
+	registry      *rules.Registry
+	factory       *notify.Factory
+	rpc           HealthChecker
+	log           *slog.Logger
+	poller        PositionReader
+	leader        LeaderReader
+	networkState  NetworkStatusReader
 	// networkNames are the chains this instance polls, primary first, from
 	// NETWORKS/NETWORK. Empty (the New default, and every test that never
 	// calls WithNetworks) means no network may be named on a monitor, so

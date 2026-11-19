@@ -128,9 +128,15 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	alerts, err := s.store.ListAlerts(r.Context(), f)
+	include, ok := parseIncludeArchived(w, r)
+	if !ok {
+		return
+	}
+	alerts, tr, err := s.queryAlerts(r.Context(), f, include, nil)
 	if err != nil {
-		s.fail(w, r, err)
+		if !s.failArchive(w, r, err) {
+			s.fail(w, r, err)
+		}
 		return
 	}
 	if alerts == nil {
@@ -148,15 +154,21 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 		effectiveLimit = 50
 	}
 	next := ""
-	if len(alerts) == effectiveLimit {
+	if len(alerts) == effectiveLimit || (tr.capped && len(alerts) > 0) {
 		next = strconv.FormatInt(alerts[len(alerts)-1].ID, 10)
 	}
 	prunedBefore, policySource := s.workspaceRetentionHorizon(r.Context())
 	setRetentionHorizonHeaders(w, prunedBefore, policySource)
+	setTruncationHeaders(w, tr)
 	resp := map[string]any{
 		"alerts":                  alerts,
 		"next_cursor":             next,
 		"retention_policy_source": policySource,
+		"truncated":               tr.Truncated,
+	}
+	if tr.Truncated {
+		resp["truncation_boundary"] = tr.Boundary.UTC().Format(time.RFC3339)
+		resp["truncation_reason"] = tr.Reason
 	}
 	if prunedBefore != nil {
 		resp["pruned_before"] = prunedBefore.UTC().Format(time.RFC3339)
@@ -197,10 +209,16 @@ func (s *Server) exportAlertsCSV(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	include, ok := parseIncludeArchived(w, r)
+	if !ok {
+		return
+	}
 	remaining := f.Limit
 	if remaining <= 0 || remaining > maxAlertExportRows {
 		remaining = maxAlertExportRows
 	}
+	budget := store.DefaultArchiveMaxChunks
+	var tr alertTruncation
 
 	// monitor_name needs a lookup that the alert rows do not carry. Fetch it
 	// once up front rather than re-querying every monitor for every page; a
@@ -218,6 +236,8 @@ func (s *Server) exportAlertsCSV(w http.ResponseWriter, r *http.Request) {
 
 	prunedBefore, policySource := s.workspaceRetentionHorizon(r.Context())
 	setRetentionHorizonHeaders(w, prunedBefore, policySource)
+	trailers := s.beginTruncationReport(r.Context(), w, f, include)
+	defer func() { endTruncationReport(w, trailers, tr) }()
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+alertExportFilename(f)+`"`)
 	w.Header().Set("Cache-Control", "no-store")
@@ -233,7 +253,10 @@ func (s *Server) exportAlertsCSV(w http.ResponseWriter, r *http.Request) {
 		if f.Limit > alertExportPageSize {
 			f.Limit = alertExportPageSize
 		}
-		page, err := s.store.ListAlerts(r.Context(), f)
+		page, ptr, err := s.queryAlerts(r.Context(), f, include, &budget)
+		if ptr.Truncated {
+			tr = ptr
+		}
 		if err != nil {
 			// Headers and rows are already on the wire, so a JSON error
 			// envelope would corrupt the CSV. Log with the request id so the

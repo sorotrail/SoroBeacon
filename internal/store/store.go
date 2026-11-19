@@ -732,6 +732,10 @@ type Alert struct {
 	Payload    json.RawMessage `json:"payload"`
 	Enrichment json.RawMessage `json:"enrichment,omitempty"`
 	CreatedAt  time.Time       `json:"created_at"`
+	// Archived is set only on alerts served from the archive tier rather than
+	// the database. It is the explicit indicator that lets a client tell the
+	// tiers apart; the rest of the shape is identical.
+	Archived bool `json:"archived,omitempty"`
 	// InhibitedByRuleID is set when an inhibition rule suppressed this
 	// alert's delivery. Nil means delivered (or never subjected to
 	// inhibition); the alert row itself is always stored.

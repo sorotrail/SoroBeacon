@@ -77,9 +77,13 @@ type PartitionLifecycleOptions struct {
 	DryRun              bool
 	Actor               string
 	Archiver            AlertArchiver
-	ShouldYield         func(context.Context) bool
-	Metrics             *metrics.Metrics
-	Log                 *slog.Logger
+	// PartitionArchiver, when set, makes whole-partition drops safe with an
+	// archive configured: each expired partition is copied and verified
+	// first, and a failure blocks its drop.
+	PartitionArchiver PartitionArchiver
+	ShouldYield       func(context.Context) bool
+	Metrics           *metrics.Metrics
+	Log               *slog.Logger
 }
 
 func (o PartitionLifecycleOptions) now() time.Time {
@@ -343,7 +347,7 @@ func (p *Postgres) ensureAlertPartitions(ctx context.Context, from time.Time, mo
 	return created, nil
 }
 
-func (p *Postgres) dropExpiredPartitions(ctx context.Context, cutoff time.Time, maxDrops int, actor string, lockTimeout time.Duration) (int64, []PartitionDropRecord, error) {
+func (p *Postgres) dropExpiredPartitions(ctx context.Context, cutoff time.Time, maxDrops int, actor string, lockTimeout time.Duration, arch PartitionArchiver) (int64, []PartitionDropRecord, error) {
 	names, err := p.alertPartitions(ctx)
 	if err != nil {
 		p.metrics.RecordAlertPartitionError("inspect")
@@ -358,6 +362,22 @@ func (p *Postgres) dropExpiredPartitions(ctx context.Context, cutoff time.Time, 
 	}
 	if strings.TrimSpace(actor) == "" {
 		actor = DefaultPartitionAuditActor
+	}
+
+	// Archive and verify every partition before the drop transaction opens.
+	// There is no second copy of this data, so nothing is dropped unless every
+	// partition in the batch has a verified archived copy; a failure aborts
+	// the whole pass and the next run retries (the archive overwrites).
+	archived := make(map[string]int64, len(drops))
+	if arch != nil {
+		for _, d := range drops {
+			n, err := p.archivePartition(ctx, arch, d)
+			if err != nil {
+				p.metrics.RecordAlertPartitionError("archive")
+				return 0, nil, fmt.Errorf("archive partition %s before drop: %w", d.Name, err)
+			}
+			archived[d.Name] = n
+		}
 	}
 
 	tx, err := p.pool.Begin(ctx)
@@ -378,9 +398,22 @@ func (p *Postgres) dropExpiredPartitions(ctx context.Context, cutoff time.Time, 
 	droppedRecords := make([]PartitionDropRecord, 0, len(drops))
 	for _, d := range drops {
 		var n int64
+		if arch != nil {
+			// Block writers so the count below is the final one, then refuse
+			// to drop if the partition holds anything the archive did not
+			// see (an alert written after the copy was taken).
+			if _, err := tx.Exec(ctx, `LOCK TABLE `+d.Name+` IN SHARE MODE`); err != nil {
+				p.metrics.RecordAlertPartitionError("drop")
+				return 0, nil, err
+			}
+		}
 		if err := tx.QueryRow(ctx, `SELECT count(*) FROM `+d.Name).Scan(&n); err != nil {
 			p.metrics.RecordAlertPartitionError("drop")
 			return 0, nil, err
+		}
+		if arch != nil && n != archived[d.Name] {
+			p.metrics.RecordAlertPartitionError("archive")
+			return 0, nil, fmt.Errorf("partition %s holds %d alerts but %d were archived; not dropping", d.Name, n, archived[d.Name])
 		}
 		// Delete by the dropped partition's own alert ids rather than by a
 		// timestamp window: ids are globally unique, so this is exact even if
@@ -480,7 +513,7 @@ func (p *Postgres) MaintainAlertPartitions(ctx context.Context, opts PartitionLi
 
 	var toDrop []PartitionDropRecord
 	cutoff, canDrop := EffectiveRetentionCutoff(now, opts.Retention, wsRetentions)
-	if canDrop && opts.Archiver == nil {
+	if canDrop && (opts.Archiver == nil || opts.PartitionArchiver != nil) {
 		toDrop = ExpiredAlertPartitions(existing, cutoff)
 		if maxDrops > 0 && len(toDrop) > maxDrops {
 			toDrop = toDrop[:maxDrops]
@@ -533,7 +566,7 @@ func (p *Postgres) MaintainAlertPartitions(ctx context.Context, opts PartitionLi
 		if opts.ShouldYield != nil && opts.ShouldYield(ctx) {
 			plan.YieldedDrops = true
 		} else {
-			alertsDropped, dropped, err := p.dropExpiredPartitions(ctx, cutoff, maxDrops, actor, lockTimeout)
+			alertsDropped, dropped, err := p.dropExpiredPartitions(ctx, cutoff, maxDrops, actor, lockTimeout, opts.PartitionArchiver)
 			if err != nil {
 				if opts.Metrics != nil && opts.Metrics != p.metrics {
 					opts.Metrics.RecordAlertPartitionError("drop")
@@ -704,3 +737,47 @@ func RunAlertPartitionLifecycle(ctx context.Context, st any, opts PartitionLifec
 }
 
 var _ PartitionLifecycleManager = (*Postgres)(nil)
+
+// archivePartition reads every alert in a partition (with its workspace) and
+// hands them to the archiver, returning the verified count.
+func (p *Postgres) archivePartition(ctx context.Context, arch PartitionArchiver, d PartitionDropRecord) (int64, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT workspace_id, id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version, runbook_url, response_guidance
+		   FROM `+d.Name+` ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var all []WorkspaceAlert
+	for rows.Next() {
+		var wa WorkspaceAlert
+		var ledger int64
+		var monitorID, ruleID, sourceMonitorID, sourceRuleID *int64
+		var origin *string
+		a := &wa.Alert
+		if err := rows.Scan(&wa.WorkspaceID, &a.ID, &monitorID, &ruleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.AcknowledgedBy, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID, &a.RuleVersion, &a.RunbookURL, &a.ResponseGuidance); err != nil {
+			return 0, err
+		}
+		a.Ledger = uint32(ledger)
+		if monitorID != nil {
+			a.MonitorID = *monitorID
+		}
+		if ruleID != nil {
+			a.RuleID = *ruleID
+		}
+		if sourceMonitorID != nil {
+			a.SourceMonitorID = *sourceMonitorID
+		}
+		if sourceRuleID != nil {
+			a.SourceRuleID = *sourceRuleID
+		}
+		if origin != nil {
+			a.FederationOrigin = *origin
+		}
+		all = append(all, wa)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	return arch.ArchivePartition(ctx, d, all)
+}
