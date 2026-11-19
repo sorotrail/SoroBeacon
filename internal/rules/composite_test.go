@@ -328,6 +328,44 @@ func TestCompositeRegisteredViaNewRegistry(t *testing.T) {
 	assert.True(t, got)
 }
 
+func TestNewComposite(t *testing.T) {
+	tests := []struct {
+		name       string
+		reg        *Registry
+		wantNilReg bool
+	}{
+		{
+			name:       "happy path: non-nil registry",
+			reg:        NewRegistry(),
+			wantNilReg: false,
+		},
+		{
+			name:       "error path: nil registry",
+			reg:        nil,
+			wantNilReg: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewComposite(tt.reg)
+			require.NotNil(t, c, "NewComposite must return a composite even for a nil registry")
+			if tt.wantNilReg {
+				assert.Nil(t, c.registry, "a nil registry must be stored as-is rather than panicking")
+				return
+			}
+			assert.True(t, c.registry == tt.reg, "composite must keep the registry it was built with")
+
+			// The composite built by NewComposite must resolve child rules
+			// through the registry it received and actually evaluate.
+			got, err := c.Evaluate(context.Background(), transferEvent(50),
+				json.RawMessage(`{"op":"or","rules":[{"type":"event_emitted","params":{"event_name":"transfer"}}]}`))
+			require.NoError(t, err)
+			assert.True(t, got)
+		})
+	}
+}
+
 // TestCompositeErrorPathsAreRootedAndSelfContained guards the shape of the
 // detail fields the API surfaces: every child error is rooted at the parent
 // params path, never left relative to the child.

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -206,4 +207,33 @@ func TestKeyTable_LifecycleAndRevocation(t *testing.T) {
 
 	assert.Empty(t, kt.GetActiveKeys(url))
 	assert.Nil(t, kt.GetCurrentKey(url))
+}
+
+func TestGenerateSigningKeyID(t *testing.T) {
+	t.Run("happy path: well formed and unique", func(t *testing.T) {
+		// GenerateSigningKeyID returns "csk_" followed by 8 random bytes
+		// hex-encoded, so the suffix is exactly 16 lowercase hex chars.
+		seen := make(map[string]struct{}, 100)
+		for i := 0; i < 100; i++ {
+			id := GenerateSigningKeyID()
+			require.NotEmpty(t, id)
+			assert.True(t, strings.HasPrefix(id, "csk_"), "key id must carry the csk_ prefix")
+			assert.Len(t, id, len("csk_")+16, "csk_ prefix plus 8 hex-encoded bytes")
+			assert.Regexp(t, `^csk_[0-9a-f]{16}$`, id, "suffix must be lowercase hex")
+			_, dup := seen[id]
+			assert.False(t, dup, "key ids must be unique across calls")
+			seen[id] = struct{}{}
+		}
+	})
+
+	t.Run("error path: no collisions across consecutive calls", func(t *testing.T) {
+		// rand.Read errors are swallowed internally, so the function never
+		// fails. The only observable failure mode would be a repeated id
+		// (a collision), which must not happen for 8 random bytes.
+		first := GenerateSigningKeyID()
+		second := GenerateSigningKeyID()
+		require.NotEmpty(t, first)
+		require.NotEmpty(t, second)
+		assert.NotEqual(t, first, second, "consecutive key ids must not collide")
+	})
 }
