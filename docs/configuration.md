@@ -554,17 +554,40 @@ Optional HTTP JSON context fetched for an alert as it is created, before deliver
 
 When enabled, one trace covers each poll cycle: `poller.poll` (root) →
 `poller.fetch_events` per page (RPC fetch + local decode) →
-`rules.evaluate` per rule → `poller.create_alert` → `store.create_alert`
-→ one `notify.deliver` per channel. Deliveries are children of their
-alert's span, never roots, so one alert's full path is one timeline —
-which is the point: metrics (issue #26) show aggregates, traces show the
-individual path. Every span also carries a `request_id` attribute (the
-ambient `X-Request-ID`) so a log line and its trace can be joined.
+`rules.evaluate` per rule → `poller.create_alert` → `store.create_alert`,
+with a `db.<verb>` span for each SQL statement.
+
+What happens after detection is not request-driven, so it is **linked**
+rather than nested:
+
+- Each channel delivery is a `notify.deliver` root span with a span link
+  (`link_kind=caused_by`) to the alert span that caused it. Delivery runs on
+  another goroutine and can outlive the cycle; as a child it would hold the
+  detection trace open.
+- Each escalation step, fired minutes later by the scheduler, is a
+  `notify.escalate` root span linked back to the alert's detection span, and
+  the step's deliveries link to it. The link comes from an in-memory, bounded
+  record of recent alerts (10,000), so after a restart a step's span carries
+  the alert id but no link.
+- Outbound channel calls over HTTP get an `HTTP <METHOD>` client span and send
+  a W3C `traceparent` header, so a traced endpoint continues the trace.
+- Inbound API requests continue a caller's `traceparent` and are named by the
+  route pattern (`GET /api/v1/alerts/{id}`), never the raw path.
+
+Every span carries a `request_id` attribute (the ambient `X-Request-ID`), so a
+log line and its trace can be joined. Sampling is parent-based: a kept root
+keeps its whole tree, and a linked delivery or escalation is sampled as its
+own root.
 
 Span attributes hold identifiers only (alert, monitor, rule, channel and
-event ids, channel type, outcome). **Channel config — webhook URLs, bot
-tokens, SMTP credentials — never enters a span**, the same rule that
-applies to logs and API responses.
+event ids, channel type, outcome), and span names come from bounded sets
+(stage names, route patterns, SQL verbs): no contract address, alert id or raw
+path ever names a span. **Channel config — webhook URLs, bot tokens, SMTP
+credentials — never enters a span**, the same rule that applies to logs and
+API responses. That is why outbound HTTP spans record only the method and
+status code, never the URL. Database spans record the statement's verb and a
+short hash identifying the statement text; parameter values, which include
+tenant data, are never recorded.
 
 Shutdown flushes pending spans to the collector (bounded to 5 seconds) so
 the last moments of a deployment are exported rather than dropped.
