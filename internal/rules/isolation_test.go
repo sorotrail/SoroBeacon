@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -270,4 +271,51 @@ func TestFrequencyThresholdSeedDoesNotBlockOtherRulesAndBoundsMemory(t *testing.
 
 	close(releaseSlowSeed)
 	wg.Wait()
+}
+
+func TestIsStorageError(t *testing.T) {
+	dbErr := errors.New("connection reset by peer")
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "nil is not a storage error",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "plain rule error is not a storage error",
+			err:  errors.New("rule evaluation failed"),
+			want: false,
+		},
+		{
+			name: "wrapped storage error is a storage error",
+			err:  WrapStorageError(dbErr),
+			want: true,
+		},
+		{
+			name: "storageError value directly is a storage error",
+			err:  storageError{err: dbErr},
+			want: true,
+		},
+		{
+			name: "nested wrapping preserves storage classification",
+			err:  fmt.Errorf("upstream failure: %w", WrapStorageError(dbErr)),
+			want: true,
+		},
+		{
+			name: "wrapping nil stays nil and is not a storage error",
+			err:  WrapStorageError(nil),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, IsStorageError(tt.err), "IsStorageError(%v)", tt.err)
+		})
+	}
 }
