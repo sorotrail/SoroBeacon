@@ -81,6 +81,14 @@ type AlertArchiver interface {
 	Archive(ctx context.Context, alerts []Alert) error
 }
 
+// partitionArchiverOf returns the archiver's whole-partition capability, if
+// it has one. Archivers that only copy row batches return nil, which keeps
+// partition drops disabled while archiving is on, as before.
+func partitionArchiverOf(arch AlertArchiver) PartitionArchiver {
+	pa, _ := arch.(PartitionArchiver)
+	return pa
+}
+
 func storeMetrics(st any) *metrics.Metrics {
 	switch s := st.(type) {
 	case *Postgres:
@@ -135,6 +143,7 @@ func PruneWorkspaceAlertsOnce(ctx context.Context, st AlertPruner, retention tim
 			Retention:           retention,
 			WorkspaceRetentions: wsRetentions,
 			Archiver:            arch,
+			PartitionArchiver:   partitionArchiverOf(arch),
 			Log:                 log,
 		})
 		if err != nil {
@@ -283,10 +292,11 @@ func RunAlertPruner(ctx context.Context, st AlertPruner, retention, interval tim
 		// into it, and drop whole expired partitions when archiving is off.
 		if mgr, ok := st.(PartitionLifecycleManager); ok {
 			plan, err := mgr.MaintainAlertPartitions(ctx, PartitionLifecycleOptions{
-				Now:       now,
-				Retention: retention,
-				Archiver:  arch,
-				Log:       log,
+				Now:               now,
+				Retention:         retention,
+				Archiver:          arch,
+				PartitionArchiver: partitionArchiverOf(arch),
+				Log:               log,
 			})
 			if err != nil {
 				log.Error("alert partition maintenance failed", "error", err, "cutoff", cutoff)

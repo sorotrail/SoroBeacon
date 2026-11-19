@@ -168,10 +168,50 @@ before the drop brings that month back; restoring a later dump cannot. A
   `alerts/<utc-day>/<firstID>-<lastID>.ndjson` under the configured prefix.
   Re-running the same batch overwrites the same key.
 - There is no built-in import command. To restore, read the NDJSON with your own
-  tooling; SoroBeacon does not query the archive.
-- Because partition drops are skipped in archive mode, expired monthly
-  partitions remain attached as empty shells after their rows are deleted. The
-  partition count therefore grows; the rows themselves are gone.
+  tooling.
+- Row-batch archiving alone skips partition drops, so expired monthly
+  partitions remain attached as empty shells after their rows are deleted.
+
+### Partition archive and archived reads
+
+With `ARCHIVE_URL` set, the server also archives whole expired partitions
+before dropping them, so partition drops stay on:
+
+1. Every alert in the partition is written as per-workspace chunks
+   (`partitions/<YYYY-MM>/<workspace-hash>/<NNNNNN>.ndjson`, at most 5000
+   alerts each) and then a manifest (`manifests/<YYYY-MM>.json`) listing each
+   chunk's checksum, size, row count, id range and time range.
+2. The copy is read back and verified against the manifest. Only then does the
+   drop transaction start; inside it the partition is locked and its row count
+   must equal the archived count, or the drop is refused. Any failure leaves the
+   partition in place and the next pass retries (writes overwrite).
+3. A chunk holds exactly one workspace, and each line repeats the workspace id,
+   which the reader re-checks, so archived rows never cross tenants.
+
+`GET /alerts`, `GET /alerts.csv` and `GET /alerts/export` accept
+`include_archived=true`. The default stays database-only. A request whose range
+reaches past the retention horizon is answered as follows:
+
+- Not opted in: the answer is complete back to the horizon and says so with
+  `truncated: true`, `truncation_boundary` and `truncation_reason`
+  (`retention_horizon`), mirrored in the `X-Alerts-Truncated`,
+  `X-Alerts-Truncation-Boundary` and `X-Alerts-Truncation-Reason` headers. The
+  exports send the same headers, or as HTTP trailers when archive rows are
+  streamed. An unbounded query (no `from`) is not flagged; `X-Pruned-Before`
+  already states the horizon.
+- Opted in with no archive configured: the same, with reason
+  `archive_not_enabled`.
+- Opted in: archived rows (flagged `"archived": true`) follow the database rows
+  in the same order, shape and cursor. At most 16 chunks are fetched per
+  request (`store.DefaultArchiveMaxChunks`). Hitting the cap sets
+  `truncated: true`, reason `archive_fetch_cap` and the boundary reached;
+  `next_cursor` continues from there, and an export stops at the cap.
+- A missing or corrupt chunk or manifest fails the request with 502 naming the
+  object. It is never a short result.
+
+Limits: months with no manifest are treated as never archived, since the
+bucket is not listed; there is no separate alert-timeline endpoint to cover; the
+partition is read into memory when archived.
 
 ## Per-workspace retention policies
 
