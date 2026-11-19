@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/telemetry"
 )
 
 // httpClient is shared by all outbound webhook-style notifiers.
@@ -61,6 +62,7 @@ func requestJSON(ctx context.Context, method, url string, body []byte, headers m
 		return fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	telemetry.InjectHTTP(ctx, req.Header)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -120,6 +122,7 @@ func postForm(ctx context.Context, endpoint string, form url.Values, headers map
 		return fmt.Errorf("build request: %w", redactURLError(err))
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	telemetry.InjectHTTP(ctx, req.Header)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -179,6 +182,7 @@ func requestJSONWithResponse(ctx context.Context, method, url string, body []byt
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	telemetry.InjectHTTP(ctx, req.Header)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
