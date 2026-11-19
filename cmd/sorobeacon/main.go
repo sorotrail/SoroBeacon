@@ -21,6 +21,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/sorotrail/sorobeacon/internal/alerts"
 	"github.com/sorotrail/sorobeacon/internal/api"
@@ -467,7 +468,13 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	// changes: m is still the same instance the poller, the dispatcher and the
 	// HTTP middleware use below.
 	m := metrics.New()
+	var queryTracer pgx.QueryTracer
+	if tel.Enabled() {
+		queryTracer = tel.NewQueryTracer()
+	}
+	notify.InstrumentHTTP(tel)
 	st, err := store.New(ctx, cfg.DatabaseURL, store.PoolSettings{
+		Tracer:          queryTracer,
 		MaxConns:        cfg.DatabaseMaxConns,
 		MinConns:        cfg.DatabaseMinConns,
 		MaxConnLifetime: cfg.DatabaseMaxConnLifetime,
@@ -706,7 +713,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	// RequestLog must sit outside Recoverer so a panic still emits the
 	// access line after chi writes 500. reqid first so the line can
 	// carry the correlation id.
-	root.Use(reqid.Middleware, api.RequestLog(log), middleware.Recoverer)
+	root.Use(reqid.Middleware, tel.Middleware, api.RequestLog(log), middleware.Recoverer)
 	root.Use(api.CORSMiddleware(api.CORSConfig{Origins: cfg.CORSAllowedOrigins}))
 	// RoutePattern returns the matched chi pattern (e.g. "/api/v1/monitors/{id}")
 	// rather than the raw path, keeping metric label cardinality bounded.

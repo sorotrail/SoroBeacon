@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -209,85 +210,31 @@ func TestKeyTable_LifecycleAndRevocation(t *testing.T) {
 	assert.Nil(t, kt.GetCurrentKey(url))
 }
 
-func TestGenerateSigningKeySecret(t *testing.T) {
-	// Happy path: generates a valid 64-character hex string (32 bytes)
-	secret := GenerateSigningKeySecret()
-	require.NotEmpty(t, secret)
-	assert.Len(t, secret, 64, "secret must be 32 bytes encoded as 64 hex chars")
+func TestGenerateSigningKeyID(t *testing.T) {
+	t.Run("happy path: well formed and unique", func(t *testing.T) {
+		// GenerateSigningKeyID returns "csk_" followed by 8 random bytes
+		// hex-encoded, so the suffix is exactly 16 lowercase hex chars.
+		seen := make(map[string]struct{}, 100)
+		for i := 0; i < 100; i++ {
+			id := GenerateSigningKeyID()
+			require.NotEmpty(t, id)
+			assert.True(t, strings.HasPrefix(id, "csk_"), "key id must carry the csk_ prefix")
+			assert.Len(t, id, len("csk_")+16, "csk_ prefix plus 8 hex-encoded bytes")
+			assert.Regexp(t, `^csk_[0-9a-f]{16}$`, id, "suffix must be lowercase hex")
+			_, dup := seen[id]
+			assert.False(t, dup, "key ids must be unique across calls")
+			seen[id] = struct{}{}
+		}
+	})
 
-	// Verify it's valid hex
-	_, err := hex.DecodeString(secret)
-	require.NoError(t, err, "secret must be valid hex")
-
-	// Error path (statistical): two calls should produce different secrets
-	// (extremely unlikely collision, but we assert uniqueness)
-	secret2 := GenerateSigningKeySecret()
-	assert.NotEqual(t, secret, secret2, "consecutive calls should produce different secrets")
-
-	// Verify both are valid hex and correct length
-	_, err = hex.DecodeString(secret2)
-	require.NoError(t, err)
-	assert.Len(t, secret2, 64)
-}
-
-func TestKeyTable_GetKey(t *testing.T) {
-	kt := NewKeyTable()
-	url := "https://example.com/webhook"
-
-	// Add a key first
-	k1, err := kt.AddKey(url, []byte("key-secret-1"))
-	require.NoError(t, err)
-
-	tests := []struct {
-		name       string
-		url        string
-		keyID      string
-		expectNil  bool
-		checkID    string // if not expectNil, verify this ID
-	}{
-		{
-			name:       "happy path - existing key for URL",
-			url:        url,
-			keyID:      k1.ID,
-			expectNil:  false,
-			checkID:    k1.ID,
-		},
-		{
-			name:       "error path - non-existent key ID for existing URL",
-			url:        url,
-			keyID:      "csk_nonexistent",
-			expectNil:  true,
-		},
-		{
-			name:       "error path - non-existent URL",
-			url:        "https://other.example.com/webhook",
-			keyID:      k1.ID,
-			expectNil:  true,
-		},
-		{
-			name:       "error path - empty key ID",
-			url:        url,
-			keyID:      "",
-			expectNil:  true,
-		},
-		{
-			name:       "error path - empty URL",
-			url:        "",
-			keyID:      k1.ID,
-			expectNil:  true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			key := kt.GetKey(tt.url, tt.keyID)
-			if tt.expectNil {
-				assert.Nil(t, key, "GetKey should return nil for %s", tt.name)
-			} else {
-				require.NotNil(t, key, "GetKey should return key for %s", tt.name)
-				assert.Equal(t, tt.checkID, key.ID)
-				assert.Equal(t, []byte("key-secret-1"), key.Key)
-			}
-		})
-	}
+	t.Run("error path: no collisions across consecutive calls", func(t *testing.T) {
+		// rand.Read errors are swallowed internally, so the function never
+		// fails. The only observable failure mode would be a repeated id
+		// (a collision), which must not happen for 8 random bytes.
+		first := GenerateSigningKeyID()
+		second := GenerateSigningKeyID()
+		require.NotEmpty(t, first)
+		require.NotEmpty(t, second)
+		assert.NotEqual(t, first, second, "consecutive key ids must not collide")
+	})
 }

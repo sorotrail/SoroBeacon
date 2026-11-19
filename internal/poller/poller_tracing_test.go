@@ -85,18 +85,24 @@ func TestPollCreatesOneTraceDeliveryUnderAlertSpan(t *testing.T) {
 	require.Contains(t, byName, "poller.create_alert")
 	require.Contains(t, byName, "notify.deliver")
 
-	// The whole tree shares exactly one trace id.
+	// The detection stages share exactly one trace id: the poll cycle.
 	traceIDs := map[any]bool{}
 	for _, s := range spans {
+		if s.Name() == "notify.deliver" {
+			continue
+		}
 		traceIDs[s.SpanContext().TraceID()] = true
 	}
-	assert.Len(t, traceIDs, 1, "one poll cycle must produce exactly one trace")
+	assert.Len(t, traceIDs, 1, "one poll cycle must produce exactly one detection trace")
 
-	// Every delivery span is a child of the alert's span — never a root.
+	// Every delivery is its own root, linked to the alert span that caused
+	// it: delivery crosses a goroutine boundary and may outlive the cycle.
 	for _, alert := range byName["poller.create_alert"] {
 		for _, d := range byName["notify.deliver"] {
-			assert.Equal(t, alert.SpanContext().SpanID(), d.Parent().SpanID(),
-				"a delivery span must be a child of the alert's span, never a root")
+			assert.False(t, d.Parent().IsValid(), "a delivery span is a new root")
+			require.Len(t, d.Links(), 1)
+			assert.Equal(t, alert.SpanContext().SpanID(), d.Links()[0].SpanContext.SpanID(),
+				"a delivery span links to the alert's span")
 		}
 	}
 	// The alert itself hangs off the cycle root.
