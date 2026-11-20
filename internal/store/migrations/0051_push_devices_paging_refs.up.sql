@@ -21,8 +21,11 @@ CREATE TABLE push_devices (
 );
 CREATE UNIQUE INDEX push_devices_channel_device_idx ON push_devices (channel_id, device_id);
 
+-- alerts is partitioned, so the reference carries the parent's created_at and
+-- points at (id, created_at), as delivery_attempts and dead_letters do.
 CREATE TABLE alert_external_refs (
-    alert_id     BIGINT NOT NULL REFERENCES alerts (id) ON DELETE CASCADE,
+    alert_id         BIGINT NOT NULL,
+    alert_created_at TIMESTAMPTZ NOT NULL,
     channel_id   BIGINT NOT NULL REFERENCES channels (id) ON DELETE CASCADE,
     workspace_id TEXT NOT NULL DEFAULT 'default',
     provider     TEXT NOT NULL,
@@ -31,6 +34,7 @@ CREATE TABLE alert_external_refs (
     state        TEXT NOT NULL DEFAULT '',
     sync_error   TEXT NOT NULL DEFAULT '',
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (alert_id, channel_id)
+    PRIMARY KEY (alert_id, channel_id),
+    FOREIGN KEY (alert_id, alert_created_at) REFERENCES alerts (id, created_at) ON DELETE CASCADE
 );
 CREATE INDEX alert_external_refs_dedup_idx ON alert_external_refs (channel_id, dedup_key);

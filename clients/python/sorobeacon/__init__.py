@@ -959,6 +959,9 @@ OPENAPI_OPERATIONS: tuple[dict[str, str], ...] = (
     {"method": "POST", "path": "/channels/{id}/keys/rotate", "client_method": "rotate_channel_key", "summary": "Rotate channel signing key with overlap"},
     {"method": "POST", "path": "/channels/{id}/keys/{keyID}/retire", "client_method": "retire_channel_key", "summary": "Retire a channel signing key"},
     {"method": "POST", "path": "/channels/{id}/keys/{keyID}/revoke", "client_method": "revoke_channel_key", "summary": "Revoke a channel signing key immediately"},
+    {"method": "GET", "path": "/channels/{id}/devices", "client_method": "list_push_devices", "summary": "List registered push devices (tokens are never returned)"},
+    {"method": "PUT", "path": "/channels/{id}/devices/{deviceID}", "client_method": "register_push_device", "summary": "Register a push device or refresh its token"},
+    {"method": "DELETE", "path": "/channels/{id}/devices/{deviceID}", "client_method": "delete_push_device", "summary": "Remove a push device"},
     {"method": "GET", "path": "/maintenance-windows", "client_method": "list_maintenance_windows", "summary": "List maintenance windows"},
     {"method": "POST", "path": "/maintenance-windows", "client_method": "create_maintenance_window", "summary": "Create a maintenance window"},
     {"method": "GET", "path": "/maintenance-windows/{id}", "client_method": "get_maintenance_window", "summary": "Fetch one maintenance window"},
@@ -1657,6 +1660,47 @@ class SoroBeaconClient:
         self._request(
             "POST",
             f"/channels/{self._quote(channel_id)}/keys/{self._quote(key_id)}/revoke",
+            headers=headers,
+        )
+
+    def list_push_devices(
+        self,
+        channel_id: Int64,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
+        return self._request(
+            "GET",
+            f"/channels/{self._quote(channel_id)}/devices",
+            headers=headers,
+        )
+
+    def register_push_device(
+        self,
+        channel_id: Int64,
+        device_id: str,
+        input_data: Mapping[str, Any],
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        self._request(
+            "PUT",
+            f"/channels/{self._quote(channel_id)}/devices/{self._quote(device_id)}",
+            body=dict(input_data),
+            has_body=True,
+            headers=headers,
+        )
+
+    def delete_push_device(
+        self,
+        channel_id: Int64,
+        device_id: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        self._request(
+            "DELETE",
+            f"/channels/{self._quote(channel_id)}/devices/{self._quote(device_id)}",
             headers=headers,
         )
 

@@ -136,8 +136,8 @@ func (p *Postgres) RetirePushDevice(ctx context.Context, channelID int64, device
 func (p *Postgres) RecordAlertExternalRef(ctx context.Context, r *AlertExternalRef) error {
 	// The insert selects through the alert, scoped to the caller's workspace,
 	// so another tenant's alert id inserts nothing.
-	tag, err := p.pool.Exec(ctx, `INSERT INTO alert_external_refs (alert_id, channel_id, workspace_id, provider, dedup_key)
-		SELECT a.id, $2, $3, $4, $5 FROM alerts a WHERE a.id = $1 AND a.workspace_id = $3
+	tag, err := p.pool.Exec(ctx, `INSERT INTO alert_external_refs (alert_id, alert_created_at, channel_id, workspace_id, provider, dedup_key)
+		SELECT a.id, a.created_at, $2, $3, $4, $5 FROM alerts a WHERE a.id = $1 AND a.workspace_id = $3
 		ON CONFLICT (alert_id, channel_id) DO UPDATE SET dedup_key = EXCLUDED.dedup_key, updated_at = now()`,
 		r.AlertID, r.ChannelID, workspaceID(ctx), r.Provider, r.DedupKey)
 	if err != nil {

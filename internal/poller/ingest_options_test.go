@@ -3,6 +3,7 @@ package poller
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -172,13 +173,15 @@ func TestIngestorEnricherAddsContextToStoredDispatchedAndPublishedAlerts(t *test
 	assert.Equal(t, "transfer", call.eventName)
 
 	require.Len(t, st.alerts, 1)
-	assert.JSONEq(t, enrichment, string(st.alerts[0].Enrichment))
+	// The enricher marks what it stored as operator supplied.
+	stored := withOperatorSource(t, enrichment)
+	assert.JSONEq(t, stored, string(st.alerts[0].Enrichment))
 	require.Len(t, d.dispatched, 1)
-	assert.JSONEq(t, enrichment, string(d.dispatched[0].Enrichment))
+	assert.JSONEq(t, stored, string(d.dispatched[0].Enrichment))
 
 	select {
 	case got := <-sub.C:
-		assert.JSONEq(t, enrichment, string(got.Enrichment))
+		assert.JSONEq(t, stored, string(got.Enrichment))
 	case <-time.After(time.Second):
 		t.Fatal("the enriched alert did not reach the publisher")
 	}
@@ -322,4 +325,16 @@ func TestIngestorEnrichesOnlyAfterARuleMatches(t *testing.T) {
 	res = ing.Handle(context.Background(), decodedTransfer(t, "ev-transfer"), st.monitors, HandleOptions{Deliver: true})
 	assert.Equal(t, 1, res.Matched)
 	assert.EqualValues(t, 1, hits.Load(), "a matched event is enriched once")
+}
+
+// withOperatorSource returns doc with the "_source": "operator" marker the
+// enricher adds to everything it fetches.
+func withOperatorSource(t *testing.T, doc string) string {
+	t.Helper()
+	var m map[string]any
+	require.NoError(t, json.Unmarshal([]byte(doc), &m))
+	m["_source"] = "operator"
+	out, err := json.Marshal(m)
+	require.NoError(t, err)
+	return string(out)
 }

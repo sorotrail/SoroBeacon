@@ -936,6 +936,9 @@ export const OPENAPI_OPERATIONS = [
   { method: "POST", path: "/channels/{id}/keys/rotate", clientMethod: "rotateChannelKey", summary: "Rotate channel signing key with overlap" },
   { method: "POST", path: "/channels/{id}/keys/{keyID}/retire", clientMethod: "retireChannelKey", summary: "Retire a channel signing key" },
   { method: "POST", path: "/channels/{id}/keys/{keyID}/revoke", clientMethod: "revokeChannelKey", summary: "Revoke a channel signing key immediately" },
+  { method: "GET", path: "/channels/{id}/devices", clientMethod: "listPushDevices", summary: "List registered push devices (tokens are never returned)" },
+  { method: "PUT", path: "/channels/{id}/devices/{deviceID}", clientMethod: "registerPushDevice", summary: "Register a push device or refresh its token" },
+  { method: "DELETE", path: "/channels/{id}/devices/{deviceID}", clientMethod: "deletePushDevice", summary: "Remove a push device" },
   { method: "GET", path: "/maintenance-windows", clientMethod: "listMaintenanceWindows", summary: "List maintenance windows" },
   { method: "POST", path: "/maintenance-windows", clientMethod: "createMaintenanceWindow", summary: "Create a maintenance window" },
   { method: "GET", path: "/maintenance-windows/{id}", clientMethod: "getMaintenanceWindow", summary: "Fetch one maintenance window" },
@@ -1576,6 +1579,42 @@ export class SoroBeaconClient {
     return this.request<void>(
       "POST",
       `/channels/${encodeURIComponent(String(channelId))}/keys/${encodeURIComponent(keyId)}/revoke`,
+      { requestOptions: options },
+    );
+  }
+
+  async listPushDevices(
+    channelId: Int64,
+    options?: RequestOptions,
+  ): Promise<unknown> {
+    return this.request(
+      "GET",
+      `/channels/${encodeURIComponent(String(channelId))}/devices`,
+      { requestOptions: options },
+    );
+  }
+
+  async registerPushDevice(
+    channelId: Int64,
+    deviceId: string,
+    input: { token: string; platform?: "fcm" },
+    options?: RequestOptions,
+  ): Promise<void> {
+    return this.request<void>(
+      "PUT",
+      `/channels/${encodeURIComponent(String(channelId))}/devices/${encodeURIComponent(deviceId)}`,
+      { body: input, requestOptions: options },
+    );
+  }
+
+  async deletePushDevice(
+    channelId: Int64,
+    deviceId: string,
+    options?: RequestOptions,
+  ): Promise<void> {
+    return this.request<void>(
+      "DELETE",
+      `/channels/${encodeURIComponent(String(channelId))}/devices/${encodeURIComponent(deviceId)}`,
       { requestOptions: options },
     );
   }

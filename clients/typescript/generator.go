@@ -159,6 +159,9 @@ var knownRouteBindings = []routeBinding{
 	{"POST", "/channels/{id}/keys/rotate", "rotateChannelKey"},
 	{"POST", "/channels/{id}/keys/{keyID}/retire", "retireChannelKey"},
 	{"POST", "/channels/{id}/keys/{keyID}/revoke", "revokeChannelKey"},
+	{"GET", "/channels/{id}/devices", "listPushDevices"},
+	{"PUT", "/channels/{id}/devices/{deviceID}", "registerPushDevice"},
+	{"DELETE", "/channels/{id}/devices/{deviceID}", "deletePushDevice"},
 	{"GET", "/maintenance-windows", "listMaintenanceWindows"},
 	{"POST", "/maintenance-windows", "createMaintenanceWindow"},
 	{"GET", "/maintenance-windows/{id}", "getMaintenanceWindow"},
@@ -1661,6 +1664,42 @@ export class SoroBeaconClient {
     return this.request<void>(
       "POST",
       ` + "`/channels/${encodeURIComponent(String(channelId))}/keys/${encodeURIComponent(keyId)}/revoke`" + `,
+      { requestOptions: options },
+    );
+  }
+
+  async listPushDevices(
+    channelId: Int64,
+    options?: RequestOptions,
+  ): Promise<unknown> {
+    return this.request(
+      "GET",
+      ` + "`/channels/${encodeURIComponent(String(channelId))}/devices`" + `,
+      { requestOptions: options },
+    );
+  }
+
+  async registerPushDevice(
+    channelId: Int64,
+    deviceId: string,
+    input: { token: string; platform?: "fcm" },
+    options?: RequestOptions,
+  ): Promise<void> {
+    return this.request<void>(
+      "PUT",
+      ` + "`/channels/${encodeURIComponent(String(channelId))}/devices/${encodeURIComponent(deviceId)}`" + `,
+      { body: input, requestOptions: options },
+    );
+  }
+
+  async deletePushDevice(
+    channelId: Int64,
+    deviceId: string,
+    options?: RequestOptions,
+  ): Promise<void> {
+    return this.request<void>(
+      "DELETE",
+      ` + "`/channels/${encodeURIComponent(String(channelId))}/devices/${encodeURIComponent(deviceId)}`" + `,
       { requestOptions: options },
     );
   }
