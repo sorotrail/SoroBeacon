@@ -73,6 +73,9 @@ func decodeCursor(cursor string) (batch int, rpcCursor string) {
 	return n, rest
 }
 
+// FetchEvents fetches one page of decoded contract events for watch from
+// Soroban RPC, starting at startLedger or resuming from cursor, and returns
+// the cursor for the next page (empty once every filter batch is drained).
 func (s *RPCSource) FetchEvents(ctx context.Context, startLedger uint32, watch []Watch, cursor string, limit int) (FetchPage, error) {
 	if limit <= 0 {
 		limit = stellar.DefaultEventsLimit
