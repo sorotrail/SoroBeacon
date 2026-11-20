@@ -158,6 +158,11 @@ var routeScopes = auth.NewRouteTable(map[string][]auth.Scope{
 	"GET /monitors/{id}/escalation":    {auth.ScopeMonitorsRead},
 	"PUT /monitors/{id}/escalation":    {auth.ScopeMonitorsWrite, auth.ScopeChannelsWrite},
 	"DELETE /monitors/{id}/escalation": {auth.ScopeMonitorsWrite},
+	// A delivery budget is monitor configuration: it decides when the monitor
+	// stops delivering, so it needs no channel scope.
+	"GET /monitors/{id}/delivery-budget":        {auth.ScopeMonitorsRead},
+	"PUT /monitors/{id}/delivery-budget":        {auth.ScopeMonitorsWrite},
+	"POST /monitors/{id}/delivery-budget/reset": {auth.ScopeMonitorsWrite},
 	// A dry run evaluates a candidate rule against stored alerts and persists
 	// nothing, so it reads both and writes neither.
 	"POST /monitors/{id}/rules/dry-run": {auth.ScopeMonitorsRead, auth.ScopeAlertsRead},

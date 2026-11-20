@@ -582,3 +582,14 @@ func TestSetChannelUnacknowledgedFlagged(t *testing.T) {
 		nilMetrics.SetChannelUnacknowledgedFlagged("ch-1", "webhook", true)
 	})
 }
+
+func TestRecordDeliveryBudgetExhaustedCountsAndIsExported(t *testing.T) {
+	m := New()
+	m.RecordDeliveryBudgetExhausted()
+	m.RecordDeliveryBudgetExhausted()
+	assert.Equal(t, float64(2), m.sampleValue(t, "sorobeacon_delivery_budget_exhausted_total", nil))
+	assert.Contains(t, ExportedMetricNames(), "sorobeacon_delivery_budget_exhausted_total")
+
+	var nilMetrics *Metrics
+	nilMetrics.RecordDeliveryBudgetExhausted() // must not panic: metrics are optional
+}

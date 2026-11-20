@@ -2497,6 +2497,7 @@ type Store interface {
 	PersistedOperations
 	Usage
 	Quotas
+	DeliveryBudgets
 	RetentionPolicies
 	Idempotency
 	GetStats(ctx context.Context) (Stats, error)
