@@ -662,6 +662,19 @@ func buildRESTIsolationChecks(fx *isolationFixture) map[string]func(t *testing.T
 			fx.assertSameNotFoundStatus(t, "DELETE /monitors/{id}/escalation", http.MethodDelete,
 				"/monitors/"+betaMon+"/escalation", "/monitors/"+missing+"/escalation", "", "")
 		},
+		"GET /monitors/{id}/delivery-budget": func(t *testing.T) {
+			fx.assertSameNotFoundStatus(t, "GET /monitors/{id}/delivery-budget", http.MethodGet,
+				"/monitors/"+betaMon+"/delivery-budget", "/monitors/"+missing+"/delivery-budget", "", "")
+		},
+		"PUT /monitors/{id}/delivery-budget": func(t *testing.T) {
+			fx.assertSameNotFoundStatus(t, "PUT /monitors/{id}/delivery-budget", http.MethodPut,
+				"/monitors/"+betaMon+"/delivery-budget", "/monitors/"+missing+"/delivery-budget",
+				`{"limit":5}`, `{"limit":5}`)
+		},
+		"POST /monitors/{id}/delivery-budget/reset": func(t *testing.T) {
+			fx.assertSameNotFoundStatus(t, "POST /monitors/{id}/delivery-budget/reset", http.MethodPost,
+				"/monitors/"+betaMon+"/delivery-budget/reset", "/monitors/"+missing+"/delivery-budget/reset", "", "")
+		},
 
 		// --- Channels (including Channel.Config secret canary checks) ---
 		"GET /channels": func(t *testing.T) {

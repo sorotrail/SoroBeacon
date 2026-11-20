@@ -17,6 +17,16 @@
 <p class="muted">Duplicate copies rules and channel attachments under a new name, created disabled so it cannot alert until reviewed.</p>
 {{if .CanAdmin}}<p><a href="/audit?target_type=monitor&target_id={{.Monitor.ID}}">Change history for this monitor &rarr;</a></p>{{end}}
 
+{{with .Budget}}{{if .Limit}}
+<h2>Delivery budget</h2>
+<p>
+  {{if .Exhausted}}<span class="pill off">exhausted</span>{{else}}<span class="pill on">active</span>{{end}}
+  <b>{{.Remaining}}</b> of {{.Limit}} deliveries left today
+  <span class="muted">({{.Used}} used; resets {{formatTime .ResetsAt $.Timezone}})</span>
+</p>
+{{if .Exhausted}}<p class="muted">Delivery stopped for this monitor. Alerts are still recorded and listed below; they are not sent to its channels until the budget resets.</p>{{end}}
+{{end}}{{end}}
+
 <h2>Activity</h2>
 {{if .Stats.Alerts}}
 <div class="stats">
