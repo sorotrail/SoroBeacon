@@ -2,6 +2,17 @@
 
 This PR implements end-to-end timeout and cancellation propagation for inbound API requests while ensuring that critical background operations (alert persistence, cursor advances, delivery records, and escalation state transitions) are explicitly detached to complete safely even if a caller disconnects.
 
+Example: request-scoped work uses the caller's context, while work that must
+finish regardless is detached from its cancellation:
+
+```go
+// Cancelled when the client disconnects.
+alerts, err := store.ListAlerts(r.Context(), filter)
+
+// Survives the disconnect, but keeps the request's values (trace ids, etc.).
+err = store.AdvanceContractCursor(context.WithoutCancel(r.Context()), network, contractID, lastLedger)
+```
+
 ## Changes
 
 - Propagated request contexts through handlers, stores, and database query executions.
@@ -14,3 +25,10 @@ This PR implements end-to-end timeout and cancellation propagation for inbound A
 - Ran `go build ./...` and `go vet ./...` successfully.
 - Executed full test suite including SQLite and Postgres conformance tests.
 - Verified `golangci-lint run` passes cleanly with no warnings or errors.
+
+A copy-paste example: the NDJSON export handler must stop its store query
+when the client disconnects mid-stream.
+
+```sh
+go test ./internal/api -run TestExportAlertsNDJSON_CancelledClientStopsQuery -v
+```

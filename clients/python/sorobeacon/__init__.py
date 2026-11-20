@@ -234,6 +234,28 @@ class DeliveryAttempt(TypedDict, total=False):
     status: Required[Literal["success", "failed"]]
 
 
+class DeliveryBudget(TypedDict, total=False):
+    exhausted: NotRequired[bool]
+    # When the budget ran out in this window; null while budget remains.
+    exhausted_at: NotRequired[ISODateTimeString]
+    # Daily budget; null means unlimited.
+    limit: NotRequired[int]
+    monitor_id: NotRequired[Int64Value]
+    # Deliveries left in the window; null when unlimited.
+    remaining: NotRequired[int | None]
+    # When the window rolls over and the budget refills; null when unlimited.
+    resets_at: NotRequired[ISODateTimeString | None]
+    # Deliveries consumed in the current window.
+    used: NotRequired[int]
+    # Start of the current UTC window; null when unlimited.
+    window_start: NotRequired[ISODateTimeString | None]
+
+
+class DeliveryBudgetInput(TypedDict, total=False):
+    # Alerts the monitor may deliver per UTC day. null clears the budget (unlimited).
+    limit: Required[int]
+
+
 class DryRunResult(TypedDict, total=False):
     # Number of historical events that matched the rule
     count: Required[int]
@@ -940,6 +962,9 @@ OPENAPI_OPERATIONS: tuple[dict[str, str], ...] = (
     {"method": "GET", "path": "/monitors/{id}/escalation", "client_method": "get_monitor_escalation", "summary": "Get a monitor's escalation policy"},
     {"method": "PUT", "path": "/monitors/{id}/escalation", "client_method": "set_monitor_escalation", "summary": "Create or replace a monitor's escalation policy"},
     {"method": "DELETE", "path": "/monitors/{id}/escalation", "client_method": "delete_monitor_escalation", "summary": "Delete a monitor's escalation policy"},
+    {"method": "GET", "path": "/monitors/{id}/delivery-budget", "client_method": "get_delivery_budget", "summary": "Get a monitor's delivery budget"},
+    {"method": "PUT", "path": "/monitors/{id}/delivery-budget", "client_method": "set_delivery_budget", "summary": "Set or clear a monitor's delivery budget"},
+    {"method": "POST", "path": "/monitors/{id}/delivery-budget/reset", "client_method": "reset_delivery_budget", "summary": "Reset a monitor's delivery budget"},
     {"method": "GET", "path": "/monitors/{id}/rules", "client_method": "list_rules", "summary": "List a monitor's rules"},
     {"method": "POST", "path": "/monitors/{id}/rules", "client_method": "create_rule", "summary": "Add a rule to a monitor"},
     {"method": "POST", "path": "/monitors/{id}/rules/bulk", "client_method": "bulk_create_rules", "summary": "Create several rules in one request"},

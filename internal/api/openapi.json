@@ -337,6 +337,90 @@
         }
       }
     },
+    "/monitors/{id}/delivery-budget": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "get": {
+        "summary": "Get a monitor's delivery budget",
+        "description": "Returns the daily delivery budget and how much of today's (UTC) window is spent. A monitor with no budget is unlimited: limit and remaining are null.",
+        "responses": {
+          "200": {
+            "description": "Delivery budget",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryBudget"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "summary": "Set or clear a monitor's delivery budget",
+        "description": "Sets the number of alerts the monitor may deliver per UTC day. Once spent, the monitor's channels get one exhaustion notice and further alerts are stored but not delivered until the window rolls over or the budget is reset. limit is required; null clears the budget (unlimited, the default). Raising the limit above what is already used un-exhausts the budget.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeliveryBudgetInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The stored budget",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryBudget"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/monitors/{id}/delivery-budget/reset": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "post": {
+        "summary": "Reset a monitor's delivery budget",
+        "description": "Manually un-exhausts the budget by zeroing today's counter, without waiting for the UTC rollover. The exhaustion notice can go out again if the budget is spent again.",
+        "responses": {
+          "200": {
+            "description": "The budget after the reset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryBudget"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/monitors/{id}/escalation": {
       "parameters": [
         {
@@ -4411,6 +4495,58 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "DeliveryBudgetInput": {
+        "type": "object",
+        "required": [
+          "limit"
+        ],
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Alerts the monitor may deliver per UTC day. null clears the budget (unlimited)."
+          }
+        }
+      },
+      "DeliveryBudget": {
+        "type": "object",
+        "properties": {
+          "monitor_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Daily budget; null means unlimited."
+          },
+          "used": {
+            "type": "integer",
+            "description": "Deliveries consumed in the current window."
+          },
+          "remaining": {
+            "type": "integer",
+            "description": "Deliveries left in the window; null when unlimited."
+          },
+          "exhausted": {
+            "type": "boolean"
+          },
+          "window_start": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Start of the current UTC window; null when unlimited."
+          },
+          "resets_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the window rolls over and the budget refills; null when unlimited."
+          },
+          "exhausted_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the budget ran out in this window; null while budget remains."
           }
         }
       },

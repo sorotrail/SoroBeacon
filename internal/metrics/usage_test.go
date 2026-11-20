@@ -51,3 +51,78 @@ func TestUsageMetrics_OpaqueHashAndCardinalityBound(t *testing.T) {
 	assert.Contains(t, body, `sorobeacon_workspace_notifications_total{channel_type="voice",outcome="error",workspace="overflow"} 2`)
 	assert.Contains(t, body, `sorobeacon_workspace_api_requests_total{workspace="overflow"} 10`)
 }
+
+func TestWorkspaceMetricLabel(t *testing.T) {
+	tests := []struct {
+		name        string
+		setup       func() *Metrics
+		workspaceID string
+		want        string
+	}{
+		{
+			name:        "tracked workspace returns opaque hash",
+			setup:       New,
+			workspaceID: "tenant-alpha",
+			want:        HashWorkspaceLabel("tenant-alpha"),
+		},
+		{
+			name:        "trimmed workspace matches untrimmed hash",
+			setup:       New,
+			workspaceID: "  tenant-alpha  ",
+			want:        HashWorkspaceLabel("tenant-alpha"),
+		},
+		{
+			name:        "blank workspace falls back to default hash",
+			setup:       New,
+			workspaceID: "   ",
+			want:        HashWorkspaceLabel("default"),
+		},
+		{
+			name: "already tracked workspace resolves from cache at capacity",
+			setup: func() *Metrics {
+				m := New()
+				m.SetMaxTrackedWorkspaces(2)
+				m.WorkspaceMetricLabel("ws-1")
+				m.WorkspaceMetricLabel("ws-2")
+				return m
+			},
+			workspaceID: "ws-1",
+			want:        HashWorkspaceLabel("ws-1"),
+		},
+		{
+			name: "workspace beyond cardinality cap returns overflow",
+			setup: func() *Metrics {
+				m := New()
+				m.SetMaxTrackedWorkspaces(2)
+				m.WorkspaceMetricLabel("ws-1")
+				m.WorkspaceMetricLabel("ws-2")
+				return m
+			},
+			workspaceID: "ws-3",
+			want:        OverflowWorkspaceLabel,
+		},
+		{
+			name: "nil metrics receiver falls back to direct hash",
+			setup: func() *Metrics {
+				return nil
+			},
+			workspaceID: "tenant-nil",
+			want:        HashWorkspaceLabel("tenant-nil"),
+		},
+		{
+			name: "nil workspace tracker falls back to direct hash",
+			setup: func() *Metrics {
+				return &Metrics{}
+			},
+			workspaceID: "tenant-uninitialized",
+			want:        HashWorkspaceLabel("tenant-uninitialized"),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := tc.setup()
+			assert.Equal(t, tc.want, m.WorkspaceMetricLabel(tc.workspaceID))
+		})
+	}
+}

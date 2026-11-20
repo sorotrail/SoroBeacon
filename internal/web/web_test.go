@@ -34,6 +34,9 @@ type emptyStore struct {
 func (emptyStore) GetStats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
 func (emptyStore) AlertChangeKey(context.Context) (int64, int64, error) { return 0, 0, nil }
 func (emptyStore) ChannelDeliveryChangeKey(context.Context, int64) (int64, int64, error) { return 0, 0, nil }
+func (emptyStore) GetDeliveryBudget(context.Context, int64, time.Time) (*store.DeliveryBudget, error) {
+	return nil, store.ErrNotFound
+}
 func (emptyStore) GetMonitorStats(context.Context, int64) (store.MonitorStats, error) {
 	return store.MonitorStats{}, nil
 }

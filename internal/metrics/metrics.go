@@ -62,6 +62,7 @@ type Metrics struct {
 	alertsFired          *prometheus.CounterVec
 	deliveries           *prometheus.CounterVec
 	throttles            *prometheus.CounterVec
+	budgetExhausted      prometheus.Counter
 	httpDuration         *prometheus.HistogramVec
 	httpNotModifiedTotal *prometheus.CounterVec
 	lastPollAgoSec       *prometheus.GaugeVec
@@ -220,6 +221,11 @@ func New() *Metrics {
 			Help: "Throttled alert delivery attempts, by channel type.",
 		}, []string{"channel"}),
 
+		budgetExhausted: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_delivery_budget_exhausted_total",
+			Help: "Times a monitor spent its daily delivery budget and stopped delivering.",
+		}),
+
 		breakerStates: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "sorobeacon_channel_breaker_state",
 			Help: "Circuit breaker state for each channel (0=closed, 1=half-open, 2=open).",
@@ -359,7 +365,7 @@ func New() *Metrics {
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
 		m.upstreamLagLedger, m.upstreamFailures,
-		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired, m.deliveries, m.throttles,
+		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired, m.deliveries, m.throttles, m.budgetExhausted,
 		m.httpDuration, m.httpNotModifiedTotal, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
 		m.reorgsTotal, m.lastReorgLedger, m.breakerStates, m.pollPanics,
 		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.replicaLagSeconds, m.deadLetters, m.deadLettersByChannel, m.heartbeatLastSuccess,
@@ -709,6 +715,16 @@ func (m *Metrics) RecordThrottle(channelType string) {
 	m.throttles.WithLabelValues(channelType).Inc()
 }
 
+// RecordDeliveryBudgetExhausted counts one monitor spending its daily delivery
+// budget. It is incremented once per exhaustion, when the notice goes out, so
+// an alert on its rate means "a monitor just stopped delivering".
+func (m *Metrics) RecordDeliveryBudgetExhausted() {
+	if m == nil {
+		return
+	}
+	m.budgetExhausted.Inc()
+}
+
 // SetBreakerState sets the gauge value for a channel's circuit breaker state.
 func (m *Metrics) SetBreakerState(channelID string, channelType string, state string) {
 	if m == nil {
@@ -862,6 +878,7 @@ func ExportedMetricNames() []string {
 		"sorobeacon_alerts_fired_total",
 		"sorobeacon_alert_deliveries_total",
 		"sorobeacon_alert_throttles_total",
+		"sorobeacon_delivery_budget_exhausted_total",
 		"sorobeacon_channel_breaker_state",
 		"sorobeacon_http_request_duration_seconds",
 		"sorobeacon_seconds_since_last_poll",
