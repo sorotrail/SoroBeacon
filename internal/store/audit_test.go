@@ -1,28 +1,45 @@
-package store
+package store_test
 
-import "testing"
+import (
+	"testing"
 
-// ValidAuditOutcome gates the outcome filter on the audit log, so an
-// unsupported value has to be rejected at the boundary instead of reaching
-// the query and quietly matching nothing.
-func TestValidAuditOutcome(t *testing.T) {
+	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/stretchr/testify/assert"
+)
+
+// ValidAuditActorType is the whitelist behind the audit_log.actor_type column,
+// so it has to accept exactly the four actor classifications and reject
+// everything else. A false positive here would persist an actor type no reader
+// understands; a false negative would drop a legitimate audit write.
+func TestValidAuditActorType(t *testing.T) {
 	tests := []struct {
-		name    string
-		outcome string
-		want    bool
+		name string
+		in   string
+		want bool
 	}{
-		{name: "succeeded", outcome: AuditOutcomeSucceeded, want: true},
-		{name: "failed", outcome: AuditOutcomeFailed, want: true},
-		{name: "empty", outcome: "", want: false},
-		{name: "unknown value", outcome: "pending", want: false},
-		{name: "wrong case", outcome: "Succeeded", want: false},
-		{name: "surrounding whitespace", outcome: " succeeded", want: false},
+		// Happy path: every supported classification, by constant and by the
+		// literal value written to the column.
+		{"person constant", store.AuditActorPerson, true},
+		{"automation constant", store.AuditActorAutomation, true},
+		{"system constant", store.AuditActorSystem, true},
+		{"anonymous constant", store.AuditActorAnonymous, true},
+		{"person literal", "person", true},
+		{"automation literal", "automation", true},
+		{"system literal", "system", true},
+		{"anonymous literal", "anonymous", true},
+
+		// Error path: values that look plausible but are not supported must be
+		// rejected rather than silently stored.
+		{"empty", "", false},
+		{"unknown actor", "robot", false},
+		{"wrong case", "Person", false},
+		{"padded", " person ", false},
+		{"typo", "persona", false},
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := ValidAuditOutcome(tc.outcome); got != tc.want {
-				t.Errorf("ValidAuditOutcome(%q) = %v, want %v", tc.outcome, got, tc.want)
-			}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, store.ValidAuditActorType(tt.in))
 		})
 	}
 }

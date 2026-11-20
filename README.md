@@ -649,6 +649,22 @@ curl -s localhost:8080/api/v1/health
 curl -s localhost:8080/api/v1/stats
 ```
 
+`GET /api/v1/stats` answers with the instance's live counters and ingest
+position, which is enough for a quick "is it working?" check or a dashboard
+panel:
+
+```json
+{
+  "monitors": 3,
+  "rules": 5,
+  "channels": 2,
+  "alerts": 128,
+  "alerts_last_24h": 7,
+  "last_ledger": 1234567,
+  "last_poll_at": "2026-09-24T12:00:00Z"
+}
+```
+
 ### Maintenance windows
 
 Time-bounded silences that suppress **delivery**, not **detection**. Alerts
