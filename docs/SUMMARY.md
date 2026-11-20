@@ -48,6 +48,7 @@
 * [Federation](channels/federation.md)
 * [Matrix](channels/matrix.md)
 * [PagerDuty](channels/pagerduty.md)
+* [Mobile push (FCM)](channels/push.md)
 * [Mattermost](channels/mattermost.md)
 * [Rocket.Chat](channels/rocketchat.md)
 * [Zulip](channels/zulip.md)

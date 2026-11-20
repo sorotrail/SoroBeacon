@@ -607,7 +607,7 @@ func RunChaosSuite(ctx context.Context, cfg ChaosConfig) (*ChaosResult, error) {
 			// Choose whether to inject an HTTP channel fault on this attempt.
 			injectFault := attempt < cfg.MaxAttempts && rng.Intn(3) == 0
 			// Also allow occasional permanent retry exhaustion to exercise dead-lettering.
-			exhaustRetries := attempt <= cfg.MaxAttempts && (( int(alert.ID)+ int(cfg.Seed))%7 == 0)
+			exhaustRetries := attempt <= cfg.MaxAttempts && ((int(alert.ID)+int(cfg.Seed))%7 == 0)
 
 			if injectFault || exhaustRetries {
 				res.ChannelFaults++
@@ -960,4 +960,3 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
-

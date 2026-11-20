@@ -9,9 +9,9 @@ import (
 
 func TestFormatRetentionSummaryHappyPath(t *testing.T) {
 	policy := store.WorkspaceRetentionPolicy{
-		WorkspaceID:       "ws123",
-		PolicySource:      "workspace",
-		EffectiveRetention:   "24h",
+		WorkspaceID:               "ws123",
+		PolicySource:              "workspace",
+		EffectiveRetention:        "24h",
 		EffectiveRetentionSeconds: 86400,
 	}
 
@@ -23,8 +23,8 @@ func TestFormatRetentionSummaryHappyPath(t *testing.T) {
 
 func TestFormatRetentionSummaryErrorPath(t *testing.T) {
 	policy := store.WorkspaceRetentionPolicy{
-		WorkspaceID:       "ws456",
-		PolicySource:      "unset",
+		WorkspaceID:               "ws456",
+		PolicySource:              "unset",
 		EffectiveRetentionSeconds: 0,
 	}
 
@@ -36,9 +36,9 @@ func TestFormatRetentionSummaryErrorPath(t *testing.T) {
 
 func TestFormatRetentionSummaryInstanceSource(t *testing.T) {
 	policy := store.WorkspaceRetentionPolicy{
-		WorkspaceID:       "ws789",
-		PolicySource:      "instance",
-		EffectiveRetention:   "7d",
+		WorkspaceID:               "ws789",
+		PolicySource:              "instance",
+		EffectiveRetention:        "7d",
 		EffectiveRetentionSeconds: 604800,
 	}
 

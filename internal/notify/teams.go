@@ -76,7 +76,7 @@ type teamsMessageCard struct {
 	Title   string `json:"title"`
 	// ThemeColor carries the alert severity as a hex colour so a critical
 	// alert is distinguishable from an info one at a glance in the list.
-	ThemeColor string            `json:"themeColor"`
+	ThemeColor string             `json:"themeColor"`
 	Sections   []teamsCardSection `json:"sections"`
 }
 

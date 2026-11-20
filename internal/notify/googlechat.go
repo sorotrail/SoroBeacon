@@ -23,8 +23,8 @@ type cardV2 struct {
 }
 
 type card struct {
-	Header    cardHeader   `json:"header"`
-	Sections  []cardSection `json:"sections"`
+	Header   cardHeader    `json:"header"`
+	Sections []cardSection `json:"sections"`
 }
 
 type cardHeader struct {

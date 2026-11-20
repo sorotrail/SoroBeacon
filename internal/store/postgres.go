@@ -34,7 +34,7 @@ type PoolSettings struct {
 	// Tracer, when set, records one span per statement (telemetry's pgx
 	// tracer): the statement's verb and a hash identifying it, never the
 	// SQL's parameter values.
-	Tracer pgx.QueryTracer
+	Tracer          pgx.QueryTracer
 	MaxConns        int32
 	MinConns        int32
 	MaxConnLifetime time.Duration

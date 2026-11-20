@@ -33,6 +33,7 @@ func NewSlack(config json.RawMessage) (Notifier, error) {
 	if err != nil {
 		return nil, fmt.Errorf("slack: %w", err)
 	}
+	tpl.kind = "slack"
 	return &Slack{cfg: cfg, tpl: tpl}, nil
 }
 

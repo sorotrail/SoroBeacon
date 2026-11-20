@@ -26,13 +26,13 @@ func TestEscapeJSONString(t *testing.T) {
 			want:  "",
 		},
 		{
-			name:  "error path - very short input (len < 2 after marshal)",
+			name: "error path - very short input (len < 2 after marshal)",
 			// The function returns "" when len(marshaled) < 2,
 			// which happens with empty string since json.Marshal("") = "{quote}{quote}" = 2 bytes
 			// but b[1:len(b)-1] gives empty string. This is covered above.
 		},
 		{
-			name:  "error path - function returns empty for marshal failure",
+			name: "error path - function returns empty for marshal failure",
 			// json.Marshal should not fail for valid Go strings, but we test the guard.
 		},
 	}

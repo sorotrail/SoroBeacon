@@ -101,6 +101,8 @@ var NonExportedInstanceTables = map[string]string{
 	"idempotency_keys":        "ephemeral HTTP transport idempotency response cache with 24h TTL",
 	"workspace_deletions":     "durable workspace deletion progress and completion tombstone log",
 	"alert_stat_rollups":      "derived trigger-maintained alert statistics rollup recomputed from alerts",
+	"push_devices":            "mobile push device tokens are credentials and are never exported; devices re-register against the restored channel",
+	"alert_external_refs":     "provider incident correlation is delivery-runtime state tied to live provider incidents, not workspace configuration",
 }
 
 // WorkspaceExportTables returns the complete ordered list of schema tables
@@ -361,44 +363,44 @@ type ExportedAlertEscalation struct {
 // export. WriteWorkspaceExportJSON streams this exact JSON structure directly
 // to an io.Writer without buffering all rows in memory.
 type WorkspaceExportBundle struct {
-	Manifest                          WorkspaceExportManifest           `json:"manifest"`
-	Format                            string                            `json:"format"`
-	Version                           int                               `json:"version"`
-	WorkspaceID                       string                            `json:"workspace_id"`
-	ExportedAt                        time.Time                         `json:"exported_at"`
-	IncludeSecrets                    bool                              `json:"include_secrets"`
-	SecretsRedacted                   bool                              `json:"secrets_redacted"`
-	IncludeAlerts                     bool                              `json:"include_alerts"`
-	AlertsIncluded                    bool                              `json:"alerts_included"`
-	Workspaces                        []ExportedWorkspace               `json:"workspaces"`
-	WorkspaceQuotas                   []WorkspaceQuota                  `json:"workspace_quotas"`
-	WorkspaceQueryBudgetState         []ExportedQueryBudgetState        `json:"workspace_query_budget_state"`
+	Manifest                          WorkspaceExportManifest            `json:"manifest"`
+	Format                            string                             `json:"format"`
+	Version                           int                                `json:"version"`
+	WorkspaceID                       string                             `json:"workspace_id"`
+	ExportedAt                        time.Time                          `json:"exported_at"`
+	IncludeSecrets                    bool                               `json:"include_secrets"`
+	SecretsRedacted                   bool                               `json:"secrets_redacted"`
+	IncludeAlerts                     bool                               `json:"include_alerts"`
+	AlertsIncluded                    bool                               `json:"alerts_included"`
+	Workspaces                        []ExportedWorkspace                `json:"workspaces"`
+	WorkspaceQuotas                   []WorkspaceQuota                   `json:"workspace_quotas"`
+	WorkspaceQueryBudgetState         []ExportedQueryBudgetState         `json:"workspace_query_budget_state"`
 	WorkspaceRetentionPolicies        []ExportedWorkspaceRetentionPolicy `json:"workspace_retention_policies"`
-	Channels                          []ExportedChannel                 `json:"channels"`
-	ChannelSigningKeys                []ExportedChannelSigningKey       `json:"channel_signing_keys"`
-	ChannelAckReconciliations         []ChannelAckReconciliation        `json:"channel_ack_reconciliations"`
-	PendingDigests                    []DigestAlert                     `json:"pending_digests"`
-	Monitors                          []Monitor                         `json:"monitors"`
-	MonitorChannels                   []ExportedMonitorChannel          `json:"monitor_channels"`
-	Rules                             []ExportedRule                    `json:"rules"`
-	RuleAbsenceState                  []ExportedRuleAbsenceState        `json:"rule_absence_state"`
-	AlertInhibitions                  []Inhibition                      `json:"alert_inhibitions"`
-	EscalationPolicies                []EscalationPolicy                `json:"escalation_policies"`
-	EscalationSteps                   []ExportedEscalationStep          `json:"escalation_steps"`
-	EscalationStepChannels            []ExportedEscalationStepChannel   `json:"escalation_step_channels"`
-	MaintenanceWindows                []MaintenanceWindow               `json:"maintenance_windows"`
-	Backfills                         []Backfill                        `json:"backfills"`
-	SavedSearches                     []SavedSearch                     `json:"saved_searches"`
-	MonitorTemplates                  []MonitorTemplate                 `json:"monitor_templates"`
-	APITokens                         []ExportedAPIToken                `json:"api_tokens"`
-	WorkspaceUsageRollups             []ExportedUsageRollup             `json:"workspace_usage_rollups"`
-	WorkspaceNotificationUsageRollups []ExportedNotificationUsageRollup `json:"workspace_notification_usage_rollups"`
-	Alerts                            []Alert                           `json:"alerts"`
-	AlertDedup                        []ExportedAlertDedup              `json:"alert_dedup"`
-	DeliveryAttempts                  []DeliveryAttempt                 `json:"delivery_attempts"`
-	DeadLetters                       []DeadLetter                      `json:"dead_letters"`
-	AlertEscalations                  []ExportedAlertEscalation         `json:"alert_escalations"`
-	Summary                           WorkspaceExportSummary            `json:"summary"`
+	Channels                          []ExportedChannel                  `json:"channels"`
+	ChannelSigningKeys                []ExportedChannelSigningKey        `json:"channel_signing_keys"`
+	ChannelAckReconciliations         []ChannelAckReconciliation         `json:"channel_ack_reconciliations"`
+	PendingDigests                    []DigestAlert                      `json:"pending_digests"`
+	Monitors                          []Monitor                          `json:"monitors"`
+	MonitorChannels                   []ExportedMonitorChannel           `json:"monitor_channels"`
+	Rules                             []ExportedRule                     `json:"rules"`
+	RuleAbsenceState                  []ExportedRuleAbsenceState         `json:"rule_absence_state"`
+	AlertInhibitions                  []Inhibition                       `json:"alert_inhibitions"`
+	EscalationPolicies                []EscalationPolicy                 `json:"escalation_policies"`
+	EscalationSteps                   []ExportedEscalationStep           `json:"escalation_steps"`
+	EscalationStepChannels            []ExportedEscalationStepChannel    `json:"escalation_step_channels"`
+	MaintenanceWindows                []MaintenanceWindow                `json:"maintenance_windows"`
+	Backfills                         []Backfill                         `json:"backfills"`
+	SavedSearches                     []SavedSearch                      `json:"saved_searches"`
+	MonitorTemplates                  []MonitorTemplate                  `json:"monitor_templates"`
+	APITokens                         []ExportedAPIToken                 `json:"api_tokens"`
+	WorkspaceUsageRollups             []ExportedUsageRollup              `json:"workspace_usage_rollups"`
+	WorkspaceNotificationUsageRollups []ExportedNotificationUsageRollup  `json:"workspace_notification_usage_rollups"`
+	Alerts                            []Alert                            `json:"alerts"`
+	AlertDedup                        []ExportedAlertDedup               `json:"alert_dedup"`
+	DeliveryAttempts                  []DeliveryAttempt                  `json:"delivery_attempts"`
+	DeadLetters                       []DeadLetter                       `json:"dead_letters"`
+	AlertEscalations                  []ExportedAlertEscalation          `json:"alert_escalations"`
+	Summary                           WorkspaceExportSummary             `json:"summary"`
 }
 
 // sensitiveConfigKeyNames lists exact lowercase JSON property names inside a
