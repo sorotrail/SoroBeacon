@@ -306,6 +306,24 @@ curl -s -X DELETE localhost:8080/api/v1/monitors/1
 `PATCH` accepts any subset of `name`, `contract_ids`, `enabled`,
 `channel_ids`; `channel_ids` replaces the monitor's channel attachments.
 
+A monitor comes back as a JSON object. This is the response to the `POST`
+above, so it doubles as the shape to assert on in a script:
+
+```json
+{
+  "id": 1,
+  "name": "My token",
+  "contract_ids": ["CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"],
+  "enabled": true,
+  "created_at": "2026-01-01T00:00:00Z",
+  "priority": "normal",
+  "last_matched_at": null,
+  "channel_ids": [1],
+  "network": "testnet",
+  "tags": []
+}
+```
+
 ### Rules
 
 The built-in rule types:
