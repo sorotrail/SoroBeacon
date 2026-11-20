@@ -180,7 +180,7 @@ func createPartitionSQL(name string, from, to time.Time) string {
 // parent/child relationship: retention owns both sides of it here rather than
 // relying on the FK, which a DROP cannot trigger.
 func (p *Postgres) DropExpiredPartitions(ctx context.Context, cutoff time.Time) (int64, error) {
-	dropped, _, err := p.dropExpiredPartitions(ctx, cutoff, 0, DefaultPartitionAuditActor, DefaultPartitionLockTimeout)
+	dropped, _, err := p.dropExpiredPartitions(ctx, cutoff, 0, DefaultPartitionAuditActor, DefaultPartitionLockTimeout, nil)
 	return dropped, err
 }
 

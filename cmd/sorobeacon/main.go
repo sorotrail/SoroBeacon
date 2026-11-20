@@ -608,7 +608,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 			}
 			return records, nil
 		})))
-	factory := notify.DefaultFactory().WithFederationOrigin(cfg.InstanceName)
+	factory := notify.DefaultFactory().WithFederationOrigin(cfg.InstanceName).WithPushDevices(st)
 	// External secrets: when a provider is configured, ${secret:...}
 	// references in channel configs resolve when a notifier is built. The
 	// stored config keeps the reference.
@@ -635,7 +635,9 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	// revoked token surfaces as a broken channel instead of as silence. The
 	// threshold is off unless the operator sets it — auto-disabling a channel
 	// is a destructive answer to a temporary problem.
+	paging := notify.NewPagingSync(st, factory, log)
 	dispatcher := notify.NewDispatcher(st, factory, log).
+		WithPaging(paging).
 		WithRateLimits(notify.RateLimits{
 			SlackRPS:     cfg.NotifyRateLimitSlackRPS,
 			TelegramRPS:  cfg.NotifyRateLimitTelegramRPS,
@@ -702,12 +704,13 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 		WithMetrics(m).
 		WithBroadcaster(liveAlerts).
 		WithAlertRetention(cfg.AlertRetention).
+		WithPaging(paging).
 		WithAuth(authn)
 	webSrv, err := web.New(st, registry, factory, log)
 	if err != nil {
 		return nil, err
 	}
-	webSrv.WithPoller(p).WithLeadership(leader).WithSilentAfter(cfg.MonitorSilentAfter).WithAuth(authn).
+	webSrv.WithPaging(paging).WithPoller(p).WithLeadership(leader).WithSilentAfter(cfg.MonitorSilentAfter).WithAuth(authn).
 		WithNetworks(config.NetworkNames(cfg.Networks)).WithTokens(tokens).WithMaxBodyBytes(cfg.HTTPMaxBodyBytes)
 	root := chi.NewRouter()
 	// RequestLog must sit outside Recoverer so a panic still emits the
@@ -725,6 +728,9 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	}
 	root.Use(m.Middleware)
 	root.Handle("/metrics", m.Handler())
+	// PagerDuty webhooks authenticate by HMAC signature, not a SoroBeacon
+	// token, so they live outside /api/v1.
+	root.Handle("/hooks/pagerduty/*", paging.WebhookHandler("/hooks/pagerduty/"))
 	root.Mount("/api/v1", apiSrv.Routes())
 	root.Mount("/", webSrv.Routes())
 
@@ -762,7 +768,14 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 		if err != nil {
 			return nil, err
 		}
-		archiver = pruner
+		// The same backend also serves whole-partition archives (verified
+		// before a drop) and the opt-in archived reads behind GET /alerts.
+		parts, err := archive.NewStoreFromURL(cfg.ArchiveURL)
+		if err != nil {
+			return nil, err
+		}
+		archiver = &archive.Tiered{Pruner: pruner, Store: parts}
+		apiSrv.WithArchiveReader(parts)
 		// Never log the URL: an operator may embed an endpoint or token in a
 		// query string. The scheme is enough to confirm what was selected.
 		log.Info("alert archiving enabled")

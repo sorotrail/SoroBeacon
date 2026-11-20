@@ -161,6 +161,9 @@ var knownRouteBindings = []routeBinding{
 	{"POST", "/channels/{id}/keys/rotate", "rotate_channel_key"},
 	{"POST", "/channels/{id}/keys/{keyID}/retire", "retire_channel_key"},
 	{"POST", "/channels/{id}/keys/{keyID}/revoke", "revoke_channel_key"},
+	{"GET", "/channels/{id}/devices", "list_push_devices"},
+	{"PUT", "/channels/{id}/devices/{deviceID}", "register_push_device"},
+	{"DELETE", "/channels/{id}/devices/{deviceID}", "delete_push_device"},
 	{"GET", "/maintenance-windows", "list_maintenance_windows"},
 	{"POST", "/maintenance-windows", "create_maintenance_window"},
 	{"GET", "/maintenance-windows/{id}", "get_maintenance_window"},
@@ -1802,6 +1805,47 @@ func writeClientClass(b *bytes.Buffer) {
         self._request(
             "POST",
             f"/channels/{self._quote(channel_id)}/keys/{self._quote(key_id)}/revoke",
+            headers=headers,
+        )
+
+    def list_push_devices(
+        self,
+        channel_id: Int64,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
+        return self._request(
+            "GET",
+            f"/channels/{self._quote(channel_id)}/devices",
+            headers=headers,
+        )
+
+    def register_push_device(
+        self,
+        channel_id: Int64,
+        device_id: str,
+        input_data: Mapping[str, Any],
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        self._request(
+            "PUT",
+            f"/channels/{self._quote(channel_id)}/devices/{self._quote(device_id)}",
+            body=dict(input_data),
+            has_body=True,
+            headers=headers,
+        )
+
+    def delete_push_device(
+        self,
+        channel_id: Int64,
+        device_id: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        self._request(
+            "DELETE",
+            f"/channels/{self._quote(channel_id)}/devices/{self._quote(device_id)}",
             headers=headers,
         )
 

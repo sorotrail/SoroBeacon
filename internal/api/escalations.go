@@ -193,6 +193,9 @@ func (s *Server) acknowledgeAlert(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	// The local acknowledgement has committed; the provider update is best
+	// effort and never fails it (see notify.PagingSync.Propagate).
+	s.paging.Propagate(r.Context(), id, "acknowledge")
 	a, err := s.store.GetAlert(r.Context(), id)
 	if err != nil {
 		s.fail(w, r, err)

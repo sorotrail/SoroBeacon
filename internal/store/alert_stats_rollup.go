@@ -383,4 +383,3 @@ func summariesEqual(a, b AlertStatisticsSummary) bool {
 	}
 	return true
 }
-

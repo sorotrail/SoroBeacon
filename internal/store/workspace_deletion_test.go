@@ -239,6 +239,7 @@ func populateEveryCoveredTableForWorkspace(t *testing.T, st Store, ws workspace.
 		Secret: "sec-" + string(ws),
 	}))
 	require.NoError(t, st.PushDigestAlert(wsCtx, ch.ID, json.RawMessage(`{"id":1}`)))
+	require.NoError(t, st.UpsertPushDevice(wsCtx, ch.ID, "dev-"+string(ws), "fcm", "tok-"+string(ws)))
 
 	mon := &Monitor{
 		Name:        "mon-" + string(ws),
@@ -304,6 +305,10 @@ func populateEveryCoveredTableForWorkspace(t *testing.T, st Store, ws workspace.
 	created, err := st.CreateAlert(wsCtx, alert)
 	require.NoError(t, err)
 	require.Equal(t, AlertCreated, created)
+	require.NoError(t, st.RecordAlertExternalRef(wsCtx, &AlertExternalRef{
+		AlertID: alert.ID, ChannelID: ch.ID, Provider: "pagerduty",
+		DedupKey: "dk-" + string(ws), IncidentID: "inc-" + string(ws), State: "triggered",
+	}))
 
 	require.NoError(t, st.RecordDeliveryAttempt(wsCtx, &DeliveryAttempt{
 		AlertID:         alert.ID,

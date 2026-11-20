@@ -123,6 +123,8 @@ func (s *SQLite) sqliteCountWorkspaceRows(ctx context.Context, ws string) (Works
 		{&c.MonitorChannels, `SELECT COUNT(*) FROM monitor_channels WHERE monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?) OR channel_id IN (SELECT id FROM channels WHERE workspace_id = ?)`, []any{ws, ws}},
 		{&c.ChannelSigningKeys, `SELECT COUNT(*) FROM channel_signing_keys WHERE workspace_id = ? OR channel_id IN (SELECT id FROM channels WHERE workspace_id = ?)`, []any{ws, ws}},
 		{&c.ChannelAckReconciliations, `SELECT COUNT(*) FROM channel_ack_reconciliations WHERE workspace_id = ? OR channel_id IN (SELECT id FROM channels WHERE workspace_id = ?)`, []any{ws, ws}},
+		{&c.PushDevices, `SELECT COUNT(*) FROM push_devices WHERE workspace_id = ? OR channel_id IN (SELECT id FROM channels WHERE workspace_id = ?)`, []any{ws, ws}},
+		{&c.AlertExternalRefs, `SELECT COUNT(*) FROM alert_external_refs WHERE workspace_id = ? OR channel_id IN (SELECT id FROM channels WHERE workspace_id = ?)`, []any{ws, ws}},
 		{&c.PendingDigests, `SELECT COUNT(*) FROM pending_digests WHERE channel_id IN (SELECT id FROM channels WHERE workspace_id = ?)`, []any{ws}},
 		{&c.EscalationPolicies, `SELECT COUNT(*) FROM escalation_policies WHERE monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?)`, []any{ws}},
 		{&c.EscalationSteps, `SELECT COUNT(*) FROM escalation_steps WHERE policy_id IN (SELECT ep.id FROM escalation_policies ep JOIN monitors m ON m.id = ep.monitor_id WHERE m.workspace_id = ?)`, []any{ws}},
@@ -426,6 +428,12 @@ func (s *SQLite) sqliteDeleteWorkspaceAlertBatch(ctx context.Context, ws string,
 	}
 	delivDel, _ := res.RowsAffected()
 
+	res, err = tx.ExecContext(ctx, `DELETE FROM alert_external_refs WHERE alert_id IN (`+placeholders+`) AND EXISTS (SELECT 1 FROM alerts WHERE id = alert_external_refs.alert_id AND workspace_id = ?)`, idAndWSArgs...) // #nosec G202 -- placeholders contains only ? markers; values are bound in idAndWSArgs
+	if err != nil {
+		return 0, fmt.Errorf("delete alert batch external refs: %w", err)
+	}
+	refsDel, _ := res.RowsAffected()
+
 	res, err = tx.ExecContext(ctx, `DELETE FROM dead_letters WHERE alert_id IN (`+placeholders+`) AND EXISTS (SELECT 1 FROM alerts WHERE id = dead_letters.alert_id AND workspace_id = ?)`, idAndWSArgs...) // #nosec G202 -- placeholders contains only ? markers; values are bound in idAndWSArgs
 	if err != nil {
 		return 0, fmt.Errorf("delete alert batch dead letters: %w", err)
@@ -448,6 +456,7 @@ func (s *SQLite) sqliteDeleteWorkspaceAlertBatch(ctx context.Context, ws string,
 	counts.Alerts += alertsDel
 	counts.DeliveryAttempts += delivDel
 	counts.DeadLetters += deadDel
+	counts.AlertExternalRefs += refsDel
 	counts.AlertEscalations += escDel
 
 	nowStr := sqliteTimeString(time.Now().UTC())
@@ -518,6 +527,8 @@ func (s *SQLite) sqliteFinalizeWorkspaceDeletion(ctx context.Context, ws string)
 		{"pending_digests", &counts.PendingDigests, `DELETE FROM pending_digests WHERE channel_id IN (SELECT id FROM channels WHERE workspace_id = ?)`, []any{ws}},
 		{"channel_signing_keys", &counts.ChannelSigningKeys, `DELETE FROM channel_signing_keys WHERE workspace_id = ? OR channel_id IN (SELECT id FROM channels WHERE workspace_id = ?)`, []any{ws, ws}},
 		{"channel_ack_reconciliations", &counts.ChannelAckReconciliations, `DELETE FROM channel_ack_reconciliations WHERE workspace_id = ? OR channel_id IN (SELECT id FROM channels WHERE workspace_id = ?)`, []any{ws, ws}},
+		{"push_devices", &counts.PushDevices, `DELETE FROM push_devices WHERE workspace_id = ? OR channel_id IN (SELECT id FROM channels WHERE workspace_id = ?)`, []any{ws, ws}},
+		{"alert_external_refs", &counts.AlertExternalRefs, `DELETE FROM alert_external_refs WHERE workspace_id = ? OR channel_id IN (SELECT id FROM channels WHERE workspace_id = ?)`, []any{ws, ws}},
 		{"channels", &counts.Channels, `DELETE FROM channels WHERE workspace_id = ?`, []any{ws}},
 		{"saved_searches", &counts.SavedSearches, `DELETE FROM saved_searches WHERE workspace_id = ?`, []any{ws}},
 		{"monitor_templates", &counts.MonitorTemplates, `DELETE FROM monitor_templates WHERE workspace_id = ?`, []any{ws}},

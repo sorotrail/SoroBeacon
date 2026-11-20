@@ -212,9 +212,9 @@ func TestFaultyTransportMultipleFaults(t *testing.T) {
 	// Use a seed that triggers multiple faults across requests
 	gen := NewGenerator(999)
 	gen.SetFaults(FaultConfig{
-		ConnectionReset:   0.3,
-		RateLimit:         0.3,
-		ServerError5xx:    0.3,
+		ConnectionReset: 0.3,
+		RateLimit:       0.3,
+		ServerError5xx:  0.3,
 	})
 	rt := NewFaultyTransport(nil, gen)
 	client := &http.Client{Transport: rt}

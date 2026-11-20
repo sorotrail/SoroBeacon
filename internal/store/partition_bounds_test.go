@@ -56,13 +56,13 @@ func TestMonthStartBoundaryCases(t *testing.T) {
 // tricky ones where month arithmetic breaks.
 func TestAlertPartitionNameRoundTrip(t *testing.T) {
 	testMonths := []time.Time{
-		time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC),   // January
-		time.Date(2024, 2, 15, 0, 0, 0, 0, time.UTC),   // February (leap year)
-		time.Date(2024, 12, 15, 0, 0, 0, 0, time.UTC),  // December
-		time.Date(2023, 2, 15, 0, 0, 0, 0, time.UTC),   // February (non-leap year)
-		time.Date(2024, 7, 1, 0, 0, 0, 0, time.UTC),    // July (DST in many zones)
-		time.Date(2024, 3, 10, 0, 0, 0, 0, time.UTC),   // March (US DST transition)
-		time.Date(2024, 11, 3, 0, 0, 0, 0, time.UTC),   // November (US DST ends)
+		time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC),  // January
+		time.Date(2024, 2, 15, 0, 0, 0, 0, time.UTC),  // February (leap year)
+		time.Date(2024, 12, 15, 0, 0, 0, 0, time.UTC), // December
+		time.Date(2023, 2, 15, 0, 0, 0, 0, time.UTC),  // February (non-leap year)
+		time.Date(2024, 7, 1, 0, 0, 0, 0, time.UTC),   // July (DST in many zones)
+		time.Date(2024, 3, 10, 0, 0, 0, 0, time.UTC),  // March (US DST transition)
+		time.Date(2024, 11, 3, 0, 0, 0, 0, time.UTC),  // November (US DST ends)
 	}
 
 	for _, ts := range testMonths {
@@ -91,14 +91,14 @@ func TestAlertPartitionNameRoundTrip(t *testing.T) {
 // entries or malformed names are safely ignored rather than causing a drop.
 func TestAlertPartitionBoundsRejectsInvalidNames(t *testing.T) {
 	invalidNames := []string{
-		alertDefaultPartition,         // "alerts_default"
-		"alerts_2024",                 // missing month
-		"alerts_2024_1",               // single-digit month
-		"alerts_2024_13",              // invalid month number
-		"alerts_2024_00",              // zero month
-		"alerts_other",                // wrong format
-		"",                            // empty
-		"some_random_table",           // unrelated table
+		alertDefaultPartition, // "alerts_default"
+		"alerts_2024",         // missing month
+		"alerts_2024_1",       // single-digit month
+		"alerts_2024_13",      // invalid month number
+		"alerts_2024_00",      // zero month
+		"alerts_other",        // wrong format
+		"",                    // empty
+		"some_random_table",   // unrelated table
 	}
 
 	for _, name := range invalidNames {
@@ -118,10 +118,10 @@ func TestAlertPartitionNameConsistency(t *testing.T) {
 	expectedName := "alerts_2024_06"
 
 	variants := []time.Time{
-		base,                                          // first instant
-		base.Add(29 * 24 * time.Hour),                 // end of month
+		base,                          // first instant
+		base.Add(29 * 24 * time.Hour), // end of month
 		base.AddDate(0, 0, 15).Add(12*time.Hour + 30*time.Minute), // mid-month afternoon
-		base.In(time.FixedZone("PST", -8*3600)),       // different timezone
+		base.In(time.FixedZone("PST", -8*3600)),                   // different timezone
 	}
 
 	for _, ts := range variants {

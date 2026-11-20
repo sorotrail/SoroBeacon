@@ -24,18 +24,18 @@ import (
 // concurrentFairnessStore is a thread-safe DispatchStore for multi-workspace
 // fairness, retry-storm, digest, and escalation tests.
 type concurrentFairnessStore struct {
-	mu               sync.Mutex
-	channelsByMon    map[int64][]store.Channel
-	channelsByID     map[int64]store.Channel
-	attempts         []store.DeliveryAttempt
-	deadLetters      []store.DeadLetter
-	health           []channelHealthCall
-	digestRows       map[int64][]store.DigestAlert
-	digestSeq        int64
-	policies         map[int64]*store.EscalationPolicy
-	runs             map[int64]*store.EscalationRun
-	alerts           map[int64]*store.Alert
-	completedEsc     []int64
+	mu            sync.Mutex
+	channelsByMon map[int64][]store.Channel
+	channelsByID  map[int64]store.Channel
+	attempts      []store.DeliveryAttempt
+	deadLetters   []store.DeadLetter
+	health        []channelHealthCall
+	digestRows    map[int64][]store.DigestAlert
+	digestSeq     int64
+	policies      map[int64]*store.EscalationPolicy
+	runs          map[int64]*store.EscalationRun
+	alerts        map[int64]*store.Alert
+	completedEsc  []int64
 }
 
 func newConcurrentFairnessStore() *concurrentFairnessStore {

@@ -732,6 +732,10 @@ type Alert struct {
 	Payload    json.RawMessage `json:"payload"`
 	Enrichment json.RawMessage `json:"enrichment,omitempty"`
 	CreatedAt  time.Time       `json:"created_at"`
+	// Archived is set only on alerts served from the archive tier rather than
+	// the database. It is the explicit indicator that lets a client tell the
+	// tiers apart; the rest of the shape is identical.
+	Archived bool `json:"archived,omitempty"`
 	// InhibitedByRuleID is set when an inhibition rule suppressed this
 	// alert's delivery. Nil means delivered (or never subjected to
 	// inhibition); the alert row itself is always stored.
@@ -1510,6 +1514,19 @@ type Channels interface {
 	RevokeChannelSigningKey(ctx context.Context, channelID int64, keyID string) error
 	RecordChannelSigningKeyUsage(ctx context.Context, channelID int64, keyID string, usedAt time.Time) error
 
+	// Push device registry (mobile push channel). The token is a credential:
+	// listings return it only to the delivery path, never to API callers.
+	UpsertPushDevice(ctx context.Context, channelID int64, deviceID, platform, token string) error
+	DeletePushDevice(ctx context.Context, channelID int64, deviceID string) error
+	ListPushDevices(ctx context.Context, channelID int64) ([]PushDevice, error)
+	RetirePushDevice(ctx context.Context, channelID int64, deviceID string) error
+
+	// External paging correlation (acknowledgement sync).
+	RecordAlertExternalRef(ctx context.Context, ref *AlertExternalRef) error
+	GetAlertExternalRefByDedupKey(ctx context.Context, channelID int64, provider, dedupKey string) (*AlertExternalRef, error)
+	ListAlertExternalRefs(ctx context.Context, alertID int64) ([]AlertExternalRef, error)
+	UpdateAlertExternalRef(ctx context.Context, alertID, channelID int64, incidentID, state, syncError string) error
+
 	// Channel acknowledgement reconciliation
 	ReconcileChannelAcknowledgements(ctx context.Context, cfg AckReconciliationConfig) ([]ChannelAckReconciliation, error)
 	GetChannelAckReconciliation(ctx context.Context, channelID int64) (ChannelAckReconciliation, error)
@@ -2071,6 +2088,8 @@ type WorkspaceDeletionCounts struct {
 	Channels                         int64 `json:"channels"`
 	MonitorChannels                  int64 `json:"monitor_channels"`
 	ChannelSigningKeys               int64 `json:"channel_signing_keys"`
+	PushDevices                      int64 `json:"push_devices"`
+	AlertExternalRefs                int64 `json:"alert_external_refs"`
 	ChannelAckReconciliations        int64 `json:"channel_ack_reconciliations"`
 	PendingDigests                   int64 `json:"pending_digests"`
 	EscalationPolicies               int64 `json:"escalation_policies"`
@@ -2097,7 +2116,7 @@ type WorkspaceDeletionCounts struct {
 // Total returns the total number of rows across all workspace-owned tables.
 func (c WorkspaceDeletionCounts) Total() int64 {
 	return c.Monitors + c.Rules + c.RuleAbsenceState + c.AlertInhibitions +
-		c.Channels + c.MonitorChannels + c.ChannelSigningKeys + c.ChannelAckReconciliations +
+		c.Channels + c.MonitorChannels + c.ChannelSigningKeys + c.ChannelAckReconciliations + c.PushDevices + c.AlertExternalRefs +
 		c.PendingDigests + c.EscalationPolicies + c.EscalationSteps + c.EscalationStepChannels +
 		c.MaintenanceWindows + c.Backfills + c.Alerts + c.AlertDedup +
 		c.DeliveryAttempts + c.DeadLetters + c.AlertEscalations + c.SavedSearches +

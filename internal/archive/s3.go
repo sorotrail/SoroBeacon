@@ -118,6 +118,40 @@ func (s *S3) Archive(ctx context.Context, key string, r io.Reader) error {
 	return nil
 }
 
+// Get fetches an object, or returns ErrObjectNotFound on a 404.
+func (s *S3) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	objectKey := key
+	if s.prefix != "" {
+		objectKey = s.prefix + "/" + key
+	}
+	rawURL := s.endpoint + "/" + objectKey
+	if s.pathStyle {
+		rawURL = s.endpoint + "/" + s.bucket + "/" + objectKey
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("archive: build s3 request: %w", err)
+	}
+	s.sign(req, time.Now().UTC())
+	res, err := s.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("archive: s3 get: %w", err)
+	}
+	if res.StatusCode == http.StatusNotFound {
+		_ = res.Body.Close()
+		return nil, ErrObjectNotFound
+	}
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		snippet, _ := io.ReadAll(io.LimitReader(res.Body, 512))
+		_ = res.Body.Close()
+		return nil, fmt.Errorf("archive: s3 get %s: status %d: %s", objectKey, res.StatusCode, strings.TrimSpace(string(snippet)))
+	}
+	return res.Body, nil
+}
+
 // sign adds the SigV4 headers for a single PUT. The payload is left unsigned
 // (UNSIGNED-PAYLOAD), which is valid for S3 and lets the body stream.
 func (s *S3) sign(req *http.Request, now time.Time) {
@@ -170,5 +204,5 @@ func hmacSHA256(key []byte, data string) []byte {
 	return mac.Sum(nil)
 }
 
-var _ Archiver = (*S3)(nil)
-var _ Archiver = (*Dir)(nil)
+var _ ObjectStore = (*S3)(nil)
+var _ ObjectStore = (*Dir)(nil)

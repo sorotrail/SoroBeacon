@@ -287,7 +287,7 @@
       ],
       "get": {
         "summary": "Per-monitor statistics",
-        "description": "Alert, delivery and per-rule counts for one monitor — the answer to \"is this monitor doing anything\", which the instance-wide /stats cannot give. Counts are explicit zeroes for a monitor with no history, and every one of the monitor's rules appears with its own alert count, including rules that never matched. An unknown monitor is 404 rather than a body of zeroes, so a deleted monitor cannot be misread as a quiet one.",
+        "description": "Alert, delivery and per-rule counts for one monitor \u2014 the answer to \"is this monitor doing anything\", which the instance-wide /stats cannot give. Counts are explicit zeroes for a monitor with no history, and every one of the monitor's rules appears with its own alert count, including rules that never matched. An unknown monitor is 404 rather than a body of zeroes, so a deleted monitor cannot be misread as a quiet one.",
         "responses": {
           "200": {
             "description": "MonitorStats",
@@ -735,12 +735,12 @@
             "type": "string",
             "default": "24h"
           },
-          "description": "How far back to aggregate delivery attempts, as a Go duration (\"24h\", \"90m\"; \"7d\" is not valid — use \"168h\"). Defaults to 24h when omitted. Must be greater than zero and at most 2160h (90 days); anything else is 400. The effective value is echoed in the response's window field."
+          "description": "How far back to aggregate delivery attempts, as a Go duration (\"24h\", \"90m\"; \"7d\" is not valid \u2014 use \"168h\"). Defaults to 24h when omitted. Must be greater than zero and at most 2160h (90 days); anything else is 400. The effective value is echoed in the response's window field."
         }
       ],
       "get": {
         "summary": "Per-channel delivery statistics",
-        "description": "Delivery attempts for one channel aggregated in the database over the requested window: total tries, successes, failures, success rate and the last success/failure timestamps. Every recorded attempt is terminal (success or failed), so total is succeeded plus failed; retries count as separate attempts. A channel with no attempts in the window returns 200 with zero counts, null timestamps and no success_rate — an undefined rate is never rendered as 0% or 100%. An unknown channel is 404. No channel configuration is returned.",
+        "description": "Delivery attempts for one channel aggregated in the database over the requested window: total tries, successes, failures, success rate and the last success/failure timestamps. Every recorded attempt is terminal (success or failed), so total is succeeded plus failed; retries count as separate attempts. A channel with no attempts in the window returns 200 with zero counts, null timestamps and no success_rate \u2014 an undefined rate is never rendered as 0% or 100%. An unknown channel is 404. No channel configuration is returned.",
         "responses": {
           "200": {
             "description": "ChannelDeliveryStats",
@@ -1873,7 +1873,7 @@
     "/health": {
       "get": {
         "summary": "Combined health report",
-        "description": "Legacy combined check; prefer /livez and /readyz. Exempt from authentication so probes and the docker-compose healthcheck keep working. On an instance that polls several Stellar networks the body adds a `networks` array — per chain: source state, last processed ledger, chain tip, lag and last successful poll — and answers 503 `degraded` when any chain's source is failing. The top-level `rpc` field is only ever the primary chain's source, which is why the array exists.",
+        "description": "Legacy combined check; prefer /livez and /readyz. Exempt from authentication so probes and the docker-compose healthcheck keep working. On an instance that polls several Stellar networks the body adds a `networks` array \u2014 per chain: source state, last processed ledger, chain tip, lag and last successful poll \u2014 and answers 503 `degraded` when any chain's source is failing. The top-level `rpc` field is only ever the primary chain's source, which is why the array exists.",
         "security": [],
         "responses": {
           "200": {
@@ -1900,7 +1900,7 @@
     "/readyz": {
       "get": {
         "summary": "Readiness probe",
-        "description": "Checks the database and the event source concurrently, bounded by a 3s timeout each, reporting per-dependency detail. On an instance that polls several Stellar networks each chain gets its own check (`rpc_testnet`, `rpc_mainnet`, ...) alongside the primary chain's `rpc`, so a node that is down on one chain cannot read as ready. Wire to readinessProbe. Exempt from authentication, so its per-dependency detail is readable without a token — do not expose it to the public internet.",
+        "description": "Checks the database and the event source concurrently, bounded by a 3s timeout each, reporting per-dependency detail. On an instance that polls several Stellar networks each chain gets its own check (`rpc_testnet`, `rpc_mainnet`, ...) alongside the primary chain's `rpc`, so a node that is down on one chain cannot read as ready. Wire to readinessProbe. Exempt from authentication, so its per-dependency detail is readable without a token \u2014 do not expose it to the public internet.",
         "security": [],
         "responses": {
           "200": {
@@ -2975,7 +2975,7 @@
     "/tokens": {
       "post": {
         "summary": "Mint a scoped API token",
-        "description": "Creates a database-backed credential: `sb_` followed by 32 random bytes, base64url-encoded. The response's `token` field is the only place the secret ever appears — the row stores a SHA-256 digest of it, so it cannot be read back, listed, logged or recovered. A client that loses the secret mints a new token and revokes the old one.\n\n`scopes` is required and non-empty: a token with no scope authenticates and can then call nothing. Every scope must come from the enumeration below. A request carrying a scoped token may only grant scopes it already holds, so `tokens:write` is not a road back to full control. `expires_in` is a Go duration string (`72h`, `168h`); omit it for a token that never expires.",
+        "description": "Creates a database-backed credential: `sb_` followed by 32 random bytes, base64url-encoded. The response's `token` field is the only place the secret ever appears \u2014 the row stores a SHA-256 digest of it, so it cannot be read back, listed, logged or recovered. A client that loses the secret mints a new token and revokes the old one.\n\n`scopes` is required and non-empty: a token with no scope authenticates and can then call nothing. Every scope must come from the enumeration below. A request carrying a scoped token may only grant scopes it already holds, so `tokens:write` is not a road back to full control. `expires_in` is a Go duration string (`72h`, `168h`); omit it for a token that never expires.",
         "requestBody": {
           "required": true,
           "content": {
@@ -3341,6 +3341,88 @@
           }
         }
       }
+    },
+    "/channels/{id}/devices": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "get": {
+        "summary": "List registered push devices (tokens are never returned)",
+        "responses": {
+          "200": {
+            "description": "Registered devices"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/channels/{id}/devices/{deviceID}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        },
+        {
+          "name": "deviceID",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "put": {
+        "summary": "Register a push device or refresh its token",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "token": {
+                    "type": "string"
+                  },
+                  "platform": {
+                    "type": "string",
+                    "enum": [
+                      "fcm"
+                    ]
+                  }
+                },
+                "required": [
+                  "token"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Registered"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Remove a push device",
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -3348,7 +3430,7 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Any of three credentials. (1) A static token from API_TOKEN (comma-separated to allow rotation): full reach over the default workspace. (2) A scoped token minted by POST /tokens — it looks like `sb_…`, and carries a scope list, an optional expiry and a revocation. Each route names the scopes it requires; a route that has no mapping denies a scoped token with 403 rather than allowing it. (3) A dashboard session cookie from /login, accepted in the browser's own same-origin requests. A token from WORKSPACE_TOKENS (`workspace=token` pairs) is accepted the same way as (1) but additionally scopes the request: it sees and changes only that workspace's monitors, channels, rules, alerts, saved searches and templates. `API_TOKEN`'s tokens belong to the `default` workspace, as do rows created before workspaces existed. Scoped tokens are workspace-bound too: the workspace comes from the row that stores the token's digest, not from the request. There is deliberately no X-Workspace header or query parameter — the workspace is a property of the credential, so a client cannot ask for another tenant's data."
+        "description": "Any of three credentials. (1) A static token from API_TOKEN (comma-separated to allow rotation): full reach over the default workspace. (2) A scoped token minted by POST /tokens \u2014 it looks like `sb_\u2026`, and carries a scope list, an optional expiry and a revocation. Each route names the scopes it requires; a route that has no mapping denies a scoped token with 403 rather than allowing it. (3) A dashboard session cookie from /login, accepted in the browser's own same-origin requests. A token from WORKSPACE_TOKENS (`workspace=token` pairs) is accepted the same way as (1) but additionally scopes the request: it sees and changes only that workspace's monitors, channels, rules, alerts, saved searches and templates. `API_TOKEN`'s tokens belong to the `default` workspace, as do rows created before workspaces existed. Scoped tokens are workspace-bound too: the workspace comes from the row that stores the token's digest, not from the request. There is deliberately no X-Workspace header or query parameter \u2014 the workspace is a property of the credential, so a client cannot ask for another tenant's data."
       }
     },
     "parameters": {
@@ -3687,7 +3769,7 @@
           "success_rate": {
             "type": "number",
             "format": "double",
-            "description": "succeeded / total as a ratio in [0, 1]. Omitted when there were no attempts in the window — an undefined rate is not 0 or 1."
+            "description": "succeeded / total as a ratio in [0, 1]. Omitted when there were no attempts in the window \u2014 an undefined rate is not 0 or 1."
           },
           "last_success_at": {
             "type": "string",
@@ -3783,7 +3865,7 @@
           },
           "network": {
             "type": "string",
-            "description": "Stellar chain these contract ids live on, chosen at creation. Omitted means the instance's primary network (the first entry in NETWORKS, or NETWORK when unset). A name this instance does not poll is rejected: the monitor would match nothing forever. A monitor's network cannot be changed afterwards — a contract id resolves to a different contract on another chain, and the alerts already stored keep their old label — so moving one means deleting and recreating it."
+            "description": "Stellar chain these contract ids live on, chosen at creation. Omitted means the instance's primary network (the first entry in NETWORKS, or NETWORK when unset). A name this instance does not poll is rejected: the monitor would match nothing forever. A monitor's network cannot be changed afterwards \u2014 a contract id resolves to a different contract on another chain, and the alerts already stored keep their old label \u2014 so moving one means deleting and recreating it."
           },
           "tags": {
             "type": "array",

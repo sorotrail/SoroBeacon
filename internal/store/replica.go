@@ -19,7 +19,7 @@ import (
 // unset, Postgres holds one pool and every read and write goes to it, exactly
 // as before this file existed.
 //
-// What is routed, and what is not
+// # What is routed, and what is not
 //
 // A read is routable when a stale answer is harmless or merely visible, which
 // rules out anything a client reads immediately after writing through this

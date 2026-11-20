@@ -711,6 +711,18 @@ func buildRESTIsolationChecks(fx *isolationFixture) map[string]func(t *testing.T
 			fx.assertSameNotFoundStatus(t, "GET /channels/{id}/keys", http.MethodGet,
 				"/channels/"+betaCh+"/keys", "/channels/"+missing+"/keys", "", "")
 		},
+		"GET /channels/{id}/devices": func(t *testing.T) {
+			fx.assertSameNotFoundStatus(t, "GET /channels/{id}/devices", http.MethodGet,
+				"/channels/"+betaCh+"/devices", "/channels/"+missing+"/devices", "", "")
+		},
+		"PUT /channels/{id}/devices/{deviceID}": func(t *testing.T) {
+			fx.assertSameNotFoundStatus(t, "PUT /channels/{id}/devices/{deviceID}", http.MethodPut,
+				"/channels/"+betaCh+"/devices/d1", "/channels/"+missing+"/devices/d1", `{"token":"t"}`, `{"token":"t"}`)
+		},
+		"DELETE /channels/{id}/devices/{deviceID}": func(t *testing.T) {
+			fx.assertSameNotFoundStatus(t, "DELETE /channels/{id}/devices/{deviceID}", http.MethodDelete,
+				"/channels/"+betaCh+"/devices/d1", "/channels/"+missing+"/devices/d1", "", "")
+		},
 		"POST /channels/{id}/keys/rotate": func(t *testing.T) {
 			fx.assertSameNotFoundStatus(t, "POST /channels/{id}/keys/rotate", http.MethodPost,
 				"/channels/"+betaCh+"/keys/rotate", "/channels/"+missing+"/keys/rotate", "", "")

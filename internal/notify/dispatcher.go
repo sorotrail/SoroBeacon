@@ -84,6 +84,8 @@ type DispatchStore interface {
 // Dispatcher fans an alert out to its monitor's channels, retrying each
 // channel with exponential backoff and recording every attempt.
 type Dispatcher struct {
+	// paging records PagerDuty incident correlation after a delivery; nil-safe.
+	paging  *PagingSync
 	store   DispatchStore
 	factory *Factory
 	log     *slog.Logger
@@ -241,6 +243,13 @@ func (d *Dispatcher) nowTime() time.Time {
 // DisableAfterFailures returns the configured threshold. Exposed for tests.
 func (d *Dispatcher) DisableAfterFailures() int {
 	return d.disableAfterFailures
+}
+
+// WithPaging attaches acknowledgement sync, so a successful PagerDuty delivery
+// records the incident it opened. Optional; nil leaves delivery unchanged.
+func (d *Dispatcher) WithPaging(p *PagingSync) *Dispatcher {
+	d.paging = p
+	return d
 }
 
 // WithMetrics attaches delivery instrumentation.
@@ -871,7 +880,7 @@ func (d *Dispatcher) flushDigest(ctx context.Context, ch store.Channel, pending 
 		return
 	}
 
-	notifier, err := d.factory.New(ch.Type, ch.Config)
+	notifier, err := d.newNotifier(ch.ID, ch.WorkspaceID, ch.Type, ch.Config)
 	if err != nil {
 		d.log.Error("build notifier for digest", "channel_id", ch.ID, "channel_type", ch.Type, "err", err)
 		return
@@ -992,7 +1001,7 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 		return
 	}
 
-	notifier, err := d.factory.New(ch.Type, ch.Config)
+	notifier, err := d.newNotifier(ch.ID, ch.WorkspaceID, ch.Type, ch.Config)
 	if err != nil {
 		// Bad config: record one failed attempt, no point retrying. The
 		// error is sanitized before it reaches the stored snippet, the log,
@@ -1170,7 +1179,11 @@ func (d *Dispatcher) sendWithRecovery(ctx context.Context, a Alert, ch store.Cha
 			err = errors.New("delivery failed")
 		}
 	}()
-	return notifier.Send(ctx, a)
+	err = notifier.Send(ctx, a)
+	if err == nil {
+		d.paging.RecordDelivery(ctx, ch, a)
+	}
+	return err
 }
 
 func sanitizeDeliveryError(err error) error {
@@ -1253,7 +1266,7 @@ func (d *Dispatcher) RedriveDeadLetter(ctx context.Context, deadLetterID int64, 
 		}
 	}
 
-	notifier, err := d.factory.New(ch.Type, ch.Config)
+	notifier, err := d.newNotifier(ch.ID, ch.WorkspaceID, ch.Type, ch.Config)
 	if err != nil {
 		return fmt.Errorf("build notifier: %w", err)
 	}
@@ -1358,7 +1371,7 @@ func (d *Dispatcher) Retry(ctx context.Context, a Alert, ch store.Channel) *stor
 			d.recordWorkspaceNotification(ctx, ch, "throttled")
 		}
 	}
-	notifier, err := d.factory.New(ch.Type, ch.Config)
+	notifier, err := d.newNotifier(ch.ID, ch.WorkspaceID, ch.Type, ch.Config)
 	if err != nil {
 		d.log.Error("build notifier", "channel_id", ch.ID, "channel_type", ch.Type, "err", err)
 		d.recordHealth(ctx, ch.ID, store.ChannelHealthUpdate{Error: err.Error(), Permanent: true})
@@ -1434,4 +1447,17 @@ func (d *Dispatcher) recordWorkspaceNotification(ctx context.Context, ch store.C
 			},
 		})
 	}
+}
+
+// newNotifier builds a channel's notifier and, for notifiers that need to know
+// which stored channel they serve (push device registry), binds it.
+func (d *Dispatcher) newNotifier(channelID int64, ws, channelType string, config json.RawMessage) (Notifier, error) {
+	n, err := d.factory.New(channelType, config)
+	if err != nil {
+		return nil, err
+	}
+	if b, ok := n.(channelBinder); ok {
+		return b.bind(channelID, ws), nil
+	}
+	return n, nil
 }
