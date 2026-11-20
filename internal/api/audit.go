@@ -41,6 +41,10 @@ var AuditRouteTable = auth.NewRouteTable(map[string]AuditRouteSpec{
 	"POST /monitors/{id}/restore":     {Action: store.AuditActionUpdate, TargetType: store.AuditTargetMonitor},
 	"POST /monitors/{id}/duplicate":   {Action: store.AuditActionCreate, TargetType: store.AuditTargetMonitor},
 
+	// Delivery budgets
+	"PUT /monitors/{id}/delivery-budget":        {Action: store.AuditActionUpdate, TargetType: store.AuditTargetMonitor},
+	"POST /monitors/{id}/delivery-budget/reset": {Action: store.AuditActionUpdate, TargetType: store.AuditTargetMonitor},
+
 	// Rules
 	"POST /monitors/{id}/rules":            {Action: store.AuditActionCreate, TargetType: store.AuditTargetRule},
 	"POST /monitors/{id}/rules/bulk":       {Action: store.AuditActionCreate, TargetType: store.AuditTargetRule},

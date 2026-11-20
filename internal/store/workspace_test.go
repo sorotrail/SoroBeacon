@@ -441,6 +441,8 @@ var unscopedStoreMethods = map[string]string{
 	"ListAlerts":                         "the frequency rule reads one rule's history; rule_id implies the tenant",
 	"ListRules":                          "the poller loads rules for a monitor it already resolved",
 	"ListChannelsForMonitor":             "the dispatcher delivers for a monitor it already resolved",
+	"ConsumeDelivery":                    "the dispatcher spends a monitor's delivery budget for an alert it already resolved; monitor ids are unique across workspaces",
+	"loadDeliveryBudgetPG":               "the locked read inside ConsumeDelivery, which is unscoped for the same reason",
 	"RecordDeliveryAttempt":              "the dispatcher writes for an alert it already resolved",
 	"CreateDeadLetter":                   "the dispatcher records a permanently failed delivery for an alert it already resolved; the row takes its tenant from that alert",
 	"CreateAlert":                        "derives the workspace from the monitor it inserts into",

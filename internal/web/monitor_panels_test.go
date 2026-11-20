@@ -22,6 +22,14 @@ type monitorPanelStore struct {
 	stats      store.MonitorStats
 	listFilter store.AlertFilter
 	listCalls  int
+	budget     *store.DeliveryBudget
+}
+
+func (s *monitorPanelStore) GetDeliveryBudget(context.Context, int64, time.Time) (*store.DeliveryBudget, error) {
+	if s.budget == nil {
+		return nil, store.ErrNotFound
+	}
+	return s.budget, nil
 }
 
 func (s *monitorPanelStore) GetMonitor(_ context.Context, id int64) (*store.Monitor, error) {
@@ -193,5 +201,49 @@ func TestMonitorPageQuietStatisticsStayQuiet(t *testing.T) {
 	}
 	if !strings.Contains(html, "No alerts yet") {
 		t.Fatalf("quiet monitor did not state its empty state, got:\n%s", html)
+	}
+}
+
+func TestMonitorPageShowsRemainingDeliveryBudget(t *testing.T) {
+	limit := 50
+	start := time.Date(2026, 3, 5, 0, 0, 0, 0, time.UTC)
+	st := &monitorPanelStore{
+		monitor: store.Monitor{ID: 7, Name: "vault", Enabled: true},
+		budget:  &store.DeliveryBudget{MonitorID: 7, Limit: &limit, Used: 20, WindowStart: start},
+	}
+	html := getHTML(t, st, "/monitors/7")
+	for _, want := range []string{"Delivery budget", "<b>30</b> of 50 deliveries left today", "active"} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("monitor page missing %q, got:\n%s", want, html)
+		}
+	}
+	if strings.Contains(html, "Delivery stopped") {
+		t.Fatal("a budget with units left must not claim delivery stopped")
+	}
+}
+
+func TestMonitorPageSaysWhenDeliveryBudgetIsExhausted(t *testing.T) {
+	limit := 5
+	at := time.Date(2026, 3, 5, 9, 0, 0, 0, time.UTC)
+	st := &monitorPanelStore{
+		monitor: store.Monitor{ID: 7, Name: "vault", Enabled: true},
+		budget: &store.DeliveryBudget{MonitorID: 7, Limit: &limit, Used: 5,
+			WindowStart: time.Date(2026, 3, 5, 0, 0, 0, 0, time.UTC), ExhaustedAt: &at},
+	}
+	html := getHTML(t, st, "/monitors/7")
+	for _, want := range []string{"exhausted", "<b>0</b> of 5 deliveries left today", "Delivery stopped"} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("monitor page missing %q, got:\n%s", want, html)
+		}
+	}
+}
+
+func TestMonitorPageHidesBudgetPanelWhenUnlimited(t *testing.T) {
+	st := &monitorPanelStore{
+		monitor: store.Monitor{ID: 7, Name: "vault", Enabled: true},
+		budget:  &store.DeliveryBudget{MonitorID: 7},
+	}
+	if html := getHTML(t, st, "/monitors/7"); strings.Contains(html, "Delivery budget") {
+		t.Fatal("an unlimited monitor must not render a budget panel")
 	}
 }
