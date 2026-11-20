@@ -14,3 +14,10 @@ This PR implements end-to-end timeout and cancellation propagation for inbound A
 - Ran `go build ./...` and `go vet ./...` successfully.
 - Executed full test suite including SQLite and Postgres conformance tests.
 - Verified `golangci-lint run` passes cleanly with no warnings or errors.
+
+A copy-paste example: the NDJSON export handler must stop its store query
+when the client disconnects mid-stream.
+
+```sh
+go test ./internal/api -run TestExportAlertsNDJSON_CancelledClientStopsQuery -v
+```
