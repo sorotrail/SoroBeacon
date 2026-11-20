@@ -620,7 +620,8 @@ curl -s -X POST localhost:8080/api/v1/channels -d '{
 }'
 # {"id":1,"name":"ops-ntfy","type":"ntfy","enabled":true,
 #  "digest_mode":"","digest_window_seconds":0,"min_severity":"",
-#  "created_at":"2026-11-20T12:00:00Z"}
+#  "created_at":"2026-11-20T12:00:00Z","timeout":15000000000,
+#  "consecutive_failures":0,"consecutive_permanent_failures":0}
 
 # 2. Test — sends a synthetic alert through the stored config.
 curl -s -X POST localhost:8080/api/v1/channels/1/test
