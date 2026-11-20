@@ -608,6 +608,25 @@ curl -s -X DELETE localhost:8080/api/v1/channels/1
 curl -s -X POST localhost:8080/api/v1/channels/1/test
 ```
 
+A minimal end-to-end example. The create call answers with the channel and its
+new `id`; `config` is write-only, so it never comes back. Feed that `id` to the
+test endpoint to check the credentials before attaching the channel to a rule:
+
+```sh
+# 1. Create — name and type are required, config depends on the type.
+curl -s -X POST localhost:8080/api/v1/channels -d '{
+  "name": "ops-ntfy", "type": "ntfy",
+  "config": {"topic": "sorobeacon-8f3a1c"}
+}'
+# {"id":1,"name":"ops-ntfy","type":"ntfy","enabled":true,
+#  "digest_mode":"","digest_window_seconds":0,"min_severity":"",
+#  "created_at":"2026-11-20T12:00:00Z"}
+
+# 2. Test — sends a synthetic alert through the stored config.
+curl -s -X POST localhost:8080/api/v1/channels/1/test
+# {"status":"sent"}
+```
+
 Generic webhook deliveries carry an `X-SoroBeacon-Timestamp` header and an
 `X-SoroBeacon-Signature` header: the hex HMAC-SHA256 of `<timestamp>.<raw
 body>` under your `secret`. During a rotation, set `previous_secret` and a
