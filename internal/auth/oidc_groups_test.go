@@ -321,3 +321,50 @@ func TestOIDCGroupMappingReloadAndBoundedTTLRevocation(t *testing.T) {
 		t.Fatalf("after cache TTL expiry, bearer = (%+v, %v), want (nil, AuthForbidden)", pr, st)
 	}
 }
+
+// HasGroupMappings is what makes login fail closed on a provider that has
+// mapping rules, so the accessor has to be right for the empty and unconfigured
+// states as well as the configured one.
+func TestHasGroupMappings(t *testing.T) {
+	viewers := GroupMapping{Group: "prod-viewers", Workspace: "prod", Role: RoleViewer}
+	admins := GroupMapping{Group: "prod-admins", Workspace: "prod", Role: RoleAdmin}
+
+	tests := []struct {
+		name     string
+		provider *OIDCProvider
+		want     bool
+	}{
+		{name: "nil provider", provider: nil, want: false},
+		{name: "no mappings configured", provider: &OIDCProvider{}, want: false},
+		{name: "one mapping", provider: &OIDCProvider{groupMappings: []GroupMapping{viewers}}, want: true},
+		{name: "several mappings", provider: &OIDCProvider{groupMappings: []GroupMapping{viewers, admins}}, want: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.provider.HasGroupMappings(); got != tc.want {
+				t.Fatalf("HasGroupMappings() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A rejected reload must not install a partial rule set: the previously active
+// mappings stay in place, so access keeps failing closed against them.
+func TestSetGroupMappingsRejectionLeavesTheActiveRules(t *testing.T) {
+	active := GroupMapping{Group: "prod-viewers", Workspace: "prod", Role: RoleViewer}
+	p := &OIDCProvider{groupMappings: []GroupMapping{active}}
+
+	err := p.SetGroupMappings([]GroupMapping{
+		active,
+		{Group: "   ", Workspace: "prod", Role: RoleAdmin},
+	})
+	if err == nil {
+		t.Fatal("SetGroupMappings accepted a mapping with an empty group name")
+	}
+	if !p.HasGroupMappings() {
+		t.Fatal("a rejected reload must not clear the active mappings")
+	}
+	if got := p.GroupMappings(); len(got) != 1 || got[0] != active {
+		t.Fatalf("GroupMappings() = %+v, want just %+v", got, active)
+	}
+}
