@@ -502,24 +502,39 @@ func TestLoadAlertRetention(t *testing.T) {
 }
 
 func TestParseRetention(t *testing.T) {
-	d, err := ParseRetention("")
-	require.NoError(t, err)
-	assert.Equal(t, time.Duration(0), d)
-
-	d, err = ParseRetention("90d")
-	require.NoError(t, err)
-	assert.Equal(t, 90*24*time.Hour, d)
-
-	d, err = ParseRetention("24h")
-	require.NoError(t, err)
-	assert.Equal(t, 24*time.Hour, d)
-
-	_, err = ParseRetention("0")
-	assert.Error(t, err)
-	_, err = ParseRetention("-1h")
-	assert.Error(t, err)
-	_, err = ParseRetention("0d")
-	assert.Error(t, err)
+	tests := []struct {
+		name    string
+		in      string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "empty keeps forever", in: ""},
+		// Whitespace is the same as unset: an operator template that expands
+		// to spaces must not start pruning history.
+		{name: "whitespace only keeps forever", in: "   "},
+		{name: "days", in: "90d", want: 90 * 24 * time.Hour},
+		{name: "one day boundary", in: "1d", want: 24 * time.Hour},
+		{name: "fractional days", in: "1.5d", want: 36 * time.Hour},
+		{name: "go duration hours", in: "24h", want: 24 * time.Hour},
+		{name: "go duration minutes", in: "90m", want: 90 * time.Minute},
+		{name: "zero", in: "0", wantErr: true},
+		{name: "negative", in: "-1h", wantErr: true},
+		{name: "zero days", in: "0d", wantErr: true},
+		{name: "negative days", in: "-2d", wantErr: true},
+		{name: "day suffix without a number", in: "d", wantErr: true},
+		{name: "not a duration", in: "soon", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseRetention(tt.in)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 func TestLoadRateLimit(t *testing.T) {
@@ -1505,4 +1520,3 @@ func TestLoadAuditRetention(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "AUDIT_RETENTION")
 }
-
