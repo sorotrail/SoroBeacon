@@ -272,3 +272,89 @@ func TestReloader_LiveRotationAndExpiryWarning(t *testing.T) {
 	require.Error(t, reloader.Reload())
 	assert.Equal(t, float64(secondExpiry.Unix()), reloader.LeafNotAfterUnix())
 }
+
+func TestReloader_ClientTLSConfig(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	ca := newTestCA(t, dir, "ca", now.Add(-time.Hour), now.Add(365*24*time.Hour))
+	certFile, keyFile, _, _ := ca.issueLeaf(t, dir, "client", "client.local", "", now.Add(-time.Hour), now.Add(24*time.Hour), false)
+
+	fullReloader, err := NewReloader(PeerConfig{
+		Component:  "client",
+		CertFile:   certFile,
+		KeyFile:    keyFile,
+		CAFile:     ca.caFile,
+		ServerName: "server.local",
+		Now:        func() time.Time { return now },
+	})
+	require.NoError(t, err)
+
+	caOnlyReloader, err := NewReloader(PeerConfig{
+		Component: "client-ca-only",
+		CAFile:    ca.caFile,
+		Now:       func() time.Time { return now },
+	})
+	require.NoError(t, err)
+
+	tests := []struct {
+		name               string
+		reloader           *Reloader
+		wantRootCAs        bool
+		wantServerName     string
+		wantGetClientCert  bool
+		wantNonEmptyClient bool
+	}{
+		{
+			name:               "configured reloader returns full mTLS client config",
+			reloader:           fullReloader,
+			wantRootCAs:        true,
+			wantServerName:     "server.local",
+			wantGetClientCert:  true,
+			wantNonEmptyClient: true,
+		},
+		{
+			name:               "ca-only reloader returns empty client certificate",
+			reloader:           caOnlyReloader,
+			wantRootCAs:        true,
+			wantServerName:     "",
+			wantGetClientCert:  true,
+			wantNonEmptyClient: false,
+		},
+		{
+			name:              "nil reloader returns minimal TLS 1.2 config",
+			reloader:          nil,
+			wantRootCAs:       false,
+			wantServerName:    "",
+			wantGetClientCert: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.reloader.ClientTLSConfig()
+			require.NotNil(t, cfg)
+			assert.Equal(t, uint16(tls.VersionTLS12), cfg.MinVersion)
+			assert.Equal(t, tc.wantServerName, cfg.ServerName)
+			if tc.wantRootCAs {
+				assert.NotNil(t, cfg.RootCAs)
+			} else {
+				assert.Nil(t, cfg.RootCAs)
+			}
+
+			if !tc.wantGetClientCert {
+				assert.Nil(t, cfg.GetClientCertificate)
+				return
+			}
+
+			require.NotNil(t, cfg.GetClientCertificate)
+			cert, certErr := cfg.GetClientCertificate(&tls.CertificateRequestInfo{})
+			require.NoError(t, certErr)
+			require.NotNil(t, cert)
+			if tc.wantNonEmptyClient {
+				assert.NotEmpty(t, cert.Certificate)
+			} else {
+				assert.Empty(t, cert.Certificate)
+			}
+		})
+	}
+}

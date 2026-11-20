@@ -531,3 +531,54 @@ func TestRecordNotModified(t *testing.T) {
 
 	assert.Equal(t, float64(1), m.sampleValue(t, "sorobeacon_http_not_modified_total", map[string]string{"route": "/api/v1/channels/1/stats"}))
 }
+
+func TestSetChannelUnacknowledgedFlagged(t *testing.T) {
+	tests := []struct {
+		name        string
+		channelID   string
+		channelType string
+		flagged     bool
+		want        float64
+	}{
+		{
+			name:        "flagged true sets gauge to 1",
+			channelID:   "ch-1",
+			channelType: "webhook",
+			flagged:     true,
+			want:        1.0,
+		},
+		{
+			name:        "flagged false sets gauge to 0",
+			channelID:   "ch-2",
+			channelType: "slack",
+			flagged:     false,
+			want:        0.0,
+		},
+	}
+
+	m := New()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m.SetChannelUnacknowledgedFlagged(tc.channelID, tc.channelType, tc.flagged)
+			got := m.sampleValue(t, "sorobeacon_channel_unacknowledged_flagged", map[string]string{
+				"channel_id":   tc.channelID,
+				"channel_type": tc.channelType,
+			})
+			assert.Equal(t, tc.want, got)
+		})
+	}
+
+	// Clearing a previously flagged channel updates the gauge back to 0.
+	m.SetChannelUnacknowledgedFlagged("ch-1", "webhook", false)
+	got := m.sampleValue(t, "sorobeacon_channel_unacknowledged_flagged", map[string]string{
+		"channel_id":   "ch-1",
+		"channel_type": "webhook",
+	})
+	assert.Equal(t, 0.0, got)
+
+	// Nil receiver must not panic.
+	var nilMetrics *Metrics
+	assert.NotPanics(t, func() {
+		nilMetrics.SetChannelUnacknowledgedFlagged("ch-1", "webhook", true)
+	})
+}
