@@ -132,6 +132,9 @@ type Dispatcher struct {
 	monitorBudget *MonitorBudgetTracker
 	usageMeter    *usage.Meter
 
+	// budgets is the optional durable per-monitor delivery budget (quota.go).
+	budgets store.DeliveryBudgets
+
 	stopMu            sync.RWMutex
 	stoppedWorkspaces map[string]struct{}
 	stoppedChannels   map[int64]struct{}
@@ -557,6 +560,9 @@ func (d *Dispatcher) dispatchSync(ctx context.Context, a Alert) {
 	// already persisted and stays visible, it is only marked and skipped.
 	// The check happens here, before fan-out, so nothing is delivered.
 	if d.suppressed(ctx, a) {
+		return
+	}
+	if !d.checkDeliveryBudget(ctx, a) {
 		return
 	}
 	if d.monitorBudget != nil && a.MonitorID > 0 {

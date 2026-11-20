@@ -200,6 +200,32 @@ curl -s -X PUT localhost:8080/api/v1/monitors/1/escalation -d '{
 
 `GET /rule-types` returns the parameter schema the dashboard's rule builder renders. Each field has a `type` (`string`, `number`, `boolean`, `object`, or `select`), `required`, `description`, and, where applicable, `default` and `options`. A `boolean` field is a JSON boolean in `params`; the builder renders it as a true/false select and starts it at `default` when one is declared. `select` is reserved for genuine enumerations such as `comparison`, `direction`, `match`, and `op`.
 
+## Delivery budgets
+
+A delivery budget caps how many alerts one monitor may deliver per UTC day. It
+is the backstop behind channel rate limiting: rate limiting paces a flood, a
+budget stops it. A monitor has no budget by default (unlimited), so existing
+deployments are unaffected.
+
+When the budget is spent, SoroBeacon stops delivering for that monitor and
+sends **one** critical notice through its channels saying so. Further alerts
+are still stored (and marked suppressed with the reason); only delivery stops.
+The budget refills at 00:00 UTC, or immediately on a manual reset. Consumption
+is stored in the database, so a restart does not reset it. The count is per
+alert, not per channel: one alert fanned out to three channels uses one unit.
+Escalation steps after the first delivery do not use further units.
+
+| Method & path | Description | Scope |
+| --- | --- | --- |
+| `GET /monitors/{id}/delivery-budget` | `200 {"monitor_id", "limit", "used", "remaining", "exhausted", "window_start", "resets_at", "exhausted_at"}`. `limit`, `remaining` and the window fields are `null` for an unlimited monitor. `404` for an unknown monitor. | `monitors:read` |
+| `PUT /monitors/{id}/delivery-budget` | Set the daily limit: `{"limit": 200}`. `{"limit": null}` clears it (unlimited). `limit` is required and must be positive. Raising the limit above what is already used un-exhausts the budget. `200` with the stored budget; `400` for a missing or non-positive limit; `404` for an unknown monitor. | `monitors:write` |
+| `POST /monitors/{id}/delivery-budget/reset` | Manually un-exhaust the budget by zeroing today's counter. `200` with the budget; `404` for an unknown monitor. | `monitors:write` |
+
+The remaining budget is shown on the monitor page, and
+`sorobeacon_delivery_budget_exhausted_total` counts monitors spending their
+budget (alert on its rate); suppressed alerts also increment
+`sorobeacon_alert_throttles_total{channel="delivery_budget"}`.
+
 ## Monitor templates
 
 A template is a reusable monitor shape: a name, a list of rules whose params may

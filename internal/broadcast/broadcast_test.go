@@ -130,6 +130,48 @@ func TestSubscriberCloseReturnsCountToZero(t *testing.T) {
 	}
 }
 
+// SubscriberCount is the leak assertion in other tests, so it has to be exact
+// for the empty broadcaster, for filters that are odd but still clients, and
+// at the buffer-depth boundary.
+func TestSubscriberCountEdgeCases(t *testing.T) {
+	tests := map[string]struct {
+		monitors   []int64
+		closeFirst int
+		wantBefore int
+		wantAfter  int
+	}{
+		"empty broadcaster":                      {wantBefore: 0, wantAfter: 0},
+		"single subscriber":                      {monitors: []int64{0}, wantBefore: 1, wantAfter: 1},
+		"negative monitor id is still a client":  {monitors: []int64{-1}, wantBefore: 1, wantAfter: 1},
+		"duplicate filters are separate clients": {monitors: []int64{7, 7}, closeFirst: 1, wantBefore: 2, wantAfter: 1},
+		"buffer-depth boundary of clients":       {monitors: make([]int64, DefaultBuffer), wantBefore: DefaultBuffer, wantAfter: DefaultBuffer},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			b := New(1)
+			subs := make([]*Subscriber, 0, len(tc.monitors))
+			for _, id := range tc.monitors {
+				subs = append(subs, b.Subscribe(id))
+			}
+			if got := b.SubscriberCount(); got != tc.wantBefore {
+				t.Fatalf("SubscriberCount = %d, want %d", got, tc.wantBefore)
+			}
+			for i := 0; i < tc.closeFirst; i++ {
+				subs[i].Close()
+			}
+			if got := b.SubscriberCount(); got != tc.wantAfter {
+				t.Fatalf("SubscriberCount after closing %d = %d, want %d", tc.closeFirst, got, tc.wantAfter)
+			}
+			for _, s := range subs {
+				s.Close()
+			}
+			if got := b.SubscriberCount(); got != 0 {
+				t.Fatalf("SubscriberCount after closing every subscriber = %d, want 0", got)
+			}
+		})
+	}
+}
+
 // A closed subscriber must stop receiving, so a disconnected client cannot
 // keep a goroutine busy draining a queue nobody owns.
 func TestClosedSubscriberReceivesNothing(t *testing.T) {

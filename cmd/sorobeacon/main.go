@@ -646,6 +646,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 		}).
 		WithMetrics(m).
 		WithDigestQueue(st).
+		WithDeliveryBudgets(st).
 		WithDisableAfterFailures(cfg.ChannelDisableAfterFailures).
 		WithFlapping(alerts.FlappingConfig{
 			Episodes:   cfg.FlappingEpisodes,
