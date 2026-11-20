@@ -321,6 +321,83 @@ func TestNewBoundDropsUnusableBindings(t *testing.T) {
 	}
 }
 
+// NewBound turns workspace-bound tokens into an Authenticator. Pin the edge cases:
+// empty input (nil/empty bindings with zero TTL yields an unconfigured authenticator
+// with default TTL), boundary values (maximum 40-character workspace ID, token
+// whitespace trimming, and explicit positive TTL), and invalid input (workspace ID
+// exceeding the 40-character maximum is dropped rather than accepted).
+func TestNewBoundEdgeCases(t *testing.T) {
+	tests := []struct {
+		name       string
+		bindings   []Binding
+		ttl        time.Duration
+		wantTokens int
+		wantTTL    time.Duration
+		probeToken string
+		wantVerify bool
+		wantWS     workspace.ID
+		wantAuth   bool
+	}{
+		{
+			name:       "empty input: nil bindings with zero ttl produces unconfigured authenticator with default ttl",
+			bindings:   nil,
+			ttl:        0,
+			wantTokens: 0,
+			wantTTL:    DefaultSessionTTL,
+			probeToken: "any-token",
+			wantVerify: false,
+			wantWS:     workspace.Default,
+			wantAuth:   true, // unconfigured authenticator is open on default workspace
+		},
+		{
+			name: "boundary values: maximum 40-character workspace id with whitespace-trimmed token and custom ttl",
+			bindings: []Binding{
+				{Workspace: workspace.ID(strings.Repeat("w", 40)), Token: "  tok-boundary  "},
+			},
+			ttl:        5 * time.Minute,
+			wantTokens: 1,
+			wantTTL:    5 * time.Minute,
+			probeToken: "tok-boundary",
+			wantVerify: true,
+			wantWS:     workspace.ID(strings.Repeat("w", 40)),
+			wantAuth:   true,
+		},
+		{
+			name: "invalid input: workspace id exceeding maximum 40-character length is dropped",
+			bindings: []Binding{
+				{Workspace: "acme", Token: "tok-acme"},
+				{Workspace: workspace.ID(strings.Repeat("w", 41)), Token: "tok-overmax"},
+			},
+			ttl:        0,
+			wantTokens: 1,
+			wantTTL:    DefaultSessionTTL,
+			probeToken: "tok-overmax",
+			wantVerify: false,
+			wantWS:     "",
+			wantAuth:   false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := NewBound(tc.bindings, tc.ttl)
+			if len(a.tokens) != tc.wantTokens {
+				t.Fatalf("len(tokens) = %d, want %d", len(a.tokens), tc.wantTokens)
+			}
+			if a.SessionTTL() != tc.wantTTL {
+				t.Fatalf("SessionTTL() = %v, want %v", a.SessionTTL(), tc.wantTTL)
+			}
+			if got := a.Verify(tc.probeToken); got != tc.wantVerify {
+				t.Fatalf("Verify(%q) = %v, want %v", tc.probeToken, got, tc.wantVerify)
+			}
+			ws, ok := a.Workspace(requestWithHeader("Authorization", "Bearer "+tc.probeToken))
+			if ok != tc.wantAuth || ws != tc.wantWS {
+				t.Fatalf("Workspace(%q) = %q, %v; want %q, %v", tc.probeToken, ws, ok, tc.wantWS, tc.wantAuth)
+			}
+		})
+	}
+}
+
 func TestSessionIDReadsTheCookie(t *testing.T) {
 	r := requestWithHeader("", "")
 	if got := SessionID(r); got != "" {
