@@ -88,6 +88,10 @@ func validateAddressList(p addressWatchlistParams) error {
 	return nil
 }
 
+// Validate reports whether params are a well-formed address_watchlist rule: a
+// non-empty list of plausible Stellar addresses no larger than
+// MaxAddressWatchlistSize, a known match mode, and a known event restriction
+// when one is given. The same checks run again when the rule is evaluated.
 func (a *AddressWatchlist) Validate(params json.RawMessage) error {
 	p, err := parseAddressWatchlist(params)
 	if err != nil {
