@@ -5,3 +5,9 @@
 ### Changes Delivered
 - Formal validation logic.
 - Comprehensive regression testing.
+
+Example rule payload for matching transfer events:
+
+```json
+{"type":"event_emitted","params":{"event_name":"transfer"}}
+```
