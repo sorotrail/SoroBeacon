@@ -51,6 +51,52 @@ func TestParseMTLSPrincipalMap(t *testing.T) {
 	})
 }
 
+func TestAuthenticator_MTLSEnabled(t *testing.T) {
+	bindings := []MTLSBinding{{
+		Subject:   "cn:ingestor",
+		Workspace: workspace.ID("acme"),
+		Role:      RoleEditor,
+	}}
+
+	tests := []struct {
+		name string
+		auth *Authenticator
+		want bool
+	}{
+		{
+			name: "disabled by default",
+			auth: New(nil, 0),
+			want: false,
+		},
+		{
+			name: "explicitly enabled without bindings",
+			auth: New(nil, 0).WithMTLS(true, nil),
+			want: true,
+		},
+		{
+			name: "enabled by a non-empty binding list",
+			auth: New(nil, 0).WithMTLS(false, bindings),
+			want: true,
+		},
+		{
+			name: "disabled again clears the flag and bindings",
+			auth: New(nil, 0).WithMTLS(true, bindings).WithMTLS(false, nil),
+			want: false,
+		},
+		{
+			name: "nil authenticator is not enabled",
+			auth: nil,
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.auth.MTLSEnabled())
+		})
+	}
+}
+
 func TestAuthenticator_MTLSRequestResolution(t *testing.T) {
 	spiffeURI, err := url.Parse("spiffe://cluster.local/ns/prod/sa/ingestor")
 	require.NoError(t, err)
