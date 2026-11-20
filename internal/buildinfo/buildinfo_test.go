@@ -27,6 +27,21 @@ func TestNormalizeDate(t *testing.T) {
 			want:  "2026-10-21T14:30:00Z",
 		},
 		{
+			name:  "unix epoch zero",
+			input: "0",
+			want:  "1970-01-01T00:00:00Z",
+		},
+		{
+			name:  "negative unix epoch",
+			input: "-1",
+			want:  "1969-12-31T23:59:59Z",
+		},
+		{
+			name:    "unix epoch overflow rejected",
+			input:   "9223372036854775808",
+			wantErr: true,
+		},
+		{
 			name:    "empty rejected",
 			input:   "   ",
 			wantErr: true,
