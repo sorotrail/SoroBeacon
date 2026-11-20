@@ -167,6 +167,43 @@ func TestHasSessionExpiresAndDrops(t *testing.T) {
 	}
 }
 
+// NewSession turns a workspace id into a tenancy decision, so the edges of
+// that input matter: an empty id is the single-tenant fallback, and an id that
+// sits at or past the workspace grammar's length boundary must reach the
+// session unchanged rather than being trimmed into a different tenant's name.
+func TestNewSessionWorkspaceEdgeCases(t *testing.T) {
+	maxLen := workspace.ID(strings.Repeat("w", 40))
+	overMaxLen := workspace.ID(strings.Repeat("w", 41))
+	tests := map[string]struct {
+		in   workspace.ID
+		want workspace.ID
+	}{
+		"empty falls back to the default workspace": {in: "", want: workspace.Default},
+		"single character is the minimum":           {in: "a", want: "a"},
+		"maximum length is kept as given":           {in: maxLen, want: maxLen},
+		"over the maximum is not truncated":         {in: overMaxLen, want: overMaxLen},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			a := New([]string{"s3cret"}, 0)
+			id := a.NewSession(tc.in)
+			if id == "" {
+				t.Fatal("NewSession returned no session id")
+			}
+			got, ok := a.SessionWorkspace(id)
+			if !ok {
+				t.Fatal("a freshly minted session must resolve to a workspace")
+			}
+			if got != tc.want {
+				t.Fatalf("session workspace = %q, want %q", got, tc.want)
+			}
+			if role, ok := a.SessionRole(id); !ok || role != RoleAdmin {
+				t.Fatalf("session role = %v, %v; want an admin", role, ok)
+			}
+		})
+	}
+}
+
 func TestZeroTTLFallsBackToDefault(t *testing.T) {
 	a := New([]string{"s3cret"}, 0)
 	if a.SessionTTL() != DefaultSessionTTL {
