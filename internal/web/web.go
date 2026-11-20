@@ -1040,6 +1040,14 @@ func (s *Server) monitorPage(r *http.Request, id int64) (map[string]any, error) 
 	if err != nil {
 		return nil, err
 	}
+	// The budget panel is informational, so a failed read hides it rather
+	// than failing the whole page: the monitor's rules and alerts are still
+	// what the person came for.
+	budget, err := s.store.GetDeliveryBudget(r.Context(), id, time.Now())
+	if err != nil {
+		s.log.Warn("load delivery budget for monitor page", "monitor_id", id, "err", err)
+		budget = nil
+	}
 	attached := map[int64]bool{}
 	for _, cid := range m.ChannelIDs {
 		attached[cid] = true
@@ -1058,6 +1066,7 @@ func (s *Server) monitorPage(r *http.Request, id int64) (map[string]any, error) 
 		"AlertsHref": template.URL("/alerts?monitor_id=" + strconv.FormatInt(id, 10)), // #nosec G203 -- fixed relative path with base-10 integer monitor ID
 		"Stats":      stats,
 		"LastAlert":  formatStatTime(stats.LastAlertAt, tz),
+		"Budget":     budget,
 		// The rule builder's own state. The page is also rendered after the
 		// builder rejects a malformed form, which fills these in with what
 		// the user typed; the defaults are the empty form.

@@ -252,6 +252,30 @@ export interface DeliveryAttempt {
   status: "success" | "failed";
 }
 
+export interface DeliveryBudget {
+  exhausted?: boolean;
+  /** When the budget ran out in this window; null while budget remains. */
+  exhausted_at?: ISODateTimeString;
+  /** Daily budget; null means unlimited. */
+  limit?: number;
+  monitor_id?: Int64Value;
+  /** Deliveries left in the window; null when unlimited. */
+  remaining?: number | null;
+  /** When the window rolls over and the budget refills; null when unlimited. */
+  resets_at?: ISODateTimeString | null;
+  /** Deliveries consumed in the current window. */
+  used?: number;
+  /** Start of the current UTC window; null when unlimited. */
+  window_start?: ISODateTimeString | null;
+}
+
+export interface DeliveryBudgetInput {
+  /**
+   * Alerts the monitor may deliver per UTC day. null clears the budget (unlimited).
+   */
+  limit: number;
+}
+
 export interface DryRunResult {
   /** Number of historical events that matched the rule */
   count: number;
@@ -917,6 +941,9 @@ export const OPENAPI_OPERATIONS = [
   { method: "GET", path: "/monitors/{id}/escalation", clientMethod: "getMonitorEscalation", summary: "Get a monitor's escalation policy" },
   { method: "PUT", path: "/monitors/{id}/escalation", clientMethod: "setMonitorEscalation", summary: "Create or replace a monitor's escalation policy" },
   { method: "DELETE", path: "/monitors/{id}/escalation", clientMethod: "deleteMonitorEscalation", summary: "Delete a monitor's escalation policy" },
+  { method: "GET", path: "/monitors/{id}/delivery-budget", clientMethod: "getDeliveryBudget", summary: "Get a monitor's delivery budget" },
+  { method: "PUT", path: "/monitors/{id}/delivery-budget", clientMethod: "setDeliveryBudget", summary: "Set or clear a monitor's delivery budget" },
+  { method: "POST", path: "/monitors/{id}/delivery-budget/reset", clientMethod: "resetDeliveryBudget", summary: "Reset a monitor's delivery budget" },
   { method: "GET", path: "/monitors/{id}/rules", clientMethod: "listRules", summary: "List a monitor's rules" },
   { method: "POST", path: "/monitors/{id}/rules", clientMethod: "createRule", summary: "Add a rule to a monitor" },
   { method: "POST", path: "/monitors/{id}/rules/bulk", clientMethod: "bulkCreateRules", summary: "Create several rules in one request" },
