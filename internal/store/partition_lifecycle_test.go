@@ -207,16 +207,16 @@ func TestEffectiveRetentionCutoffAndExpiredPartitions(t *testing.T) {
 }
 
 type fakeLifecycleStore struct {
-	mu           sync.Mutex
-	ensureCalls  int
-	checkCalls   int
-	dropCalls    int
-	ensureErr    error
-	checkErr     error
-	dropErr      error
-	droppedRows  int64
-	lastMonths   int
-	lastCutoff   time.Time
+	mu          sync.Mutex
+	ensureCalls int
+	checkCalls  int
+	dropCalls   int
+	ensureErr   error
+	checkErr    error
+	dropErr     error
+	droppedRows int64
+	lastMonths  int
+	lastCutoff  time.Time
 }
 
 func (f *fakeLifecycleStore) EnsureAlertPartitions(_ context.Context, _ time.Time, months int) error {

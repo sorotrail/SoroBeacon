@@ -51,6 +51,13 @@ var SensitiveColumnInventory = []SensitiveColumnDecision{
 		Explanation: "Holds only the short display prefix of the token so operators can identify tokens in the UI without storing the secret.",
 	},
 	{
+		Table:       "push_devices",
+		Column:      "token",
+		Mechanism:   "plaintext-write-only",
+		Searchable:  false,
+		Explanation: "Holds an FCM device registration token. It is stored as provided because the sender needs the exact value, is never returned by the API or written to logs or errors, and is useless without the service-account credentials of the sender. Deleted with its channel and with the workspace.",
+	},
+	{
 		Table:       "delivery_attempts",
 		Column:      "response_snippet",
 		Mechanism:   "redacted-plaintext",

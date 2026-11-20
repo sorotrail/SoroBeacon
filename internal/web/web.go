@@ -64,6 +64,9 @@ var faviconSVG []byte
 
 // Server renders the dashboard.
 type Server struct {
+	// paging propagates dashboard acknowledgements to external paging
+	// providers; nil-safe.
+	paging   *notify.PagingSync
 	store    store.Store
 	registry *rules.Registry
 	factory  *notify.Factory
@@ -2346,6 +2349,7 @@ func (s *Server) acknowledgeAlert(w http.ResponseWriter, r *http.Request) {
 	if !already {
 		s.audit(r, store.AuditActionUpdate, "alert", id)
 	}
+	s.paging.Propagate(r.Context(), id, "acknowledge")
 	loc := withAckFlag(returnTo(r, "/alerts/"+strconv.FormatInt(id, 10)), already)
 	http.Redirect(w, r, loc, http.StatusSeeOther)
 }
@@ -2422,4 +2426,11 @@ func splitLines(s string) []string {
 // always store one canonical set.
 func splitTags(s string) []string {
 	return store.NormalizeTags(splitLines(s))
+}
+
+// WithPaging enables outbound acknowledgement sync to external paging
+// providers. Optional.
+func (s *Server) WithPaging(p *notify.PagingSync) *Server {
+	s.paging = p
+	return s
 }

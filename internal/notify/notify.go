@@ -13,6 +13,7 @@ import (
 	"html"
 	"log/slog"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -78,6 +79,10 @@ type Alert struct {
 	// ResponseGuidance is the resolved triage instruction note for this alert
 	// (rule -> monitor -> workspace default).
 	ResponseGuidance string `json:"response_guidance,omitempty"`
+
+	// esc escapes enrichment text for the channel rendering this alert. It is
+	// set by the channel just before rendering and is never serialised.
+	esc func(string) string
 }
 
 // Notifier sends one alert to one destination. Implementations should
@@ -105,6 +110,8 @@ type Factory struct {
 	constructors     map[string]Constructor
 	secrets          *secrets.Resolver
 	federationOrigin string
+	pushOnce         sync.Once
+	push             *pushShared
 }
 
 // Channel type names understood by DefaultFactory.
@@ -132,6 +139,7 @@ const (
 	TypeTeams        = "teams"
 	TypeSNS          = "sns"
 	TypeJSONTemplate = "jsontemplate"
+	// TypePush is declared in push.go.
 )
 
 // DefaultFactory returns a Factory with the built-in channel types.
@@ -161,6 +169,7 @@ func DefaultFactory() *Factory {
 	f.Register(TypeTeams, NewTeams)
 	f.Register(TypeSNS, NewSNS)
 	f.Register(TypeJSONTemplate, NewJSONTemplate)
+	f.Register(TypePush, f.newPush)
 	return f
 }
 
@@ -238,6 +247,10 @@ var defaultTemplate = template.Must(template.New("alert").Parse(strings.TrimSpac
 Rule: {{.RuleType}} (#{{.RuleID}})
 {{- if .ContractID}}
 Contract: {{.ContractID}}{{end}}
+{{- if .ContractLabel}}
+Label: {{.ContractLabel}} (from {{.EnrichmentSource}}{{if .EnrichmentStale}}, stale{{end}}; unverified){{end}}
+{{- if .PrimaryAmount}}
+Amount: {{.PrimaryAmount}}{{end}}
 {{- if .Silence}}
 No {{.EventName}} for {{.Silence}}
 {{- else if .EventName}}
@@ -359,6 +372,9 @@ func digestLine(a Alert) string {
 // The zero value means "no override": render then falls back to RenderText.
 type channelTemplate struct {
 	tpl *template.Template
+	// kind selects how enrichment text is escaped for this channel (see
+	// escapeFor); empty means plain text.
+	kind string
 }
 
 // EscapeSlackMrkdwn escapes &, <, and > per Slack's mrkdwn rules so untrusted
@@ -435,6 +451,7 @@ func (t channelTemplate) render(a Alert) (string, error) {
 	if a.Digest != "" {
 		return a.Digest, nil
 	}
+	a.esc = escapeFor(t.kind)
 	if t.tpl == nil {
 		return RenderText(a)
 	}

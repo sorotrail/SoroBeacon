@@ -1,0 +1,15 @@
+apiVersion: sorobeacon.io/v1alpha1
+kind: Channel
+metadata:
+  name: oncall-slack
+spec:
+  type: slack
+  minSeverity: warning
+  # Non-secret settings go in config. Secrets are referenced, never inlined.
+  secretRefs:
+    - configKey: webhook_url
+      name: oncall-slack-webhook
+      key: url
+  # Orphan (default) leaves the channel in SoroBeacon when this resource is
+  # deleted; Delete removes the channel only.
+  deletionPolicy: Orphan

@@ -82,10 +82,10 @@ type monitorBucket struct {
 // enforcing caps with hysteresis recovery and separate critical allowances.
 // It isolates capacity per workspace to preserve multi-tenant fairness.
 type MonitorBudgetTracker struct {
-	mu        sync.Mutex
+	mu         sync.Mutex
 	defaultCfg MonitorCapConfig
-	overrides map[string]MonitorCapConfig
-	buckets   map[string]*monitorBucket
+	overrides  map[string]MonitorCapConfig
+	buckets    map[string]*monitorBucket
 }
 
 // NewMonitorBudgetTracker creates a tracker with default configuration.

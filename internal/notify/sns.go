@@ -26,7 +26,7 @@ type SNSAPI interface {
 
 // SNS publishes alerts to an AWS SNS topic using SigV4 signing.
 type SNS struct {
-	cfg   snsConfig
+	cfg    snsConfig
 	client SNSAPI
 }
 

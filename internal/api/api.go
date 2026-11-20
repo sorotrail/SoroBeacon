@@ -73,7 +73,10 @@ const MaxChannelConfigBytes int = 64 << 10
 const MaxTemplateBytes int = 32 << 10
 
 type Server struct {
-	store store.Store
+	// paging propagates local acknowledgements to external paging providers;
+	// nil-safe.
+	paging *notify.PagingSync
+	store  store.Store
 	// archiveReader serves opt-in archived alert history; nil disables it.
 	archiveReader store.ArchiveReader
 	registry      *rules.Registry
@@ -262,6 +265,13 @@ func (s *Server) WithLeadership(r LeaderReader) *Server {
 	return s
 }
 
+// WithPaging enables outbound acknowledgement sync to external paging
+// providers. Optional.
+func (s *Server) WithPaging(p *notify.PagingSync) *Server {
+	s.paging = p
+	return s
+}
+
 // WithReadyzLagThreshold fails /readyz when ledger lag exceeds n.
 // Zero (the default) leaves the probe unaffected so existing deployments
 // cannot start failing without opting in.
@@ -396,6 +406,9 @@ func (s *Server) Routes() chi.Router {
 		r.Delete("/{id}", s.deleteChannel)
 		r.Post("/{id}/test", s.testChannel)
 		r.Get("/{id}/keys", s.listChannelSigningKeys)
+		r.Get("/{id}/devices", s.listPushDevices)
+		r.Put("/{id}/devices/{deviceID}", s.registerPushDevice)
+		r.Delete("/{id}/devices/{deviceID}", s.deletePushDevice)
 		r.Post("/{id}/keys/rotate", s.rotateChannelSigningKey)
 		r.Post("/{id}/keys/{keyID}/retire", s.retireChannelSigningKey)
 		r.Post("/{id}/keys/{keyID}/revoke", s.revokeChannelSigningKey)

@@ -35,10 +35,10 @@ func TestWorkspaceQuotas_ResourceEnforcementAndIsolation(t *testing.T) {
 	wsB := workspace.With(context.Background(), "beta")
 
 	_, err := st.SetWorkspaceQuota(sys, WorkspaceQuota{
-		WorkspaceID:  "alpha",
-		MaxMonitors:  2,
-		MaxRules:     3,
-		MaxChannels:  1,
+		WorkspaceID: "alpha",
+		MaxMonitors: 2,
+		MaxRules:    3,
+		MaxChannels: 1,
 	})
 	require.NoError(t, err)
 
@@ -141,8 +141,8 @@ func TestWorkspaceQueryBudget_ConsumeRefillAndReconcile(t *testing.T) {
 
 	t0 := time.Date(2026, time.July, 1, 12, 0, 0, 0, time.UTC)
 	_, err := st.SetWorkspaceQuota(sys, WorkspaceQuota{
-		WorkspaceID:          "budget-ws",
-		QueryCostBudget:      100,
+		WorkspaceID:           "budget-ws",
+		QueryCostBudget:       100,
 		QueryCostRefillPerSec: 10, // 10 tokens/sec
 	})
 	require.NoError(t, err)

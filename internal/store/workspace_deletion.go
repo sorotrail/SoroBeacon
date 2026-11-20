@@ -33,6 +33,8 @@ func WorkspaceDeletionCoveredTables() []string {
 		"channels",
 		"channel_signing_keys",
 		"channel_ack_reconciliations",
+		"push_devices",
+		"alert_external_refs",
 		"pending_digests",
 		"monitors",
 		"monitor_channels",
@@ -230,6 +232,8 @@ func (p *Postgres) pgCountWorkspaceRows(ctx context.Context, ws string) (Workspa
 		{&c.MonitorChannels, `SELECT COUNT(*) FROM monitor_channels WHERE monitor_id IN (SELECT id FROM monitors WHERE workspace_id = $1) OR channel_id IN (SELECT id FROM channels WHERE workspace_id = $1)`},
 		{&c.ChannelSigningKeys, `SELECT COUNT(*) FROM channel_signing_keys WHERE workspace_id = $1 OR channel_id IN (SELECT id FROM channels WHERE workspace_id = $1)`},
 		{&c.ChannelAckReconciliations, `SELECT COUNT(*) FROM channel_ack_reconciliations WHERE workspace_id = $1 OR channel_id IN (SELECT id FROM channels WHERE workspace_id = $1)`},
+		{&c.PushDevices, `SELECT COUNT(*) FROM push_devices WHERE workspace_id = $1 OR channel_id IN (SELECT id FROM channels WHERE workspace_id = $1)`},
+		{&c.AlertExternalRefs, `SELECT COUNT(*) FROM alert_external_refs WHERE workspace_id = $1 OR channel_id IN (SELECT id FROM channels WHERE workspace_id = $1)`},
 		{&c.PendingDigests, `SELECT COUNT(*) FROM pending_digests WHERE channel_id IN (SELECT id FROM channels WHERE workspace_id = $1)`},
 		{&c.EscalationPolicies, `SELECT COUNT(*) FROM escalation_policies WHERE monitor_id IN (SELECT id FROM monitors WHERE workspace_id = $1)`},
 		{&c.EscalationSteps, `SELECT COUNT(*) FROM escalation_steps WHERE policy_id IN (SELECT ep.id FROM escalation_policies ep JOIN monitors m ON m.id = ep.monitor_id WHERE m.workspace_id = $1)`},
@@ -524,6 +528,12 @@ func (p *Postgres) pgDeleteWorkspaceAlertBatch(ctx context.Context, ws string, b
 	}
 	delivDel := tag.RowsAffected()
 
+	tag, err = tx.Exec(ctx, `DELETE FROM alert_external_refs WHERE alert_id = ANY($1) AND EXISTS (SELECT 1 FROM alerts WHERE id = alert_external_refs.alert_id AND workspace_id = $2)`, ids, ws)
+	if err != nil {
+		return 0, fmt.Errorf("delete alert batch external refs: %w", err)
+	}
+	refsDel := tag.RowsAffected()
+
 	tag, err = tx.Exec(ctx, `DELETE FROM dead_letters WHERE alert_id = ANY($1) AND EXISTS (SELECT 1 FROM alerts WHERE id = dead_letters.alert_id AND workspace_id = $2)`, ids, ws)
 	if err != nil {
 		return 0, fmt.Errorf("delete alert batch dead letters: %w", err)
@@ -551,6 +561,7 @@ func (p *Postgres) pgDeleteWorkspaceAlertBatch(ctx context.Context, ws string, b
 	counts.Alerts += alertsDel
 	counts.DeliveryAttempts += delivDel
 	counts.DeadLetters += deadDel
+	counts.AlertExternalRefs += refsDel
 	counts.AlertEscalations += escDel
 	counts.AlertDedup += dedupDel
 
@@ -622,6 +633,8 @@ func (p *Postgres) pgFinalizeWorkspaceDeletion(ctx context.Context, ws string) e
 		{"pending_digests", &counts.PendingDigests, `DELETE FROM pending_digests WHERE channel_id IN (SELECT id FROM channels WHERE workspace_id = $1)`},
 		{"channel_signing_keys", &counts.ChannelSigningKeys, `DELETE FROM channel_signing_keys WHERE workspace_id = $1 OR channel_id IN (SELECT id FROM channels WHERE workspace_id = $1)`},
 		{"channel_ack_reconciliations", &counts.ChannelAckReconciliations, `DELETE FROM channel_ack_reconciliations WHERE workspace_id = $1 OR channel_id IN (SELECT id FROM channels WHERE workspace_id = $1)`},
+		{"push_devices", &counts.PushDevices, `DELETE FROM push_devices WHERE workspace_id = $1 OR channel_id IN (SELECT id FROM channels WHERE workspace_id = $1)`},
+		{"alert_external_refs", &counts.AlertExternalRefs, `DELETE FROM alert_external_refs WHERE workspace_id = $1 OR channel_id IN (SELECT id FROM channels WHERE workspace_id = $1)`},
 		{"channels", &counts.Channels, `DELETE FROM channels WHERE workspace_id = $1`},
 		{"saved_searches", &counts.SavedSearches, `DELETE FROM saved_searches WHERE workspace_id = $1`},
 		{"monitor_templates", &counts.MonitorTemplates, `DELETE FROM monitor_templates WHERE workspace_id = $1`},

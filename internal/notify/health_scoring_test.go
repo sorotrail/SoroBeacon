@@ -170,7 +170,7 @@ func TestChannelHealth_HistoryVisibility(t *testing.T) {
 	channelID := int64(78)
 
 	// Record sequence of mixed events
-	mgr.RecordOutcome(channelID, nil, now)                                                         // +25 -> 100
+	mgr.RecordOutcome(channelID, nil, now)                                                                 // +25 -> 100
 	mgr.RecordOutcome(channelID, errors.New("timeout: context deadline exceeded"), now.Add(1*time.Minute)) // -15 -> 85
 	mgr.RecordOutcome(channelID, &HTTPStatusError{StatusCode: 500}, now.Add(2*time.Minute))                // -20 -> 65
 

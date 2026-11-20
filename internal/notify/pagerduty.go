@@ -15,6 +15,11 @@ type pagerDutyConfig struct {
 	Severity string `json:"severity,omitempty"`
 	// EventsURL overrides the Events API base URL, mainly for tests.
 	EventsURL string `json:"events_url,omitempty"`
+	// WebhookSecret is the PagerDuty webhook subscription secret used to verify
+	// inbound acknowledgement and resolution events (see pagingsync.go). It is a
+	// secret and supports ${secret:...} references like the routing key. Empty
+	// leaves the inbound direction closed: every inbound request is refused.
+	WebhookSecret string `json:"webhook_secret,omitempty"`
 }
 
 // pagerDutySeverities are the values the Events API v2 accepts.
@@ -128,6 +133,28 @@ func (p *PagerDuty) Send(ctx context.Context, a Alert) error {
 	if err := postJSON(ctx, p.cfg.EventsURL+"/v2/enqueue", body, nil); err != nil {
 		// postJSON's error carries only the status and a response-body
 		// snippet, so the routing key stays out of the delivery snippet.
+		return fmt.Errorf("pagerduty: %w", err)
+	}
+	return nil
+}
+
+// SendAction acknowledges or resolves the incident behind dedupKey through the
+// Events API v2. It is the outbound half of acknowledgement sync. The error is
+// the same status-only error Send returns, so the routing key stays out of it.
+func (p *PagerDuty) SendAction(ctx context.Context, dedupKey, action string) error {
+	eventAction := "acknowledge"
+	if action == "resolve" {
+		eventAction = "resolve"
+	}
+	body, err := json.Marshal(map[string]any{
+		"routing_key":  p.cfg.RoutingKey,
+		"event_action": eventAction,
+		"dedup_key":    dedupKey,
+	})
+	if err != nil {
+		return err
+	}
+	if err := postJSON(ctx, p.cfg.EventsURL+"/v2/enqueue", body, nil); err != nil {
 		return fmt.Errorf("pagerduty: %w", err)
 	}
 	return nil

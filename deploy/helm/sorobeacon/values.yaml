@@ -171,6 +171,26 @@ podDisruptionBudget:
 #   promotes within lease.DefaultInterval (3s) when the leader pod drains.
 # - Setting worker.replicaCount > 2 adds no throughput and only increases
 #   advisory-lock polling against PostgreSQL.
+# Kubernetes operator (Channel custom resource). Off by default: enabling it
+# installs the CRD, a ClusterRole limited to Channel resources, a namespaced
+# Role that can get Secrets, and one operator Deployment. It reconciles against
+# the public API with a scoped token (channels read and write, one workspace)
+# taken from an existing Secret; it never gets an admin credential. See
+# docs/operator.md.
+operator:
+  enabled: false
+  image:
+    repository: ghcr.io/sorotrail/sorobeacon-operator
+    tag: ""
+    pullPolicy: IfNotPresent
+  # Defaults to this release's Service.
+  apiURL: ""
+  tokenSecret:
+    name: ""
+    key: token
+  reconcileInterval: 30s
+  resources: {}
+
 worker:
   enabled: false
   replicaCount: 1
