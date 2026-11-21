@@ -1,0 +1,73 @@
+{
+  "uid": "sorobeacon-store",
+  "title": "SoroBeacon — Store, Replica Routing & API Latency",
+  "description": "Database read pool distribution (primary vs replica), replica fallback rate, and HTTP route latency across API surfaces.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "tags": ["sorobeacon", "store", "retention"],
+  "links": [
+    { "title": "Overview Dashboard", "type": "link", "url": "/d/sorobeacon-overview" },
+    { "title": "Retention & Reorg Runbook", "type": "link", "url": "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/retention.md" }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "route",
+        "type": "query",
+        "query": "label_values(sorobeacon_http_request_duration_seconds_count, route)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "selected": true, "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Read Replica Routing Status",
+      "type": "stat",
+      "description": "1 when a read replica is configured and active; 0 when all read-only queries route to the primary.",
+      "targets": [
+        { "refId": "A", "expr": "sorobeacon_store_replica_enabled" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Store Read Rate by Pool (primary vs replica)",
+      "type": "timeseries",
+      "description": "Good: when replica is enabled, read-only queries land on pool=\"replica\".",
+      "targets": [
+        { "refId": "A", "expr": "sum by (pool) (rate(sorobeacon_store_reads_total[5m]))" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Replica Fallback Rate",
+      "type": "timeseries",
+      "description": "Good: 0 fallbacks/sec. A non-zero rate means the read replica is unreachable or timing out and traffic is falling back to primary.",
+      "targets": [
+        { "refId": "A", "expr": "rate(sorobeacon_store_replica_fallbacks_total[5m])" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "HTTP Request Latency by Route (p50 / p95 / p99)",
+      "type": "timeseries",
+      "description": "Good: p95 < 250ms across API routes. Rising latency on alert queries indicates partition scan pressure; see docs/operations/retention.md.",
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.95, sum by (le, route) (rate(sorobeacon_http_request_duration_seconds_bucket{route=~\"$route\"}[5m])))" },
+        { "refId": "B", "expr": "histogram_quantile(0.99, sum by (le, route) (rate(sorobeacon_http_request_duration_seconds_bucket{route=~\"$route\"}[5m])))" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "HTTP Request Rate by Status Code",
+      "type": "timeseries",
+      "description": "Good: 5xx rate at 0. Tracks request volume and error responses across API endpoints.",
+      "targets": [
+        { "refId": "A", "expr": "sum by (route, status) (rate(sorobeacon_http_request_duration_seconds_count{route=~\"$route\"}[5m]))" }
+      ]
+    }
+  ]
+}

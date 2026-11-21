@@ -1,0 +1,64 @@
+{
+  "uid": "sorobeacon-channels",
+  "title": "SoroBeacon — Notification Channels & Circuit Breakers",
+  "description": "Per-channel health, circuit breaker states (closed / half-open / open), error ratios, and rate-limit throttling across all 26 channel types.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "tags": ["sorobeacon", "channels", "breakers"],
+  "links": [
+    { "title": "Overview Dashboard", "type": "link", "url": "/d/sorobeacon-overview" },
+    { "title": "Delivery Dashboard", "type": "link", "url": "/d/sorobeacon-delivery" },
+    { "title": "Delivery Failures Runbook", "type": "link", "url": "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/delivery-failures.md" }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "channel_type",
+        "type": "query",
+        "query": "label_values(sorobeacon_channel_breaker_state, channel_type)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "selected": true, "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Open Circuit Breakers by Channel",
+      "type": "stat",
+      "description": "Good: 0 open circuit breakers. Any channel with state=\"open\" == 1 has tripped due to repeated downstream failures.",
+      "targets": [
+        { "refId": "A", "expr": "sum by (channel_id, channel_type) (sorobeacon_channel_breaker_state{channel_type=~\"$channel_type\", state=\"open\"})" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Half-Open Circuit Breakers (Probing Recovery)",
+      "type": "stat",
+      "description": "Good: 0 half-open breakers in steady state. Shows channels currently testing whether a downstream endpoint has recovered.",
+      "targets": [
+        { "refId": "A", "expr": "sum by (channel_id, channel_type) (sorobeacon_channel_breaker_state{channel_type=~\"$channel_type\", state=\"half-open\"})" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Channel Delivery Success Ratio by Type (15m)",
+      "type": "timeseries",
+      "description": "Good: 1.0 (100%) per channel type. Isolates whether failures are specific to one provider (e.g. Slack vs PagerDuty).",
+      "targets": [
+        { "refId": "A", "expr": "sum by (channel) (rate(sorobeacon_alert_deliveries_total{outcome=\"ok\"}[15m])) / clamp_min(sum by (channel) (rate(sorobeacon_alert_deliveries_total[15m])), 1e-9)" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Channel Throttling Rate by Type",
+      "type": "timeseries",
+      "description": "Good: 0 throttles/sec. Indicates which channel types are hitting configured rate limits.",
+      "targets": [
+        { "refId": "A", "expr": "sum by (channel) (rate(sorobeacon_alert_throttles_total[5m]))" }
+      ]
+    }
+  ]
+}

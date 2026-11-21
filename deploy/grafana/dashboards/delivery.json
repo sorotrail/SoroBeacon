@@ -1,0 +1,74 @@
+{
+  "uid": "sorobeacon-delivery",
+  "title": "SoroBeacon — Alert Delivery & Dead-Letter Queue",
+  "description": "Diagnostic view answering which channels are failing, what the dead-letter backlog is, and whether SSE subscribers or throttles are dropping notifications.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "tags": ["sorobeacon", "delivery", "dlq"],
+  "links": [
+    { "title": "Overview Dashboard", "type": "link", "url": "/d/sorobeacon-overview" },
+    { "title": "Channels Dashboard", "type": "link", "url": "/d/sorobeacon-channels" },
+    { "title": "Delivery Failures Runbook", "type": "link", "url": "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/delivery-failures.md" }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "channel",
+        "type": "query",
+        "query": "label_values(sorobeacon_alert_deliveries_total, channel)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "selected": true, "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Alerts Fired vs Deliveries Completed",
+      "type": "timeseries",
+      "description": "Good: delivery rate tracks alerts fired closely. Divergence indicates throttling, digest buffering, or channel failures.",
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(sorobeacon_alerts_fired_total[5m]))" },
+        { "refId": "B", "expr": "sum(rate(sorobeacon_alert_deliveries_total{channel=~\"$channel\", outcome=\"ok\"}[5m]))" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Failing Deliveries by Channel Type",
+      "type": "timeseries",
+      "description": "Good: 0 errors/sec. Identifies which channel types are experiencing downstream endpoint failures.",
+      "targets": [
+        { "refId": "A", "expr": "sum by (channel) (rate(sorobeacon_alert_deliveries_total{channel=~\"$channel\", outcome=\"error\"}[5m]))" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Dead-Letter Queue Backlog",
+      "type": "timeseries",
+      "description": "Good: 0 items waiting in DLQ. Rising backlog requires operator inspection and re-drive via the Dead Letters API.",
+      "targets": [
+        { "refId": "A", "expr": "sorobeacon_dead_letters_total" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Throttled Deliveries by Channel Type",
+      "type": "timeseries",
+      "description": "Good: near 0 during normal operations. High values mean per-channel rate limits are actively protecting downstream endpoints.",
+      "targets": [
+        { "refId": "A", "expr": "sum by (channel) (rate(sorobeacon_alert_throttles_total{channel=~\"$channel\"}[5m]))" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Live SSE Stream Dropped Events",
+      "type": "timeseries",
+      "description": "Good: 0 dropped events. Non-zero rate means a connected SSE client is reading too slowly to keep up with alert bursts.",
+      "targets": [
+        { "refId": "A", "expr": "rate(sorobeacon_alerts_stream_dropped_total[5m])" }
+      ]
+    }
+  ]
+}
