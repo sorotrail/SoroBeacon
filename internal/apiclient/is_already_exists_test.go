@@ -55,6 +55,26 @@ func TestIsAlreadyExists(t *testing.T) {
 			err:  nil,
 			want: false,
 		},
+		{
+			name: "empty API error",
+			err:  &APIError{},
+			want: false,
+		},
+		{
+			name: "error whose text mentions a conflict but is not an API error",
+			err:  errors.New("409 conflict: resource busy"),
+			want: false,
+		},
+		{
+			name: "double wrapped already exists",
+			err:  fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", &APIError{Status: http.StatusConflict})),
+			want: true,
+		},
+		{
+			name: "already exists code on a non-conflict status",
+			err:  &APIError{Status: http.StatusOK, Code: apierr.CodeAlreadyExists},
+			want: true,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
