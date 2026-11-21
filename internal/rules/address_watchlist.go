@@ -88,6 +88,10 @@ func validateAddressList(p addressWatchlistParams) error {
 	return nil
 }
 
+// Validate reports whether params are a well-formed address_watchlist rule: a
+// non-empty list of plausible Stellar addresses no larger than
+// MaxAddressWatchlistSize, a known match mode, and a known event restriction
+// when one is given. The same checks run again when the rule is evaluated.
 func (a *AddressWatchlist) Validate(params json.RawMessage) error {
 	p, err := parseAddressWatchlist(params)
 	if err != nil {
@@ -111,6 +115,9 @@ func (a *AddressWatchlist) Validate(params json.RawMessage) error {
 	return nil
 }
 
+// Evaluate reports whether ev is a SEP-41 token event whose from or to
+// address appears in the configured watchlist, honouring the match and event
+// restrictions. Malformed params are an error, never a silent non-match.
 func (a *AddressWatchlist) Evaluate(_ context.Context, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error) {
 	set, err := a.setFor(params)
 	if err != nil {

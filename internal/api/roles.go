@@ -52,6 +52,12 @@ var routeRoles = auth.NewRouteTable(map[string]auth.Role{
 	"PUT /monitors/{id}/escalation":    auth.RoleEditor,
 	"DELETE /monitors/{id}/escalation": auth.RoleEditor,
 
+	// A delivery budget decides when a monitor stops delivering, so it is an
+	// editor's decision; reading it is a viewer's.
+	"GET /monitors/{id}/delivery-budget":        auth.RoleViewer,
+	"PUT /monitors/{id}/delivery-budget":        auth.RoleEditor,
+	"POST /monitors/{id}/delivery-budget/reset": auth.RoleEditor,
+
 	// Channels: a channel is where alerts go, so changing one is an editor's
 	// decision. Testing one sends a real notification, which is a write even
 	// though nothing is stored.

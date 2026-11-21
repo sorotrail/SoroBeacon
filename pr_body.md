@@ -20,6 +20,17 @@ err = store.AdvanceContractCursor(context.WithoutCancel(r.Context()), network, c
 - Ensured database statement timeouts and connection-level cancel handling are correctly bound.
 - Distinguished client disconnections and cancellations in metrics and logs from internal server faults to protect error budgets.
 
+Example: a background worker has no caller to inherit cancellation from, so it
+bounds each delivery attempt with its own timeout instead:
+
+```go
+// Detached from any request, but still bounded so a hung webhook cannot
+// stall the worker forever.
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+err := store.RecordDeliveryAttempt(ctx, attempt)
+```
+
 ## Verification
 
 - Ran `go build ./...` and `go vet ./...` successfully.

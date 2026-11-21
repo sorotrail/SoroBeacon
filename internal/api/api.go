@@ -390,6 +390,9 @@ func (s *Server) Routes() chi.Router {
 			r.Get("/escalation", s.getMonitorEscalation)
 			r.Put("/escalation", s.putMonitorEscalation)
 			r.Delete("/escalation", s.deleteMonitorEscalation)
+			r.Get("/delivery-budget", s.getDeliveryBudget)
+			r.Put("/delivery-budget", s.putDeliveryBudget)
+			r.Post("/delivery-budget/reset", s.resetDeliveryBudget)
 		})
 	})
 
