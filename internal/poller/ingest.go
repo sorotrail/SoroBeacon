@@ -80,6 +80,8 @@ func (in *Ingestor) WithPublisher(b *broadcast.Broadcaster) *Ingestor {
 	return in
 }
 
+// WithEnricher attaches an alert enricher to the Ingestor, used to fetch
+// operator-supplied context for each created alert.
 func (in *Ingestor) WithEnricher(e *alerts.Enricher) *Ingestor {
 	in.enricher = e
 	return in

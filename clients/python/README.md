@@ -11,6 +11,13 @@ Generated Python client for the [SoroBeacon](https://github.com/sorotrail/SoroBe
 - **Typed error taxonomy (`SoroBeaconAPIError`)**: Non-2xx responses raise `SoroBeaconAPIError` with `.status`, `.code` (`ErrorCode`), `.request_id`, `.details` (`list[ErrorDetail]`), and predicate helpers (`is_not_found()`, `is_already_exists()`, `is_invalid_argument()`, `is_conflict()`, `is_unauthenticated()`, `is_permission_denied()`, `is_rate_limited()`, `is_quota_exceeded()`, `is_payload_too_large()`, `is_service_unavailable()`).
 - **Iterator cursor pagination**: `paginate_monitors`, `paginate_trash_monitors`, `paginate_channels`, `paginate_alerts`, and `paginate_audit_logs` walk `next_cursor` pages transparently as standard Python iterators (`for alert in client.paginate_alerts(...):`).
 
+```python
+from sorobeacon import parse_json_preserving_wide_ints, to_int
+
+payload = parse_json_preserving_wide_ints('{"id": "9007199254740993", "amount": "1250.50"}')
+exact_id = to_int(payload["id"])  # 9007199254740993 (no float precision loss)
+```
+
 ## Packaging Decision
 
 Matching `@sorotrail/sorobeacon-client` in `clients/typescript`, `sorobeacon-client` has zero third-party runtime dependencies (relying only on the Python standard library) and is consumed directly from the repository:

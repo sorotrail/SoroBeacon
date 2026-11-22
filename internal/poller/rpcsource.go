@@ -26,6 +26,8 @@ func NewRPCSource(rpc stellar.Client, decoder stellar.Decoder) *RPCSource {
 	return &RPCSource{rpc: rpc, decoder: decoder}
 }
 
+// LatestLedger returns the chain tip sequence from the RPC's getLatestLedger
+// call, used for cold starts; a failed call yields 0 and the RPC error.
 func (s *RPCSource) LatestLedger(ctx context.Context) (uint32, error) {
 	latest, err := s.rpc.GetLatestLedger(ctx)
 	if err != nil {

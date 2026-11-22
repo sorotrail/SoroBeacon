@@ -76,6 +76,8 @@ func (Absence) Validate(params json.RawMessage) error {
 	return nil
 }
 
+// Spec parses params into the AbsenceSpec the poller's sweep acts on. It
+// applies the same checks as Validate and returns its FieldErrors on failure.
 func (Absence) Spec(params json.RawMessage) (AbsenceSpec, error) {
 	spec, problems := parseAbsenceProblems(params)
 	if len(problems) > 0 {

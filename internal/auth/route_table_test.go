@@ -1,6 +1,9 @@
 package auth
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestPatternMatches(t *testing.T) {
 	tests := []struct {
@@ -30,4 +33,30 @@ func TestPatternMatches(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRouteTablePatterns(t *testing.T) {
+	t.Run("sorted copy of route keys", func(t *testing.T) {
+		tbl := NewRouteTable(map[string]string{
+			"/monitors/{id}": "detail",
+			"/healthz":       "health",
+			"/monitors":      "list",
+		})
+		want := []string{"/healthz", "/monitors", "/monitors/{id}"}
+		got := tbl.Patterns()
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("Patterns() = %v, want %v", got, want)
+		}
+		got[0] = "/mutated"
+		if again := tbl.Patterns(); !reflect.DeepEqual(again, want) {
+			t.Fatalf("Patterns() after caller mutation = %v, want %v", again, want)
+		}
+	})
+
+	t.Run("nil route table", func(t *testing.T) {
+		var tbl *RouteTable[string]
+		if got := tbl.Patterns(); got != nil {
+			t.Fatalf("(*RouteTable).Patterns() = %v, want nil", got)
+		}
+	})
 }
