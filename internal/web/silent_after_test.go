@@ -38,3 +38,38 @@ func TestWithSilentAfterKeepsPreviousOnInvalid(t *testing.T) {
 		t.Errorf("SilentAfter = %v, want %v", got, time.Hour)
 	}
 }
+
+// TestSilentAfter focuses on the SilentAfter getter itself under a range of
+// configurations, complementing the setter tests above.
+func TestSilentAfter(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*Server)
+		want  time.Duration
+	}{
+		{
+			"default is 24h before any configuration",
+			func(*Server) {},
+			24 * time.Hour,
+		},
+		{
+			"reflects the duration set by WithSilentAfter",
+			func(s *Server) { s.WithSilentAfter(6 * time.Hour) },
+			6 * time.Hour,
+		},
+		{
+			"retains previous value when zero duration is passed",
+			func(s *Server) { s.WithSilentAfter(2 * time.Hour); s.WithSilentAfter(0) },
+			2 * time.Hour,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer(t)
+			tc.setup(s)
+			if got := s.SilentAfter(); got != tc.want {
+				t.Errorf("SilentAfter() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
