@@ -13,9 +13,27 @@ func TestBuildResolverHappyPath(t *testing.T) {
 	require.NotNil(t, resolver)
 }
 
-func TestBuildResolverErrorPath(t *testing.T) {
+func TestBuildResolverEdgeCases(t *testing.T) {
 	t.Helper()
-	cfg := Config{SecretsProvider: ""}
-	resolver := BuildResolver(cfg)
-	require.Nil(t, resolver)
+
+	tests := []struct {
+		name         string
+		provider     string
+		wantResolver bool
+	}{
+		{name: "empty provider"},
+		{name: "unsupported provider", provider: "unknown"},
+		{name: "valid provider with blank tokens", provider: " , env, ", wantResolver: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := BuildResolver(Config{SecretsProvider: tt.provider})
+			if tt.wantResolver {
+				require.NotNil(t, resolver)
+			} else {
+				require.Nil(t, resolver)
+			}
+		})
+	}
 }
