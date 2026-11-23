@@ -183,7 +183,6 @@ func (d *Dispatcher) RateLimits() RateLimits {
 	return d.rateLimits
 }
 
-// WithFlapping configures when repeated alert episodes are damped.
 // WithMonitorBudget attaches a monitor notification budget tracker.
 func (d *Dispatcher) WithMonitorBudget(tracker *MonitorBudgetTracker) *Dispatcher {
 	d.monitorBudget = tracker
@@ -205,6 +204,10 @@ func (d *Dispatcher) MonitorBudget() *MonitorBudgetTracker {
 	return d.monitorBudget
 }
 
+// WithFlapping configures when repeated alert episodes are damped: a rule is
+// flapping once it raises Episodes episodes within Window, and a gap of
+// QuietAfter ends an episode. Zero fields keep their current value, so the
+// defaults can be overridden one at a time.
 func (d *Dispatcher) WithFlapping(config alerts.FlappingConfig) *Dispatcher {
 	if config.Episodes > 0 {
 		d.flapping.Episodes = config.Episodes
