@@ -327,6 +327,11 @@ func (s *Server) SilentAfter() time.Duration {
 	return s.silentAfter
 }
 
+// MaxBodyBytes returns the configured max body bytes limit. Exposed for tests.
+func (s *Server) MaxBodyBytes() int64 {
+	return s.maxBodyBytes
+}
+
 func (s *Server) monitorRow(m store.Monitor, tz string, now time.Time) monitorListRow {
 	row := monitorListRow{Monitor: m}
 	if m.LastMatchedAt == nil {

@@ -401,6 +401,9 @@ func (s *Server) ListMonitors(ctx context.Context, req *ListMonitorsRequest) (*L
 	return resp, nil
 }
 
+// ListAlerts returns one page of alerts for the caller's workspace, filtered
+// by monitor and rule and paginated by cursor (req.Cursor is the last ID seen).
+// Limits outside 1-500 are clamped to the default page size of 50.
 func (s *Server) ListAlerts(ctx context.Context, req *ListAlertsRequest) (*ListAlertsResponse, error) {
 	limit := int(req.Limit)
 	if limit <= 0 || limit > 500 {

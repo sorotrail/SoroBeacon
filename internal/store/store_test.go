@@ -56,3 +56,39 @@ func TestNormalizeAlertSearch(t *testing.T) {
 		})
 	}
 }
+
+// ValidMaintenanceScope is the validation guard behind maintenance window
+// scopes, accepting only global, monitor, and contract scopes.
+func TestValidMaintenanceScope(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		// Happy path: every accepted scope value by constant and literal.
+		{name: "happy path: global constant", in: MaintenanceScopeGlobal, want: true},
+		{name: "happy path: monitor constant", in: MaintenanceScopeMonitor, want: true},
+		{name: "happy path: contract constant", in: MaintenanceScopeContract, want: true},
+		{name: "happy path: global literal", in: "global", want: true},
+		{name: "happy path: monitor literal", in: "monitor", want: true},
+		{name: "happy path: contract literal", in: "contract", want: true},
+
+		// Error/invalid paths: empty, unknown values, wrong case, and padded whitespace.
+		{name: "error path: empty scope", in: "", want: false},
+		{name: "error path: unknown scope", in: "workspace", want: false},
+		{name: "error path: unknown scope all", in: "all", want: false},
+		{name: "error path: uppercase global", in: "GLOBAL", want: false},
+		{name: "error path: title case monitor", in: "Monitor", want: false},
+		{name: "error path: title case contract", in: "Contract", want: false},
+		{name: "error path: leading and trailing whitespace", in: " global ", want: false},
+		{name: "error path: whitespace-padded monitor", in: " monitor", want: false},
+		{name: "error path: tab and newline padded contract", in: "\tcontract\n", want: false},
+		{name: "error path: whitespace only", in: "   ", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, ValidMaintenanceScope(tt.in))
+		})
+	}
+}
