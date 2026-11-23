@@ -1,0 +1,4 @@
+add ValidAuditSurface function and unit tests in internal/store
+
+- Created ValidAuditSurface() to validate audit surface values (monitor, rule, channel)
+- Added table-driven unit tests covering happy path and error paths
