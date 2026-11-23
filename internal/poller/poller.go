@@ -252,6 +252,8 @@ func (p *Poller) WithPublisher(b *broadcast.Broadcaster) *Poller {
 	return p
 }
 
+// WithEnricher attaches an alert enricher to the poller's ingest pipeline,
+// used to fetch operator-supplied context for each created alert.
 func (p *Poller) WithEnricher(e *alerts.Enricher) *Poller {
 	p.ing.WithEnricher(e)
 	return p
