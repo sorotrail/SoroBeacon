@@ -1,27 +1,21 @@
 # PR: Add edge cases to NewPruner tests
 
 ## Summary
-Added table-driven unit tests for the `NewPruner` function in `internal/archive/archive.go`.
+Added 2 new table-driven edge cases to `TestNewPrunerEdgeCases` in `internal/archive/archive_test.go`:
+- `empty alerts is no-op` - verifies that empty alert batch is handled as a no-op
+- `single alert boundary` - verifies single alert processing and deterministic key generation
 
 ## Changes
+- `internal/archive/archive_test.go`: Added 2 new test cases to the existing table-driven test
+- Added `context` and `time` imports
+- Added test for empty alerts input (boundary condition)
+- Added test for single alert (boundary value with deterministic key verification)
 
-### Enhanced file: `internal/archive/archive_test.go`
-- Added `TestNewPrunerEdgeCases` with table-driven tests covering:
-  - **Error path**: nil backend returns an error `"archive: nil backend"`
-  - **Happy path**: valid backend (Dir archiver) succeeds
+## Test Cases
+1. **nil backend returns error** - Existing: verifies nil backend returns error
+2. **valid backend succeeds** - Existing: verifies valid backend succeeds
+3. **empty alerts is no-op** - New: verifies empty alerts slice succeeds as no-op
+4. **single alert boundary** - New: verifies single alert processing and `BatchKey` deterministic key generation
 
-### Test Cases
-1. `nil_backend_returns_error` - verifies that passing a nil backend to `NewPruner` returns an error
-2. `valid_backend_succeeds` - verifies that a valid backend (directory-based archiver) allows `NewPruner` to succeed
-
-## Test Results
-Both test cases pass:
-- `nil_backend_returns_error` ✓
-- `valid_backend_succeeds` ✓
-
-## Checklist
-- [x] Edge case tests added for `NewPruner` function
-- [x] Table-driven test structure used (consistent with project style)
-- [x] Nil backend error case covered
-- [x] Valid backend happy path covered
-- [x] All existing tests continue to pass
+## Verification
+Run `go test -v ./internal/archive/...` to execute all 4 test cases (including 2 new ones).
