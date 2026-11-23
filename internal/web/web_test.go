@@ -32,6 +32,11 @@ type emptyStore struct {
 }
 
 func (emptyStore) GetStats(context.Context) (store.Stats, error) { return store.Stats{}, nil }
+func (emptyStore) AlertChangeKey(context.Context) (int64, int64, error) { return 0, 0, nil }
+func (emptyStore) ChannelDeliveryChangeKey(context.Context, int64) (int64, int64, error) { return 0, 0, nil }
+func (emptyStore) GetDeliveryBudget(context.Context, int64, time.Time) (*store.DeliveryBudget, error) {
+	return nil, store.ErrNotFound
+}
 func (emptyStore) GetMonitorStats(context.Context, int64) (store.MonitorStats, error) {
 	return store.MonitorStats{}, nil
 }
@@ -59,6 +64,13 @@ func (emptyStore) ListChannelsPage(context.Context, store.ListFilter) ([]store.C
 func (emptyStore) GetChannelDeliveryStats(context.Context, int64, time.Time) (store.ChannelDeliveryStats, error) {
 	return store.ChannelDeliveryStats{}, nil
 }
+func (emptyStore) ListChannelAckReconciliations(context.Context) (map[int64]store.ChannelAckReconciliation, error) {
+	return nil, nil
+}
+func (emptyStore) RegisterPersistedOperation(context.Context, store.PersistedOperation) error { return nil }
+func (emptyStore) GetPersistedOperation(context.Context, string) (*store.PersistedOperation, error) { return nil, store.ErrNotFound }
+func (emptyStore) ListPersistedOperations(context.Context) ([]store.PersistedOperation, error) { return nil, nil }
+func (emptyStore) DeletePersistedOperation(context.Context, string) error { return nil }
 func (emptyStore) ListSavedSearches(context.Context) ([]store.SavedSearch, error) { return nil, nil }
 func (emptyStore) CreateSavedSearch(context.Context, *store.SavedSearch) error    { return nil }
 func (emptyStore) GetSavedSearch(context.Context, int64) (*store.SavedSearch, error) {
@@ -79,6 +91,15 @@ func (emptyStore) DeleteMonitorTemplate(context.Context, int64) error           
 func (emptyStore) CreateAuditEntry(context.Context, *store.AuditEntry) error           { return nil }
 func (emptyStore) ListAuditEntries(context.Context, store.AuditFilter) ([]store.AuditEntry, error) {
 	return nil, nil
+}
+func (emptyStore) ListDeadLetters(context.Context, store.DeadLetterFilter) ([]store.DeadLetter, error) {
+	return nil, nil
+}
+func (emptyStore) ListDeadLetterGroups(context.Context, store.DeadLetterFilter) ([]store.DeadLetterGroup, error) {
+	return nil, nil
+}
+func (emptyStore) BulkDeleteDeadLetters(context.Context, store.DeadLetterFilter) (int64, error) {
+	return 0, nil
 }
 
 func newTestServer(t *testing.T) *Server {
@@ -645,14 +666,14 @@ func TestAlertsPageRendersExportLink(t *testing.T) {
 }
 
 func TestMonitorFilterQueryOmitsDefaults(t *testing.T) {
-	if got := monitorFilterQuery("", "", "", ""); got != "" {
+	if got := monitorFilterQuery("", "", "", "", nil); got != "" {
 		t.Fatalf("defaults = %q, want empty so ?cursor= stays stable", got)
 	}
-	if got := monitorFilterQuery("", "", "name", ""); got != "" {
+	if got := monitorFilterQuery("", "", "name", "", nil); got != "" {
 		t.Fatalf("default sort = %q, want empty", got)
 	}
-	got := monitorFilterQuery("treasury", "false", "id", "testnet")
-	if !strings.Contains(got, "q=treasury") || !strings.Contains(got, "enabled=false") || !strings.Contains(got, "sort=id") || !strings.HasSuffix(got, "&") {
+	got := monitorFilterQuery("treasury", "false", "id", "testnet", []string{"ops"})
+	if !strings.Contains(got, "q=treasury") || !strings.Contains(got, "enabled=false") || !strings.Contains(got, "sort=id") || !strings.Contains(got, "tag=ops") || !strings.HasSuffix(got, "&") {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -1294,6 +1315,128 @@ func TestToggleRule(t *testing.T) {
 	}
 }
 
+// **New tests for malformed/unknown ID handling**
+
+func TestToggleRuleWithMalformedIDs(t *testing.T) {
+	// Tests ensure that routes with malformed or unknown IDs return 404
+	// rather than panicking or returning unexpected status codes.
+	st := &ruleToggleStore{rule: store.Rule{ID: 5, MonitorID: 1, Type: "transfer", Enabled: true}}
+	s, err := New(st, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	tests := []struct {
+		name       string
+		path       string
+		expected   int
+		formValues map[string]string
+	}{
+		{"malformed monitor ID",
+		"/monitors/abc/rules/5/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"malformed rule ID",
+		"/monitors/1/rules/abc/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"unknown monitor ID",
+		"/monitors/9999/rules/5/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"unknown rule ID",
+		"/monitors/1/rules/9999/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"empty monitor ID",
+		"/monitors//rules/5/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"empty rule ID",
+		"/monitors/1/rules//toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"nil monitor ID (zero)",
+		"/monitors/0/rules/5/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"nil rule ID (zero)",
+		"/monitors/1/rules/0/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"very long monitor ID",
+		"/monitors/99999999999999999/rules/5/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"very long rule ID",
+		"/monitors/1/rules/99999999999999999/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},		// No '#' in these paths: it starts a URL fragment, so the client would
+		// strip it and everything after it before the request is ever sent.
+		{"special chars in monitor ID",
+			"/monitors/!@$/rules/5/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"special chars in rule ID",
+			"/monitors/1/rules/!@$/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"unicode monitor ID",
+		"/monitors/日本語/rules/5/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"unicode rule ID",
+		"/monitors/1/rules/日本語/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"floating point monitor ID",
+		"/monitors/1.5/rules/5/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+		{"1-digit monitor ID",
+		"/monitors/1/rules/5/toggle",
+			http.StatusSeeOther,
+			map[string]string{},
+		},		// The fake store holds exactly rule 5, so rule 1 is an unknown ID.
+		// The valid 1-digit case is pinned by "1-digit monitor ID" above.
+		{"unknown 1-digit rule ID",
+			"/monitors/1/rules/1/toggle",
+			http.StatusNotFound,
+			map[string]string{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res, err := client.Post(srv.URL+tt.path, "application/x-www-form-urlencoded", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			res.Body.Close()
+			if res.StatusCode != tt.expected {
+				t.Fatalf("%s: got status %d, want %d", tt.name, res.StatusCode, tt.expected)
+			}
+		})
+	}
+}
+
 // deliveriesStore backs GET /alerts/{id}/deliveries with a fixed set of
 // attempts and one named channel.
 type deliveriesStore struct {
@@ -1376,6 +1519,50 @@ func TestAlertDeliveries_EmptyIsNotAnError(t *testing.T) {
 	body, _ := io.ReadAll(res.Body)
 	if !strings.Contains(string(body), "No delivery attempts yet") {
 		t.Fatalf("expected the empty-state message, got: %s", body)
+	}
+}
+
+func TestAlertDeliveries_ConditionalNotModified(t *testing.T) {
+	st := deliveriesStore{attempts: []store.DeliveryAttempt{
+		{ID: 1, ChannelID: 7, Status: "success", ResponseSnippet: "200 OK"},
+	}}
+	srv := httptest.NewServer(newDeliveriesServer(t, st).Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/alerts/1/deliveries")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.StatusCode)
+	}
+
+	etag := res.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("expected ETag header to be set")
+	}
+	if got := res.Header.Get("Cache-Control"); got != "private, no-cache" {
+		t.Fatalf("expected Cache-Control private, no-cache, got %s", got)
+	}
+
+	// Revalidate with If-None-Match
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/alerts/1/deliveries", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("If-None-Match", etag)
+	res304, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res304.Body.Close()
+	if res304.StatusCode != http.StatusNotModified {
+		t.Fatalf("expected 304 Not Modified, got %d", res304.StatusCode)
+	}
+	body, _ := io.ReadAll(res304.Body)
+	if len(body) != 0 {
+		t.Fatalf("expected empty body for 304, got %s", body)
 	}
 }
 

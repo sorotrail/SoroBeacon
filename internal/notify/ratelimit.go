@@ -129,6 +129,16 @@ func (l *ChannelRateLimiter) Wait(ctx context.Context, channelID int64, channelT
 	return lim.Wait(ctx)
 }
 
+// Remove deletes the rate limiter bucket for a channel that has been deleted.
+func (l *ChannelRateLimiter) Remove(channelID int64) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	delete(l.limiters, channelID)
+	l.mu.Unlock()
+}
+
 // ParseRetryAfter parses a Retry-After header value (either seconds or HTTP-date) and returns a duration.
 func ParseRetryAfter(value string) (time.Duration, bool) {
 	value = strings.TrimSpace(value)

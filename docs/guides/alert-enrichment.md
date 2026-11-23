@@ -144,3 +144,37 @@ slower costs the enrichment, not the alert.
   service can put arbitrary text in your on-call's chat. Templates cannot
   address channel config, so the blast radius is message text — but treat the
   enrichment endpoint as part of your delivery trust boundary.
+
+## Contract and token context
+
+The enrichment object can carry `label` (a human name for the contract),
+`token_symbol` and `token_decimals`. When present, the default message adds a
+`Label:` line and an `Amount:` line, and templates can use `.ContractLabel`,
+`.TokenSymbol`, `.EnrichmentSource`, `.EnrichmentStale`, `.PrimaryAmount` and
+`.AmountDisplay "<payload field>"`.
+
+- **Exact integer first.** The amount line always shows the exact integer from
+  the event payload. The decimal rendering is added beside it, built from the
+  integer's digits by string arithmetic, never through a float, so a wide i128
+  keeps every digit. It is labelled as unverified metadata and names its source.
+- **Untrusted text.** Label and symbol are control and bidirectional-format
+  characters stripped, length bounded, and escaped for the destination: Slack
+  mrkdwn for Slack and Markdown for Discord. Email is plain text and is not
+  escaped. A symbol that imitates a well-known token is not detected; the
+  `unverified` label and the named source are the defence.
+- **Latency budget.** The lookup has a hard deadline (`ALERT_ENRICHMENT_TIMEOUT`,
+  default 2s) and runs while the alert is created; past it the alert is created
+  unenriched.
+- **Cache.** In-process, at most 1024 contracts, expired by `ALERT_ENRICHMENT_CACHE_TTL`.
+  If the source fails, an answer up to 24h past its TTL is reused and marked
+  `_stale`; older than that the alert is unenriched. The `_source` and `_stale`
+  keys are set by SoroBeacon and override anything the source sends. There is
+  no cross-replica invalidation channel in the codebase, so each replica picks
+  up a changed label when its own entry expires.
+
+### Limitations
+
+- The source is the operator-supplied endpoint only. Field names from contract
+  specs are not added by this path; spec-decoded payloads are unchanged.
+- Escaping is wired for Slack and Discord default and custom templates. Other
+  channels receive the cleaned text unescaped.

@@ -53,8 +53,8 @@ func (s *Signal) Send(ctx context.Context, a Alert) error {
 		return err
 	}
 	body, err := json.Marshal(map[string]any{
-		"message":   msg,
-		"number":    s.cfg.Number,
+		"message":    msg,
+		"number":     s.cfg.Number,
 		"recipients": s.cfg.Recipients,
 	})
 	if err != nil {

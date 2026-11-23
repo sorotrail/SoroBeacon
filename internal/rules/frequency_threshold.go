@@ -32,8 +32,9 @@ type frequencyThresholdParams struct {
 // MatchRecord is one stored match, used to rebuild a frequency rule's window
 // after a restart.
 type MatchRecord struct {
-	At      time.Time
-	EventID string
+	At          time.Time
+	EventID     string
+	RuleVersion int
 }
 
 // MatchLog is the durable record a frequency_threshold rule consults once per
@@ -94,6 +95,10 @@ type freqState struct {
 	episode time.Time
 	// seeded records that the state was rebuilt (or attempted) once.
 	seeded bool
+	// version and paramsKey track the rule revision and condition parameters
+	// that produced this state so an in-place rule edit starts a fresh window.
+	version   int
+	paramsKey string
 }
 
 func (s *freqState) clone() freqState {
@@ -176,6 +181,20 @@ func (f *FrequencyThreshold) clock() time.Time {
 	return time.Now()
 }
 
+func (s *freqState) clone() *freqState {
+	if s == nil {
+		return nil
+	}
+	cp := *s
+	if len(s.matches) > 0 {
+		cp.matches = make([]time.Time, len(s.matches))
+		copy(cp.matches, s.matches)
+	} else {
+		cp.matches = nil
+	}
+	return &cp
+}
+
 // state returns the per-rule state, creating it lazily so the zero value works.
 func (f *FrequencyThreshold) state(ruleID int64) *freqState {
 	if f.states == nil {
@@ -183,10 +202,75 @@ func (f *FrequencyThreshold) state(ruleID int64) *freqState {
 	}
 	s := f.states[ruleID]
 	if s == nil {
+		if len(f.states) >= MaxTrackedStatefulRules {
+			f.evictOldestRuleLocked()
+		}
 		s = &freqState{}
 		f.states[ruleID] = s
 	}
 	return s
+}
+
+func (f *FrequencyThreshold) evictOldestRuleLocked() {
+	var (
+		victimID   int64
+		victimTime time.Time
+		found      bool
+	)
+	for id, st := range f.states {
+		if st == nil || len(st.matches) == 0 {
+			delete(f.states, id)
+			return
+		}
+		last := st.matches[len(st.matches)-1]
+		if !found || last.Before(victimTime) {
+			victimID = id
+			victimTime = last
+			found = true
+		}
+	}
+	if found {
+		delete(f.states, victimID)
+	}
+}
+
+// ResetRule clears any cached window and episode state for ruleID so a newly
+// edited or re-enabled rule starts with a clean rolling window.
+func (f *FrequencyThreshold) ResetRule(ruleID int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.states, ruleID)
+}
+
+// SnapshotRule returns a deep copy of ruleID's rolling-window state so an
+// isolated or composite evaluation can roll back partial state changes if the
+// evaluation panics, times out, or errors.
+func (f *FrequencyThreshold) SnapshotRule(ruleID int64) any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.states == nil {
+		return (*freqState)(nil)
+	}
+	return f.states[ruleID].clone()
+}
+
+// RestoreRule atomically restores ruleID's rolling-window state to snapshot.
+func (f *FrequencyThreshold) RestoreRule(ruleID int64, snapshot any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.states == nil {
+		f.states = map[int64]*freqState{}
+	}
+	snap, ok := snapshot.(*freqState)
+	if !ok || snap == nil {
+		delete(f.states, ruleID)
+		return
+	}
+	f.states[ruleID] = snap.clone()
+}
+
+func canonicalParamsKey(p frequencyThresholdParams) string {
+	return fmt.Sprintf("%s|%d|%s", p.EventName, p.Count, p.Window)
 }
 
 func (*FrequencyThreshold) Validate(params json.RawMessage) error {
@@ -252,6 +336,25 @@ func (f *FrequencyThreshold) Evaluate(ctx context.Context, ev *stellar.DecodedEv
 
 	now := f.clock()
 	ruleID := RuleID(ctx)
+	ruleVersion := RuleVersion(ctx)
+	pKey := canonicalParamsKey(p)
+
+	f.mu.Lock()
+	existing := f.states[ruleID]
+	needSeed := (existing == nil || !existing.seeded) && f.matchLog != nil && ruleID != 0
+	f.mu.Unlock()
+
+	var (
+		seedRecords   []MatchRecord
+		seedAttempted bool
+		seedErr       error
+	)
+	if needSeed {
+		seedAttempted = true
+		doneDB := EnterDB(ctx)
+		seedRecords, seedErr = f.matchLog.RecentMatches(ctx, ruleID, now.Add(-window))
+		doneDB(seedErr)
+	}
 
 	f.mu.Lock()
 	snapshot := f.state(ruleID).clone()
@@ -271,6 +374,14 @@ func (f *FrequencyThreshold) Evaluate(ctx context.Context, ev *stellar.DecodedEv
 			// retry the rebuild on the next one.
 			return false, nil
 		}
+		s.version = ruleVersion
+		s.paramsKey = pKey
+	}
+	if s.version == 0 && ruleVersion > 0 {
+		s.version = ruleVersion
+	}
+	if s.paramsKey == "" {
+		s.paramsKey = pKey
 	}
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -341,6 +452,9 @@ func (f *FrequencyThreshold) seed(ctx context.Context, s *freqState, ruleID int6
 	s.seeded = true
 	episodeAt := time.Time{}
 	for _, r := range records {
+		if ruleVersion > 0 && r.RuleVersion > 0 && r.RuleVersion != ruleVersion {
+			continue
+		}
 		s.matches = append(s.matches, r.At)
 		if !r.At.Before(now.Add(-window)) && r.At.After(episodeAt) {
 			// The newest stored alert inside the window is this rule's most
@@ -353,10 +467,13 @@ func (f *FrequencyThreshold) seed(ctx context.Context, s *freqState, ruleID int6
 		s.matches = s.matches[len(s.matches)-capMatches:]
 	}
 	if episodeAt.IsZero() {
-		return true
+		return
 	}
 	s.armed = true
 	for _, r := range records {
+		if ruleVersion > 0 && r.RuleVersion > 0 && r.RuleVersion != ruleVersion {
+			continue
+		}
 		if r.At.Equal(episodeAt) {
 			if start, ok := decodeEpisode(r.EventID); ok {
 				episodeAt = start
@@ -365,7 +482,6 @@ func (f *FrequencyThreshold) seed(ctx context.Context, s *freqState, ruleID int6
 		}
 	}
 	s.episode = episodeAt
-	return true
 }
 
 func parseFrequencyThreshold(params json.RawMessage) (frequencyThresholdParams, error) {

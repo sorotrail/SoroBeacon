@@ -34,6 +34,7 @@
     <td>
       {{/* Auto-disable is the state worth shouting about: the channel is off
            and nobody chose that, so it says why and repeats the last error. */}}
+      {{$ack := index $.AckReconciliations .ID}}
       {{if .AutoDisabled}}
         <span class="pill silent">auto-disabled</span>
         <div class="muted">Turned off after {{.ConsecutivePermanentFailures}} consecutive failures that will not clear on their own. Re-enable it to start delivering again.</div>
@@ -43,11 +44,18 @@
       {{else if .ConsecutiveFailures}}
         <span class="pill never">failing ({{.ConsecutiveFailures}})</span>
         {{if .LastError}}<div class="muted">Last error: {{.LastError}}</div>{{end}}
+      {{else if and $ack $ack.Flagged}}
+        <span class="pill silent">unacknowledged</span>
+        <div class="muted">Delivered {{$ack.DeliveredTotal}} alert(s) without human acknowledgement.</div>
       {{else if .LastSuccessAt}}
         <span class="muted">Last success {{relTimePtr .LastSuccessAt}}.</span>
       {{else}}
         <span class="muted">No deliveries yet.</span>
       {{end}}
+      {{if and $ack (not .AutoDisabled) .Enabled (not .ConsecutiveFailures) (not $ack.Flagged) (gt $ack.DeliveredTotal 0)}}
+        <div class="muted">{{$ack.AcknowledgedTotal}} of {{$ack.DeliveredTotal}} acknowledged.</div>
+      {{end}}
+      <div class="muted">{{receiptLabel .Type}}</div>
     </td>
     <td>
       {{/* Delivery outcomes over the window, aggregated in the database.

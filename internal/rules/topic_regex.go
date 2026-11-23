@@ -136,7 +136,10 @@ func (*TopicRegex) Validate(params json.RawMessage) error {
 	return nil
 }
 
-func (t *TopicRegex) Evaluate(_ context.Context, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error) {
+func (t *TopicRegex) Evaluate(ctx context.Context, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	// The same params blob is evaluated once per event for the life of the
 	// rule, so a cache hit skips both the JSON parse and the compile.
 	if e, ok := t.cache.get(string(params)); ok {

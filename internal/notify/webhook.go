@@ -9,30 +9,40 @@ import (
 )
 
 // SignatureHeader carries the hex HMAC-SHA256 of the canonical signing
-// string (timestamp + "." + raw body), keyed with the channel's current
-// active secret. Receivers should recompute and compare.
+// string, keyed with the channel's current active secret.
 const SignatureHeader = "X-SoroBeacon-Signature"
 
 // SignaturePreviousHeader carries the same signature computed under
-// previous_secret. It is only sent while a secret rotation is in flight so
-// a receiver that has not switched keys yet can still verify a delivery.
+// previous_secret or the rotating-out key.
 const SignaturePreviousHeader = "X-SoroBeacon-Signature-Previous"
 
-// TimestampHeader carries the Unix-seconds timestamp the signature is
-// computed over. It is deliberately part of the signed string so receivers
-// can reject replays: a bare signature over the body alone would let anyone
-// who captures one request replay it forever.
+// TimestampHeader carries the Unix-seconds timestamp the signature is computed over.
 const TimestampHeader = "X-SoroBeacon-Timestamp"
 
-// webhookConfig: {"url": "https://example.com/hook", "secret": "shared-secret",
-// "previous_secret": "the-secret-we-are-rotating-from"}
+// KeyIDHeader carries the key identifier used to sign the request, allowing consumers
+// to select the correct verification key directly.
+const KeyIDHeader = "X-SoroBeacon-Key-ID"
+
+// IdempotencyHeader carries the stable event identifier so receivers can deduplicate.
+const IdempotencyHeader = "X-SoroBeacon-Idempotency-Key"
+
+// WebhookSigningKey represents a key configured on the webhook channel.
+type WebhookSigningKey struct {
+	ID        string    `json:"id"`
+	Secret    string    `json:"secret"`
+	IsCurrent bool      `json:"is_current"`
+	Status    string    `json:"status"` // "active", "retired", "revoked"
+	CreatedAt time.Time `json:"created_at,omitempty"`
+}
+
+// webhookConfig holds configuration for the generic webhook channel.
+// It supports either a single legacy secret or multiple signing keys with rotation.
 type webhookConfig struct {
-	URL string `json:"url"`
-	// Secret signs every request; it is the key a receiver should hold.
-	Secret string `json:"secret"`
-	// PreviousSecret, when set, is used to emit a second signature so a
-	// receiver can roll over without dropping deliveries mid-rotation.
-	PreviousSecret string `json:"previous_secret"`
+	URL            string              `json:"url"`
+	Secret         string              `json:"secret"`
+	PreviousSecret string              `json:"previous_secret"`
+	KeyID          string              `json:"key_id"`
+	Keys           []WebhookSigningKey `json:"keys"`
 }
 
 // Webhook POSTs the full alert as JSON to an arbitrary endpoint, signed
@@ -50,10 +60,48 @@ func NewWebhook(config json.RawMessage) (Notifier, error) {
 	if cfg.URL == "" {
 		return nil, fmt.Errorf("webhook: url is required")
 	}
-	if cfg.Secret == "" {
+	if cfg.Secret == "" && len(cfg.Keys) == 0 {
 		return nil, fmt.Errorf("webhook: secret is required")
 	}
 	return &Webhook{cfg: cfg}, nil
+}
+
+func (w *Webhook) resolveKeys() (currentKey []byte, currentKeyID string, prevKey []byte, prevKeyID string) {
+	if len(w.cfg.Keys) > 0 {
+		var activeKeys []WebhookSigningKey
+		for _, k := range w.cfg.Keys {
+			if k.Status == "active" || k.Status == "" {
+				activeKeys = append(activeKeys, k)
+			}
+		}
+		for _, k := range activeKeys {
+			if k.IsCurrent {
+				currentKey = []byte(k.Secret)
+				currentKeyID = k.ID
+				break
+			}
+		}
+		if len(currentKey) == 0 && len(activeKeys) > 0 {
+			last := activeKeys[len(activeKeys)-1]
+			currentKey = []byte(last.Secret)
+			currentKeyID = last.ID
+		}
+		for _, k := range activeKeys {
+			if k.ID != currentKeyID {
+				prevKey = []byte(k.Secret)
+				prevKeyID = k.ID
+				break
+			}
+		}
+		return
+	}
+
+	currentKey = []byte(w.cfg.Secret)
+	currentKeyID = w.cfg.KeyID
+	if w.cfg.PreviousSecret != "" {
+		prevKey = []byte(w.cfg.PreviousSecret)
+	}
+	return
 }
 
 func (w *Webhook) Send(ctx context.Context, a Alert) error {
@@ -62,15 +110,30 @@ func (w *Webhook) Send(ctx context.Context, a Alert) error {
 		return err
 	}
 
-	// The timestamp is computed once and reused for both signatures; a
-	// receiver validates each header against the same signed string.
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	currentKey, currentKeyID, prevKey, prevKeyID := w.resolveKeys()
+
 	headers := map[string]string{
 		TimestampHeader: timestamp,
-		SignatureHeader: Sign([]byte(w.cfg.Secret), timestamp, body),
 	}
-	if w.cfg.PreviousSecret != "" {
-		headers[SignaturePreviousHeader] = Sign([]byte(w.cfg.PreviousSecret), timestamp, body)
+
+	if currentKeyID != "" {
+		headers[KeyIDHeader] = currentKeyID
+		if a.EventID != "" {
+			headers[IdempotencyHeader] = a.EventID
+		}
+		headers[SignatureHeader] = SignCanonical(currentKey, currentKeyID, timestamp, a.EventID, body)
+	} else {
+		// Legacy single secret without key ID
+		headers[SignatureHeader] = Sign(currentKey, timestamp, body)
+	}
+
+	if len(prevKey) > 0 {
+		if prevKeyID != "" {
+			headers[SignaturePreviousHeader] = SignCanonical(prevKey, prevKeyID, timestamp, a.EventID, body)
+		} else {
+			headers[SignaturePreviousHeader] = Sign(prevKey, timestamp, body)
+		}
 	}
 
 	if err := postJSON(ctx, w.cfg.URL, body, headers); err != nil {

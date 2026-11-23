@@ -84,23 +84,31 @@ func (o *Opsgenie) alias(a Alert) string {
 }
 
 func (o *Opsgenie) Send(ctx context.Context, a Alert) error {
+	details := map[string]string{
+		"monitor_id":   fmt.Sprintf("%d", a.MonitorID),
+		"monitor_name": a.MonitorName,
+		"rule_id":      fmt.Sprintf("%d", a.RuleID),
+		"rule_type":    a.RuleType,
+		"event_id":     a.EventID,
+		"contract_id":  a.ContractID,
+		"event_name":   a.EventName,
+		"ledger":       fmt.Sprintf("%d", a.Ledger),
+		"tx_hash":      a.TxHash,
+	}
+	if a.RunbookURL != "" {
+		details["runbook_url"] = a.RunbookURL
+	}
+	if a.ResponseGuidance != "" {
+		details["response_guidance"] = a.ResponseGuidance
+	}
+
 	// Build the alert payload
 	payload := map[string]any{
 		"message":     fmt.Sprintf("SoroBeacon alert: %s", a.MonitorName),
 		"alias":       o.alias(a),
 		"description": buildDescription(a),
 		"priority":    o.cfg.Priority,
-		"details": map[string]string{
-			"monitor_id":   fmt.Sprintf("%d", a.MonitorID),
-			"monitor_name": a.MonitorName,
-			"rule_id":      fmt.Sprintf("%d", a.RuleID),
-			"rule_type":    a.RuleType,
-			"event_id":     a.EventID,
-			"contract_id":  a.ContractID,
-			"event_name":   a.EventName,
-			"ledger":       fmt.Sprintf("%d", a.Ledger),
-			"tx_hash":      a.TxHash,
-		},
+		"details":     details,
 	}
 
 	if len(o.cfg.Responders) > 0 {
@@ -135,5 +143,11 @@ func buildDescription(a Alert) string {
 	fmt.Fprintf(&b, "Tx: %s\n", a.TxHash)
 	fmt.Fprintf(&b, "Event ID: %s\n", a.EventID)
 	fmt.Fprintf(&b, "At: %s UTC\n", a.CreatedAt.UTC().Format("2006-01-02 15:04:05"))
+	if a.RunbookURL != "" {
+		fmt.Fprintf(&b, "Runbook: %s\n", a.RunbookURL)
+	}
+	if a.ResponseGuidance != "" {
+		fmt.Fprintf(&b, "Guidance: %s\n", a.ResponseGuidance)
+	}
 	return b.String()
 }

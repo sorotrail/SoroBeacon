@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/telemetry"
 )
 
 // httpClient is shared by all outbound webhook-style notifiers.
@@ -194,4 +195,16 @@ func requestJSONWithResponse(ctx context.Context, method, url string, body []byt
 		return nil, fmt.Errorf("status %d: %s", res.StatusCode, string(respBody))
 	}
 	return respBody, nil
+}
+
+// InstrumentHTTP traces every outbound webhook-style delivery and
+// propagates the trace to the endpoint (traceparent). The spans carry the
+// method and status code only, never the URL, which is channel
+// configuration. Call it once at startup, before deliveries start; a nil
+// provider leaves the client untouched.
+func InstrumentHTTP(p *telemetry.Provider) {
+	if p == nil || !p.Enabled() {
+		return
+	}
+	httpClient.Transport = p.Transport(httpClient.Transport)
 }

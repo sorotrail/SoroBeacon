@@ -500,3 +500,90 @@ func TestScopedTokenDeniedOnUnmappedRoute(t *testing.T) {
 		t.Error("the handler ran for a request the role check denied")
 	}
 }
+
+func TestTokenRotationAPI(t *testing.T) {
+	h, _, _ := newTokenServer(t, nil)
+
+	// 1. Mint initial token
+	predRaw := mint(t, h, `{"name":"ci-deploy","scopes":["monitors:read","monitors:write"]}`)
+	predID := tokenIDOf(t, h, acmeToken, predRaw)
+
+	// 2. Rotate token
+	rotRes := callJSON(t, h, http.MethodPost, "/tokens/"+strconv.FormatInt(predID, 10)+"/rotate", acmeToken,
+		`{"name":"ci-deploy-v2","overlap":"48h"}`)
+	if rotRes.Code != http.StatusCreated {
+		t.Fatalf("POST /tokens/{id}/rotate = %d (%s), want 201", rotRes.Code, rotRes.Body)
+	}
+	var rotOut struct {
+		ID            int64    `json:"id"`
+		Name          string   `json:"name"`
+		Prefix        string   `json:"prefix"`
+		Scopes        []string `json:"scopes"`
+		Token         string   `json:"token"`
+		RotatedFromID *int64   `json:"rotated_from_id"`
+	}
+	if err := json.Unmarshal(rotRes.Body.Bytes(), &rotOut); err != nil {
+		t.Fatalf("decode rotate response: %v", err)
+	}
+	if rotOut.Token == "" || rotOut.Token == predRaw {
+		t.Fatalf("successor token must be non-empty and distinct, got %q", rotOut.Token)
+	}
+	if rotOut.RotatedFromID == nil || *rotOut.RotatedFromID != predID {
+		t.Fatalf("successor rotated_from_id = %v, want %d", rotOut.RotatedFromID, predID)
+	}
+	if !slices.Contains(rotOut.Scopes, "monitors:read") || !slices.Contains(rotOut.Scopes, "monitors:write") {
+		t.Fatalf("successor scopes must default to predecessor scopes, got %v", rotOut.Scopes)
+	}
+	succID := rotOut.ID
+	succRaw := rotOut.Token
+
+	// 3. GET /tokens/{id} for predecessor and successor
+	getPred := callJSON(t, h, http.MethodGet, "/tokens/"+strconv.FormatInt(predID, 10), acmeToken, "")
+	if getPred.Code != http.StatusOK {
+		t.Fatalf("GET /tokens/{predID} = %d, want 200", getPred.Code)
+	}
+	var predDoc struct {
+		SuccessorID *int64 `json:"successor_id"`
+		ExpiresAt   string `json:"expires_at"`
+	}
+	_ = json.Unmarshal(getPred.Body.Bytes(), &predDoc)
+	if predDoc.SuccessorID == nil || *predDoc.SuccessorID != succID {
+		t.Fatalf("predecessor successor_id = %v, want %d", predDoc.SuccessorID, succID)
+	}
+	if predDoc.ExpiresAt == "" {
+		t.Fatal("predecessor must have expires_at set after rotation")
+	}
+
+	getSucc := callJSON(t, h, http.MethodGet, "/tokens/"+strconv.FormatInt(succID, 10), acmeToken, "")
+	if getSucc.Code != http.StatusOK {
+		t.Fatalf("GET /tokens/{succID} = %d, want 200", getSucc.Code)
+	}
+
+	// 4. Both tokens work during overlap
+	resPred := callJSON(t, h, http.MethodGet, "/version", predRaw, "")
+	if resPred.Code != http.StatusOK {
+		t.Fatalf("predecessor token failed during overlap = %d", resPred.Code)
+	}
+	resSucc := callJSON(t, h, http.MethodGet, "/version", succRaw, "")
+	if resSucc.Code != http.StatusOK {
+		t.Fatalf("successor token failed = %d", resSucc.Code)
+	}
+
+	// 5. Abandon rotation
+	abandRes := callJSON(t, h, http.MethodPost, "/tokens/"+strconv.FormatInt(predID, 10)+"/abandon", acmeToken, "")
+	if abandRes.Code != http.StatusOK {
+		t.Fatalf("POST /tokens/{id}/abandon = %d, want 200", abandRes.Code)
+	}
+
+	// Successor must now be revoked
+	resSuccAfter := callJSON(t, h, http.MethodGet, "/version", succRaw, "")
+	if resSuccAfter.Code != http.StatusUnauthorized {
+		t.Fatalf("successor after abandon = %d, want 401", resSuccAfter.Code)
+	}
+
+	// Predecessor must still authenticate
+	resPredAfter := callJSON(t, h, http.MethodGet, "/version", predRaw, "")
+	if resPredAfter.Code != http.StatusOK {
+		t.Fatalf("predecessor after abandon = %d, want 200", resPredAfter.Code)
+	}
+}

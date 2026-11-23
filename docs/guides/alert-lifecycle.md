@@ -176,6 +176,12 @@ There is no separate alert lifecycle state machine or "resolved" state.
 `POST /alerts/{id}/acknowledge` records acknowledgement and stops escalation;
 grouping, inhibition and flapping are delivery-time decisions.
 
+Editing a rule's condition or disabling a rule increments the rule's `version`,
+resets its cooldown, `frequency_threshold` window, and `absence_of_event`
+silence clock, and stops any in-flight escalations for unacknowledged alerts of
+that rule. Historical alert rows are never deleted or rewritten when a rule
+changes; each alert retains the `rule_version` that produced it.
+
 ## "Why didn't it…" quick map
 
 | Symptom | Most likely step | First thing to check |

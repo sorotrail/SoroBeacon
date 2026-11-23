@@ -4,27 +4,31 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/sorotrail/sorobeacon/internal/apierr"
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/buildinfo"
 	"github.com/sorotrail/sorobeacon/internal/lease"
+	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
 	"github.com/sorotrail/sorobeacon/internal/reqid"
 	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/usage"
 )
 
 // Server holds the API's dependencies.
@@ -59,15 +63,29 @@ type LeaderReader interface {
 // Used when New is not followed by WithMaxBodyBytes.
 const DefaultMaxBodyBytes int64 = 1 << 20
 
+// DefaultBulkMaxBodyBytes is 10 MiB, allowed for bulk writes.
+const DefaultBulkMaxBodyBytes int64 = 10 << 20
+
+// MaxChannelConfigBytes is the upper bound on a channel's config payload (64 KiB).
+const MaxChannelConfigBytes int = 64 << 10
+
+// MaxTemplateBytes is the upper bound on a notification template or template body (32 KiB).
+const MaxTemplateBytes int = 32 << 10
+
 type Server struct {
-	store        store.Store
-	registry     *rules.Registry
-	factory      *notify.Factory
-	rpc          HealthChecker
-	log          *slog.Logger
-	poller       PositionReader
-	leader       LeaderReader
-	networkState NetworkStatusReader
+	// paging propagates local acknowledgements to external paging providers;
+	// nil-safe.
+	paging *notify.PagingSync
+	store  store.Store
+	// archiveReader serves opt-in archived alert history; nil disables it.
+	archiveReader store.ArchiveReader
+	registry      *rules.Registry
+	factory       *notify.Factory
+	rpc           HealthChecker
+	log           *slog.Logger
+	poller        PositionReader
+	leader        LeaderReader
+	networkState  NetworkStatusReader
 	// networkNames are the chains this instance polls, primary first, from
 	// NETWORKS/NETWORK. Empty (the New default, and every test that never
 	// calls WithNetworks) means no network may be named on a monitor, so
@@ -77,6 +95,9 @@ type Server struct {
 	readyzLagThreshold uint32
 	rateLimit          RateLimitConfig
 	maxBodyBytes       int64
+	bulkMaxBodyBytes   int64
+	endpointBodyLimits map[string]int64
+	metrics            *metrics.Metrics
 	// broadcaster fans newly created alerts out to live SSE subscribers on
 	// GET /alerts/stream. main hands it the same instance the poller
 	// publishes into; the New default is an empty one so the endpoint works
@@ -92,17 +113,53 @@ type Server struct {
 	// tokens mints and resolves scoped API tokens. Nil leaves the /tokens
 	// endpoints off and only static credentials authenticating.
 	tokens *auth.Manager
+	// breaker fast-fails requests when the database is unavailable.
+	breaker *store.StoreBreaker
+	// usageMeter buffers per-workspace API request counts in memory and
+	// flushes them to durable rollups.
+	usageMeter *usage.Meter
+	// dispatcher is the shared notification dispatcher, used to cancel
+	// in-flight deliveries and purge per-workspace queues on workspace deletion.
+	dispatcher *notify.Dispatcher
+
+	subMu               sync.Mutex
+	activeSubscriptions map[string]int64
+	quotaClock          func() time.Time
+	alertRetention      time.Duration
+
+	idempotencyTTL    time.Duration
+	idempotencyClock  func() time.Time
+	idempotencyMu     sync.Mutex
+	idempotencyFlight map[string]*inFlightIdempotency
+	idempotencyMem    map[string]*store.IdempotencyRecord
 }
 
 // New wires an API server. Rate limiting stays off until WithRateLimit, and
 // live alerts stay quiet until WithBroadcaster shares the poller's fan-out.
 func New(st store.Store, reg *rules.Registry, f *notify.Factory, rpc HealthChecker, log *slog.Logger) *Server {
+	var b *store.StoreBreaker
+	if bp, ok := st.(interface{ Breaker() *store.StoreBreaker }); ok {
+		b = bp.Breaker()
+	}
+	if b == nil {
+		b = store.NewStoreBreaker(3, 5*time.Second)
+	}
 	return &Server{
 		store: st, registry: reg, factory: f, rpc: rpc, log: log,
-		maxBodyBytes:    DefaultMaxBodyBytes,
-		broadcaster:     broadcast.New(broadcast.DefaultBuffer),
-		streamHeartbeat: defaultStreamHeartbeat,
+		maxBodyBytes:       DefaultMaxBodyBytes,
+		bulkMaxBodyBytes:   DefaultBulkMaxBodyBytes,
+		endpointBodyLimits: make(map[string]int64),
+		broadcaster:        broadcast.New(broadcast.DefaultBuffer),
+		streamHeartbeat:    defaultStreamHeartbeat,
+		breaker:            b,
+		usageMeter:         usage.NewMeter(st, nil, log),
 	}
+}
+
+// WithBreaker sets the circuit breaker protecting the server against database outages.
+func (s *Server) WithBreaker(b *store.StoreBreaker) *Server {
+	s.breaker = b
+	return s
 }
 
 // WithMaxBodyBytes sets the write-endpoint body limit applied by
@@ -112,6 +169,58 @@ func (s *Server) WithMaxBodyBytes(n int64) *Server {
 	if n > 0 {
 		s.maxBodyBytes = n
 	}
+	return s
+}
+
+// WithBulkMaxBodyBytes sets the body limit for bulk write endpoints
+// (such as /monitors/bulk or /alerts/import).
+func (s *Server) WithBulkMaxBodyBytes(n int64) *Server {
+	if n > 0 {
+		s.bulkMaxBodyBytes = n
+	}
+	return s
+}
+
+// WithEndpointMaxBodyBytes sets a custom body limit override for a specific endpoint path.
+func (s *Server) WithEndpointMaxBodyBytes(path string, n int64) *Server {
+	if s.endpointBodyLimits == nil {
+		s.endpointBodyLimits = make(map[string]int64)
+	}
+	if n > 0 {
+		s.endpointBodyLimits[path] = n
+	}
+	return s
+}
+
+// WithMetrics attaches Prometheus instrumentation so request body rejections are tracked.
+func (s *Server) WithMetrics(m *metrics.Metrics) *Server {
+	s.metrics = m
+	if s.usageMeter != nil {
+		s.usageMeter.WithMetrics(m)
+	}
+	return s
+}
+
+// WithUsageMeter attaches a shared workspace usage meter.
+func (s *Server) WithUsageMeter(um *usage.Meter) *Server {
+	if um != nil {
+		if s.metrics != nil {
+			um.WithMetrics(s.metrics)
+		}
+		s.usageMeter = um
+	}
+	return s
+}
+
+// UsageMeter returns the server's workspace usage meter.
+func (s *Server) UsageMeter() *usage.Meter {
+	return s.usageMeter
+}
+
+// WithDispatcher attaches the notification dispatcher so workspace deletion can
+// immediately cancel in-flight deliveries and purge per-workspace queues.
+func (s *Server) WithDispatcher(d *notify.Dispatcher) *Server {
+	s.dispatcher = d
 	return s
 }
 
@@ -153,6 +262,13 @@ func (s *Server) defaultNetwork() string {
 // behaved.
 func (s *Server) WithLeadership(r LeaderReader) *Server {
 	s.leader = r
+	return s
+}
+
+// WithPaging enables outbound acknowledgement sync to external paging
+// providers. Optional.
+func (s *Server) WithPaging(p *notify.PagingSync) *Server {
+	s.paging = p
 	return s
 }
 
@@ -221,7 +337,10 @@ func (s *Server) WithTokens(m *auth.Manager) *Server {
 // served (authenticated and authorised) traffic.
 func (s *Server) Routes() chi.Router {
 	mux := chi.NewRouter()
-	mux.Use(middleware.Recoverer, MaxBodyMiddleware(s.maxBodyBytes))
+	mux.Use(middleware.Recoverer)
+	mux.Use(s.metricsContextMiddleware)
+	mux.Use(MaxBodyMiddlewareWithResolver(s.limitForRequest, s.metrics))
+	mux.Use(s.auditRejectedAuthMiddleware)
 	mux.Use(AuthMiddleware(s.auth, s.log))
 	mux.Use(auth.RoleCheck{
 		Authenticator: s.auth,
@@ -236,9 +355,13 @@ func (s *Server) Routes() chi.Router {
 		Deny: s.denyRole,
 	}.Middleware())
 	mux.Use(RateLimitMiddleware(s.rateLimit))
+	mux.Use(s.usageMiddleware)
+	mux.Use(s.queryBudgetMiddleware)
+	mux.Use(s.degradedMiddleware)
+	mux.Use(s.idempotencyMiddleware)
 	// Innermost, so only authenticated, rate-limited requests are audited
 	// and an audit failure never blocks the request.
-	mux.Use(AuditMiddleware(s.store, s.log))
+	mux.Use(AuditMiddlewareWithOptions(s.store, s.rateLimit.TrustForwarded, s.log))
 	// JSON clients hitting a typo'd path or the wrong method should get
 	// the same envelope as every other API error, not chi's plain-text
 	// 404/405. The dashboard mux is a different router and is untouched.
@@ -267,6 +390,9 @@ func (s *Server) Routes() chi.Router {
 			r.Get("/escalation", s.getMonitorEscalation)
 			r.Put("/escalation", s.putMonitorEscalation)
 			r.Delete("/escalation", s.deleteMonitorEscalation)
+			r.Get("/delivery-budget", s.getDeliveryBudget)
+			r.Put("/delivery-budget", s.putDeliveryBudget)
+			r.Post("/delivery-budget/reset", s.resetDeliveryBudget)
 		})
 	})
 
@@ -278,10 +404,17 @@ func (s *Server) Routes() chi.Router {
 		r.Get("/{id}", s.getChannel)
 		// Registered under the channel's own id rather than under /stats:
 		// the statistics are one channel's, not the instance's.
-		r.Get("/{id}/stats", s.channelStats)
+		r.Get("/{id}/stats", s.withConditionalETag(s.channelStatsChangeKey, s.channelStats))
 		r.Patch("/{id}", s.updateChannel)
 		r.Delete("/{id}", s.deleteChannel)
 		r.Post("/{id}/test", s.testChannel)
+		r.Get("/{id}/keys", s.listChannelSigningKeys)
+		r.Get("/{id}/devices", s.listPushDevices)
+		r.Put("/{id}/devices/{deviceID}", s.registerPushDevice)
+		r.Delete("/{id}/devices/{deviceID}", s.deletePushDevice)
+		r.Post("/{id}/keys/rotate", s.rotateChannelSigningKey)
+		r.Post("/{id}/keys/{keyID}/retire", s.retireChannelSigningKey)
+		r.Post("/{id}/keys/{keyID}/revoke", s.revokeChannelSigningKey)
 	})
 
 	mux.Route("/maintenance-windows", func(r chi.Router) {
@@ -319,10 +452,20 @@ func (s *Server) Routes() chi.Router {
 	mux.Route("/tokens", func(r chi.Router) {
 		r.Post("/", s.createToken)
 		r.Get("/", s.listTokens)
+		r.Get("/{id}", s.getToken)
+		r.Post("/{id}/rotate", s.rotateToken)
+		r.Post("/{id}/abandon", s.abandonTokenRotation)
 		r.Post("/{id}/revoke", s.revokeToken)
 	})
 
-	mux.Get("/alerts", s.listAlerts)
+	mux.Route("/graphql/operations", func(r chi.Router) {
+		r.Post("/", s.registerPersistedOperation)
+		r.Get("/", s.listPersistedOperations)
+		r.Get("/{id}", s.getPersistedOperation)
+		r.Delete("/{id}", s.deletePersistedOperation)
+	})
+
+	mux.Get("/alerts", s.withConditionalETag(s.alertChangeKey, s.listAlerts))
 	// Registered before /alerts.csv and the /alerts/{id}/... routes for
 	// readability; chi matches the static segment either way.
 	mux.Get("/alerts/stream", s.streamAlerts)
@@ -330,8 +473,12 @@ func (s *Server) Routes() chi.Router {
 	mux.Get("/alerts/export", s.exportAlertsNDJSON)
 	mux.Get("/alerts/{id}/deliveries", s.listDeliveries)
 	mux.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)
+	mux.Get("/dead-letters/groups", s.listDeadLetterGroups)
+	mux.Post("/dead-letters/bulk/redrive", s.bulkRedriveDeadLetters)
+	mux.Post("/dead-letters/bulk/discard", s.bulkDiscardDeadLetters)
 	mux.Get("/dead-letters", s.listDeadLetters)
 	mux.Post("/dead-letters/{id}/redrive", s.redriveDeadLetter)
+	mux.Post("/dead-letters/{id}/discard", s.discardDeadLetter)
 	mux.Post("/alerts/{id}/acknowledge", s.acknowledgeAlert)
 	mux.Get("/health", s.health)
 	mux.Get("/livez", s.livez)
@@ -340,8 +487,22 @@ func (s *Server) Routes() chi.Router {
 	mux.Get("/version", s.version)
 	mux.Get("/rule-types", s.listRuleTypes)
 	mux.Get("/stats", s.stats)
-	mux.Get("/stats/alerts-daily", s.alertsDaily)
+	mux.Get("/stats/alerts-daily", s.withConditionalETag(s.alertsDailyChangeKey, s.alertsDaily))
+	mux.Get("/usage", s.usage)
+	mux.Get("/quotas", s.getQuotas)
+	mux.Put("/quotas", s.putQuotas)
+	mux.Get("/retention", s.getRetention)
+	mux.Put("/retention", s.putRetention)
+	mux.Delete("/retention", s.deleteRetention)
+	mux.Get("/workspace/export", s.exportWorkspace)
 	mux.Get("/audit", s.listAudit)
+
+	mux.Route("/workspaces/{id}", func(r chi.Router) {
+		r.Get("/export", s.exportWorkspace)
+		r.Delete("/", s.deleteWorkspace)
+		r.Post("/delete", s.deleteWorkspace)
+		r.Get("/delete", s.getWorkspaceDeletion)
+	})
 
 	return mux
 }
@@ -367,6 +528,9 @@ func parseListFilter(w http.ResponseWriter, r *http.Request) (store.ListFilter, 
 	// Network narrows a list to one chain. Unset means every network an
 	// instance polls, which is what a caller that predates multi-network sees.
 	f.Network = strings.ToLower(strings.TrimSpace(q.Get("network")))
+	// A repeated ?tag= ANDs: the caller gets monitors carrying every named
+	// tag. Normalisation drops blanks, so ?tag= with no value is no filter.
+	f.Tags = store.NormalizeTags(q["tag"])
 	if v := q.Get("sort"); v != "" {
 		switch v {
 		case "name", "id", "created_at":
@@ -427,18 +591,19 @@ func writeNoContent(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// writeErr emits the structured error envelope. The top-level "error"
-// string is kept for clients written against the original shape; the
-// "request_id" field lets a quoted error be mapped to one request in the
-// logs, and "code" gives clients a stable token to branch on.
-//
-// details is purely additive: omitted when empty so existing clients keep
-// working. When present, every validation problem in the request is listed
-// rather than only the first.
+// writeErr emits the structured error envelope using the default taxonomy code for the status.
 func writeErr(w http.ResponseWriter, r *http.Request, status int, msg string, details ...FieldError) {
+	writeErrCode(w, r, status, apierr.CodeFromStatus(status), msg, details...)
+}
+
+// writeErrCode emits the structured error envelope with an explicit machine-readable taxonomy code.
+func writeErrCode(w http.ResponseWriter, r *http.Request, status int, code string, msg string, details ...FieldError) {
+	if code == "" {
+		code = apierr.CodeFromStatus(status)
+	}
 	body := map[string]any{
 		"error":      msg,
-		"code":       http.StatusText(status),
+		"code":       code,
 		"request_id": reqid.From(r),
 	}
 	if len(details) > 0 {
@@ -459,7 +624,7 @@ func writeValidation(w http.ResponseWriter, r *http.Request, details []FieldErro
 	if len(details) > 1 {
 		msg = "validation failed"
 	}
-	writeErr(w, r, http.StatusBadRequest, msg, details...)
+	writeErrCode(w, r, http.StatusBadRequest, apierr.CodeInvalidArgument, msg, details...)
 }
 
 // writeUnprocessable reports problems that make a well-formed request
@@ -471,7 +636,7 @@ func writeUnprocessable(w http.ResponseWriter, r *http.Request, details []FieldE
 	if len(details) == 0 {
 		return
 	}
-	writeErr(w, r, http.StatusUnprocessableEntity, "validation failed", details...)
+	writeErrCode(w, r, http.StatusUnprocessableEntity, apierr.CodeInvalidArgument, "validation failed", details...)
 }
 
 // detailsFromErr turns a Validate / constructor error into envelope
@@ -509,7 +674,7 @@ func joinPath(prefix, field string) string {
 }
 
 func (s *Server) notFound(w http.ResponseWriter, r *http.Request) {
-	writeErr(w, r, http.StatusNotFound, "not found")
+	writeErrCode(w, r, http.StatusNotFound, apierr.CodeNotFound, "not found")
 }
 
 func (s *Server) methodNotAllowed(w http.ResponseWriter, r *http.Request) {
@@ -519,7 +684,7 @@ func (s *Server) methodNotAllowed(w http.ResponseWriter, r *http.Request) {
 	if allow := allowHeader(r); allow != "" {
 		w.Header().Set("Allow", allow)
 	}
-	writeErr(w, r, http.StatusMethodNotAllowed, "method not allowed")
+	writeErrCode(w, r, http.StatusMethodNotAllowed, apierr.CodeMethodNotAllowed, "method not allowed")
 }
 
 func allowHeader(r *http.Request) string {
@@ -548,23 +713,68 @@ func allowHeader(r *http.Request) string {
 	return strings.Join(allow, ", ")
 }
 
-// fail maps store errors to HTTP responses.
+// fail maps store errors to HTTP responses using the error taxonomy.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
-	// A constraint violation is the request's fault, not the server's: it
-	// named a record that does not exist, or a value the database refuses.
-	// Answering 500 would tell the sender the failure is transient, and a
-	// federated sender retries a request that cannot succeed — three times,
-	// and then into the dead-letter queue.
-	if errors.Is(err, store.ErrConstraint) {
-		writeErr(w, r, http.StatusUnprocessableEntity, constraintMessage(err))
+	var quotaErr *store.QuotaExceededError
+	if errors.As(err, &quotaErr) {
+		s.writeQuotaExceeded(w, r, quotaErr)
 		return
 	}
-	if errors.Is(err, store.ErrNotFound) {
-		writeErr(w, r, http.StatusNotFound, "not found")
+	c := apierr.Classify(err)
+	if c.Code == apierr.CodeQuotaExceeded {
+		s.writeQuotaExceeded(w, r, nil)
 		return
 	}
-	s.log.Error("api error", "request_id", reqid.From(r), "err", err)
-	writeErr(w, r, http.StatusInternalServerError, "internal error")
+	if c.Code == apierr.CodeInternalError {
+		s.log.Error("api error", "request_id", reqid.From(r), "err", err)
+	}
+	if c.Status == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", "5")
+		if s.breaker != nil {
+			s.breaker.RecordFailure(err)
+		}
+		if s.metrics != nil {
+			s.metrics.RecordDatabaseUnavailable()
+		}
+	}
+	writeErrCode(w, r, c.Status, c.Code, c.Message)
+}
+
+func (s *Server) isDegraded() bool {
+	if rep, ok := s.store.(store.DegradationReporter); ok && rep.Degraded() {
+		return true
+	}
+	if s.breaker != nil && s.breaker.Degraded() {
+		return true
+	}
+	return false
+}
+
+// isExemptFromDegraded reports whether a path is allowed to answer during degraded mode.
+func isExemptFromDegraded(path string) bool {
+	p := strings.TrimPrefix(path, "/api/v1")
+	switch p {
+	case "/livez", "/readyz", "/health", "/version", "/poller":
+		return true
+	}
+	return false
+}
+
+// degradedMiddleware fails fast with 503 Service Unavailable when the store is degraded,
+// protecting the recovering database from request stampedes.
+func (s *Server) degradedMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isExemptFromDegraded(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if s.isDegraded() {
+			w.Header().Set("Retry-After", "5")
+			writeErrCode(w, r, http.StatusServiceUnavailable, apierr.CodeServiceUnavailable, "database unavailable: service operating in degraded mode")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // constraintMessage describes a constraint violation in the caller's terms.
@@ -587,11 +797,58 @@ func constraintMessage(err error) string {
 	}
 }
 
+type metricsCtxKey struct{}
+
+func (s *Server) metricsContextMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.metrics != nil {
+			r = r.WithContext(context.WithValue(r.Context(), metricsCtxKey{}, s.metrics))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) limitForRequest(r *http.Request) int64 {
+	path := r.URL.Path
+	trimmed := strings.TrimPrefix(path, "/api/v1")
+	if s.endpointBodyLimits != nil {
+		if limit, ok := s.endpointBodyLimits[trimmed]; ok && limit > 0 {
+			return limit
+		}
+		if limit, ok := s.endpointBodyLimits[path]; ok && limit > 0 {
+			return limit
+		}
+	}
+	if strings.HasSuffix(trimmed, "/bulk") || strings.HasSuffix(trimmed, "/import") {
+		if s.bulkMaxBodyBytes > 0 {
+			return s.bulkMaxBodyBytes
+		}
+		return DefaultBulkMaxBodyBytes
+	}
+	if s.maxBodyBytes > 0 {
+		return s.maxBodyBytes
+	}
+	return DefaultMaxBodyBytes
+}
+
+func metricsFrom(ctx context.Context) *metrics.Metrics {
+	if ctx == nil {
+		return nil
+	}
+	if m, ok := ctx.Value(metricsCtxKey{}).(*metrics.Metrics); ok {
+		return m
+	}
+	return nil
+}
+
 func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
+			if m := metricsFrom(r.Context()); m != nil {
+				m.RecordBodyRejection(rejectionLimitType(r))
+			}
 			writeErr(w, r, http.StatusRequestEntityTooLarge, "request body too large")
 			return false
 		}
@@ -679,12 +936,8 @@ func (s *Server) attachPoller(out map[string]any) {
 	out["last_successful_poll"] = pos.LastSuccessfulPoll.UTC().Format(time.RFC3339)
 }
 
-func (s *Server) version(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, buildinfo.Info{
-		Version: buildinfo.Version,
-		Commit:  buildinfo.Commit,
-		Date:    buildinfo.Date,
-	})
+func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, buildinfo.Current())
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
@@ -693,12 +946,15 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	setRetentionHorizonHeaders(w, st.PrunedBefore, st.RetentionPolicySource)
 	writeJSON(w, http.StatusOK, st)
 }
 
 type alertsDailyResponse struct {
-	Timezone string                `json:"timezone"`
-	Days     []store.AlertDayCount `json:"days"`
+	Timezone              string                `json:"timezone"`
+	Days                  []store.AlertDayCount `json:"days"`
+	PrunedBefore          *time.Time            `json:"pruned_before,omitempty"`
+	RetentionPolicySource string                `json:"retention_policy_source,omitempty"`
 }
 
 func (s *Server) alertsDaily(w http.ResponseWriter, r *http.Request) {
@@ -710,5 +966,12 @@ func (s *Server) alertsDaily(w http.ResponseWriter, r *http.Request) {
 	if days == nil {
 		days = []store.AlertDayCount{}
 	}
-	writeJSON(w, http.StatusOK, alertsDailyResponse{Timezone: "UTC", Days: days})
+	prunedBefore, policySource := s.workspaceRetentionHorizon(r.Context())
+	setRetentionHorizonHeaders(w, prunedBefore, policySource)
+	writeJSON(w, http.StatusOK, alertsDailyResponse{
+		Timezone:              "UTC",
+		Days:                  days,
+		PrunedBefore:          prunedBefore,
+		RetentionPolicySource: policySource,
+	})
 }

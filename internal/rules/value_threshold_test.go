@@ -272,3 +272,38 @@ func TestValueThreshold_Evaluate(t *testing.T) {
 		})
 	}
 }
+
+// TestValueThresholdEventNames pins the answers the poller narrows on: a
+// rule scoped to one event names it; a rule that judges every event's value
+// (no event_name) may match anything and must report ok=false so the
+// contract stays unfiltered.
+func TestValueThresholdEventNames(t *testing.T) {
+	tests := []struct {
+		name   string
+		params string
+		want   []string
+		wantOK bool
+	}{
+		{"scoped to one event", `{"event_name":"transfer","comparison":"gt","threshold":100}`, []string{"transfer"}, true},
+		{"scoped with a value_path", `{"event_name":"mint","comparison":"lt","threshold":1,"value_path":"amount"}`, []string{"mint"}, true},
+		{"no event_name judges every event", `{"comparison":"gt","threshold":100}`, nil, false},
+		{"empty event_name is no narrowing either", `{"event_name":"","comparison":"gt","threshold":100}`, nil, false},
+		{"malformed params", `{"comparison":`, nil, false},
+	}
+	for _, tt := range tests {
+		got, ok := (ValueThreshold{}).EventNames(json.RawMessage(tt.params))
+		if ok != tt.wantOK {
+			t.Errorf("%s: ok = %v, want %v", tt.name, ok, tt.wantOK)
+			continue
+		}
+		if tt.wantOK {
+			if len(got) != 1 || got[0] != tt.want[0] {
+				t.Errorf("%s: got %v, want %v", tt.name, got, tt.want)
+			}
+			continue
+		}
+		if got != nil {
+			t.Errorf("%s: got %v, want nil for a rule that cannot name its events", tt.name, got)
+		}
+	}
+}

@@ -68,8 +68,8 @@ type FaultConfig struct {
 // ReportSeedOnFailure should be called in a test's defer to print the seed
 // when a test fails, enabling reproduction.
 type Generator struct {
-	rng   *rand.Rand
-	seed  uint64
+	rng    *rand.Rand
+	seed   uint64
 	faults FaultConfig
 }
 
@@ -223,8 +223,8 @@ func (t *FaultyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 // slowReader wraps an io.ReadCloser and trickles bytes slowly.
 type slowReader struct {
-	body  io.ReadCloser
-	gen   *Generator
+	body   io.ReadCloser
+	gen    *Generator
 	closed bool
 }
 
@@ -258,11 +258,11 @@ func (s *slowReader) Close() error {
 
 // truncatedReader wraps an io.ReadCloser and cuts off at a random point.
 type truncatedReader struct {
-	body    io.ReadCloser
-	gen     *Generator
-	limit   int
-	read    int
-	closed  bool
+	body   io.ReadCloser
+	gen    *Generator
+	limit  int
+	read   int
+	closed bool
 }
 
 func newTruncatedReader(body io.ReadCloser, gen *Generator) *truncatedReader {

@@ -10,8 +10,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log/slog"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -71,6 +73,16 @@ type Alert struct {
 	// from a local one in the channels that key on the alert's identity: a
 	// forwarded alert has no local rule id to key on.
 	FederationOrigin string `json:"federation_origin,omitempty"`
+	// RunbookURL is the resolved http/https runbook link for this alert
+	// (rule -> monitor -> workspace default).
+	RunbookURL string `json:"runbook_url,omitempty"`
+	// ResponseGuidance is the resolved triage instruction note for this alert
+	// (rule -> monitor -> workspace default).
+	ResponseGuidance string `json:"response_guidance,omitempty"`
+
+	// esc escapes enrichment text for the channel rendering this alert. It is
+	// set by the channel just before rendering and is never serialised.
+	esc func(string) string
 }
 
 // Notifier sends one alert to one destination. Implementations should
@@ -98,6 +110,8 @@ type Factory struct {
 	constructors     map[string]Constructor
 	secrets          *secrets.Resolver
 	federationOrigin string
+	pushOnce         sync.Once
+	push             *pushShared
 }
 
 // Channel type names understood by DefaultFactory.
@@ -122,8 +136,10 @@ const (
 	TypeGoogleChat   = "googlechat"
 	TypeOpsgenie     = "opsgenie"
 	TypeGotify       = "gotify"
+	TypeTeams        = "teams"
 	TypeSNS          = "sns"
 	TypeJSONTemplate = "jsontemplate"
+	// TypePush is declared in push.go.
 )
 
 // DefaultFactory returns a Factory with the built-in channel types.
@@ -150,8 +166,10 @@ func DefaultFactory() *Factory {
 	f.Register(TypeGoogleChat, NewGoogleChat)
 	f.Register(TypeOpsgenie, NewOpsgenie)
 	f.Register(TypeGotify, NewGotify)
+	f.Register(TypeTeams, NewTeams)
 	f.Register(TypeSNS, NewSNS)
 	f.Register(TypeJSONTemplate, NewJSONTemplate)
+	f.Register(TypePush, f.newPush)
 	return f
 }
 
@@ -229,6 +247,10 @@ var defaultTemplate = template.Must(template.New("alert").Parse(strings.TrimSpac
 Rule: {{.RuleType}} (#{{.RuleID}})
 {{- if .ContractID}}
 Contract: {{.ContractID}}{{end}}
+{{- if .ContractLabel}}
+Label: {{.ContractLabel}} (from {{.EnrichmentSource}}{{if .EnrichmentStale}}, stale{{end}}; unverified){{end}}
+{{- if .PrimaryAmount}}
+Amount: {{.PrimaryAmount}}{{end}}
 {{- if .Silence}}
 No {{.EventName}} for {{.Silence}}
 {{- else if .EventName}}
@@ -239,6 +261,10 @@ Ledger: {{.Ledger}}{{end}}
 Tx: {{.TxHash}}{{end}}
 Event ID: {{.EventID}}
 At: {{.CreatedAt.UTC.Format "2006-01-02 15:04:05"}} UTC
+{{- if .RunbookURL}}
+Runbook: {{.RunbookURL}}{{end}}
+{{- if .ResponseGuidance}}
+Guidance: {{.ResponseGuidance}}{{end}}
 {{- if gt .GroupCount 0}}
 Group: {{.GroupCount}} alert(s) in window {{.WindowStart.UTC.Format "2006-01-02T15:04:05Z"}} to {{.WindowEnd.UTC.Format "2006-01-02T15:04:05Z"}}
 {{- end}}
@@ -346,6 +372,59 @@ func digestLine(a Alert) string {
 // The zero value means "no override": render then falls back to RenderText.
 type channelTemplate struct {
 	tpl *template.Template
+	// kind selects how enrichment text is escaped for this channel (see
+	// escapeFor); empty means plain text.
+	kind string
+}
+
+// EscapeSlackMrkdwn escapes &, <, and > per Slack's mrkdwn rules so untrusted
+// or operator-provided text cannot inject <!channel> mentions or link syntax.
+func EscapeSlackMrkdwn(s string) string {
+	r := strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+	)
+	return r.Replace(s)
+}
+
+// EscapeHTML escapes &, <, >, ", and ' for safe embedding in HTML bodies.
+func EscapeHTML(s string) string {
+	return html.EscapeString(s)
+}
+
+// EscapeJSONString returns s escaped as a JSON string body without surrounding
+// double quotes, suitable for interpolation inside a JSON template literal.
+func EscapeJSONString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil || len(b) < 2 {
+		return ""
+	}
+	return string(b[1 : len(b)-1])
+}
+
+// EscapeMarkdown escapes common Markdown formatting and link-control characters.
+func EscapeMarkdown(s string) string {
+	r := strings.NewReplacer(
+		`\`, `\\`,
+		"`", "\\`",
+		"*", `\*`,
+		"_", `\_`,
+		"[", `\[`,
+		"]", `\]`,
+		"(", `\(`,
+		")", `\)`,
+		"<", `&lt;`,
+		">", `&gt;`,
+	)
+	return r.Replace(s)
+}
+
+var channelTemplateFuncs = template.FuncMap{
+	"slackEscape":    EscapeSlackMrkdwn,
+	"htmlEscape":     EscapeHTML,
+	"jsonEscape":     EscapeJSONString,
+	"markdownEscape": EscapeMarkdown,
 }
 
 // parseChannelTemplate compiles a channel's optional template. An empty (or
@@ -355,7 +434,7 @@ func parseChannelTemplate(raw string) (channelTemplate, error) {
 	if strings.TrimSpace(raw) == "" {
 		return channelTemplate{}, nil
 	}
-	tpl, err := template.New("alert").Parse(raw)
+	tpl, err := template.New("alert").Funcs(channelTemplateFuncs).Parse(raw)
 	if err != nil {
 		return channelTemplate{}, fmt.Errorf("invalid template: %w", err)
 	}
@@ -372,6 +451,7 @@ func (t channelTemplate) render(a Alert) (string, error) {
 	if a.Digest != "" {
 		return a.Digest, nil
 	}
+	a.esc = escapeFor(t.kind)
 	if t.tpl == nil {
 		return RenderText(a)
 	}

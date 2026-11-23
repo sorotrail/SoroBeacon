@@ -3,6 +3,7 @@
 package config
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/secrets"
 )
 
@@ -44,6 +46,12 @@ const (
 	// Stellar and a few getLedgers pages per cycle — cheap, and deep enough
 	// to cover the practical reorg depth.
 	DefaultReorgTrackingWindow uint32 = 128
+	// DefaultHeartbeatInterval is how often a healthy instance pings
+	// HEARTBEAT_URL when HEARTBEAT_INTERVAL is unset. It must stay
+	// comfortably longer than the poll interval: the ping is sent only
+	// when a new successful poll appeared since the last check, so an
+	// interval at or below the poll cycle would read as no progress.
+	DefaultHeartbeatInterval = time.Minute
 	// DefaultGraphQLMaxDepth is the maximum query depth for GraphQL.
 	// DefaultGraphQLMaxComplexity is the maximum query complexity for GraphQL.
 	DefaultGraphQLMaxDepth      = 10
@@ -168,6 +176,23 @@ type Config struct {
 	// ReadyzLagThreshold is the ledger lag at which /readyz fails.
 	// Zero (the default) disables the check so existing probes stay green.
 	ReadyzLagThreshold uint32
+	// HeartbeatURL enables the external dead-man's switch: when set, the
+	// leader pings this URL while ingest is demonstrably healthy
+	// (HEARTBEAT_URL). The URL is a credential — its path identifies the
+	// monitor to the external service — so it is never logged, never
+	// printed in LogAttrs, and never included in an error message.
+	HeartbeatURL string
+	// HeartbeatInterval is how often the health of ingest is re-evaluated
+	// (HEARTBEAT_INTERVAL); DefaultHeartbeatInterval when unset, and Load
+	// rejects a value at or below PollInterval because a heartbeat faster
+	// than the poll cycle could never observe new progress.
+	HeartbeatInterval time.Duration
+	// HeartbeatFailureSuffix, when set, enables one failure ping per
+	// outage to HeartbeatURL+suffix (HEARTBEAT_FAILURE_SUFFIX, e.g.
+	// "/fail" — the convention Healthchecks.io and most other
+	// dead-man's-switch services use). Unset means success pings only:
+	// the external service notices the silence itself.
+	HeartbeatFailureSuffix string
 	// RateLimitRPS is the per-client API token-bucket refill rate.
 	// Zero (default) disables the limiter.
 	RateLimitRPS float64
@@ -182,6 +207,11 @@ type Config struct {
 	// are kept. Zero (the default, when ALERT_RETENTION is unset) keeps
 	// everything forever so upgrades never start deleting history.
 	AlertRetention time.Duration
+	// AuditRetention is how long administrative audit_log records are kept
+	// (AUDIT_RETENTION). It is configured separately from ALERT_RETENTION
+	// because audit records and alerts age under different operational and
+	// compliance policies. Zero (the default) keeps audit records forever.
+	AuditRetention time.Duration
 	// AlertEnrichmentURL is an optional operator-supplied HTTP JSON source.
 	AlertEnrichmentURL      string
 	AlertEnrichmentTimeout  time.Duration
@@ -268,6 +298,25 @@ type Config struct {
 	// channel types without a specific limit (NOTIFY_RATE_LIMIT_DEFAULT_RPS).
 	// Zero keeps the built-in notifier default; see notify.RateLimits.
 	NotifyRateLimitDefaultRPS float64
+
+	// Server TLS / mTLS (HTTP API + dashboard + gRPC server).
+	TLSCertFile     string
+	TLSKeyFile      string
+	TLSClientCAFile string
+	TLSClientAuth   string
+	MTLSBindings    []auth.MTLSBinding
+
+	// Upstream SoroTrail client TLS / mTLS.
+	SoroTrailTLSCertFile   string
+	SoroTrailTLSKeyFile    string
+	SoroTrailTLSCAFile     string
+	SoroTrailTLSServerName string
+
+	// Database client TLS / mTLS (PostgreSQL).
+	DatabaseSSLMode         string
+	DatabaseSSLCertFile     string
+	DatabaseSSLKeyFile      string
+	DatabaseSSLRootCertFile string
 }
 
 // OTLPConfig is the tracing slice of the configuration. It is a struct so a
@@ -298,6 +347,8 @@ type GraphQLConfig struct {
 	MaxDepth int
 	// MaxComplexity limits the maximum query complexity. Default 1000.
 	MaxComplexity int
+	// AllowlistOnly requires all executed queries to match registered persisted operations. Default false.
+	AllowlistOnly bool
 }
 
 // PlaygroundEnabled reports whether the interactive playground is served.
@@ -333,6 +384,15 @@ func (p *problemList) add(field string, err error) {
 	p.list = append(p.list, Problem{Field: field, Reason: err.Error()})
 }
 
+func (p *problemList) has(field string) bool {
+	for _, pr := range p.list {
+		if pr.Field == field {
+			return true
+		}
+	}
+	return false
+}
+
 // Load reads configuration from the environment and, optionally, a YAML file
 // pointed to by CONFIG_FILE. Environment values win over the file, and the file
 // wins over defaults so a checked-in config stays sane while emergency
@@ -366,6 +426,31 @@ func LoadProblems() (Config, []Problem) {
 		return Config{}, []Problem{{Field: "CONFIG_FILE", Reason: err.Error()}}
 	}
 
+	var secretsCfg Config
+	if err := loadSecrets(&secretsCfg, fileValues); err != nil {
+		ps.add("SECRETS_PROVIDER", err)
+	}
+	secretResolver := BuildResolver(secretsCfg)
+
+	lookupSecret := func(key string) string {
+		raw := lookupConfigValue(key, fileValues)
+		if !secrets.IsReference(raw) {
+			return raw
+		}
+		if secretResolver == nil {
+			ps.add(key, fmt.Errorf("cannot resolve secret reference %s for %s: SECRETS_PROVIDER is not configured", raw, key))
+			return ""
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		val, err := secretResolver.ResolveString(ctx, raw)
+		if err != nil {
+			ps.add(key, fmt.Errorf("resolve %s secret reference %s: %w", key, raw, err))
+			return ""
+		}
+		return val
+	}
+
 	nets, err := ParseNetworks(func(key string) string {
 		return lookupConfigValue(key, fileValues)
 	})
@@ -382,9 +467,10 @@ func LoadProblems() (Config, []Problem) {
 		Networks:           nets,
 		RPCURL:             net.RPCURL,
 		RPCURLs:            net.RPCURLs,
-		DatabaseURL:        lookupConfigValue("DATABASE_URL", fileValues),
+		DatabaseURL:        lookupSecret("DATABASE_URL"),
 		InstanceName:       strings.TrimSpace(lookupConfigValue("INSTANCE_NAME", fileValues)),
 		PollInterval:       DefaultPollInterval,
+		HeartbeatInterval:  DefaultHeartbeatInterval,
 		HTTPAddr:           valueOrFallback("HTTP_ADDR", fileValues, DefaultHTTPAddr),
 		HTTPMaxBodyBytes:   DefaultHTTPMaxBodyBytes,
 		LogLevel:           slog.LevelInfo,
@@ -399,10 +485,17 @@ func LoadProblems() (Config, []Problem) {
 		// alerts exactly as soon as it did before this feature.
 		ReorgTrackingWindow:    DefaultReorgTrackingWindow,
 		ReorgConfirmationDepth: 0,
+		SecretsProvider:        secretsCfg.SecretsProvider,
+		SecretsCacheTTL:        secretsCfg.SecretsCacheTTL,
+		VaultAddr:              secretsCfg.VaultAddr,
+		VaultToken:             secretsCfg.VaultToken,
+		VaultNamespace:         secretsCfg.VaultNamespace,
 	}
 
-	if err := validateDatabaseURL(cfg.DatabaseURL); err != nil {
-		ps.add("DATABASE_URL", err)
+	if !ps.has("DATABASE_URL") {
+		if err := validateDatabaseURL(cfg.DatabaseURL); err != nil {
+			ps.add("DATABASE_URL", err)
+		}
 	}
 	// The pool knobs below are Postgres-only. Knowing the backend here lets
 	// Load fail loudly when a SQLite deployment carries them instead of
@@ -466,17 +559,23 @@ func LoadProblems() (Config, []Problem) {
 		}
 	}
 
-	tokens, err := parseAPITokens(lookupConfigValue("API_TOKEN", fileValues))
-	if err != nil {
-		ps.add("API_TOKEN", err)
+	rawAPITokens := lookupSecret("API_TOKEN")
+	if !ps.has("API_TOKEN") {
+		tokens, err := parseAPITokens(rawAPITokens)
+		if err != nil {
+			ps.add("API_TOKEN", err)
+		}
+		cfg.APITokens = tokens
 	}
-	cfg.APITokens = tokens
 
-	bound, err := parseWorkspaceTokens(lookupConfigValue("WORKSPACE_TOKENS", fileValues))
-	if err != nil {
-		ps.add("WORKSPACE_TOKENS", err)
+	rawWSTokens := lookupSecret("WORKSPACE_TOKENS")
+	if !ps.has("WORKSPACE_TOKENS") {
+		bound, err := parseWorkspaceTokens(rawWSTokens)
+		if err != nil {
+			ps.add("WORKSPACE_TOKENS", err)
+		}
+		cfg.WorkspaceTokens = bound
 	}
-	cfg.WorkspaceTokens = bound
 	// A token that names two workspaces is rejected at startup, not at the
 	// first request: resolution would otherwise depend on which configured
 	// entry the comparison happened to hit, which is the one failure mode
@@ -486,7 +585,7 @@ func LoadProblems() (Config, []Problem) {
 	}
 
 	oidc, err := parseOIDC(func(key string) string {
-		return lookupConfigValue(key, fileValues)
+		return lookupSecret(key)
 	})
 	if err != nil {
 		ps.add("OIDC_ISSUER", err)
@@ -518,6 +617,41 @@ func LoadProblems() (Config, []Problem) {
 		} else {
 			cfg.ReadyzLagThreshold = uint32(n)
 		}
+	}
+	// Heartbeat. The URL is parsed only to validate its shape: it is a
+	// credential, so neither it nor anything derived from it is ever
+	// echoed back in an error. It is validated after POLL_INTERVAL (which
+	// is parsed above) because the interval comparison depends on it.
+	if v := lookupSecret("HEARTBEAT_URL"); v != "" {
+		if !ps.has("HEARTBEAT_URL") {
+			u, err := url.Parse(v)
+			if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+				ps.add("HEARTBEAT_URL", fmt.Errorf("invalid HEARTBEAT_URL: want an http(s) URL with a host (the URL itself is not printed because its path is a credential)"))
+			} else {
+				cfg.HeartbeatURL = v
+			}
+		}
+	}
+	if v := lookupConfigValue("HEARTBEAT_INTERVAL", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			ps.add("HEARTBEAT_INTERVAL", fmt.Errorf("invalid HEARTBEAT_INTERVAL %q (want a positive duration like 30s or 5m)", v))
+		} else {
+			cfg.HeartbeatInterval = d
+		}
+	}
+	if v := lookupConfigValue("HEARTBEAT_FAILURE_SUFFIX", fileValues); v != "" {
+		if !strings.HasPrefix(v, "/") {
+			ps.add("HEARTBEAT_FAILURE_SUFFIX", fmt.Errorf("invalid HEARTBEAT_FAILURE_SUFFIX %q (want a path suffix starting with /, like /fail)", v))
+		} else {
+			cfg.HeartbeatFailureSuffix = v
+		}
+	}
+	if cfg.HeartbeatFailureSuffix != "" && cfg.HeartbeatURL == "" {
+		ps.add("HEARTBEAT_FAILURE_SUFFIX", fmt.Errorf("HEARTBEAT_FAILURE_SUFFIX %q is set but HEARTBEAT_URL is not: there is no endpoint to fail", cfg.HeartbeatFailureSuffix))
+	}
+	if cfg.HeartbeatURL != "" && cfg.HeartbeatInterval <= cfg.PollInterval {
+		ps.add("HEARTBEAT_INTERVAL", fmt.Errorf("HEARTBEAT_INTERVAL %s must be longer than POLL_INTERVAL %s: a ping is sent only when a new successful poll appeared since the last check, so a heartbeat at or below the poll interval would read as no progress", cfg.HeartbeatInterval, cfg.PollInterval))
 	}
 	if v := lookupConfigValue("RATE_LIMIT_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
@@ -643,24 +777,29 @@ func LoadProblems() (Config, []Problem) {
 	// sets REPLICA_DATABASE_URL believes reads are being routed, and a
 	// deployment that silently serves everything from the primary while
 	// claiming otherwise is worse than one that refuses to boot.
-	replicaURL := strings.TrimSpace(lookupConfigValue("REPLICA_DATABASE_URL", fileValues))
+	replicaURL := strings.TrimSpace(lookupSecret("REPLICA_DATABASE_URL"))
 	switch {
 	case sqliteBackend && replicaURL != "":
 		ps.add("REPLICA_DATABASE_URL", fmt.Errorf("REPLICA_DATABASE_URL has no effect on a sqlite DATABASE_URL: SQLite serves reads and writes from one file; unset it or use Postgres"))
 	case replicaURL != "":
-		if err := validateReplicaDatabaseURL(replicaURL, cfg.DatabaseURL); err != nil {
-			ps.add("REPLICA_DATABASE_URL", err)
-		} else {
-			cfg.ReplicaDatabaseURL = replicaURL
+		if !ps.has("REPLICA_DATABASE_URL") {
+			if err := validateReplicaDatabaseURL(replicaURL, cfg.DatabaseURL); err != nil {
+				ps.add("REPLICA_DATABASE_URL", err)
+			} else {
+				cfg.ReplicaDatabaseURL = replicaURL
+			}
 		}
 	default:
 		cfg.ReplicaDatabaseURL = replicaURL
 	}
-	key, err := parseEncryptionKey(lookupConfigValue("CONFIG_ENCRYPTION_KEY", fileValues))
-	if err != nil {
-		ps.add("CONFIG_ENCRYPTION_KEY", err)
+	rawEncKey := lookupSecret("CONFIG_ENCRYPTION_KEY")
+	if !ps.has("CONFIG_ENCRYPTION_KEY") {
+		key, err := parseEncryptionKey(rawEncKey)
+		if err != nil {
+			ps.add("CONFIG_ENCRYPTION_KEY", err)
+		}
+		cfg.ConfigEncryptionKey = key
 	}
-	cfg.ConfigEncryptionKey = key
 	grpcAddr := lookupConfigValue("GRPC_ADDR", fileValues)
 	if grpcAddr != "" {
 		if err := validateHTTPAddr(grpcAddr); err != nil {
@@ -676,6 +815,14 @@ func LoadProblems() (Config, []Problem) {
 			ps.add("ALERT_RETENTION", fmt.Errorf("invalid ALERT_RETENTION %q: %w", v, err))
 		} else {
 			cfg.AlertRetention = d
+		}
+	}
+	if v := lookupConfigValue("AUDIT_RETENTION", fileValues); v != "" {
+		d, err := ParseRetention(v)
+		if err != nil {
+			ps.add("AUDIT_RETENTION", fmt.Errorf("invalid AUDIT_RETENTION %q: %w", v, err))
+		} else {
+			cfg.AuditRetention = d
 		}
 	}
 	if v := lookupConfigValue("FLAPPING_EPISODES", fileValues); v != "" {
@@ -702,7 +849,7 @@ func LoadProblems() (Config, []Problem) {
 			cfg.FlappingQuietAfter = d
 		}
 	}
-	cfg.AlertEnrichmentURL = strings.TrimSpace(lookupConfigValue("ALERT_ENRICHMENT_URL", fileValues))
+	cfg.AlertEnrichmentURL = strings.TrimSpace(lookupSecret("ALERT_ENRICHMENT_URL"))
 	cfg.AlertEnrichmentTimeout = 2 * time.Second
 	cfg.AlertEnrichmentCacheTTL = 5 * time.Minute
 	if v := lookupConfigValue("ALERT_ENRICHMENT_TIMEOUT", fileValues); v != "" {
@@ -795,6 +942,17 @@ func LoadProblems() (Config, []Problem) {
 			cfg.GraphQL.MaxComplexity = n
 		}
 	}
+	cfg.GraphQL.AllowlistOnly = false
+	if v := lookupConfigValue("GRAPHQL_ALLOWLIST_ONLY", fileValues); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			cfg.GraphQL.AllowlistOnly = true
+		case "0", "false", "no", "off":
+			cfg.GraphQL.AllowlistOnly = false
+		default:
+			ps.add("GRAPHQL_ALLOWLIST_ONLY", fmt.Errorf("invalid GRAPHQL_ALLOWLIST_ONLY %q (want true|false)", v))
+		}
+	}
 
 	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_SLACK_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
@@ -829,9 +987,7 @@ func LoadProblems() (Config, []Problem) {
 		}
 	}
 
-	if err := loadSecrets(&cfg, fileValues); err != nil {
-		ps.add("SECRETS_PROVIDER", err)
-	}
+	loadMTLS(&cfg, fileValues, sqliteBackend, &ps)
 
 	return cfg, ps.list
 }
@@ -844,10 +1000,18 @@ func LoadProblems() (Config, []Problem) {
 // one: environment first, config file as the fallback.
 func loadSecrets(cfg *Config, fileValues map[string]string) error {
 	cfg.SecretsProvider = strings.ToLower(strings.TrimSpace(lookupConfigValue("SECRETS_PROVIDER", fileValues)))
-	switch cfg.SecretsProvider {
-	case "", "env", "vault":
-	default:
-		return fmt.Errorf("invalid SECRETS_PROVIDER %q (want env|vault, or unset to disable external secrets)", cfg.SecretsProvider)
+	hasVault := false
+	if cfg.SecretsProvider != "" {
+		for _, rawP := range strings.Split(cfg.SecretsProvider, ",") {
+			p := strings.TrimSpace(rawP)
+			switch p {
+			case "env", "file":
+			case "vault", "all":
+				hasVault = true
+			default:
+				return fmt.Errorf("invalid SECRETS_PROVIDER %q (want env|vault|file, or unset to disable external secrets)", cfg.SecretsProvider)
+			}
+		}
 	}
 
 	cfg.SecretsCacheTTL = secrets.DefaultTTL
@@ -865,10 +1029,44 @@ func loadSecrets(cfg *Config, fileValues map[string]string) error {
 	cfg.VaultAddr = strings.TrimRight(strings.TrimSpace(lookupConfigValue("VAULT_ADDR", fileValues)), "/")
 	cfg.VaultToken = lookupConfigValue("VAULT_TOKEN", fileValues)
 	cfg.VaultNamespace = strings.TrimSpace(lookupConfigValue("VAULT_NAMESPACE", fileValues))
-	if cfg.SecretsProvider == "vault" && cfg.VaultAddr == "" {
-		return fmt.Errorf("VAULT_ADDR is required when SECRETS_PROVIDER=vault")
+	if hasVault && cfg.VaultAddr == "" {
+		return fmt.Errorf("VAULT_ADDR is required when SECRETS_PROVIDER includes vault")
 	}
 	return nil
+}
+
+// BuildResolver returns a secrets.Resolver built from cfg.SecretsProvider.
+// It returns nil when external secrets are disabled.
+func BuildResolver(cfg Config) *secrets.Resolver {
+	if cfg.SecretsProvider == "" {
+		return nil
+	}
+	r := secrets.NewResolver()
+	registered := 0
+	for _, rawP := range strings.Split(cfg.SecretsProvider, ",") {
+		switch strings.TrimSpace(rawP) {
+		case "env":
+			r.Register(secrets.NewEnvProvider())
+			registered++
+		case "file":
+			r.Register(secrets.NewFileProvider())
+			registered++
+		case "vault":
+			r.Register(secrets.NewVaultProvider(cfg.VaultAddr, cfg.VaultToken, cfg.VaultNamespace))
+			registered++
+		case "all":
+			r.Register(secrets.NewEnvProvider())
+			r.Register(secrets.NewFileProvider())
+			if cfg.VaultAddr != "" {
+				r.Register(secrets.NewVaultProvider(cfg.VaultAddr, cfg.VaultToken, cfg.VaultNamespace))
+			}
+			registered++
+		}
+	}
+	if registered == 0 {
+		return nil
+	}
+	return r.WithTTL(cfg.SecretsCacheTTL)
 }
 
 func valueOrFallback(key string, fileValues map[string]string, fallback string) string {
@@ -941,6 +1139,12 @@ func (c Config) LogAttrs() []slog.Attr {
 		slog.String("http_addr", c.HTTPAddr),
 		slog.String("source_mode", c.SourceMode),
 		slog.String("poll_interval", c.PollInterval.String()),
+		// On/off, the interval and whether failure pings are configured —
+		// never the URL: its path is the credential the external service
+		// keys on, and LogAttrs is the one place configuration is printed.
+		slog.Bool("heartbeat_enabled", c.HeartbeatURL != ""),
+		slog.String("heartbeat_interval", c.HeartbeatInterval.String()),
+		slog.Bool("heartbeat_failure_pings", c.HeartbeatFailureSuffix != ""),
 		slog.String("log_level", strings.ToLower(c.LogLevel.String())),
 		slog.String("network", c.Network.Name),
 		slog.String("rpc_url", redactURLCredentials(c.RPCURL)),
@@ -973,6 +1177,7 @@ func (c Config) LogAttrs() []slog.Attr {
 		slog.Bool("graphql_playground_enabled", c.GraphQL.EnablePlayground),
 		slog.Int("graphql_max_depth", c.GraphQL.MaxDepth),
 		slog.Int("graphql_max_complexity", c.GraphQL.MaxComplexity),
+		slog.Bool("graphql_allowlist_only", c.GraphQL.AllowlistOnly),
 		slog.Int("channel_disable_after_failures", c.ChannelDisableAfterFailures),
 	}
 }

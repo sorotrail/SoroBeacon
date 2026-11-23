@@ -188,7 +188,7 @@ func TestTopicPositionValidate(t *testing.T) {
 		{name: "valid position and equals", params: `{"position": 2, "equals": "POOL_USDC_XLM"}`},
 		{name: "position 0 is valid", params: `{"position": 0, "equals": "deposit"}`},
 		{name: "optional event accepted", params: `{"position": 2, "equals": "POOL_USDC_XLM", "event": "deposit"}`},
-		{name: "missing position defaults to 0, the event-name topic", params: `{"equals": "deposit"}`},
+		{name: "missing position is rejected", params: `{"equals": "deposit"}`, wantErr: true, wantSub: "position is required"},
 		{name: "negative position", params: `{"position": -1, "equals": "x"}`, wantErr: true, wantSub: "negative"},
 		{name: "missing equals", params: `{"position": 2}`, wantErr: true, wantSub: "equals is required"},
 		{name: "empty equals", params: `{"position": 2, "equals": ""}`, wantErr: true, wantSub: "equals is required"},

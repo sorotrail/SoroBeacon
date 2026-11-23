@@ -59,6 +59,8 @@ The file is a convenience for operators; do not put secrets in it unless you hav
 | `HTTP_ADDR` | `:8080` | Listen address for the API and dashboard. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` (structured JSON via `log/slog`). |
 | `READYZ_LAG_THRESHOLD` | `0` (disabled) | Fail `/readyz` when poller ledger lag (chain tip minus last processed ledger) exceeds this. Unset or `0` leaves existing probes unchanged. |
+| `HEARTBEAT_URL` | unset (off) | External dead-man's switch: while ingest is demonstrably healthy the leader pings this URL (once per `HEARTBEAT_INTERVAL`, default `1m`); the external service alerts when the pings stop. The URL is a credential and is never logged. Must be longer than `POLL_INTERVAL`. |
+| `HEARTBEAT_FAILURE_SUFFIX` | unset (success pings only) | When set (e.g. `/fail`), one failure ping per outage goes to `HEARTBEAT_URL` plus this suffix. Requires `HEARTBEAT_URL`. |
 | `ALERT_RETENTION` | unset (keep forever) | Age after which alerts are deleted in batches of 1000 (`90d`, `24h`, …). `delivery_attempts` follow via `ON DELETE CASCADE`. Unset preserves current behaviour: nothing is pruned. |
 
 ## Where secrets live

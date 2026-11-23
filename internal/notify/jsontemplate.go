@@ -50,7 +50,7 @@ func NewJSONTemplate(config json.RawMessage) (Notifier, error) {
 		return nil, errors.New("jsontemplate: body_template is required")
 	}
 
-	tmpl, err := template.New("body_template").Parse(cfg.BodyTemplate)
+	tmpl, err := template.New("body_template").Funcs(channelTemplateFuncs).Parse(cfg.BodyTemplate)
 	if err != nil {
 		return nil, fmt.Errorf("jsontemplate: invalid body_template: %w", err)
 	}

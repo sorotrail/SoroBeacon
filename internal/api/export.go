@@ -21,6 +21,10 @@ func (s *Server) exportAlertsNDJSON(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	include, ok := parseIncludeArchived(w, r)
+	if !ok {
+		return
+	}
 	if f.Limit <= 0 || f.Limit > maxAlertExportRows {
 		f.Limit = maxAlertExportRows
 	}
@@ -38,6 +42,11 @@ func (s *Server) exportAlertsNDJSON(w http.ResponseWriter, r *http.Request) {
 		names[m.ID] = m.Name
 	}
 
+	prunedBefore, policySource := s.workspaceRetentionHorizon(r.Context())
+	setRetentionHorizonHeaders(w, prunedBefore, policySource)
+	trailers := s.beginTruncationReport(r.Context(), w, f, include)
+	var tr alertTruncation
+	defer func() { endTruncationReport(w, trailers, tr) }()
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Request-ID", reqid.From(r))
@@ -52,7 +61,7 @@ func (s *Server) exportAlertsNDJSON(w http.ResponseWriter, r *http.Request) {
 	count := 0
 	flushEvery := alertExportPageSize
 
-	err = s.store.ListAlertsStream(r.Context(), f, func(a store.Alert) error {
+	err = s.exportAlertRows(r.Context(), f, include, &tr, func(a store.Alert) error {
 		line := exportAlertNDJSONRow(a, names[a.MonitorID])
 		b, err := json.Marshal(line)
 		if err != nil {

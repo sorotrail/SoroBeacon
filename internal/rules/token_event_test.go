@@ -144,3 +144,69 @@ func BenchmarkTokenEvent(b *testing.B) {
 		})
 	}
 }
+
+// TestTokenEventEventNames pins the answers the poller narrows on: one event
+// names one event, the wildcard expands to every SEP-41 event the layout
+// knows (never a subset), and an empty event cannot be narrowed at all.
+func TestTokenEventEventNames(t *testing.T) {
+	allSEP41 := []string{"transfer", "mint", "burn", "clawback", "set_admin"}
+
+	t.Run("one event", func(t *testing.T) {
+		got, ok := (TokenEvent{}).EventNames(json.RawMessage(`{"event":"burn"}`))
+		if !ok {
+			t.Fatal("ok = false, want true for a rule scoped to one event")
+		}
+		if len(got) != 1 || got[0] != "burn" {
+			t.Fatalf("got %v, want [burn]", got)
+		}
+	})
+
+	t.Run("wildcard expands to every SEP-41 event", func(t *testing.T) {
+		got, ok := (TokenEvent{}).EventNames(json.RawMessage(`{"event":"*"}`))
+		if !ok {
+			t.Fatal("ok = false, want true for a wildcard rule")
+		}
+		if len(got) != len(allSEP41) {
+			t.Fatalf("got %v, want all %d SEP-41 events", got, len(allSEP41))
+		}
+		seen := map[string]bool{}
+		for _, n := range got {
+			seen[n] = true
+		}
+		for _, n := range allSEP41 {
+			if !seen[n] {
+				t.Errorf("wildcard dropped %q: a filter on these names would never fetch it", n)
+			}
+		}
+	})
+
+	t.Run("empty event cannot be narrowed", func(t *testing.T) {
+		for _, params := range []string{`{}`, `{"event":""}`} {
+			got, ok := (TokenEvent{}).EventNames(json.RawMessage(params))
+			if ok || got != nil {
+				t.Errorf("EventNames(%s) = %v, %v; want nil, false", params, got, ok)
+			}
+		}
+	})
+
+	// Validate rejects an unknown event at create time, so the shape only
+	// reaches EventNames through a rule written before a rename. Naming it is
+	// safe: the rule can never match, so a filter that fetches nothing for it
+	// loses nothing.
+	t.Run("unknown event names itself", func(t *testing.T) {
+		got, ok := (TokenEvent{}).EventNames(json.RawMessage(`{"event":"not_a_sep41_event"}`))
+		if !ok {
+			t.Fatal("ok = false, want true")
+		}
+		if len(got) != 1 || got[0] != "not_a_sep41_event" {
+			t.Fatalf("got %v, want the configured name back", got)
+		}
+	})
+
+	t.Run("malformed params", func(t *testing.T) {
+		got, ok := (TokenEvent{}).EventNames(json.RawMessage(`{"event":`))
+		if ok || got != nil {
+			t.Errorf("EventNames(malformed) = %v, %v; want nil, false", got, ok)
+		}
+	})
+}

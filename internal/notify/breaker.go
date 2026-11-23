@@ -119,3 +119,13 @@ func (r *BreakerRegistry) Get(channelID int64) *ChannelBreaker {
 	}
 	return cb
 }
+
+// Remove deletes the circuit breaker state for a channel that has been deleted.
+func (r *BreakerRegistry) Remove(channelID int64) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	delete(r.breakers, channelID)
+	r.mu.Unlock()
+}

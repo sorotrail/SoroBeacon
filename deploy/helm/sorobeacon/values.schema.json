@@ -1,12 +1,24 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "type": "object",
-  "required": ["database"],
+  "required": [
+    "database"
+  ],
   "properties": {
     "replicaCount": {
       "type": "integer",
       "minimum": 0,
-      "description": "Number of pod replicas."
+      "description": "Number of API (or combined) pod replicas."
+    },
+    "minReadySeconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Minimum seconds a newly ready pod must stay healthy before rolling updates advance."
+    },
+    "terminationGracePeriodSeconds": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Pod termination grace period in seconds. Must exceed config.shutdownGracePeriod so in-flight deliveries and SSE streams finish cleanly."
     },
     "image": {
       "type": "object",
@@ -18,7 +30,11 @@
         },
         "pullPolicy": {
           "type": "string",
-          "enum": ["Always", "IfNotPresent", "Never"],
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ],
           "description": "Image pull policy."
         },
         "tag": {
@@ -33,7 +49,9 @@
       "items": {
         "type": "object",
         "properties": {
-          "name": { "type": "string" }
+          "name": {
+            "type": "string"
+          }
         },
         "additionalProperties": false
       },
@@ -82,7 +100,11 @@
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["ClusterIP", "NodePort", "LoadBalancer"],
+          "enum": [
+            "ClusterIP",
+            "NodePort",
+            "LoadBalancer"
+          ],
           "description": "Kubernetes Service type."
         },
         "port": {
@@ -107,16 +129,24 @@
         "requests": {
           "type": "object",
           "properties": {
-            "cpu": { "type": "string" },
-            "memory": { "type": "string" }
+            "cpu": {
+              "type": "string"
+            },
+            "memory": {
+              "type": "string"
+            }
           },
           "additionalProperties": false
         },
         "limits": {
           "type": "object",
           "properties": {
-            "cpu": { "type": "string" },
-            "memory": { "type": "string" }
+            "cpu": {
+              "type": "string"
+            },
+            "memory": {
+              "type": "string"
+            }
           },
           "additionalProperties": false
         }
@@ -135,13 +165,183 @@
       "type": "object",
       "description": "Affinity rules for pod scheduling."
     },
+    "podAntiAffinity": {
+      "type": "object",
+      "description": "Opt-in pod anti-affinity rules for spreading replicas across hosts.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "soft",
+            "hard"
+          ]
+        },
+        "topologyKey": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "autoscaling": {
+      "type": "object",
+      "description": "HorizontalPodAutoscaler settings for the stateless API Deployment.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "minReplicas": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxReplicas": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "targetMemoryUtilizationPercentage": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 100
+        },
+        "targetCPUUtilizationPercentage": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 100
+        },
+        "customMetrics": {
+          "type": "array"
+        },
+        "behavior": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "description": "PodDisruptionBudget settings for the API Deployment.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "minAvailable": {
+          "type": [
+            "integer",
+            "string",
+            "null"
+          ]
+        },
+        "maxUnavailable": {
+          "type": [
+            "integer",
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "worker": {
+      "type": "object",
+      "description": "Dedicated background worker Deployment settings (bounded by the Postgres leader lease).",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "minReadySeconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "podAnnotations": {
+          "type": "object"
+        },
+        "resources": {
+          "type": "object"
+        },
+        "nodeSelector": {
+          "type": "object"
+        },
+        "tolerations": {
+          "type": "array"
+        },
+        "affinity": {
+          "type": "object"
+        },
+        "podAntiAffinity": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "soft",
+                "hard"
+              ]
+            },
+            "topologyKey": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "podDisruptionBudget": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "minAvailable": {
+              "type": [
+                "integer",
+                "string",
+                "null"
+              ]
+            },
+            "maxUnavailable": {
+              "type": [
+                "integer",
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
     "config": {
       "type": "object",
       "description": "Non-secret application configuration, rendered into a ConfigMap.",
       "properties": {
         "network": {
           "type": "string",
-          "enum": ["testnet", "mainnet", "futurenet", "custom"],
+          "enum": [
+            "testnet",
+            "mainnet",
+            "futurenet",
+            "custom"
+          ],
           "description": "Stellar network to monitor."
         },
         "rpcUrl": {
@@ -155,7 +355,10 @@
         },
         "sourceMode": {
           "type": "string",
-          "enum": ["rpc", "sorotrail"],
+          "enum": [
+            "rpc",
+            "sorotrail"
+          ],
           "description": "Where events come from."
         },
         "sorotrailUrl": {
@@ -183,7 +386,12 @@
         },
         "logLevel": {
           "type": "string",
-          "enum": ["debug", "info", "warn", "error"],
+          "enum": [
+            "debug",
+            "info",
+            "warn",
+            "error"
+          ],
           "description": "Minimum slog level."
         },
         "monitorSilentAfter": {
@@ -214,6 +422,18 @@
           "minimum": 0,
           "description": "Ledger lag at which /readyz fails. 0 disables the check."
         },
+        "heartbeatUrl": {
+          "type": "string",
+          "description": "External dead-man's-switch endpoint (HEARTBEAT_URL). Treated as a credential by the application and never logged. Empty disables the heartbeat."
+        },
+        "heartbeatInterval": {
+          "type": "string",
+          "description": "How often a healthy instance pings (HEARTBEAT_INTERVAL, Go duration). Must be longer than pollInterval. Empty uses the application default (1m)."
+        },
+        "heartbeatFailureSuffix": {
+          "type": "string",
+          "description": "Path suffix for the one-per-outage failure ping (HEARTBEAT_FAILURE_SUFFIX), e.g. /fail. Requires heartbeatUrl; empty means success pings only."
+        },
         "networks": {
           "type": "string",
           "description": "NETWORKS: comma-separated chains to poll, primary first. Empty means the single chain NETWORK names."
@@ -235,8 +455,16 @@
         },
         "rateLimitTrustForwarded": {
           "anyOf": [
-            { "type": "boolean" },
-            { "type": "string", "enum": ["true", "false"] }
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "string",
+              "enum": [
+                "true",
+                "false"
+              ]
+            }
           ],
           "description": "Key clients by X-Forwarded-For. Only behind a trusted proxy."
         },
@@ -247,6 +475,10 @@
         "alertRetention": {
           "type": "string",
           "description": "How long to keep alerts, e.g. 90d or 24h. Empty keeps history forever."
+        },
+        "auditRetention": {
+          "type": "string",
+          "description": "How long to keep audit log entries, e.g. 90d or 24h. Empty keeps history forever."
         },
         "configFile": {
           "type": "string",
@@ -267,6 +499,10 @@
         "graphqlMaxComplexity": {
           "type": "string",
           "description": "GraphQL query complexity ceiling (1-10000). Empty uses the application default."
+        },
+        "graphqlAllowlistOnly": {
+          "type": "boolean",
+          "description": "Require all executed GraphQL queries to match registered persisted operations."
         },
         "rpcUrls": {
           "type": "string",
@@ -336,12 +572,24 @@
       "description": "External Postgres connection. Either url or existingSecret must be set.",
       "anyOf": [
         {
-          "properties": { "url": { "minLength": 1 } },
-          "required": ["url"]
+          "properties": {
+            "url": {
+              "minLength": 1
+            }
+          },
+          "required": [
+            "url"
+          ]
         },
         {
-          "properties": { "existingSecret": { "minLength": 1 } },
-          "required": ["existingSecret"]
+          "properties": {
+            "existingSecret": {
+              "minLength": 1
+            }
+          },
+          "required": [
+            "existingSecret"
+          ]
         }
       ],
       "properties": {
@@ -390,6 +638,26 @@
           "type": "string",
           "minLength": 1,
           "description": "Base delay between startup connection attempts (Go duration), doubled after every failure with jitter. Defaults to 2s."
+        },
+        "sslMode": {
+          "type": "string",
+          "description": "DATABASE_SSL_MODE: disable, allow, prefer, require, verify-ca, or verify-full."
+        },
+        "sslCertFile": {
+          "type": "string",
+          "description": "DATABASE_SSL_CERT_FILE: path to the client certificate presented to Postgres."
+        },
+        "sslKeyFile": {
+          "type": "string",
+          "description": "DATABASE_SSL_KEY_FILE: path to the client private key presented to Postgres."
+        },
+        "sslRootCertFile": {
+          "type": "string",
+          "description": "DATABASE_SSL_ROOT_CERT_FILE: path to the CA bundle used to verify Postgres."
+        },
+        "tlsSecretName": {
+          "type": "string",
+          "description": "Optional Secret mounted read-only at /etc/sorobeacon/tls/database."
         }
       },
       "additionalProperties": false
@@ -465,6 +733,18 @@
           "type": "string",
           "description": "OIDC_ROLE_CLAIM: claim naming the user's role."
         },
+        "groupClaim": {
+          "type": "string",
+          "description": "OIDC_GROUP_CLAIM: claim naming the user's group memberships."
+        },
+        "groupMappings": {
+          "type": "string",
+          "description": "OIDC_GROUP_MAPPINGS: comma-separated group=workspace:role mappings."
+        },
+        "groupCacheTTL": {
+          "type": "string",
+          "description": "OIDC_GROUP_CACHE_TTL: how long resolved group mappings are cached."
+        },
         "loginStateTTL": {
           "type": "string",
           "pattern": "^[0-9]+(ms|s|m|h)$",
@@ -479,8 +759,13 @@
       "properties": {
         "provider": {
           "type": "string",
-          "enum": ["", "env", "vault"],
-          "description": "env (default) reads the encrypted database column; vault fetches from HashiCorp Vault."
+          "enum": [
+            "",
+            "env",
+            "vault",
+            "file"
+          ],
+          "description": "env (default) reads the encrypted database column; vault fetches from HashiCorp Vault; file reads from mounted files."
         },
         "cacheTtl": {
           "type": "string",
@@ -517,6 +802,116 @@
           "type": "integer",
           "minimum": 1,
           "description": "Upper bound on the hook, in seconds."
+        }
+      },
+      "additionalProperties": false
+    },
+    "tls": {
+      "type": "object",
+      "description": "Server and client TLS / mTLS settings.",
+      "properties": {
+        "secretName": {
+          "type": "string",
+          "description": "Optional Secret mounted read-only at /etc/sorobeacon/tls/server."
+        },
+        "certFile": {
+          "type": "string",
+          "description": "TLS_CERT_FILE: server TLS certificate path."
+        },
+        "keyFile": {
+          "type": "string",
+          "description": "TLS_KEY_FILE: server TLS private key path."
+        },
+        "clientCAFile": {
+          "type": "string",
+          "description": "TLS_CLIENT_CA_FILE: CA bundle used to verify client certificates."
+        },
+        "clientAuth": {
+          "type": "string",
+          "enum": [
+            "",
+            "none",
+            "request",
+            "require"
+          ],
+          "description": "TLS_CLIENT_AUTH: client certificate verification policy."
+        },
+        "principalMap": {
+          "type": "string",
+          "description": "MTLS_PRINCIPAL_MAP: comma-separated subject=workspace[:role] mappings."
+        },
+        "sorotrailSecretName": {
+          "type": "string",
+          "description": "Optional Secret mounted read-only at /etc/sorobeacon/tls/sorotrail."
+        },
+        "sorotrailCertFile": {
+          "type": "string",
+          "description": "SOROTRAIL_TLS_CERT_FILE: client certificate path for upstream SoroTrail."
+        },
+        "sorotrailKeyFile": {
+          "type": "string",
+          "description": "SOROTRAIL_TLS_KEY_FILE: client private key path for upstream SoroTrail."
+        },
+        "sorotrailCAFile": {
+          "type": "string",
+          "description": "SOROTRAIL_TLS_CA_FILE: CA bundle path for upstream SoroTrail."
+        },
+        "sorotrailServerName": {
+          "type": "string",
+          "description": "SOROTRAIL_TLS_SERVER_NAME: optional SNI / hostname override for upstream SoroTrail."
+        }
+      },
+      "additionalProperties": false
+    },
+    "operator": {
+      "type": "object",
+      "description": "Optional Kubernetes operator for Channel custom resources. Off by default.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "image": {
+          "type": "object",
+          "properties": {
+            "repository": {
+              "type": "string",
+              "minLength": 1
+            },
+            "tag": {
+              "type": "string"
+            },
+            "pullPolicy": {
+              "type": "string",
+              "enum": [
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "apiURL": {
+          "type": "string"
+        },
+        "tokenSecret": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "reconcileInterval": {
+          "type": "string"
+        },
+        "resources": {
+          "type": "object"
         }
       },
       "additionalProperties": false

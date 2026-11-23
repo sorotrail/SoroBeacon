@@ -5,8 +5,10 @@ package poller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,6 +26,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
 	"github.com/sorotrail/sorobeacon/internal/telemetry"
+	"github.com/sorotrail/sorobeacon/internal/usage"
 )
 
 // Position is a race-free snapshot of how far the poller has got relative
@@ -83,6 +86,15 @@ type Store interface {
 // notify.Dispatcher; mocked in tests.
 type Dispatcher interface {
 	Dispatch(ctx context.Context, a notify.Alert)
+}
+
+// RetentionGapRecorder is implemented by stores that persist retention gaps
+// (store.RetentionGaps). It is asserted rather than a method on Store so a
+// store that predates the feature — or a test fake with nothing to record —
+// keeps compiling; both real backends implement it, which is what makes a
+// detected gap survive a restart instead of living only in a log line.
+type RetentionGapRecorder interface {
+	RecordRetentionGap(ctx context.Context, network string, fromLedger, toLedger uint32, detectedAt time.Time) error
 }
 
 // Poller runs the ingest loop: getEvents from the last checkpoint, decode,
@@ -148,7 +160,9 @@ type Poller struct {
 	warnedOrphans bool
 	// slowRuleThreshold is the duration after which a rule evaluation is
 	// considered slow and logged. Zero disables slow rule logging.
-	slowRuleThreshold time.Duration
+	slowRuleThreshold   time.Duration
+	workspaceEvalBudget time.Duration
+	usageMeter          *usage.Meter
 }
 
 // Position returns the last successful poll snapshot. Safe to call from
@@ -198,18 +212,20 @@ func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval 
 		reg.WithLogger(log)
 	}
 	p := &Poller{
-		source:   src,
-		store:    st,
-		registry: reg,
-		log:      log,
-		now:      time.Now,
-		dispatch: d,
-		ing:      NewIngestor(st, reg, d, log),
-		sched:    NewScheduler(),
+		source:              src,
+		store:               st,
+		registry:            reg,
+		log:                 log,
+		now:                 time.Now,
+		dispatch:            d,
+		ing:                 NewIngestor(st, reg, d, log),
+		sched:               NewScheduler(),
+		workspaceEvalBudget: rules.DefaultWorkspaceEvalBudget,
 	}
 	// Written through the same atomic SetInterval uses, so construction and
 	// a later reload can never disagree about which value is live.
 	p.interval.Store(int64(interval))
+	p.bindRegistryHooks()
 	return p
 }
 
@@ -233,6 +249,14 @@ func (p *Poller) WithRuleEvalTimeout(d time.Duration) *Poller {
 	return p
 }
 
+// WithUsageMeter attaches per-workspace usage metering to the poller and its
+// shared Ingestor.
+func (p *Poller) WithUsageMeter(um *usage.Meter) *Poller {
+	p.usageMeter = um
+	p.ing = p.ing.WithUsageMeter(um)
+	return p
+}
+
 // WithPublisher attaches the live fan-out that serves the SSE endpoint. The
 // same Broadcaster is handed to internal/api: the shared Ingestor publishes
 // into it as alerts are created and /alerts/stream reads out of it, so no
@@ -243,6 +267,8 @@ func (p *Poller) WithPublisher(b *broadcast.Broadcaster) *Poller {
 	return p
 }
 
+// WithEnricher attaches an alert enricher to the poller's ingest pipeline,
+// used to fetch operator-supplied context for each created alert.
 func (p *Poller) WithEnricher(e *alerts.Enricher) *Poller {
 	p.ing.WithEnricher(e)
 	return p
@@ -306,6 +332,65 @@ func (p *Poller) WithSlowRuleThreshold(d time.Duration) *Poller {
 	return p
 }
 
+// WithRuleTimeout configures the per-rule evaluation timeout (excluding
+// attributed database I/O). Zero disables the timeout.
+func (p *Poller) WithRuleTimeout(d time.Duration) *Poller {
+	if p.registry != nil {
+		p.registry.WithEvalTimeout(d)
+	}
+	return p
+}
+
+// WithRuleQuarantineThreshold configures how many consecutive rule-attributed
+// evaluation failures (timeouts, panics, or runtime errors) quarantine a rule.
+// Zero disables automatic quarantine.
+func (p *Poller) WithRuleQuarantineThreshold(threshold int) *Poller {
+	if p.registry != nil {
+		p.registry.WithQuarantineThreshold(threshold)
+	}
+	return p
+}
+
+// WithWorkspaceEvalBudget bounds how much total rule-evaluation time a single
+// workspace may consume on one event before its remaining rules are skipped
+// for that event. Zero disables the per-workspace budget.
+func (p *Poller) WithWorkspaceEvalBudget(d time.Duration) *Poller {
+	p.workspaceEvalBudget = d
+	if p.ing != nil {
+		p.ing.WithWorkspaceEvalBudget(d)
+	}
+	return p
+}
+
+// ReenableRule clears any quarantine and failure strikes for ruleID and resets
+// its stateful evaluator state so a fixed rule can resume evaluation cleanly.
+func (p *Poller) ReenableRule(ctx context.Context, ruleID int64) bool {
+	if p == nil || p.registry == nil {
+		return false
+	}
+	return p.registry.ReenableRule(ctx, ruleID)
+}
+
+// QuarantinedRules returns a snapshot of all currently quarantined rules.
+func (p *Poller) QuarantinedRules() []rules.RuleQuarantineState {
+	if p == nil || p.registry == nil {
+		return nil
+	}
+	return p.registry.QuarantinedRules()
+}
+
+func (p *Poller) bindRegistryHooks() {
+	if p == nil || p.registry == nil {
+		return
+	}
+	p.registry.WithQuarantineHook(func(ctx context.Context, state rules.RuleQuarantineState) {
+		handleQuarantineTransition(ctx, p.log, p.metrics, p.store, p.registry, state)
+	})
+	p.registry.WithEvalObserver(func(_ context.Context, obs rules.EvalObservation) {
+		handleEvalObservation(p.log, p.metrics, p.slowRuleThreshold, obs)
+	})
+}
+
 // Run polls until ctx is cancelled. RPC errors back off exponentially
 // (capped at 10x the poll interval) instead of hammering the node.
 func (p *Poller) Run(ctx context.Context) {
@@ -327,7 +412,11 @@ func (p *Poller) Run(ctx context.Context) {
 			if ctx.Err() != nil {
 				continue
 			}
-			delay = min(delay*2, 10*p.Interval())
+			baseDelay := min(delay*2, 10*p.Interval())
+			delay = baseDelay
+			if half := baseDelay / 2; half > 0 {
+				delay = half + time.Duration(rand.Int63n(int64(half))) // #nosec G404 -- retry backoff jitter is not security-sensitive; credentials use crypto/rand
+			}
 			p.recordBackoff(true)
 			p.log.Error("poll failed", "err", err, "retry_in", delay)
 			continue
@@ -353,6 +442,7 @@ func (p *Poller) recordCycle(ok bool, took time.Duration) {
 	p.metrics.RecordPoll(ok, took)
 	p.metrics.RecordEvents(p.scanned, p.matched)
 	p.metrics.RecordRuleEvaluations(p.evaluations)
+	p.recordUpstreamMetrics()
 }
 
 // Poll runs one ingest cycle as a single trace. The root span
@@ -362,6 +452,10 @@ func (p *Poller) recordCycle(ok bool, took time.Duration) {
 // which stage was slow. Exported so tests (and one-shot tools) can drive
 // the poller without the timing loop.
 func (p *Poller) Poll(ctx context.Context) error {
+	if degraded, ok := p.store.(store.DegradationReporter); ok && degraded.Degraded() {
+		return store.ErrUnavailable
+	}
+
 	if p.telemetry != nil {
 		var span trace.Span
 		ctx, span = p.telemetry.WithRequestID(ctx, "poller.poll")
@@ -531,6 +625,20 @@ func (p *Poller) Poll(ctx context.Context) error {
 		}
 	}
 
+	// A checkpoint older than the source's retention window can never be
+	// read: getEvents errors, or silently returns from oldestLedger, and
+	// the events in between are unrecoverably gone either way. Jumping to
+	// the oldest retained ledger turns an erroring loop into a resume, and
+	// recording the hole turns silent data loss into a visible one. A
+	// resume inside the window records nothing and changes nothing.
+	oldestRetained, retentionErr := p.checkRetention(ctx, &state)
+	if retentionErr != nil {
+		// Not being able to ask is not a reason to fail the cycle: the
+		// fetch below surfaces a real outage on its own, and a source
+		// that cannot answer has nothing to clamp to.
+		p.log.Warn("retention check failed", "err", retentionErr)
+	}
+
 	storedCursors, err := p.store.ListContractCursors(ctx, p.network)
 	if err != nil {
 		return err
@@ -551,6 +659,16 @@ func (p *Poller) Poll(ctx context.Context) error {
 				lastLedger = coldStartLedger - 1
 			}
 			if err := p.store.InitializeContractCursor(ctx, p.network, w.ContractID, lastLedger); err != nil {
+				return err
+			}
+		}
+		// A contract cursor that fell behind retention would start this
+		// cycle at ledgers the source has forgotten, exactly like the
+		// checkpoint checkRetention clamped above. AdvanceContractCursor
+		// ignores stale writes, so an already-current cursor is untouched.
+		if oldestRetained > 1 && lastLedger+1 < oldestRetained {
+			lastLedger = oldestRetained - 1
+			if err := p.store.AdvanceContractCursor(ctx, p.network, w.ContractID, lastLedger); err != nil {
 				return err
 			}
 		}
@@ -593,6 +711,10 @@ func (p *Poller) Poll(ctx context.Context) error {
 		groupCheckpoint := uint32(0)
 		failedLedger := make(map[string]uint32)
 		cursor := ""
+		if len(starts) == 1 && state.LastCursor != "" {
+			cursor = state.LastCursor
+		}
+		reanchoredCursor := false
 		for {
 			fetchCtx := ctx
 			fetchSpan := telemetry.NoopSpan()
@@ -608,15 +730,39 @@ func (p *Poller) Poll(ctx context.Context) error {
 			if err != nil {
 				telemetry.RecordError(fetchSpan, err)
 				fetchSpan.End()
+				if cursor != "" && !reanchoredCursor && errors.Is(err, ErrInvalidCursor) {
+					reanchoredCursor = true
+					p.log.Warn("upstream rejected cursor; re-anchoring from checkpoint",
+						"cursor", cursor, "start_ledger", groupStart, "err", err)
+					cursor = ""
+					if state.LastCursor != "" {
+						state.LastCursor = ""
+						_ = p.store.SetIngestState(ctx, p.network, state)
+					}
+					continue
+				}
+				p.recordUpstreamMetrics()
 				return err
 			}
 			fetchSpan.End()
 
+			if err := p.reconcileUpstreamRetractions(ctx, &state, monitors); err != nil {
+				p.log.Warn("upstream retraction reconciliation failed", "err", err)
+			}
+
 			if page.LatestLedger > 0 && (groupCheckpoint == 0 || page.LatestLedger < groupCheckpoint) {
 				groupCheckpoint = page.LatestLedger
 			}
+			if page.NextCursor == "" && page.LatestLedger > groupCheckpoint {
+				if _, isUpstream := p.source.(UpstreamStatusSource); isUpstream {
+					groupCheckpoint = page.LatestLedger
+				}
+			}
 			if page.LatestLedger > 0 && (checkpoint == 0 || page.LatestLedger < checkpoint) {
 				checkpoint = page.LatestLedger
+			}
+			if page.NextCursor == "" && len(starts) == 1 && groupCheckpoint > checkpoint {
+				checkpoint = groupCheckpoint
 			}
 			if page.LatestLedger > tip {
 				tip = page.LatestLedger
@@ -665,6 +811,11 @@ func (p *Poller) Poll(ctx context.Context) error {
 	if confirmActive && checkpoint > confirmedThrough {
 		checkpoint = confirmedThrough
 	}
+	chainHead := p.recordUpstreamMetrics()
+	chainTip := tip
+	if chainHead > chainTip {
+		chainTip = chainHead
+	}
 	p.metrics.SetPollLag(int64(tip) - int64(checkpoint))
 	for _, pr := range prioritiesInServiceOrder {
 		if tierCounts[pr] == 0 {
@@ -687,8 +838,58 @@ func (p *Poller) Poll(ctx context.Context) error {
 	if processed == 0 {
 		processed = state.LastLedger
 	}
-	p.recordPosition(processed, tip, time.Now())
+	p.recordPosition(processed, chainTip, time.Now())
 	return nil
+}
+
+// checkRetention compares the resume point against the oldest ledger the
+// source still serves and, when the checkpoint has fallen behind, records
+// the gap and advances state (persisting it) so the cycle that follows
+// starts at the oldest retained ledger. It returns that ledger — 0 when the
+// source does not report one, when the store has no checkpoint yet, or when
+// the checkpoint is inside the window — so the caller can clamp each
+// contract cursor to the same boundary.
+//
+// A resume inside the retention window records nothing and changes nothing:
+// the comparison is the whole feature. When a source cannot answer, or the
+// store cannot persist the record, the jump still happens if the numbers
+// are known — a visible warning beats an erroring loop either way.
+func (p *Poller) checkRetention(ctx context.Context, state *store.IngestState) (uint32, error) {
+	rep, ok := p.source.(RetentionReporter)
+	if !ok || state.LastLedger == 0 {
+		return 0, nil
+	}
+	oldest, err := rep.OldestLedger(ctx)
+	if err != nil {
+		return 0, err
+	}
+	// Oldest is the first retained ledger, so the first unreadable one is
+	// oldest-1; oldest < 2 means "unknown" or an unusable window, and there
+	// is nothing sensible to jump to.
+	if oldest < 2 || state.LastLedger+1 >= oldest {
+		return oldest, nil
+	}
+	from, to := state.LastLedger+1, oldest-1
+	p.log.Warn("checkpoint fell outside source retention; jumping to the oldest retained ledger",
+		"gap_from_ledger", from,
+		"gap_to_ledger", to,
+		"ledgers_missed", to-from+1)
+	rec, ok := p.store.(RetentionGapRecorder)
+	if !ok {
+		// The hole is real either way; say so loudly even where this store
+		// cannot keep the record.
+		p.log.Warn("store cannot persist retention gaps; this record lives only in the log")
+	} else if err := rec.RecordRetentionGap(ctx, p.network, from, to, p.now()); err != nil {
+		// Detection still proceeds: refusing to jump because the record
+		// failed would trade a visible gap for an erroring poller.
+		p.log.Error("record retention gap", "err", err)
+	}
+	state.LastLedger = to
+	state.LastCursor = ""
+	if err := p.store.SetIngestState(ctx, p.network, *state); err != nil {
+		return 0, err
+	}
+	return oldest, nil
 }
 
 // handleEvent runs every enabled rule of every monitor watching the
@@ -706,14 +907,17 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 		return true
 	}
 
+	orderedMonitors := orderMonitorsByWorkspaceFairness(monitors)
+	workspaceElapsed := make(map[string]time.Duration)
 	processed := true
-	for _, m := range monitors {
-		ruleList, err := p.store.ListRules(ctx, m.ID, true)
+	for _, m := range orderedMonitors {
+		ruleList, err := p.listRulesForCycle(ctx, byContract, m.ID)
 		if err != nil {
 			p.log.Error("list rules", "monitor_id", m.ID, "err", err)
 			processed = false
 			continue
 		}
+		var evals int64
 		for _, rule := range ruleList {
 			// An absence rule is re-armed by a matching event and fired by
 			// the sweep; evaluating it here would be asking the wrong
@@ -732,6 +936,7 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 			start := time.Now()
 			matched, err := p.registry.Evaluate(ruleCtx, rule.Type, decoded, rule.Params)
 			duration := time.Since(start)
+			workspaceElapsed[m.WorkspaceID] += duration
 			if p.metrics != nil {
 				p.metrics.RecordRuleEval(rule.Type, matched, err, duration)
 			}
@@ -784,6 +989,9 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 				}
 			}
 		}
+		if evals > 0 {
+			p.recordWorkspaceRuleEvaluations(ctx, m.WorkspaceID, evals)
+		}
 	}
 	return processed
 }
@@ -830,15 +1038,21 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 		return false
 	}
 
+	runbookURL, responseGuidance := store.ResolveAlertGuidance(&rule, &m, "", "")
+	payload = store.WithGuidance(payload, runbookURL, responseGuidance)
+
 	alert := &store.Alert{
-		MonitorID:      m.ID,
-		RuleID:         rule.ID,
-		EventID:        eventID,
-		Payload:        payload,
-		Ledger:         ev.Ledger,
-		LedgerClosedAt: ev.LedgerClosedAt,
-		Cooldown:       ruleCooldown(rule),
-		Severity:       rule.Severity,
+		MonitorID:        m.ID,
+		RuleID:           rule.ID,
+		EventID:          eventID,
+		Payload:          payload,
+		Ledger:           ev.Ledger,
+		LedgerClosedAt:   ev.LedgerClosedAt,
+		Cooldown:         ruleCooldown(rule),
+		Severity:         rule.Severity,
+		RuleVersion:      rule.Version,
+		RunbookURL:       runbookURL,
+		ResponseGuidance: responseGuidance,
 	}
 	outcome, err := p.store.CreateAlert(ctx, alert)
 	if err != nil {
@@ -855,6 +1069,7 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 			"rule_id", rule.ID, "event_id", ev.ID, "cooldown", alert.Cooldown)
 		return true
 	}
+	p.recordWorkspaceAlertRaised(ctx, m.WorkspaceID)
 	logAttrs := []any{"alert_id", alert.ID, "monitor", m.Name, "rule_id", rule.ID, "event_id", ev.ID}
 	if alert.SuppressedSinceLast > 0 {
 		logAttrs = append(logAttrs, "suppressed_since_last", alert.SuppressedSinceLast)
@@ -894,9 +1109,11 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 		CreatedAt: alert.CreatedAt,
 		// GroupCount is 1 for the first alert in a window (the one
 		// we are delivering now) and 0 when grouping is disabled.
-		GroupCount:  1,
-		WindowStart: time.Time{},
-		WindowEnd:   time.Time{},
+		GroupCount:       1,
+		WindowStart:      time.Time{},
+		WindowEnd:        time.Time{},
+		RunbookURL:       alert.RunbookURL,
+		ResponseGuidance: alert.ResponseGuidance,
 	})
 	return true
 }
@@ -1032,11 +1249,17 @@ func (p *Poller) fireAbsence(ctx context.Context, m store.Monitor, rule store.Ru
 		return
 	}
 
+	runbookURL, responseGuidance := store.ResolveAlertGuidance(&rule, &m, "", "")
+	payload = store.WithGuidance(payload, runbookURL, responseGuidance)
+
 	alert := &store.Alert{
-		MonitorID: m.ID,
-		RuleID:    rule.ID,
-		EventID:   AbsenceEventID(lastSeen),
-		Payload:   payload,
+		MonitorID:        m.ID,
+		RuleID:           rule.ID,
+		EventID:          AbsenceEventID(lastSeen),
+		Payload:          payload,
+		RuleVersion:      rule.Version,
+		RunbookURL:       runbookURL,
+		ResponseGuidance: responseGuidance,
 	}
 	outcome, err := p.store.CreateAlert(ctx, alert)
 	if err != nil {
@@ -1055,21 +1278,24 @@ func (p *Poller) fireAbsence(ctx context.Context, m store.Monitor, rule store.Ru
 		return
 	}
 	p.metrics.RecordAlert()
+	p.recordWorkspaceAlertRaised(ctx, m.WorkspaceID)
 	p.log.Info("absence alert created",
 		"alert_id", alert.ID, "monitor", m.Name, "rule_id", rule.ID,
 		"event_name", spec.EventName, "silent_for", silent)
 
 	p.dispatch.Dispatch(ctx, notify.Alert{
-		ID:          alert.ID,
-		MonitorID:   m.ID,
-		MonitorName: m.Name,
-		RuleID:      rule.ID,
-		RuleType:    rule.Type,
-		EventID:     alert.EventID,
-		EventName:   spec.EventName,
-		Silence:     silent,
-		Payload:     payload,
-		CreatedAt:   alert.CreatedAt,
+		ID:               alert.ID,
+		MonitorID:        m.ID,
+		MonitorName:      m.Name,
+		RuleID:           rule.ID,
+		RuleType:         rule.Type,
+		EventID:          alert.EventID,
+		EventName:        spec.EventName,
+		Silence:          silent,
+		Payload:          alert.Payload,
+		CreatedAt:        alert.CreatedAt,
+		RunbookURL:       alert.RunbookURL,
+		ResponseGuidance: alert.ResponseGuidance,
 	})
 }
 
@@ -1085,4 +1311,37 @@ func (p *Poller) fireAbsence(ctx context.Context, m store.Monitor, rule store.Ru
 // built from lives in the database.
 func AbsenceEventID(lastSeen time.Time) string {
 	return "absence-" + strconv.FormatInt(lastSeen.UTC().UnixNano(), 10)
+}
+
+func (p *Poller) recordWorkspaceRuleEvaluations(ctx context.Context, workspaceID string, n int64) {
+	if n <= 0 {
+		return
+	}
+	if p.usageMeter != nil {
+		p.usageMeter.RecordRuleEvaluations(workspaceID, n)
+		return
+	}
+	if p.metrics != nil {
+		p.metrics.RecordWorkspaceRuleEvaluations(workspaceID, n)
+	}
+	if uStore, ok := p.store.(store.Usage); ok {
+		_ = store.SafeRecordWorkspaceUsageBatch(ctx, uStore, []store.WorkspaceUsageDelta{
+			{WorkspaceID: workspaceID, RuleEvaluations: n},
+		})
+	}
+}
+
+func (p *Poller) recordWorkspaceAlertRaised(ctx context.Context, workspaceID string) {
+	if p.usageMeter != nil {
+		p.usageMeter.RecordAlertRaised(workspaceID, 1)
+		return
+	}
+	if p.metrics != nil {
+		p.metrics.RecordWorkspaceAlertRaised(workspaceID, 1)
+	}
+	if uStore, ok := p.store.(store.Usage); ok {
+		_ = store.SafeRecordWorkspaceUsageBatch(ctx, uStore, []store.WorkspaceUsageDelta{
+			{WorkspaceID: workspaceID, AlertsRaised: 1},
+		})
+	}
 }

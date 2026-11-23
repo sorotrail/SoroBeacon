@@ -17,6 +17,7 @@ import (
 type statsHealthStore struct {
 	healthStore
 	stats map[int64]store.ChannelDeliveryStats
+	acks  map[int64]store.ChannelAckReconciliation
 	err   error
 }
 
@@ -25,6 +26,13 @@ func (s *statsHealthStore) GetChannelDeliveryStats(_ context.Context, id int64, 
 		return store.ChannelDeliveryStats{}, s.err
 	}
 	return s.stats[id], nil
+}
+
+func (s *statsHealthStore) ListChannelAckReconciliations(_ context.Context) (map[int64]store.ChannelAckReconciliation, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.acks, nil
 }
 
 // A healthy channel shows its rate as a percentage with an explicit "ok" word,
@@ -114,5 +122,42 @@ func TestChannelsPageFailsWhenStatsStoreFails(t *testing.T) {
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("GET /channels with a failing stats store = %d, want 500", res.StatusCode)
+	}
+}
+
+// A channel flagged as unacknowledged displays the 'unacknowledged' pill and details.
+func TestChannelsPageShowsUnacknowledgedFlaggedBadge(t *testing.T) {
+	rate := 1.0
+	srv := healthWebServer(t, &statsHealthStore{
+		healthStore: healthStore{channel: store.Channel{ID: 3, Name: "ops-silent", Type: "slack", Enabled: true}},
+		stats: map[int64]store.ChannelDeliveryStats{
+			3: {ChannelID: 3, Total: 5, Succeeded: 5, Failed: 0, SuccessRate: &rate},
+		},
+		acks: map[int64]store.ChannelAckReconciliation{
+			3: {ChannelID: 3, DeliveredTotal: 5, AcknowledgedTotal: 0, UnacknowledgedTotal: 5, UnackRate: &rate, Flagged: true},
+		},
+	}, scriptedNotifier{})
+	defer srv.Close()
+
+	html := getPage(t, srv.URL+"/channels")
+
+	for _, want := range []string{"unacknowledged", "Delivered 5 alert(s) without human acknowledgement", "HTTP acceptance only"} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("unacknowledged channel page is missing %q:\n%s", want, html)
+		}
+	}
+}
+
+// Channel types display their receipt capability in the health column.
+func TestChannelsPageShowsReceiptCapabilities(t *testing.T) {
+	srv := healthWebServer(t, &statsHealthStore{
+		healthStore: healthStore{channel: store.Channel{ID: 5, Name: "pager", Type: "pagerduty", Enabled: true}},
+	}, scriptedNotifier{})
+	defer srv.Close()
+
+	html := getPage(t, srv.URL+"/channels")
+
+	if !strings.Contains(html, "native paging acknowledgement") {
+		t.Fatalf("pagerduty channel must display native paging acknowledgement:\n%s", html)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/sorotrail/sorobeacon/internal/apierr"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/reqid"
 	"github.com/sorotrail/sorobeacon/internal/rules"
@@ -94,8 +95,9 @@ func assertEnvelope(t *testing.T, status int, ct string, raw map[string]any, bod
 	if got, _ := raw["error"].(string); got != wantMsg {
 		t.Fatalf("error = %q, want %q", got, wantMsg)
 	}
-	if got, _ := raw["code"].(string); got != http.StatusText(wantStatus) {
-		t.Fatalf("code = %q, want %q", got, http.StatusText(wantStatus))
+	wantCode := apierr.CodeFromStatus(wantStatus)
+	if got, _ := raw["code"].(string); got != wantCode {
+		t.Fatalf("code = %q, want %q", got, wantCode)
 	}
 	reqID, _ := raw["request_id"].(string)
 	if reqID == "" {

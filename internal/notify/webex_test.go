@@ -71,10 +71,10 @@ func TestNewWebexInvalidTemplate(t *testing.T) {
 
 func TestWebexSendSuccess(t *testing.T) {
 	var (
-		gotMethod       string
-		gotContentType  string
-		gotAuthHeader   string
-		gotBody         []byte
+		gotMethod      string
+		gotContentType string
+		gotAuthHeader  string
+		gotBody        []byte
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
@@ -126,9 +126,9 @@ func TestWebexSendCustomTemplate(t *testing.T) {
 
 func TestWebexSendServerError(t *testing.T) {
 	tests := []struct {
-		name          string
-		status        int
-		expectStatus  bool // whether to expect the status code in the error
+		name         string
+		status       int
+		expectStatus bool // whether to expect the status code in the error
 	}{
 		{"unauthorized", http.StatusUnauthorized, false},
 		{"forbidden", http.StatusForbidden, false},
