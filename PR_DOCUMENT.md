@@ -1,32 +1,27 @@
-# PR: Add unit tests for ValidAuditSurface
+# PR: Add edge cases to NewPruner tests
 
 ## Summary
-Added unit tests for the `ValidAuditSurface` function in `internal/store/audit.go`.
+Added table-driven unit tests for the `NewPruner` function in `internal/archive/archive.go`.
 
 ## Changes
 
-### New file: `internal/store/audit.go`
-- Created the `ValidAuditSurface` function that validates audit surface values
-- Returns `true` for valid surfaces: `"monitor"`, `"rule"`, `"channel"`
-- Returns `false` for invalid surfaces (empty string, unknown values)
+### Enhanced file: `internal/archive/archive_test.go`
+- Added `TestNewPrunerEdgeCases` with table-driven tests covering:
+  - **Error path**: nil backend returns an error `"archive: nil backend"`
+  - **Happy path**: valid backend (Dir archiver) succeeds
 
-### New file: `internal/store/audit_test.go`
-- Added table-driven unit tests covering:
-  - **Happy path**: Valid surfaces (`monitor`, `rule`, `channel`)
-  - **Error path**: Invalid surfaces (`""`, `"unknown"`, `"  "`)
+### Test Cases
+1. `nil_backend_returns_error` - verifies that passing a nil backend to `NewPruner` returns an error
+2. `valid_backend_succeeds` - verifies that a valid backend (directory-based archiver) allows `NewPruner` to succeed
 
 ## Test Results
-All 6 test cases pass:
-- `monitor_surface_is_valid` ✓
-- `rule_surface_is_valid` ✓
-- `channel_surface_is_valid` ✓
-- `empty_surface_is_invalid` ✓
-- `unknown_surface_is_invalid` ✓
-- `nil-like_surface_is_invalid` ✓
+Both test cases pass:
+- `nil_backend_returns_error` ✓
+- `valid_backend_succeeds` ✓
 
 ## Checklist
-- [x] Function `ValidAuditSurface` created in `internal/store/audit.go`
-- [x] Table-driven unit tests added in `internal/store/audit_test.go`
-- [x] All tests pass (6/6)
-- [x] No existing tests broken
-- [x] Code follows project conventions (similar to `ValidDeliveryStatus` pattern)
+- [x] Edge case tests added for `NewPruner` function
+- [x] Table-driven test structure used (consistent with project style)
+- [x] Nil backend error case covered
+- [x] Valid backend happy path covered
+- [x] All existing tests continue to pass
