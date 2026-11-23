@@ -10,10 +10,13 @@
 // The wiring rule for call sites: start a span with Provider.StartSpan (or
 // the Tracer directly), do the work, record the error with
 // span.RecordError and span.SetStatus, and let the context carry the trace
-// onward. Boundary spans already exist for the poll cycle, event decode,
-// rule evaluation, alert persistence and each channel delivery; a delivery
-// span must be a child of the alert's span, never a root — that parent
-// chain is the whole point, and the poller test pins it.
+// onward. Boundary spans exist for the poll cycle, event decode, rule
+// evaluation, alert persistence and each SQL statement. Work that happens
+// because of a span but outside its lifetime — a channel delivery on another
+// goroutine, an escalation step minutes later — starts a new root with
+// StartLinked, carrying a span link to its cause; a parent-child edge there
+// would hold the detection trace open. The dispatcher and poller tests pin
+// those links.
 package telemetry
 
 import (

@@ -96,9 +96,9 @@ func TestDeleteMonitorCascadesAndAudits(t *testing.T) {
 }
 
 // TestDeleteMonitorUnknownID pins 404 for a well-formed id that addresses
-// nothing, and that the failed attempt writes no audit row: the log records
-// changes that happened, and a phantom delete entry would send an operator
-// hunting for a removal that never occurred.
+// nothing, and that the failed attempt is recorded with Outcome=="failed" and
+// StatusCode==404 so operators can distinguish failed attempts from succeeded
+// deletions.
 func TestDeleteMonitorUnknownID(t *testing.T) {
 	srv, st, logBuf := sqliteAPI(t)
 
@@ -115,8 +115,11 @@ func TestDeleteMonitorUnknownID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list audit: %v", err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("failed delete wrote %d audit rows, want none: %+v", len(entries), entries)
+	if len(entries) != 1 {
+		t.Fatalf("failed delete wrote %d audit rows, want 1: %+v", len(entries), entries)
+	}
+	if entries[0].Outcome != store.AuditOutcomeFailed || entries[0].StatusCode != http.StatusNotFound {
+		t.Errorf("audit outcome/status = %q/%d, want %q/404", entries[0].Outcome, entries[0].StatusCode, store.AuditOutcomeFailed)
 	}
 }
 

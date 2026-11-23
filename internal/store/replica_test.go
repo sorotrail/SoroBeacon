@@ -2,14 +2,24 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
@@ -96,6 +106,7 @@ func TestConnectReplicaUnsetKeepsReadsOnPrimary(t *testing.T) {
 	require.NoError(t, p.connectReplica(context.Background(), PoolSettings{}))
 
 	assert.Nil(t, p.replica)
+	assert.Equal(t, DefaultMaxReplicaLag, p.MaxReplicaLag())
 }
 
 // TestConnectReplicaRejectsUnparseableURL covers the read-replica half of the
@@ -110,6 +121,172 @@ func TestConnectReplicaRejectsUnparseableURL(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "postgres replica")
 	assert.Nil(t, p.replica)
+}
+
+// TestOnlyReplicaRoutedMethodsUseReplicaHelpers mechanically verifies via
+// go/ast that the set of functions in internal/store calling queryRows or
+// queryRowFallback matches ReplicaRoutedMethods() in both directions, and that
+// no method in PrimaryOnlyCriticalMethods() ever touches the replica (#572).
+func TestOnlyReplicaRoutedMethodsUseReplicaHelpers(t *testing.T) {
+	routed := ReplicaRoutedMethods()
+	primaryOnly := PrimaryOnlyCriticalMethods()
+
+	for fn, reason := range routed {
+		assert.NotEmpty(t, strings.TrimSpace(reason), "ReplicaRoutedMethods entry %s must carry a justification", fn)
+		_, conflict := primaryOnly[fn]
+		assert.Falsef(t, conflict, "%s cannot appear in both ReplicaRoutedMethods and PrimaryOnlyCriticalMethods", fn)
+	}
+
+	fset := token.NewFileSet()
+	actualCallers := make(map[string]bool)
+	definedFuncs := make(map[string]bool)
+
+	for _, file := range sqlSourceFiles(t) {
+		fAST, err := parser.ParseFile(fset, file, nil, 0)
+		require.NoError(t, err, "parse %s", file)
+
+		for _, decl := range fAST.Decls {
+			fnDecl, ok := decl.(*ast.FuncDecl)
+			if !ok || fnDecl.Body == nil {
+				continue
+			}
+			fnName := fnDecl.Name.Name
+			definedFuncs[fnName] = true
+			if file == "replica.go" {
+				continue
+			}
+			ast.Inspect(fnDecl.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				if sel.Sel.Name == "queryRows" || sel.Sel.Name == "queryRowFallback" {
+					actualCallers[fnName] = true
+				}
+				return true
+			})
+		}
+	}
+
+	for fn := range actualCallers {
+		_, allowed := routed[fn]
+		assert.Truef(t, allowed,
+			"store function %s calls queryRows/queryRowFallback but is not in ReplicaRoutedMethods(); default new methods to p.pool or add to ReplicaRoutedMethods with a reviewed reason",
+			fn)
+	}
+	for fn := range routed {
+		assert.Truef(t, actualCallers[fn],
+			"ReplicaRoutedMethods() lists %s, which no longer calls queryRows or queryRowFallback",
+			fn)
+	}
+	for fn, reason := range primaryOnly {
+		assert.NotEmpty(t, strings.TrimSpace(reason))
+		assert.Truef(t, definedFuncs[fn], "PrimaryOnlyCriticalMethods() lists %s, which is not defined in internal/store", fn)
+		assert.Falsef(t, actualCallers[fn], "primary-only critical method %s must never call replica helpers", fn)
+	}
+}
+
+func TestReplicaLagBoundAndMetrics(t *testing.T) {
+	m := metrics.New()
+	p := &Postgres{metrics: m}
+	require.NoError(t, p.connectReplica(context.Background(), PoolSettings{
+		MaxReplicaLag: 15 * time.Second,
+	}))
+	assert.Equal(t, 15*time.Second, p.MaxReplicaLag())
+	assert.Equal(t, time.Duration(0), p.ObservedReplicaLag())
+	assert.False(t, p.replicaLagExceeded())
+
+	p.SetObservedReplicaLag(10 * time.Second)
+	assert.Equal(t, 10*time.Second, p.ObservedReplicaLag())
+	assert.False(t, p.replicaLagExceeded(), "lag within MaxReplicaLag must keep routing to the replica")
+
+	p.SetObservedReplicaLag(20 * time.Second)
+	assert.Equal(t, 20*time.Second, p.ObservedReplicaLag())
+	assert.True(t, p.replicaLagExceeded(), "lag above MaxReplicaLag must trigger fallback to the primary")
+
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	assert.Contains(t, rec.Body.String(), "sorobeacon_store_replica_lag_seconds 20")
+}
+
+func TestPostgresReplicaRoutingFallbackLagAndReadAfterWrite(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping Postgres replica routing test")
+	}
+	require.NoError(t, Migrate(url))
+
+	ctx := context.Background()
+	m := metrics.New()
+	st, err := NewPostgres(ctx, url, PoolSettings{
+		ReplicaURL:    url,
+		MaxReplicaLag: 10 * time.Second,
+		Metrics:       m,
+	})
+	require.NoError(t, err)
+	t.Cleanup(st.Close)
+	require.NoError(t, st.resetConformance(ctx))
+
+	// 1. SampleReplicaLag succeeds against Postgres and records a non-negative lag.
+	lag, err := st.SampleReplicaLag(ctx)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, lag, time.Duration(0))
+
+	// 2. Write followed immediately by its own read on primary-only methods.
+	mon := &Monitor{Name: "primary-read-your-writes", ContractIDs: []string{"CCONTRACT1"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, mon))
+	gotMon, err := st.GetMonitor(ctx, mon.ID)
+	require.NoError(t, err)
+	assert.Equal(t, mon.Name, gotMon.Name)
+
+	rule := &Rule{MonitorID: mon.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true}
+	require.NoError(t, st.CreateRule(ctx, rule))
+
+	a1 := &Alert{MonitorID: mon.ID, RuleID: rule.ID, EventID: "evt-1", Payload: json.RawMessage(`{}`)}
+	_, err = st.CreateAlert(ctx, a1)
+	require.NoError(t, err)
+	a2 := &Alert{MonitorID: mon.ID, RuleID: rule.ID, EventID: "evt-2", Payload: json.RawMessage(`{}`)}
+	_, err = st.CreateAlert(ctx, a2)
+	require.NoError(t, err)
+
+	gotAlert, err := st.GetAlert(ctx, a1.ID)
+	require.NoError(t, err)
+	assert.Equal(t, a1.EventID, gotAlert.EventID)
+
+	// 3. Routed reads use the replica pool when healthy and within MaxReplicaLag.
+	_, err = st.ListMonitorsPage(ctx, ListFilter{Limit: 10})
+	require.NoError(t, err)
+	page1, err := st.ListAlerts(ctx, AlertFilter{Limit: 1})
+	require.NoError(t, err)
+	require.Len(t, page1, 1)
+	page2, err := st.ListAlerts(ctx, AlertFilter{Limit: 1, AfterID: page1[0].ID})
+	require.NoError(t, err)
+	require.Len(t, page2, 1)
+	assert.NotEqual(t, page1[0].ID, page2[0].ID)
+
+	// 4. Exceeding MaxReplicaLag routes subsequent reads to the primary and increments fallbacks.
+	st.SetObservedReplicaLag(30 * time.Second)
+	_, err = st.GetStats(ctx)
+	require.NoError(t, err)
+
+	// 5. Closing the replica pool falls back to the primary transparently, while Ping (readiness) stays green.
+	st.SetObservedReplicaLag(0)
+	st.replica.Close()
+	alertsAfterClose, err := st.ListAlerts(ctx, AlertFilter{Limit: 10})
+	require.NoError(t, err)
+	assert.Len(t, alertsAfterClose, 2)
+	require.NoError(t, st.Ping(ctx), "readiness Ping must succeed when only the replica is down")
+
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	assert.Contains(t, body, `sorobeacon_store_reads_total{pool="replica"}`)
+	assert.Contains(t, body, `sorobeacon_store_reads_total{pool="primary"}`)
+	assert.Contains(t, body, `sorobeacon_store_replica_fallbacks_total`)
 }
 
 // TestBuildAlertQueryIsParameterised guards the shared query builder that both

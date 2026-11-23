@@ -52,6 +52,21 @@ func (TopicPosition) Validate(params json.RawMessage) error {
 		return err
 	}
 	var details FieldErrors
+	// position is required. An omitted field decodes to 0, which is a
+	// legitimate answer (the event-name topic), so presence has to be judged
+	// on the raw object rather than on the decoded value: silently comparing
+	// topic 0 for a caller who forgot the field is a rule that fires on the
+	// wrong events, and both the schema and the reference document the field
+	// as required.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(params, &raw); err == nil {
+		if _, present := raw["position"]; !present {
+			details = append(details, FieldError{
+				Field:  "position",
+				Reason: "topic_position: position is required",
+			})
+		}
+	}
 	if p.Position < 0 {
 		details = append(details, FieldError{
 			Field:  "position",

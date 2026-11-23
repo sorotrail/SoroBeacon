@@ -37,6 +37,9 @@ type tokenRow struct {
 	State        string
 	Revoked      bool
 	NeverExpires bool
+	IsRotating   bool
+	SuccessorID  int64
+	RotatedFrom  int64
 }
 
 func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
@@ -73,6 +76,7 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
+		s.auditOutcome(r, store.AuditActionCreate, store.AuditTargetToken, 0, store.AuditOutcomeFailed, http.StatusBadRequest, err.Error(), "name", "scopes")
 		list, lerr := s.listTokens(r)
 		if lerr != nil {
 			s.fail(w, lerr)
@@ -89,6 +93,7 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.auditOutcome(r, store.AuditActionCreate, store.AuditTargetToken, tok.ID, store.AuditOutcomeSucceeded, http.StatusOK, "", "name", "scopes")
 	list, err := s.listTokens(r)
 	if err != nil {
 		s.fail(w, err)
@@ -121,12 +126,14 @@ func (s *Server) revokeToken(w http.ResponseWriter, r *http.Request) {
 		// Another workspace's token and a token that does not exist are the
 		// same 404 here, as they are through the API.
 		if errors.Is(err, store.ErrNotFound) {
+			s.auditOutcome(r, store.AuditActionDelete, store.AuditTargetToken, id, store.AuditOutcomeFailed, http.StatusNotFound, "token not found")
 			http.NotFound(w, r)
 			return
 		}
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionDelete, store.AuditTargetToken, id)
 	s.log.Info("api token revoked", "token_id", id)
 	http.Redirect(w, r, "/tokens", http.StatusSeeOther)
 }
@@ -138,6 +145,13 @@ func (s *Server) tokenPageData(r *http.Request, list []auth.Token, newToken stri
 	now := time.Now()
 	rows := make([]tokenRow, 0, len(list))
 	for _, t := range list {
+		var succID, rotFrom int64
+		if t.SuccessorID != nil {
+			succID = *t.SuccessorID
+		}
+		if t.RotatedFromID != nil {
+			rotFrom = *t.RotatedFromID
+		}
 		rows = append(rows, tokenRow{
 			ID:           t.ID,
 			Name:         t.Name,
@@ -149,6 +163,9 @@ func (s *Server) tokenPageData(r *http.Request, list []auth.Token, newToken stri
 			State:        tokenState(t, now),
 			Revoked:      !t.RevokedAt.IsZero(),
 			NeverExpires: t.ExpiresAt.IsZero(),
+			IsRotating:   t.SuccessorID != nil,
+			SuccessorID:  succID,
+			RotatedFrom:  rotFrom,
 		})
 	}
 	return map[string]any{
@@ -199,10 +216,12 @@ func tokenState(t auth.Token, now time.Time) string {
 	switch {
 	case !t.RevokedAt.IsZero():
 		return "revoked"
+	case !t.ExpiresAt.IsZero() && !now.Before(t.ExpiresAt):
+		return "expired"
+	case t.SuccessorID != nil:
+		return "rotating"
 	case t.ExpiresAt.IsZero():
 		return "no expiry"
-	case !now.Before(t.ExpiresAt):
-		return "expired"
 	default:
 		return "active"
 	}

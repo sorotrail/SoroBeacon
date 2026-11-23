@@ -88,6 +88,44 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Labels for the dedicated background worker Deployment (worker.enabled=true).
+Deliberately distinct from sorobeacon.selectorLabels so the Service never
+routes external API or dashboard traffic to worker pods.
+*/}}
+{{- define "sorobeacon.workerSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "sorobeacon.name" . }}-worker
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: worker
+{{- end }}
+
+{{/*
+Renders podAntiAffinity for either the API Deployment or the Worker Deployment
+when podAntiAffinity.enabled is true and raw affinity is unset.
+Accepts a dict with "antiAffinity" and "selectorLabels".
+*/}}
+{{- define "sorobeacon.renderPodAntiAffinity" -}}
+{{- $aa := .antiAffinity -}}
+{{- $labels := .selectorLabels -}}
+{{- $topologyKey := default "kubernetes.io/hostname" $aa.topologyKey -}}
+podAntiAffinity:
+  {{- if eq (default "soft" $aa.type) "hard" }}
+  requiredDuringSchedulingIgnoredDuringExecution:
+    - topologyKey: {{ $topologyKey }}
+      labelSelector:
+        matchLabels:
+          {{- $labels | nindent 10 }}
+  {{- else }}
+  preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        topologyKey: {{ $topologyKey }}
+        labelSelector:
+          matchLabels:
+            {{- $labels | nindent 12 }}
+  {{- end }}
+{{- end }}
+
+{{/*
 sorobeacon.configData is the application's non-secret configuration as
 ConfigMap data. It is defined once and included by both the release ConfigMap
 and the migration hook's own ConfigMap, so the two cannot drift: adding a new
@@ -109,6 +147,7 @@ HORIZON_URL: {{ .Values.config.horizonUrl | quote }}
 GRAPHQL_PLAYGROUND: {{ .Values.config.graphqlPlayground | toString | quote }}
 GRAPHQL_MAX_DEPTH: {{ .Values.config.graphqlMaxDepth | quote }}
 GRAPHQL_MAX_COMPLEXITY: {{ .Values.config.graphqlMaxComplexity | quote }}
+GRAPHQL_ALLOWLIST_ONLY: {{ .Values.config.graphqlAllowlistOnly | toString | quote }}
 INSTANCE_NAME: {{ .Values.config.instanceName | quote }}
 HTTP_ADDR: {{ .Values.config.httpAddr | quote }}
 HTTP_MAX_BODY_BYTES: {{ .Values.config.httpMaxBodyBytes | int64 | quote }}
@@ -120,6 +159,9 @@ FLAPPING_EPISODES: {{ .Values.config.flappingEpisodes | int64 | quote }}
 FLAPPING_WINDOW: {{ .Values.config.flappingWindow | quote }}
 FLAPPING_QUIET_AFTER: {{ .Values.config.flappingQuietAfter | quote }}
 READYZ_LAG_THRESHOLD: {{ .Values.config.readyzLagThreshold | int64 | quote }}
+HEARTBEAT_URL: {{ .Values.config.heartbeatUrl | quote }}
+HEARTBEAT_INTERVAL: {{ .Values.config.heartbeatInterval | quote }}
+HEARTBEAT_FAILURE_SUFFIX: {{ .Values.config.heartbeatFailureSuffix | quote }}
 CHANNEL_DISABLE_AFTER_FAILURES: {{ .Values.config.channelDisableAfterFailures | int64 | quote }}
 NETWORKS: {{ .Values.config.networks | quote }}
 OIDC_ISSUER: {{ .Values.oidc.issuer | quote }}
@@ -130,12 +172,16 @@ OIDC_ALLOWED_DOMAINS: {{ .Values.oidc.allowedDomains | quote }}
 OIDC_WORKSPACE: {{ .Values.oidc.workspace | quote }}
 OIDC_WORKSPACE_CLAIM: {{ .Values.oidc.workspaceClaim | quote }}
 OIDC_ROLE_CLAIM: {{ .Values.oidc.roleClaim | quote }}
+OIDC_GROUP_CLAIM: {{ .Values.oidc.groupClaim | quote }}
+OIDC_GROUP_MAPPINGS: {{ .Values.oidc.groupMappings | quote }}
+OIDC_GROUP_CACHE_TTL: {{ .Values.oidc.groupCacheTTL | quote }}
 OIDC_LOGIN_STATE_TTL: {{ .Values.oidc.loginStateTTL | quote }}
 RATE_LIMIT_RPS: {{ .Values.config.rateLimitRps | quote }}
 RATE_LIMIT_BURST: {{ .Values.config.rateLimitBurst | int64 | quote }}
 RATE_LIMIT_TRUST_FORWARDED: {{ .Values.config.rateLimitTrustForwarded | toString | quote }}
 CORS_ALLOWED_ORIGINS: {{ .Values.config.corsAllowedOrigins | quote }}
 ALERT_RETENTION: {{ .Values.config.alertRetention | quote }}
+AUDIT_RETENTION: {{ .Values.config.auditRetention | quote }}
 DATABASE_MAX_CONNS: {{ .Values.database.maxConns | int64 | quote }}
 DATABASE_MIN_CONNS: {{ .Values.database.minConns | int64 | quote }}
 DATABASE_MAX_CONN_LIFETIME: {{ .Values.database.maxConnLifetime | quote }}
@@ -161,4 +207,17 @@ SECRETS_PROVIDER: {{ .Values.secrets.provider | quote }}
 SECRETS_CACHE_TTL: {{ .Values.secrets.cacheTtl | quote }}
 VAULT_ADDR: {{ .Values.secrets.vaultAddr | quote }}
 VAULT_NAMESPACE: {{ .Values.secrets.vaultNamespace | quote }}
+TLS_CERT_FILE: {{ .Values.tls.certFile | quote }}
+TLS_KEY_FILE: {{ .Values.tls.keyFile | quote }}
+TLS_CLIENT_CA_FILE: {{ .Values.tls.clientCAFile | quote }}
+TLS_CLIENT_AUTH: {{ .Values.tls.clientAuth | quote }}
+MTLS_PRINCIPAL_MAP: {{ .Values.tls.principalMap | quote }}
+SOROTRAIL_TLS_CERT_FILE: {{ .Values.tls.sorotrailCertFile | quote }}
+SOROTRAIL_TLS_KEY_FILE: {{ .Values.tls.sorotrailKeyFile | quote }}
+SOROTRAIL_TLS_CA_FILE: {{ .Values.tls.sorotrailCAFile | quote }}
+SOROTRAIL_TLS_SERVER_NAME: {{ .Values.tls.sorotrailServerName | quote }}
+DATABASE_SSL_MODE: {{ .Values.database.sslMode | quote }}
+DATABASE_SSL_CERT_FILE: {{ .Values.database.sslCertFile | quote }}
+DATABASE_SSL_KEY_FILE: {{ .Values.database.sslKeyFile | quote }}
+DATABASE_SSL_ROOT_CERT_FILE: {{ .Values.database.sslRootCertFile | quote }}
 {{- end }}

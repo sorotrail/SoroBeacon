@@ -51,9 +51,16 @@ var routeScopes = auth.NewRouteTable(map[string][]auth.Scope{
 	"DELETE /channels/{id}":    {auth.ScopeChannelsWrite},
 	// Testing a channel sends a real notification through it, which is a write
 	// even though nothing is stored.
-	"POST /channels/{id}/test":      {auth.ScopeChannelsWrite},
-	"POST /channels/bulk":           {auth.ScopeChannelsWrite},
-	"POST /channels/{id}/duplicate": {auth.ScopeChannelsWrite},
+	"POST /channels/{id}/test":                 {auth.ScopeChannelsWrite},
+	"POST /channels/bulk":                      {auth.ScopeChannelsWrite},
+	"POST /channels/{id}/duplicate":            {auth.ScopeChannelsWrite},
+	"GET /channels/{id}/keys":                  {auth.ScopeChannelsRead},
+	"GET /channels/{id}/devices":               {auth.ScopeChannelsRead},
+	"PUT /channels/{id}/devices/{deviceID}":    {auth.ScopeChannelsWrite},
+	"DELETE /channels/{id}/devices/{deviceID}": {auth.ScopeChannelsWrite},
+	"POST /channels/{id}/keys/rotate":          {auth.ScopeChannelsWrite},
+	"POST /channels/{id}/keys/{keyID}/retire":  {auth.ScopeChannelsWrite},
+	"POST /channels/{id}/keys/{keyID}/revoke":  {auth.ScopeChannelsWrite},
 
 	"POST /templates":        {auth.ScopeTemplatesWrite},
 	"GET /templates":         {auth.ScopeTemplatesRead},
@@ -75,12 +82,51 @@ var routeScopes = auth.NewRouteTable(map[string][]auth.Scope{
 	// authentication altogether (isProbePath), so there is no credential to
 	// scope. The coverage test skips them for the same reason.
 
-	"GET /stats":              {auth.ScopeStatsRead},
-	"GET /stats/alerts-daily": {auth.ScopeAlertsRead},
+	"GET /stats":                  {auth.ScopeStatsRead},
+	"GET /stats/alerts-daily":     {auth.ScopeAlertsRead},
+	"GET /usage":                  {auth.ScopeStatsRead},
+	"GET /quotas":                 {auth.ScopeStatsRead},
+	"PUT /quotas":                 {auth.ScopeMonitorsWrite},
+	"GET /retention":              {auth.ScopeStatsRead},
+	"PUT /retention":              {auth.ScopeMonitorsWrite},
+	"DELETE /retention":           {auth.ScopeMonitorsWrite},
+	"GET /workspace/export":       {auth.ScopeMonitorsRead},
+	"GET /workspaces/{id}/export": {auth.ScopeMonitorsRead},
 
-	"POST /tokens":             {auth.ScopeTokensWrite},
-	"GET /tokens":              {auth.ScopeTokensRead},
-	"POST /tokens/{id}/revoke": {auth.ScopeTokensWrite},
+	"DELETE /workspaces/{id}": {
+		auth.ScopeMonitorsWrite,
+		auth.ScopeChannelsWrite,
+		auth.ScopeAlertsWrite,
+		auth.ScopeTemplatesWrite,
+		auth.ScopeTokensWrite,
+	},
+	"POST /workspaces/{id}/delete": {
+		auth.ScopeMonitorsWrite,
+		auth.ScopeChannelsWrite,
+		auth.ScopeAlertsWrite,
+		auth.ScopeTemplatesWrite,
+		auth.ScopeTokensWrite,
+	},
+	"GET /workspaces/{id}/delete": {
+		auth.ScopeMonitorsRead,
+		auth.ScopeChannelsRead,
+		auth.ScopeAlertsRead,
+		auth.ScopeTemplatesRead,
+		auth.ScopeTokensRead,
+	},
+
+	"POST /tokens":              {auth.ScopeTokensWrite},
+	"GET /tokens":               {auth.ScopeTokensRead},
+	"GET /tokens/{id}":          {auth.ScopeTokensRead},
+	"POST /tokens/{id}/rotate":  {auth.ScopeTokensWrite},
+	"POST /tokens/{id}/abandon": {auth.ScopeTokensWrite},
+	"POST /tokens/{id}/revoke":  {auth.ScopeTokensWrite},
+
+	// Persisted GraphQL operations:
+	"GET /graphql/operations":         {auth.ScopeNone},
+	"GET /graphql/operations/{id}":    {auth.ScopeNone},
+	"POST /graphql/operations":        {auth.ScopeMonitorsWrite},
+	"DELETE /graphql/operations/{id}": {auth.ScopeMonitorsWrite},
 
 	// Routes main added after the scope table was first written. Each one is
 	// mapped to the resource it reads or writes, never to a new scope: the
@@ -112,6 +158,11 @@ var routeScopes = auth.NewRouteTable(map[string][]auth.Scope{
 	"GET /monitors/{id}/escalation":    {auth.ScopeMonitorsRead},
 	"PUT /monitors/{id}/escalation":    {auth.ScopeMonitorsWrite, auth.ScopeChannelsWrite},
 	"DELETE /monitors/{id}/escalation": {auth.ScopeMonitorsWrite},
+	// A delivery budget is monitor configuration: it decides when the monitor
+	// stops delivering, so it needs no channel scope.
+	"GET /monitors/{id}/delivery-budget":        {auth.ScopeMonitorsRead},
+	"PUT /monitors/{id}/delivery-budget":        {auth.ScopeMonitorsWrite},
+	"POST /monitors/{id}/delivery-budget/reset": {auth.ScopeMonitorsWrite},
 	// A dry run evaluates a candidate rule against stored alerts and persists
 	// nothing, so it reads both and writes neither.
 	"POST /monitors/{id}/rules/dry-run": {auth.ScopeMonitorsRead, auth.ScopeAlertsRead},
@@ -124,7 +175,11 @@ var routeScopes = auth.NewRouteTable(map[string][]auth.Scope{
 	// queue reads alerts, and redriving one sends a notification: that is an
 	// alert write, not a channel edit.
 	"GET /dead-letters":               {auth.ScopeAlertsRead},
+	"GET /dead-letters/groups":        {auth.ScopeAlertsRead},
 	"POST /dead-letters/{id}/redrive": {auth.ScopeAlertsWrite},
+	"POST /dead-letters/{id}/discard": {auth.ScopeAlertsWrite},
+	"POST /dead-letters/bulk/redrive": {auth.ScopeAlertsWrite},
+	"POST /dead-letters/bulk/discard": {auth.ScopeAlertsWrite},
 })
 
 // requiredScopes resolves the permissions a request needs. ok false means the

@@ -1,17 +1,91 @@
 {{define "content"}}
 <h1>Dead-Letter Queue</h1>
-<p class="muted">Permanently failed deliveries after exhausted retries.</p>
+<p class="muted">Permanently failed deliveries after exhausted retries. Triage by group, re-drive after fixes, or discard resolved items.</p>
+
+{{if .Groups}}
+<h2>Backlog by Group</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Channel</th>
+      <th>Cause</th>
+      <th>Count</th>
+      <th>Oldest</th>
+      <th>Newest</th>
+      <th>Bulk Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {{range .Groups}}
+    <tr>
+      <td><strong>{{.ChannelName}}</strong> <span class="muted">({{.ChannelType}})</span></td>
+      <td><code>{{.Cause}}</code></td>
+      <td><strong>{{.Count}}</strong></td>
+      <td>{{.OldestAge}}</td>
+      <td>{{.NewestAge}}</td>
+      <td>
+        <form class="inline" method="post" action="/dead-letters/bulk/redrive" onsubmit="return confirm('Re-drive all dead letters in group {{.ChannelName}} ({{.Cause}})?');">
+          <input type="hidden" name="channel_id" value="{{.ChannelID}}">
+          <input type="hidden" name="cause" value="{{.Cause}}">
+          <button class="btn-sm">Re-drive Group</button>
+        </form>
+        <form class="inline" method="post" action="/dead-letters/bulk/discard" onsubmit="return confirm('Discard all dead letters in group {{.ChannelName}} ({{.Cause}})?');">
+          <input type="hidden" name="channel_id" value="{{.ChannelID}}">
+          <input type="hidden" name="cause" value="{{.Cause}}">
+          <button class="btn-sm">Discard Group</button>
+        </form>
+      </td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{end}}
+
+<form class="filters" method="get" action="/dead-letters">
+  <label for="channel_id">Channel
+    <select id="channel_id" name="channel_id">
+      <option value="">All channels</option>
+      {{range .Channels}}
+      <option value="{{.ID}}" {{if eq .ID $.SelectedChannel}}selected{{end}}>{{.Name}}</option>
+      {{end}}
+    </select>
+  </label>
+  <label for="cause">Cause
+    <select id="cause" name="cause">
+      <option value="">All causes</option>
+      {{range .Causes}}
+      <option value="{{.}}" {{if eq . $.SelectedCause}}selected{{end}}>{{.}}</option>
+      {{end}}
+    </select>
+  </label>
+  <label for="older_than">Age
+    <select id="older_than" name="older_than">
+      <option value="">Any age</option>
+      <option value="1h" {{if eq $.SelectedOlderThan "1h"}}selected{{end}}>Older than 1 hour</option>
+      <option value="24h" {{if eq $.SelectedOlderThan "24h"}}selected{{end}}>Older than 24 hours</option>
+      <option value="168h" {{if eq $.SelectedOlderThan "168h"}}selected{{end}}>Older than 7 days</option>
+      <option value="720h" {{if eq $.SelectedOlderThan "720h"}}selected{{end}}>Older than 30 days</option>
+    </select>
+  </label>
+  <button>Filter</button>
+  {{if or .SelectedChannel .SelectedCause .SelectedOlderThan}}
+  <a href="/dead-letters" style="align-self: center; margin-left: .5rem;">Clear</a>
+  {{end}}
+</form>
+
 {{if .DeadLetters}}
+<h2>Items</h2>
 <table>
   <thead>
     <tr>
       <th>ID</th>
       <th>Alert ID</th>
       <th>Channel</th>
+      <th>Cause</th>
+      <th>Age</th>
       <th>Attempts</th>
       <th>Last Status</th>
       <th>Last Error</th>
-      <th>Created At</th>
       <th>Actions</th>
     </tr>
   </thead>
@@ -21,13 +95,17 @@
       <td>{{.ID}}</td>
       <td><a href="/alerts/{{.AlertID}}">{{.AlertID}}</a></td>
       <td>{{.ChannelName}}</td>
+      <td><code>{{.Cause}}</code></td>
+      <td><strong>{{.Age}}</strong></td>
       <td>{{.AttemptCount}}</td>
       <td>{{.LastStatus}}</td>
       <td><code>{{.LastError}}</code></td>
-      <td>{{.CreatedAt}}</td>
       <td>
-        <form method="post" action="/dead-letters/{{.ID}}/redrive" style="display:inline;">
+        <form class="inline" method="post" action="/dead-letters/{{.ID}}/redrive">
           <button class="btn-sm">Re-drive</button>
+        </form>
+        <form class="inline" method="post" action="/dead-letters/{{.ID}}/discard" onsubmit="return confirm('Discard dead letter {{.ID}}?');">
+          <button class="btn-sm">Discard</button>
         </form>
       </td>
     </tr>
@@ -35,6 +113,9 @@
   </tbody>
 </table>
 {{else}}
-<p>No dead-lettered deliveries.</p>
+<div class="empty">
+  <h2>No dead-lettered deliveries</h2>
+  <p>Deliveries that permanently fail all retries land here for triage and redrive.</p>
+</div>
 {{end}}
 {{end}}

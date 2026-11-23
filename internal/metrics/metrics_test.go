@@ -19,28 +19,30 @@ const (
 	poolNamePrimary = "primary"
 	poolNameReplica = "replica"
 
-	storeReadsName        = "sorobeacon_store_reads_total"
-	storeFallbacksName    = "sorobeacon_store_replica_fallbacks_total"
-	replicaEnabledName    = "sorobeacon_store_replica_enabled"
-	pollsName             = "sorobeacon_polls_total"
-	pollDurationName      = "sorobeacon_poll_duration_seconds"
-	pollLagName           = "sorobeacon_poll_lag_ledgers"
-	pollAgeName           = "sorobeacon_seconds_since_last_poll"
-	eventsScannedName     = "sorobeacon_events_scanned_total"
-	eventsMatchedName     = "sorobeacon_events_matched_total"
-	ruleEvaluationsName   = "sorobeacon_rule_evaluations_total"
-	alertsFiredName       = "sorobeacon_alerts_fired_total"
-	deliveriesName        = "sorobeacon_alert_deliveries_total"
-	priorityContractsName = "sorobeacon_poll_priority_contracts"
-	priorityLagName       = "sorobeacon_poll_lag_ledgers_by_priority"
-	reorgsName            = "sorobeacon_reorgs_total"
-	lastReorgLedgerName   = "sorobeacon_last_reorg_ledger"
-	throttlesName         = "sorobeacon_alert_throttles_total"
-	breakerStateName      = "sorobeacon_channel_breaker_state"
-	httpDurationName      = "sorobeacon_http_request_duration_seconds"
-	streamDroppedName     = "sorobeacon_alerts_stream_dropped_total"
-	deadLettersName       = "sorobeacon_dead_letters_total"
-	pollPanicsName        = "sorobeacon_poll_panics_total"
+	storeReadsName         = "sorobeacon_store_reads_total"
+	storeFallbacksName     = "sorobeacon_store_replica_fallbacks_total"
+	replicaEnabledName     = "sorobeacon_store_replica_enabled"
+	replicaLagName         = "sorobeacon_store_replica_lag_seconds"
+	pollsName              = "sorobeacon_polls_total"
+	pollDurationName       = "sorobeacon_poll_duration_seconds"
+	pollLagName            = "sorobeacon_poll_lag_ledgers"
+	pollAgeName            = "sorobeacon_seconds_since_last_poll"
+	eventsScannedName      = "sorobeacon_events_scanned_total"
+	eventsMatchedName      = "sorobeacon_events_matched_total"
+	ruleEvaluationsName    = "sorobeacon_rule_evaluations_total"
+	alertsFiredName        = "sorobeacon_alerts_fired_total"
+	deliveriesName         = "sorobeacon_alert_deliveries_total"
+	priorityContractsName  = "sorobeacon_poll_priority_contracts"
+	priorityLagName        = "sorobeacon_poll_lag_ledgers_by_priority"
+	reorgsName             = "sorobeacon_reorgs_total"
+	lastReorgLedgerName    = "sorobeacon_last_reorg_ledger"
+	throttlesName          = "sorobeacon_alert_throttles_total"
+	breakerStateName       = "sorobeacon_channel_breaker_state"
+	httpDurationName       = "sorobeacon_http_request_duration_seconds"
+	streamDroppedName      = "sorobeacon_alerts_stream_dropped_total"
+	deadLettersName        = "sorobeacon_dead_letters_total"
+	deadLettersChannelName = "sorobeacon_dead_letters"
+	pollPanicsName         = "sorobeacon_poll_panics_total"
 )
 
 func TestRecordPollTracksOutcomesAndDuration(t *testing.T) {
@@ -64,6 +66,21 @@ func TestSetPollLagRecordsGauge(t *testing.T) {
 	m.SetPollLag(17)
 
 	assert.Equal(t, float64(17), m.sampleValue(t, pollLagName, nil))
+}
+
+func TestUpstreamGauges(t *testing.T) {
+	m := New()
+
+	m.SetUpstreamLag(42)
+	m.SetUpstreamFailures(3)
+
+	assert.Equal(t, float64(42), m.sampleValue(t, "sorobeacon_upstream_lag_ledgers", nil))
+	assert.Equal(t, float64(3), m.sampleValue(t, "sorobeacon_upstream_consecutive_failures", nil))
+
+	m.SetUpstreamLag(-5)
+	m.SetUpstreamFailures(-1)
+	assert.Equal(t, float64(0), m.sampleValue(t, "sorobeacon_upstream_lag_ledgers", nil))
+	assert.Equal(t, float64(0), m.sampleValue(t, "sorobeacon_upstream_consecutive_failures", nil))
 }
 
 func TestTickPollAgeRecordsGauge(t *testing.T) {
@@ -248,6 +265,16 @@ func TestSetReplicaEnabledTracksBothDirections(t *testing.T) {
 	assert.Equal(t, float64(0), m.sampleValue(t, replicaEnabledName, nil))
 }
 
+func TestSetReplicaLagTracksSecondsAndClampsNegative(t *testing.T) {
+	m := New()
+
+	require.Equal(t, float64(0), m.sampleValue(t, replicaLagName, nil))
+	m.SetReplicaLag(4.25)
+	assert.InDelta(t, 4.25, m.sampleValue(t, replicaLagName, nil), 0.0001)
+	m.SetReplicaLag(-1.5)
+	assert.Equal(t, float64(0), m.sampleValue(t, replicaLagName, nil))
+}
+
 // TestReadMetricsAreNilSafe pins the package contract that a nil *Metrics
 // records nothing rather than panicking. The store holds a *Metrics it was
 // handed without a nil check, so this is load-bearing for every embedder and
@@ -261,6 +288,7 @@ func TestReadMetricsAreNilSafe(t *testing.T) {
 		m.RecordReplicaFallback()
 		m.SetReplicaEnabled(true)
 		m.SetReplicaEnabled(false)
+		m.SetReplicaLag(1.5)
 	})
 }
 
@@ -397,6 +425,25 @@ func TestDeadLetterGaugeHasNoLabels(t *testing.T) {
 	t.Fatalf("%s was not exported", deadLettersName)
 }
 
+func TestDeadLettersByWorkspaceAndChannel(t *testing.T) {
+	m := New()
+
+	m.RecordDeadLetterFor("acme", "slack")
+	m.RecordDeadLetterFor("acme", "slack")
+	m.RecordDeadLetterFor("beta", "pagerduty")
+
+	assert.Equal(t, float64(2), m.sampleValue(t, deadLettersChannelName, map[string]string{"workspace": "acme", "channel": "slack"}))
+	assert.Equal(t, float64(1), m.sampleValue(t, deadLettersChannelName, map[string]string{"workspace": "beta", "channel": "pagerduty"}))
+	assert.Equal(t, float64(3), m.sampleValue(t, deadLettersName, nil), "global unlabelled count also increments")
+
+	m.ClearDeadLetterFor("acme", "slack")
+	assert.Equal(t, float64(1), m.sampleValue(t, deadLettersChannelName, map[string]string{"workspace": "acme", "channel": "slack"}))
+	assert.Equal(t, float64(2), m.sampleValue(t, deadLettersName, nil))
+
+	m.SetDeadLettersFor("acme", "slack", 10)
+	assert.Equal(t, float64(10), m.sampleValue(t, deadLettersChannelName, map[string]string{"workspace": "acme", "channel": "slack"}))
+}
+
 func TestRecordPanicCountsPerNetwork(t *testing.T) {
 	m := New()
 	m.WithNetwork("testnet").RecordPanic()
@@ -432,5 +479,117 @@ func TestDeadLetterPanicAndNetworkAreNilSafe(t *testing.T) {
 		m.SetDeadLetters(3)
 		m.RecordDeadLetter()
 		m.ClearDeadLetter()
+		m.RecordHeartbeatSuccess()
+		m.RecordBodyRejection("max_body")
 	})
+}
+
+func TestRecordBodyRejection(t *testing.T) {
+	m := New()
+	m.RecordBodyRejection("max_body")
+	m.RecordBodyRejection("max_body")
+	m.RecordBodyRejection("template_size")
+
+	gotMax := m.sampleValue(t, "sorobeacon_request_body_rejections_total", map[string]string{"limit": "max_body"})
+	assert.Equal(t, float64(2), gotMax)
+
+	gotTmpl := m.sampleValue(t, "sorobeacon_request_body_rejections_total", map[string]string{"limit": "template_size"})
+	assert.Equal(t, float64(1), gotTmpl)
+}
+
+// The heartbeat metric is the inside-the-instance record that the external
+// dead-man's switch was being fed: it is zero until the first successful
+// ping and stamps the time on every one after that, so an operator can see
+// from /metrics when the external service last heard from this instance.
+func TestRecordHeartbeatSuccess(t *testing.T) {
+	m := New()
+
+	// A metrics handler scrape is what a dashboard would see; reading the
+	// registry directly is the same value without the HTTP round-trip.
+	m.RecordHeartbeatSuccess()
+	got := m.sampleValue(t, "sorobeacon_heartbeat_last_success_timestamp_seconds", nil)
+	assert.InDelta(t, float64(time.Now().Unix()), got, 5,
+		"the gauge should stamp the moment of the last successful ping")
+}
+
+func TestRecordNotModified(t *testing.T) {
+	m := New()
+	m.RecordNotModified("/api/v1/alerts")
+	m.RecordNotModified("/api/v1/alerts")
+	m.RecordNotModified("/api/v1/stats/alerts-daily")
+
+	assert.Equal(t, float64(2), m.sampleValue(t, "sorobeacon_http_not_modified_total", map[string]string{"route": "/api/v1/alerts"}))
+	assert.Equal(t, float64(1), m.sampleValue(t, "sorobeacon_http_not_modified_total", map[string]string{"route": "/api/v1/stats/alerts-daily"}))
+
+	// Test via Middleware with 304 response
+	handler := m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	req := httptest.NewRequest("GET", "/api/v1/channels/1/stats", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, float64(1), m.sampleValue(t, "sorobeacon_http_not_modified_total", map[string]string{"route": "/api/v1/channels/1/stats"}))
+}
+
+func TestSetChannelUnacknowledgedFlagged(t *testing.T) {
+	tests := []struct {
+		name        string
+		channelID   string
+		channelType string
+		flagged     bool
+		want        float64
+	}{
+		{
+			name:        "flagged true sets gauge to 1",
+			channelID:   "ch-1",
+			channelType: "webhook",
+			flagged:     true,
+			want:        1.0,
+		},
+		{
+			name:        "flagged false sets gauge to 0",
+			channelID:   "ch-2",
+			channelType: "slack",
+			flagged:     false,
+			want:        0.0,
+		},
+	}
+
+	m := New()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m.SetChannelUnacknowledgedFlagged(tc.channelID, tc.channelType, tc.flagged)
+			got := m.sampleValue(t, "sorobeacon_channel_unacknowledged_flagged", map[string]string{
+				"channel_id":   tc.channelID,
+				"channel_type": tc.channelType,
+			})
+			assert.Equal(t, tc.want, got)
+		})
+	}
+
+	// Clearing a previously flagged channel updates the gauge back to 0.
+	m.SetChannelUnacknowledgedFlagged("ch-1", "webhook", false)
+	got := m.sampleValue(t, "sorobeacon_channel_unacknowledged_flagged", map[string]string{
+		"channel_id":   "ch-1",
+		"channel_type": "webhook",
+	})
+	assert.Equal(t, 0.0, got)
+
+	// Nil receiver must not panic.
+	var nilMetrics *Metrics
+	assert.NotPanics(t, func() {
+		nilMetrics.SetChannelUnacknowledgedFlagged("ch-1", "webhook", true)
+	})
+}
+
+func TestRecordDeliveryBudgetExhaustedCountsAndIsExported(t *testing.T) {
+	m := New()
+	m.RecordDeliveryBudgetExhausted()
+	m.RecordDeliveryBudgetExhausted()
+	assert.Equal(t, float64(2), m.sampleValue(t, "sorobeacon_delivery_budget_exhausted_total", nil))
+	assert.Contains(t, ExportedMetricNames(), "sorobeacon_delivery_budget_exhausted_total")
+
+	var nilMetrics *Metrics
+	nilMetrics.RecordDeliveryBudgetExhausted() // must not panic: metrics are optional
 }

@@ -1,10 +1,11 @@
 package notify
 
 // Tracing tests for the dispatcher. In production Dispatch is handed the
-// poller's alert-span context, so the notify.deliver span lands under the
-// alert's span on the poll cycle's trace; these tests re-create that shape
-// with an in-memory exporter and pin the attributes and the no-secrets
-// rule on the span itself.
+// poller's alert-span context. Delivery runs on its own goroutine and can
+// outlive detection, so notify.deliver is a new root span *linked* to the
+// alert's span rather than a child of it; these tests re-create that shape
+// with an in-memory exporter and pin the link, the attributes and the
+// no-secrets rule on the span itself.
 
 import (
 	"context"
@@ -44,9 +45,9 @@ func tracedDispatcher(t *testing.T, st *fakeDispatchStore, n Notifier) (*Dispatc
 	return d, exp, tp.Tracer("test-parent")
 }
 
-func TestDeliverSpanIsChildOfAlertContext(t *testing.T) {
-	// The dispatcher must not start roots: whatever ctx Dispatch receives
-	// (in production the poller's alert span) is the parent.
+func TestDeliverSpanIsLinkedToAlertContext(t *testing.T) {
+	// Whatever ctx Dispatch receives (in production the poller's alert span)
+	// is what the delivery links back to.
 	st := &fakeDispatchStore{channels: []store.Channel{mockChannel(1)}}
 	n := &mockNotifier{}
 	d, exp, tracer := tracedDispatcher(t, st, n)
@@ -61,8 +62,46 @@ func TestDeliverSpanIsChildOfAlertContext(t *testing.T) {
 	require.Len(t, spans, 2, "the fake alert parent and the delivery span")
 	deliver := findSpan(spans, "notify.deliver")
 	require.NotNil(t, deliver)
-	assert.Equal(t, alertSpan.SpanContext().SpanID(), deliver.Parent().SpanID(),
-		"the delivery span must be a child of the alert's span, never a root")
+	assert.False(t, deliver.Parent().IsValid(),
+		"delivery is a new root, so the detection trace is not held open")
+	require.Len(t, deliver.Links(), 1, "delivery links to the span that caused it")
+	assert.Equal(t, alertSpan.SpanContext().SpanID(), deliver.Links()[0].SpanContext.SpanID())
+	assert.Equal(t, alertSpan.SpanContext().TraceID(), deliver.Links()[0].SpanContext.TraceID())
+}
+
+func TestEscalationStepLinksBackToTheAlert(t *testing.T) {
+	// An escalation step fires minutes after detection, from the
+	// scheduler, with no trace in its context. It must still link to the
+	// alert's detection span, remembered when the alert was dispatched.
+	st := &fakeDispatchStore{channels: []store.Channel{mockChannel(1)}}
+	n := &mockNotifier{}
+	d, exp, tracer := tracedDispatcher(t, st, n)
+
+	ctx, alertSpan := tracer.Start(context.Background(), "poller.create_alert")
+	alert := Alert{ID: 77, MonitorID: 2}
+	d.Dispatch(ctx, alert)
+	alertSpan.End()
+
+	// Later, from a context with no span at all.
+	d.deliverStep(context.Background(), alert, store.EscalationStep{ChannelIDs: []int64{1}})
+
+	escalate := findSpan(exp.Ended(), "notify.escalate")
+	require.NotNil(t, escalate)
+	assert.False(t, escalate.Parent().IsValid())
+	require.Len(t, escalate.Links(), 1)
+	assert.Equal(t, alertSpan.SpanContext().SpanID(), escalate.Links()[0].SpanContext.SpanID(),
+		"the escalation step links back to the alert's detection span")
+}
+
+func TestEscalationWithoutRememberedAlertStillTraces(t *testing.T) {
+	// After a restart the detection span is forgotten: the step still gets
+	// a span with the alert id, just no link.
+	st := &fakeDispatchStore{channels: []store.Channel{mockChannel(1)}}
+	d, exp, _ := tracedDispatcher(t, st, &mockNotifier{})
+	d.deliverStep(context.Background(), Alert{ID: 5, MonitorID: 2}, store.EscalationStep{ChannelIDs: []int64{1}})
+	escalate := findSpan(exp.Ended(), "notify.escalate")
+	require.NotNil(t, escalate)
+	assert.Empty(t, escalate.Links())
 }
 
 // findSpan picks the first span with the given name from a batch of ended spans.

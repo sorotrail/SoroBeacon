@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sorobeacon-client"
+version = "0.1.0"
+description = "Generated Python client for the SoroBeacon HTTP API"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sorobeacon*"]
+
+[tool.setuptools.package-data]
+sorobeacon = ["py.typed"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = false
+warn_unused_configs = true
+disallow_any_generics = false
+files = ["sorobeacon", "examples"]

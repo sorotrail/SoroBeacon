@@ -102,16 +102,17 @@ them.
 
 | Routes | Required scopes |
 | --- | --- |
-| `GET /monitors`, `GET /monitors/{id}`, `GET /monitors/{id}/rules`, `POST /monitors/{id}/rules/dry-run` | `monitors:read` (dry-run also `alerts:read`) |
-| `POST /monitors`, `PATCH`/`DELETE /monitors/{id}`, `POST /monitors/{id}/duplicate`, `POST /monitors/{id}/rules`, `POST /monitors/{id}/rules/bulk`, `PATCH`/`DELETE /monitors/{id}/rules/{ruleID}`, `POST /monitors/import`, `DELETE /monitors/{id}/escalation` | `monitors:write` |
+| `GET /monitors`, `GET /monitors/{id}`, `GET /monitors/{id}/rules`, `GET /monitors/trash`, `POST /monitors/{id}/rules/dry-run` | `monitors:read` (dry-run also `alerts:read`) |
+| `POST /monitors`, `POST /monitors/bulk`, `PATCH`/`DELETE /monitors/{id}`, `POST /monitors/{id}/duplicate`, `POST /monitors/{id}/soft-delete`, `POST /monitors/{id}/restore`, `POST /monitors/{id}/rules`, `POST /monitors/{id}/rules/bulk`, `PATCH`/`DELETE /monitors/{id}/rules/{ruleID}`, `POST /monitors/import`, `DELETE /monitors/{id}/escalation` | `monitors:write` |
 | `GET /monitors/{id}/escalation` | `monitors:read` |
 | `PUT /monitors/{id}/escalation` | `monitors:write` + `channels:write` |
 | `GET /channels`, `GET /channels/{id}` | `channels:read` |
-| `POST /channels`, `PATCH`/`DELETE /channels/{id}`, `POST /channels/{id}/test` | `channels:write` |
+| `POST /channels`, `POST /channels/bulk`, `POST /channels/{id}/duplicate`, `PATCH`/`DELETE /channels/{id}`, `POST /channels/{id}/test` | `channels:write` |
+| `GET /channels/{id}/stats` | `stats:read` |
 | `GET /templates`, `GET /templates/{id}` | `templates:read` |
 | `POST /templates`, `PATCH`/`DELETE /templates/{id}`, `POST /templates/{id}/instantiate`, `POST /templates/{id}/instantiate/bulk` | `templates:write` (instantiate also `monitors:write`) |
-| `GET /alerts`, `GET /alerts.csv`, `GET /alerts/export`, `GET /alerts/stream`, `GET /alerts/{id}/deliveries`, `GET /dead-letters`, `GET /inhibitions`, `GET /maintenance-windows`, `GET /maintenance-windows/{id}` | `alerts:read` |
-| `POST /alerts/{id}/acknowledge`, `POST /alerts/{id}/deliveries/{channelID}/retry`, `POST /ingest`, `POST /dead-letters/{id}/redrive`, `POST /inhibitions`, `DELETE /inhibitions/{sourceID}/{targetID}`, `POST`/`PATCH`/`DELETE /maintenance-windows...` | `alerts:write` |
+| `GET /alerts`, `GET /alerts.csv`, `GET /alerts/export`, `GET /alerts/stream`, `GET /alerts/{id}/deliveries`, `GET /dead-letters`, `GET /dead-letters/groups`, `GET /inhibitions`, `GET /maintenance-windows`, `GET /maintenance-windows/{id}` | `alerts:read` |
+| `POST /alerts/{id}/acknowledge`, `POST /alerts/{id}/deliveries/{channelID}/retry`, `POST /ingest`, `POST /dead-letters/{id}/redrive`, `POST /dead-letters/{id}/discard`, `POST /dead-letters/bulk/redrive`, `POST /dead-letters/bulk/discard`, `POST /inhibitions`, `DELETE /inhibitions/{sourceID}/{targetID}`, `POST`/`PATCH`/`DELETE /maintenance-windows...` | `alerts:write` |
 | `GET /stats`, `GET /monitors/{id}/stats` | `stats:read` |
 | `GET /stats/alerts-daily` | `alerts:read` |
 | `POST /tokens`, `POST /tokens/{id}/revoke` | `tokens:write` |
@@ -149,9 +150,42 @@ The suffix is **stripped when the token table is built**: an entry
 `secret`, not `secret:viewer`. The suffix selects the role; it is not part of
 the secret the client sends.
 
-An OIDC deployment maps roles with `OIDC_ROLE_CLAIM`, naming a claim in the
-verified ID token whose value is `viewer`, `editor` or `admin`. A claim the
-token lacks, or one naming no known role, leaves the identity an admin.
+An OIDC deployment maps roles either with `OIDC_ROLE_CLAIM` (naming a claim in
+the verified ID token whose value is `viewer`, `editor` or `admin`; a claim the
+token lacks, or one naming no known role, leaves the identity an admin) or with
+declarative group mappings (`OIDC_GROUP_CLAIM` and `OIDC_GROUP_MAPPINGS`).
+
+#### Declarative OIDC group mapping
+
+Enterprise identity providers emit group memberships (typically in the `groups`
+claim), and `OIDC_GROUP_MAPPINGS` maps each group name to a `(workspace, role)`
+pair without issuing per-user tokens:
+
+```sh
+OIDC_GROUP_CLAIM=groups
+OIDC_GROUP_MAPPINGS=sre-prod=prod:admin,devs-prod=prod:editor,auditors=prod:viewer,devs-staging=staging:editor
+OIDC_GROUP_CACHE_TTL=5m
+```
+
+* **Fail-closed:** When `OIDC_GROUP_MAPPINGS` is configured, a token whose
+  group claim is missing, empty, or matches no configured rule is denied
+  (`403 Forbidden` on `/api/v1` and rejected on `/login/oidc/callback`). It is
+  **never** defaulted to `OIDC_WORKSPACE` or `admin`.
+* **Multi-group precedence:** When a token carries multiple groups, every
+  matching rule is evaluated. Within a single workspace, the highest role wins
+  (`admin > editor > viewer`). Across multiple workspaces, the primary
+  `(workspace, role)` is the grant with the highest role, with ties broken by
+  the earliest matching rule in `OIDC_GROUP_MAPPINGS` declaration order; all
+  matched `(workspace, role)` grants remain recorded on the resolved
+  `Identity`/`Principal`.
+* **Live reload and bounded revocation (`OIDC_GROUP_CACHE_TTL`):** Group
+  mappings can be updated at runtime via `OIDCProvider.SetGroupMappings`
+  without restarting the process, immediately invalidating cached group
+  resolutions and re-evaluating active OIDC sessions. When a group is removed
+  at the identity provider, cached bearer and session grants expire or
+  re-validate within `OIDC_GROUP_CACHE_TTL` (default `5m`).
+* **No claim or token leakage:** Neither raw claim values nor tokens are ever
+  logged, returned in error responses, or echoed in startup errors.
 
 ### What each role may do
 
@@ -174,7 +208,7 @@ disagree in either direction.
 | `GET /monitors`, `/monitors/{id}`, `/monitors/{id}/stats`, `/monitors/{id}/rules`, `/monitors/{id}/escalation`, `/monitors/trash` | viewer |
 | `GET /channels`, `/channels/{id}`, `/channels/{id}/stats` | viewer |
 | `GET /templates`, `/templates/{id}` | viewer |
-| `GET /alerts`, `/alerts.csv`, `/alerts/export`, `/alerts/stream`, `/alerts/{id}/deliveries`, `/dead-letters`, `/inhibitions`, `/maintenance-windows`, `/maintenance-windows/{id}` | viewer |
+| `GET /alerts`, `/alerts.csv`, `/alerts/export`, `/alerts/stream`, `/alerts/{id}/deliveries`, `/dead-letters`, `/dead-letters/groups`, `/inhibitions`, `/maintenance-windows`, `/maintenance-windows/{id}` | viewer |
 | `GET /stats`, `/stats/alerts-daily` | viewer |
 | `GET /version`, `/poller`, `/rule-types` | viewer |
 | `POST /monitors`, `/monitors/bulk`, `/monitors/import` | editor |
@@ -184,7 +218,7 @@ disagree in either direction.
 | `PUT`/`DELETE /monitors/{id}/escalation` | editor |
 | `POST /channels`, `PATCH`/`DELETE /channels/{id}`, `/channels/bulk`, `/channels/{id}/duplicate`, `/channels/{id}/test` | editor |
 | `POST /templates`, `PATCH`/`DELETE /templates/{id}`, `/templates/{id}/instantiate`, `/templates/{id}/instantiate/bulk` | editor |
-| `POST /alerts/{id}/acknowledge`, `/alerts/{id}/deliveries/{channelID}/retry`, `/ingest`, `/dead-letters/{id}/redrive`, `/inhibitions`, `DELETE /inhibitions/{sourceID}/{targetID}` | editor |
+| `POST /alerts/{id}/acknowledge`, `/alerts/{id}/deliveries/{channelID}/retry`, `/ingest`, `/dead-letters/{id}/redrive`, `/dead-letters/{id}/discard`, `/dead-letters/bulk/redrive`, `/dead-letters/bulk/discard`, `/inhibitions`, `DELETE /inhibitions/{sourceID}/{targetID}` | editor |
 | `POST`/`PATCH`/`DELETE /maintenance-windows...` | editor |
 | `GET`/`POST /tokens`, `POST /tokens/{id}/revoke` | admin |
 | `GET /audit` | admin |

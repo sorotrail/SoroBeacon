@@ -120,8 +120,8 @@ func TestSignalSendSuccess(t *testing.T) {
 	assert.Equal(t, "/v2/send", gotURL)
 
 	var payload struct {
-		Message   string   `json:"message"`
-		Number    string   `json:"number"`
+		Message    string   `json:"message"`
+		Number     string   `json:"number"`
 		Recipients []string `json:"recipients"`
 	}
 	require.NoError(t, json.Unmarshal(gotBody, &payload))

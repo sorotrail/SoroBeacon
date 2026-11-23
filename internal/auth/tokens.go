@@ -199,12 +199,22 @@ type Token struct {
 	// Workspace is the tenant the token belongs to, read from its row. The
 	// request that authenticates has no workspace yet — resolving it is this
 	// value's job — so the tenancy cannot come from the caller.
-	Workspace  workspace.ID `json:"-"`
-	Scopes     []Scope
-	ExpiresAt  time.Time
-	LastUsedAt time.Time
-	RevokedAt  time.Time
-	CreatedAt  time.Time
+	Workspace            workspace.ID `json:"-"`
+	Scopes               []Scope
+	ExpiresAt            time.Time
+	LastUsedAt           time.Time
+	RevokedAt            time.Time
+	CreatedAt            time.Time
+	RotatedFromID        *int64
+	SuccessorID          *int64
+	RotatedAt            time.Time
+	PreRotationExpiresAt time.Time
+}
+
+// IsRotating reports whether this token is currently in the process of being rotated
+// to a successor token.
+func (t *Token) IsRotating() bool {
+	return t != nil && t.SuccessorID != nil
 }
 
 // Live reports whether the token may authenticate right now. Revoked and
@@ -227,6 +237,12 @@ func (t *Token) Live(now time.Time) bool {
 // acts on, and what it is allowed to do there.
 type Principal struct {
 	Workspace workspace.ID
+	// Role is the resolved role for this caller (e.g. from a static token,
+	// session, or OIDC claim/group mapping).
+	Role Role
+	// Grants holds all (Workspace, Role) pairs resolved for a multi-group OIDC
+	// identity, in declared mapping order with highest role per workspace.
+	Grants []WorkspaceGrant
 	// restricted is true for a database token, for which scopes is the whole
 	// grant. It is a flag rather than "scopes is nil" because the list is
 	// stored as a comma-separated string: a token minted with no scopes
@@ -239,6 +255,41 @@ type Principal struct {
 	// Name is the token's label, for log lines that identify *which* credential
 	// was used without containing any part of it.
 	Name string
+	// ActorType classifies the caller for administrative audit records
+	// ("person" vs "automation").
+	ActorType string
+}
+
+// EffectiveActorType returns the caller's actor classification ("person" or
+// "automation"), defaulting to "automation" for restricted tokens and "person"
+// otherwise.
+func (p *Principal) EffectiveActorType() string {
+	if p == nil {
+		return "anonymous"
+	}
+	if p.ActorType != "" {
+		return p.ActorType
+	}
+	if p.restricted {
+		return "automation"
+	}
+	return "person"
+}
+
+// RoleInWorkspace reports the role granted to this principal in ws, if any.
+func (p *Principal) RoleInWorkspace(ws workspace.ID) (Role, bool) {
+	if p == nil {
+		return RoleUnknown, false
+	}
+	for _, g := range p.Grants {
+		if g.Workspace == ws {
+			return g.Role, true
+		}
+	}
+	if p.Workspace == ws && p.Role != RoleUnknown {
+		return p.Role, true
+	}
+	return RoleUnknown, false
 }
 
 // Allowed reports whether this caller may perform the action a route asks for.
@@ -319,8 +370,11 @@ type TokenStore interface {
 	// database failed" without this package importing the store's errors.
 	TokenByHash(ctx context.Context, hash string) (token *Token, found bool, err error)
 	ListAPITokens(ctx context.Context) ([]Token, error)
+	GetAPIToken(ctx context.Context, id int64) (*Token, error)
 	RevokeAPIToken(ctx context.Context, id int64) error
 	TouchAPIToken(ctx context.Context, id int64, at time.Time) error
+	RotateAPIToken(ctx context.Context, predecessorID int64, successor *Token, predecessorExpiry time.Time) error
+	AbandonAPITokenRotation(ctx context.Context, id int64) error
 }
 
 // Manager mints, authenticates and retires database tokens.
@@ -403,6 +457,17 @@ func (m *Manager) Authenticate(ctx context.Context, raw string) (*Principal, err
 	if !t.Live(now) {
 		return nil, ErrInvalidToken
 	}
+	if !t.ExpiresAt.IsZero() {
+		rem := t.ExpiresAt.Sub(now)
+		if rem > 0 && rem <= ExpiringSoonThreshold {
+			m.log.Warn("api token in use close to expiry",
+				"token_id", t.ID,
+				"name", t.Name,
+				"prefix", t.Prefix,
+				"expires_at", t.ExpiresAt.Format(time.RFC3339),
+				"time_remaining", rem.Round(time.Second).String())
+		}
+	}
 	if !t.LastUsedAt.IsZero() && now.Sub(t.LastUsedAt) < touchInterval {
 		// A busy CI job would otherwise write one row per request. The stamp is
 		// for finding stale tokens, and "used within the last minute" answers
@@ -428,6 +493,7 @@ func principalFor(t *Token) *Principal {
 		scopes:     t.Scopes,
 		tokenID:    t.ID,
 		Name:       t.Name,
+		ActorType:  "automation",
 	}
 }
 
@@ -449,6 +515,90 @@ func (m *Manager) Revoke(ctx context.Context, id int64) error {
 		return ErrInvalidToken
 	}
 	return m.store.RevokeAPIToken(ctx, id)
+}
+
+// DefaultRotationOverlap is the fallback overlap duration during which both
+// predecessor and successor tokens remain valid simultaneously.
+const DefaultRotationOverlap = 7 * 24 * time.Hour
+
+// ExpiringSoonThreshold defines when an authenticated token triggers a warning
+// that it will expire soon.
+const ExpiringSoonThreshold = 24 * time.Hour
+
+// Get returns one token by ID in the caller's workspace.
+func (m *Manager) Get(ctx context.Context, id int64) (*Token, error) {
+	if m == nil || m.store == nil {
+		return nil, ErrInvalidToken
+	}
+	return m.store.GetAPIToken(ctx, id)
+}
+
+// Rotate issues a successor token while keeping the predecessor valid for the
+// overlap window. The plaintext secret of the successor is returned exactly once.
+func (m *Manager) Rotate(ctx context.Context, predecessorID int64, name string, scopes []Scope, overlap time.Duration, successorExpiresAt time.Time) (string, *Token, error) {
+	if m == nil || m.store == nil {
+		return "", nil, ErrInvalidToken
+	}
+	pred, err := m.store.GetAPIToken(ctx, predecessorID)
+	if err != nil {
+		return "", nil, err
+	}
+	now := m.now()
+	if !pred.Live(now) {
+		return "", nil, fmt.Errorf("cannot rotate inactive token")
+	}
+
+	secret, err := newTokenSecret()
+	if err != nil {
+		return "", nil, err
+	}
+
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = pred.Name
+	}
+	if len(name) > MaxTokenNameLen {
+		return "", nil, fmt.Errorf("name must be at most %d characters", MaxTokenNameLen)
+	}
+
+	// Successor's scopes default to predecessor's scopes
+	if len(scopes) == 0 {
+		scopes = append([]Scope{}, pred.Scopes...)
+	}
+
+	if overlap <= 0 {
+		overlap = DefaultRotationOverlap
+	}
+	newPredExpiry := now.Add(overlap).UTC().Truncate(time.Second)
+	// If predecessor already had an earlier expiry, keep the earlier one
+	if !pred.ExpiresAt.IsZero() && pred.ExpiresAt.Before(newPredExpiry) {
+		newPredExpiry = pred.ExpiresAt
+	}
+
+	succ := &Token{
+		Name:          name,
+		Prefix:        secret[:len(TokenPrefix)+tokenPrefixLen],
+		Hash:          HashToken(secret),
+		Scopes:        append([]Scope{}, scopes...),
+		ExpiresAt:     successorExpiresAt.UTC().Truncate(time.Second),
+		RotatedFromID: &pred.ID,
+		RotatedAt:     now.UTC().Truncate(time.Second),
+	}
+
+	if err := m.store.RotateAPIToken(ctx, predecessorID, succ, newPredExpiry); err != nil {
+		return "", nil, err
+	}
+
+	return secret, succ, nil
+}
+
+// AbandonRotation revokes the successor token and restores the predecessor token's
+// pre-rotation state without inconsistent state.
+func (m *Manager) AbandonRotation(ctx context.Context, id int64) error {
+	if m == nil || m.store == nil {
+		return ErrInvalidToken
+	}
+	return m.store.AbandonAPITokenRotation(ctx, id)
 }
 
 // HashToken is the credential digest: hex SHA-256 over the raw secret.

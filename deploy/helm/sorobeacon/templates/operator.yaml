@@ -1,0 +1,177 @@
+{{- if .Values.operator.enabled -}}
+{{- /* The operator and its CRD are off by default. The CRD lives in templates/
+so the toggle also controls it: Helm installs files in crds/ unconditionally. */ -}}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: channels.sorobeacon.io
+  labels:
+    {{- include "sorobeacon.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  group: sorobeacon.io
+  scope: Namespaced
+  names:
+    kind: Channel
+    listKind: ChannelList
+    plural: channels
+    singular: channel
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Type
+          type: string
+          jsonPath: .spec.type
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [type]
+              properties:
+                name: {type: string}
+                type: {type: string}
+                enabled: {type: boolean}
+                minSeverity: {type: string, enum: ["", info, warning, critical]}
+                adopt: {type: boolean}
+                deletionPolicy: {type: string, enum: [Orphan, Delete]}
+                config:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                secretRefs:
+                  type: array
+                  items:
+                    type: object
+                    required: [configKey, name, key]
+                    properties:
+                      configKey: {type: string}
+                      name: {type: string}
+                      key: {type: string}
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "sorobeacon.fullname" . }}-operator
+  labels:
+    {{- include "sorobeacon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+---
+# Minimal permissions: Channel resources (get, list, patch for finalizers and
+# status) and get on Secrets. Secret access is a namespaced Role, so the
+# operator can only read Secrets in the release namespace: Channel resources
+# that reference Secrets must live there.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "sorobeacon.fullname" . }}-operator
+  labels:
+    {{- include "sorobeacon.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [sorobeacon.io]
+    resources: [channels]
+    verbs: [get, list, patch]
+  - apiGroups: [sorobeacon.io]
+    resources: [channels/status]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "sorobeacon.fullname" . }}-operator
+  labels:
+    {{- include "sorobeacon.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "sorobeacon.fullname" . }}-operator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "sorobeacon.fullname" . }}-operator
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "sorobeacon.fullname" . }}-operator-secrets
+  labels:
+    {{- include "sorobeacon.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "sorobeacon.fullname" . }}-operator-secrets
+  labels:
+    {{- include "sorobeacon.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "sorobeacon.fullname" . }}-operator-secrets
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "sorobeacon.fullname" . }}-operator
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sorobeacon.fullname" . }}-operator
+  labels:
+    {{- include "sorobeacon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "sorobeacon.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: operator
+  template:
+    metadata:
+      labels:
+        {{- include "sorobeacon.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: operator
+    spec:
+      serviceAccountName: {{ include "sorobeacon.fullname" . }}-operator
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
+          env:
+            - name: SOROBEACON_URL
+              value: {{ .Values.operator.apiURL | default (printf "http://%s:%v" (include "sorobeacon.fullname" .) .Values.service.port) | quote }}
+            - name: SOROBEACON_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "operator.tokenSecret.name is required when operator.enabled" .Values.operator.tokenSecret.name }}
+                  key: {{ .Values.operator.tokenSecret.key }}
+            - name: RECONCILE_INTERVAL
+              value: {{ .Values.operator.reconcileInterval | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          {{- with .Values.operator.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

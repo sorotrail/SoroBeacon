@@ -1,0 +1,6 @@
+test: add edge cases to NewPruner tests
+
+Added 2 new table-driven edge cases to TestNewPrunerEdgeCases:
+- empty alerts is no-op
+- single alert boundary (verifies deterministic key)
+- Existing cases: nil backend returns error, valid backend succeeds

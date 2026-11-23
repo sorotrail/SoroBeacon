@@ -51,6 +51,16 @@ type OIDC struct {
 	// is minted with (OIDC_ROLE_CLAIM): "viewer", "editor" or "admin". Empty
 	// means every identity that signs in is an admin.
 	RoleClaim string
+	// GroupClaim names the ID-token claim holding group memberships
+	// (OIDC_GROUP_CLAIM, default "groups" when OIDC_GROUP_MAPPINGS is set).
+	GroupClaim string
+	// GroupMappings is the parsed OIDC_GROUP_MAPPINGS list, mapping provider
+	// groups to (Workspace, Role) pairs. When non-empty, group mapping is
+	// fail-closed.
+	GroupMappings []auth.GroupMapping
+	// GroupCacheTTL bounds how long a resolved group mapping is cached before
+	// re-evaluation (OIDC_GROUP_CACHE_TTL, default 5m).
+	GroupCacheTTL time.Duration
 	// AllowedDomains is the e-mail domain allow-list (OIDC_ALLOWED_DOMAINS).
 	// Empty accepts every account the provider authenticates.
 	AllowedDomains []string
@@ -78,6 +88,7 @@ func parseOIDC(getenv func(string) string) (OIDC, error) {
 		Workspace:      workspace.ID(strings.TrimSpace(getenv("OIDC_WORKSPACE"))),
 		WorkspaceClaim: strings.TrimSpace(getenv("OIDC_WORKSPACE_CLAIM")),
 		RoleClaim:      strings.TrimSpace(getenv("OIDC_ROLE_CLAIM")),
+		GroupClaim:     strings.TrimSpace(getenv("OIDC_GROUP_CLAIM")),
 		Scopes:         splitList(getenv("OIDC_SCOPES")),
 		AllowedDomains: lowerList(getenv("OIDC_ALLOWED_DOMAINS")),
 	}
@@ -95,7 +106,8 @@ func parseOIDC(getenv func(string) string) (OIDC, error) {
 		// variable the operator actually got wrong is the useful answer.
 		for _, key := range []string{
 			"OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET", "OIDC_REDIRECT_URL", "OIDC_SCOPES",
-			"OIDC_WORKSPACE", "OIDC_WORKSPACE_CLAIM", "OIDC_ROLE_CLAIM", "OIDC_ALLOWED_DOMAINS", "OIDC_LOGIN_STATE_TTL",
+			"OIDC_WORKSPACE", "OIDC_WORKSPACE_CLAIM", "OIDC_ROLE_CLAIM", "OIDC_GROUP_CLAIM",
+			"OIDC_GROUP_MAPPINGS", "OIDC_GROUP_CACHE_TTL", "OIDC_ALLOWED_DOMAINS", "OIDC_LOGIN_STATE_TTL",
 		} {
 			if strings.TrimSpace(getenv(key)) != "" {
 				return o, fmt.Errorf("%s is set but OIDC_ISSUER is not, so single sign-on is off: set OIDC_ISSUER to the provider's base URL or unset %s", key, key)
@@ -106,6 +118,23 @@ func parseOIDC(getenv func(string) string) (OIDC, error) {
 
 	if !workspace.Valid(string(o.Workspace)) {
 		return o, fmt.Errorf("invalid OIDC_WORKSPACE %q: ids are 1-40 characters of [a-z0-9_-]", o.Workspace)
+	}
+	if rawGroups := getenv("OIDC_GROUP_MAPPINGS"); rawGroups != "" {
+		mappings, err := auth.ParseGroupMappings(rawGroups)
+		if err != nil {
+			return o, err
+		}
+		o.GroupMappings = mappings
+	}
+	if v := strings.TrimSpace(getenv("OIDC_GROUP_CACHE_TTL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return o, fmt.Errorf("invalid OIDC_GROUP_CACHE_TTL: %w", err)
+		}
+		if d <= 0 {
+			return o, fmt.Errorf("OIDC_GROUP_CACHE_TTL must be greater than 0")
+		}
+		o.GroupCacheTTL = d
 	}
 	if v := strings.TrimSpace(getenv("OIDC_LOGIN_STATE_TTL")); v != "" {
 		d, err := time.ParseDuration(v)
@@ -164,6 +193,9 @@ func (o OIDC) AuthOIDC() auth.OIDCConfig {
 		Workspace:      o.Workspace,
 		WorkspaceClaim: o.WorkspaceClaim,
 		RoleClaim:      o.RoleClaim,
+		GroupClaim:     o.GroupClaim,
+		GroupMappings:  o.GroupMappings,
+		GroupCacheTTL:  o.GroupCacheTTL,
 		AllowedDomains: o.AllowedDomains,
 		StateTTL:       o.StateTTL,
 	}

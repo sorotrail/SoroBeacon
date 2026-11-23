@@ -51,7 +51,10 @@ func (r *RuleResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 			},
 			"monitor_id": schema.Int64Attribute{
 				Required:    true,
-				Description: "Parent monitor ID.",
+				Description: "Parent monitor ID. Changing this forces replacement.",
+				PlanModifiers: []planmodifier.Int64{
+					int64planmodifier.RequiresReplace(),
+				},
 			},
 			"type": schema.StringAttribute{
 				Required:    true,
@@ -99,6 +102,10 @@ func (r *RuleResource) Create(ctx context.Context, req resource.CreateRequest, r
 	var result apiRule
 	path := fmt.Sprintf("/monitors/%d/rules", plan.MonitorID.ValueInt64())
 	if err := r.client.create(ctx, path, body, &result); err != nil {
+		if IsAlreadyExists(err) {
+			resp.Diagnostics.AddError("Create rule failed: rule already exists", err.Error())
+			return
+		}
 		resp.Diagnostics.AddError("Create rule failed", err.Error())
 		return
 	}
@@ -117,6 +124,10 @@ func (r *RuleResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 	var rules []apiRule
 	path := fmt.Sprintf("/monitors/%d/rules", state.MonitorID.ValueInt64())
 	if err := r.client.get(ctx, path, &rules); err != nil {
+		if IsNotFound(err) {
+			resp.State.RemoveResource(ctx)
+			return
+		}
 		resp.Diagnostics.AddError("Read rules failed", err.Error())
 		return
 	}

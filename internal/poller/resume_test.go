@@ -71,9 +71,12 @@ func (f *crashRPC) GetNetwork(context.Context) (*stellar.Network, error) {
 
 // errorRPC fails every GetEvents call and still records the requests it was
 // asked to make, so a test can assert the cursor did not move by watching
-// what the next cycle asks for.
+// what the next cycle asks for. oldest is what getHealth reports as the
+// oldest retained ledger, exactly like fakeRPC, so a retention test can
+// drive the clamp against a source that is down.
 type errorRPC struct {
 	latest   uint32
+	oldest   uint32
 	requests []stellar.GetEventsRequest
 }
 
@@ -85,7 +88,9 @@ func (f *errorRPC) GetEvents(_ context.Context, req stellar.GetEventsRequest) (*
 func (f *errorRPC) GetLatestLedger(context.Context) (*stellar.LatestLedger, error) {
 	return latestLedgerAt(f.latest), nil
 }
-func (f *errorRPC) GetHealth(context.Context) (*stellar.Health, error) { return healthyHealth(), nil }
+func (f *errorRPC) GetHealth(context.Context) (*stellar.Health, error) {
+	return &stellar.Health{Status: "healthy", OldestLedger: f.oldest}, nil
+}
 func (f *errorRPC) GetNetwork(context.Context) (*stellar.Network, error) {
 	return anyNetwork(), nil
 }

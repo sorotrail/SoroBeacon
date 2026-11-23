@@ -199,3 +199,15 @@ func requestJSONWithResponse(ctx context.Context, method, url string, body []byt
 	}
 	return respBody, nil
 }
+
+// InstrumentHTTP traces every outbound webhook-style delivery and
+// propagates the trace to the endpoint (traceparent). The spans carry the
+// method and status code only, never the URL, which is channel
+// configuration. Call it once at startup, before deliveries start; a nil
+// provider leaves the client untouched.
+func InstrumentHTTP(p *telemetry.Provider) {
+	if p == nil || !p.Enabled() {
+		return
+	}
+	httpClient.Transport = p.Transport(httpClient.Transport)
+}

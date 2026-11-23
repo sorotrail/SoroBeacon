@@ -23,6 +23,11 @@
       "post": {
         "description": "Required role: editor",
         "summary": "Create a monitor",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -90,6 +95,14 @@
               "type": "string"
             },
             "description": "Only monitors watching this Stellar chain. Omitted means every chain this instance polls."
+          },
+          {
+            "name": "tag",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Only monitors carrying this tag. Repeat the parameter to require several tags (AND). Tags are matched after normalisation (trimmed, lowercased)."
           },
           {
             "name": "limit",
@@ -274,7 +287,7 @@
       ],
       "get": {
         "summary": "Per-monitor statistics",
-        "description": "Alert, delivery and per-rule counts for one monitor — the answer to \"is this monitor doing anything\", which the instance-wide /stats cannot give. Counts are explicit zeroes for a monitor with no history, and every one of the monitor's rules appears with its own alert count, including rules that never matched. An unknown monitor is 404 rather than a body of zeroes, so a deleted monitor cannot be misread as a quiet one.",
+        "description": "Alert, delivery and per-rule counts for one monitor \u2014 the answer to \"is this monitor doing anything\", which the instance-wide /stats cannot give. Counts are explicit zeroes for a monitor with no history, and every one of the monitor's rules appears with its own alert count, including rules that never matched. An unknown monitor is 404 rather than a body of zeroes, so a deleted monitor cannot be misread as a quiet one.",
         "responses": {
           "200": {
             "description": "MonitorStats",
@@ -317,6 +330,90 @@
           },
           "400": {
             "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/monitors/{id}/delivery-budget": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "get": {
+        "summary": "Get a monitor's delivery budget",
+        "description": "Returns the daily delivery budget and how much of today's (UTC) window is spent. A monitor with no budget is unlimited: limit and remaining are null.",
+        "responses": {
+          "200": {
+            "description": "Delivery budget",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryBudget"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "summary": "Set or clear a monitor's delivery budget",
+        "description": "Sets the number of alerts the monitor may deliver per UTC day. Once spent, the monitor's channels get one exhaustion notice and further alerts are stored but not delivered until the window rolls over or the budget is reset. limit is required; null clears the budget (unlimited, the default). Raising the limit above what is already used un-exhausts the budget.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeliveryBudgetInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The stored budget",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryBudget"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/monitors/{id}/delivery-budget/reset": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "post": {
+        "summary": "Reset a monitor's delivery budget",
+        "description": "Manually un-exhausts the budget by zeroing today's counter, without waiting for the UTC rollover. The exhaustion notice can go out again if the budget is spent again.",
+        "responses": {
+          "200": {
+            "description": "The budget after the reset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryBudget"
+                }
+              }
+            }
           },
           "404": {
             "$ref": "#/components/responses/Error"
@@ -722,12 +819,12 @@
             "type": "string",
             "default": "24h"
           },
-          "description": "How far back to aggregate delivery attempts, as a Go duration (\"24h\", \"90m\"; \"7d\" is not valid — use \"168h\"). Defaults to 24h when omitted. Must be greater than zero and at most 2160h (90 days); anything else is 400. The effective value is echoed in the response's window field."
+          "description": "How far back to aggregate delivery attempts, as a Go duration (\"24h\", \"90m\"; \"7d\" is not valid \u2014 use \"168h\"). Defaults to 24h when omitted. Must be greater than zero and at most 2160h (90 days); anything else is 400. The effective value is echoed in the response's window field."
         }
       ],
       "get": {
         "summary": "Per-channel delivery statistics",
-        "description": "Delivery attempts for one channel aggregated in the database over the requested window: total tries, successes, failures, success rate and the last success/failure timestamps. Every recorded attempt is terminal (success or failed), so total is succeeded plus failed; retries count as separate attempts. A channel with no attempts in the window returns 200 with zero counts, null timestamps and no success_rate — an undefined rate is never rendered as 0% or 100%. An unknown channel is 404. No channel configuration is returned.",
+        "description": "Delivery attempts for one channel aggregated in the database over the requested window: total tries, successes, failures, success rate and the last success/failure timestamps. Every recorded attempt is terminal (success or failed), so total is succeeded plus failed; retries count as separate attempts. A channel with no attempts in the window returns 200 with zero counts, null timestamps and no success_rate \u2014 an undefined rate is never rendered as 0% or 100%. An unknown channel is 404. No channel configuration is returned.",
         "responses": {
           "200": {
             "description": "ChannelDeliveryStats",
@@ -824,6 +921,100 @@
             "$ref": "#/components/responses/Error"
           },
           "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/channels/{id}/keys": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "get": {
+        "summary": "List signing keys for a channel",
+        "responses": {
+          "200": {
+            "description": "List of signing keys without secrets"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/channels/{id}/keys/rotate": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "post": {
+        "summary": "Rotate channel signing key with overlap",
+        "responses": {
+          "201": {
+            "description": "Key rotated; secret returned once"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/channels/{id}/keys/{keyID}/retire": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        },
+        {
+          "name": "keyID",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Retire a channel signing key",
+        "responses": {
+          "200": {
+            "description": "Key retired"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/channels/{id}/keys/{keyID}/revoke": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        },
+        {
+          "name": "keyID",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Revoke a channel signing key immediately",
+        "responses": {
+          "200": {
+            "description": "Key revoked"
+          },
+          "404": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -1549,6 +1740,46 @@
         }
       }
     },
+    "/dead-letters/groups": {
+      "get": {
+        "summary": "Roll up dead letters into groups by channel and cause",
+        "responses": {
+          "200": {
+            "description": "Dead letter groups",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dead-letters/bulk/redrive": {
+      "post": {
+        "summary": "Re-drive a batch of dead letters matching filter or IDs",
+        "responses": {
+          "200": {
+            "description": "Bulk redrive results"
+          }
+        }
+      }
+    },
+    "/dead-letters/bulk/discard": {
+      "post": {
+        "summary": "Discard a batch of dead letters matching filter or IDs",
+        "responses": {
+          "200": {
+            "description": "Bulk discard results"
+          }
+        }
+      }
+    },
     "/dead-letters/{id}/redrive": {
       "parameters": [
         {
@@ -1560,6 +1791,24 @@
         "responses": {
           "200": {
             "description": "Re-driven successfully"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/dead-letters/{id}/discard": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "post": {
+        "summary": "Discard one dead letter from the backlog",
+        "responses": {
+          "204": {
+            "description": "Discarded successfully"
           },
           "404": {
             "$ref": "#/components/responses/Error"
@@ -1708,7 +1957,7 @@
     "/health": {
       "get": {
         "summary": "Combined health report",
-        "description": "Legacy combined check; prefer /livez and /readyz. Exempt from authentication so probes and the docker-compose healthcheck keep working. On an instance that polls several Stellar networks the body adds a `networks` array — per chain: source state, last processed ledger, chain tip, lag and last successful poll — and answers 503 `degraded` when any chain's source is failing. The top-level `rpc` field is only ever the primary chain's source, which is why the array exists.",
+        "description": "Legacy combined check; prefer /livez and /readyz. Exempt from authentication so probes and the docker-compose healthcheck keep working. On an instance that polls several Stellar networks the body adds a `networks` array \u2014 per chain: source state, last processed ledger, chain tip, lag and last successful poll \u2014 and answers 503 `degraded` when any chain's source is failing. The top-level `rpc` field is only ever the primary chain's source, which is why the array exists.",
         "security": [],
         "responses": {
           "200": {
@@ -1735,7 +1984,7 @@
     "/readyz": {
       "get": {
         "summary": "Readiness probe",
-        "description": "Checks the database and the event source concurrently, bounded by a 3s timeout each, reporting per-dependency detail. On an instance that polls several Stellar networks each chain gets its own check (`rpc_testnet`, `rpc_mainnet`, ...) alongside the primary chain's `rpc`, so a node that is down on one chain cannot read as ready. Wire to readinessProbe. Exempt from authentication, so its per-dependency detail is readable without a token — do not expose it to the public internet.",
+        "description": "Checks the database and the event source concurrently, bounded by a 3s timeout each, reporting per-dependency detail. On an instance that polls several Stellar networks each chain gets its own check (`rpc_testnet`, `rpc_mainnet`, ...) alongside the primary chain's `rpc`, so a node that is down on one chain cannot read as ready. Wire to readinessProbe. Exempt from authentication, so its per-dependency detail is readable without a token \u2014 do not expose it to the public internet.",
         "security": [],
         "responses": {
           "200": {
@@ -1805,9 +2054,10 @@
     "/stats": {
       "get": {
         "summary": "Service statistics",
+        "description": "Instance counters plus the ingest checkpoint. When the poller has ever detected its checkpoint falling outside the source's event retention, the response carries retention_gap (network, from_ledger, to_ledger, detected_at) describing the most recent hole in ingest history; it is omitted when no gap has been recorded.",
         "responses": {
           "200": {
-            "description": "Counts of monitors, rules, alerts and deliveries",
+            "description": "Counts of monitors, rules, alerts and deliveries, the ingest checkpoint, and the most recent retention gap when one was recorded",
             "content": {
               "application/json": {
                 "schema": {
@@ -1815,6 +2065,514 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/usage": {
+      "get": {
+        "summary": "Per-workspace usage metering summary",
+        "description": "Returns durable per-period usage rollups (alerts raised, rule evaluations, notifications by channel type and outcome, API requests) and live stored row counts. Scoped to the caller's workspace for workspace-bound credentials, or available across workspaces to an unrestricted operator.",
+        "parameters": [
+          {
+            "name": "workspace",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workspace usage summary and per-period rollups",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/quotas": {
+      "get": {
+        "summary": "Per-workspace resource quotas and query cost budget status",
+        "description": "Returns configured resource quotas (monitors, rules, channels, SSE subscriptions), live resource usage, and query cost budget status for the workspace.",
+        "parameters": [
+          {
+            "name": "workspace",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workspace quota and query cost budget status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "summary": "Configure per-workspace resource quotas and query cost budget",
+        "description": "Updates resource quotas (max_monitors, max_rules, max_channels, max_subscriptions) and query cost budget (query_cost_budget, query_cost_refill_per_sec) for a workspace.",
+        "parameters": [
+          {
+            "name": "workspace",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "workspace_id": {
+                    "type": "string"
+                  },
+                  "max_monitors": {
+                    "type": "integer"
+                  },
+                  "max_rules": {
+                    "type": "integer"
+                  },
+                  "max_channels": {
+                    "type": "integer"
+                  },
+                  "max_subscriptions": {
+                    "type": "integer"
+                  },
+                  "query_cost_budget": {
+                    "type": "number"
+                  },
+                  "query_cost_refill_per_sec": {
+                    "type": "number"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated workspace quota and query cost budget status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/workspaces/{id}": {
+      "delete": {
+        "summary": "Delete a workspace and everything belonging to it (or preview via dry-run)",
+        "description": "Permanently deletes a workspace and all tenant-owned monitors, rules, channels, signing keys, alerts, delivery attempts, dead letters, escalations, maintenance windows, backfills, saved searches, templates, API tokens, usage rollups, quotas, and idempotency keys. Requires confirm={id} unless dry_run=true.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "confirm",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "batch_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "max_alert_batches",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "X-Confirm-Workspace",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workspace deletion result or dry-run preview counts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Bounded deletion batch completed; additional alert batches remain",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/workspaces/{id}/delete": {
+      "get": {
+        "summary": "Inspect workspace deletion progress or completion tombstone",
+        "description": "Returns the persisted status and row counts for an in-progress or completed workspace deletion (or a read-only preview when dry_run=true).",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Workspace deletion progress or tombstone",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "summary": "Delete a workspace and everything belonging to it (or preview via dry-run)",
+        "description": "Permanently deletes a workspace and all tenant-owned data, or returns a read-only count preview when dry_run=true. Requires confirm matching the target workspace ID when dry_run is false.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Confirm-Workspace",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "dry_run": {
+                    "type": "boolean"
+                  },
+                  "confirm": {
+                    "type": "string"
+                  },
+                  "batch_size": {
+                    "type": "integer"
+                  },
+                  "max_alert_batches": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Workspace deletion result or dry-run preview counts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Bounded deletion batch completed; additional alert batches remain",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/workspace/export": {
+      "get": {
+        "summary": "Stream a single-workspace data export for the caller's workspace",
+        "description": "Exports all tenant-owned configuration, operational state, and (optionally) alert history belonging to the authenticated workspace as a versioned, deterministic JSON bundle or NDJSON stream. Secrets are redacted by default unless include_secrets=true is supplied.",
+        "parameters": [
+          {
+            "name": "workspace",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "include_secrets",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "include_alerts",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "json",
+                "ndjson"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Streamed workspace export bundle (JSON or NDJSON)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/workspaces/{id}/export": {
+      "get": {
+        "summary": "Stream a single-workspace data export by workspace ID",
+        "description": "Exports all tenant-owned configuration, operational state, and (optionally) alert history belonging to the named workspace as a versioned, deterministic JSON bundle or NDJSON stream. Only credentials belonging to {id} or an instance operator with cross-workspace privileges may call this endpoint.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "include_secrets",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "include_alerts",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "json",
+                "ndjson"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Streamed workspace export bundle (JSON or NDJSON)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }
@@ -2301,7 +3059,7 @@
     "/tokens": {
       "post": {
         "summary": "Mint a scoped API token",
-        "description": "Creates a database-backed credential: `sb_` followed by 32 random bytes, base64url-encoded. The response's `token` field is the only place the secret ever appears — the row stores a SHA-256 digest of it, so it cannot be read back, listed, logged or recovered. A client that loses the secret mints a new token and revokes the old one.\n\n`scopes` is required and non-empty: a token with no scope authenticates and can then call nothing. Every scope must come from the enumeration below. A request carrying a scoped token may only grant scopes it already holds, so `tokens:write` is not a road back to full control. `expires_in` is a Go duration string (`72h`, `168h`); omit it for a token that never expires.",
+        "description": "Creates a database-backed credential: `sb_` followed by 32 random bytes, base64url-encoded. The response's `token` field is the only place the secret ever appears \u2014 the row stores a SHA-256 digest of it, so it cannot be read back, listed, logged or recovered. A client that loses the secret mints a new token and revokes the old one.\n\n`scopes` is required and non-empty: a token with no scope authenticates and can then call nothing. Every scope must come from the enumeration below. A request carrying a scoped token may only grant scopes it already holds, so `tokens:write` is not a road back to full control. `expires_in` is a Go duration string (`72h`, `168h`); omit it for a token that never expires.",
         "requestBody": {
           "required": true,
           "content": {
@@ -2390,6 +3148,163 @@
         }
       }
     },
+    "/tokens/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "get": {
+        "summary": "Get an API token by ID",
+        "description": "Returns token metadata including last_used_at and rotation relationships. Never returns the token secret.",
+        "responses": {
+          "200": {
+            "description": "Token details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIToken"
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/TokenManagementDisabled"
+          }
+        }
+      }
+    },
+    "/tokens/{id}/rotate": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "post": {
+        "summary": "Rotate an API token with overlap",
+        "description": "Initiates an overlapping token rotation, issuing a successor token while predecessor remains valid until its new expiry. The plaintext secret of the successor is returned exactly once.",
+        "responses": {
+          "201": {
+            "description": "Successor token minted. Plaintext secret returned once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedAPIToken"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/TokenManagementDisabled"
+          }
+        }
+      }
+    },
+    "/tokens/{id}/abandon": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "post": {
+        "summary": "Abandon an in-progress token rotation",
+        "description": "Cancels an in-progress rotation, revoking the successor token and restoring the predecessor token's pre-rotation state without inconsistent state.",
+        "responses": {
+          "200": {
+            "description": "Rotation abandoned"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/TokenManagementDisabled"
+          }
+        }
+      }
+    },
+    "/graphql/operations": {
+      "get": {
+        "summary": "List registered persisted GraphQL operations",
+        "description": "Required role: viewer",
+        "responses": {
+          "200": {
+            "description": "List of registered operations"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "summary": "Register a persisted GraphQL operation",
+        "description": "Required role: admin",
+        "responses": {
+          "201": {
+            "description": "Operation registered"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/graphql/operations/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "Get a registered persisted GraphQL operation",
+        "description": "Required role: viewer",
+        "responses": {
+          "200": {
+            "description": "Operation details"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a registered persisted GraphQL operation",
+        "description": "Required role: admin",
+        "responses": {
+          "204": {
+            "description": "Operation deleted"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/monitors/trash": {
       "get": {
         "summary": "List deleted monitors (trash)",
@@ -2472,6 +3387,126 @@
           }
         }
       }
+    },
+    "/retention": {
+      "get": {
+        "summary": "Get effective workspace alert retention policy",
+        "description": "Required role: viewer. Returns the workspace's effective alert retention policy, its policy_source (workspace, instance, or unset), and the current pruned_before horizon.",
+        "responses": {
+          "200": {
+            "description": "Workspace retention policy summary"
+          }
+        }
+      },
+      "put": {
+        "summary": "Set workspace alert retention policy override",
+        "description": "Required role: admin. Configures a per-workspace alert retention override. Shortening an active retention window requires confirm_shorten=true.",
+        "responses": {
+          "200": {
+            "description": "Updated workspace retention policy summary"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Reset workspace alert retention policy to instance default",
+        "description": "Required role: admin. Deletes the workspace's retention override so it falls back to the instance-wide ALERT_RETENTION default. If resetting shortens effective retention, confirm_shorten=true is required.",
+        "responses": {
+          "200": {
+            "description": "Effective workspace retention policy after reset"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/channels/{id}/devices": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
+      "get": {
+        "summary": "List registered push devices (tokens are never returned)",
+        "responses": {
+          "200": {
+            "description": "Registered devices"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/channels/{id}/devices/{deviceID}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        },
+        {
+          "name": "deviceID",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "put": {
+        "summary": "Register a push device or refresh its token",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "token": {
+                    "type": "string"
+                  },
+                  "platform": {
+                    "type": "string",
+                    "enum": [
+                      "fcm"
+                    ]
+                  }
+                },
+                "required": [
+                  "token"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Registered"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Remove a push device",
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -2479,7 +3514,7 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Any of three credentials. (1) A static token from API_TOKEN (comma-separated to allow rotation): full reach over the default workspace. (2) A scoped token minted by POST /tokens — it looks like `sb_…`, and carries a scope list, an optional expiry and a revocation. Each route names the scopes it requires; a route that has no mapping denies a scoped token with 403 rather than allowing it. (3) A dashboard session cookie from /login, accepted in the browser's own same-origin requests. A token from WORKSPACE_TOKENS (`workspace=token` pairs) is accepted the same way as (1) but additionally scopes the request: it sees and changes only that workspace's monitors, channels, rules, alerts, saved searches and templates. `API_TOKEN`'s tokens belong to the `default` workspace, as do rows created before workspaces existed. Scoped tokens are workspace-bound too: the workspace comes from the row that stores the token's digest, not from the request. There is deliberately no X-Workspace header or query parameter — the workspace is a property of the credential, so a client cannot ask for another tenant's data."
+        "description": "Any of three credentials. (1) A static token from API_TOKEN (comma-separated to allow rotation): full reach over the default workspace. (2) A scoped token minted by POST /tokens \u2014 it looks like `sb_\u2026`, and carries a scope list, an optional expiry and a revocation. Each route names the scopes it requires; a route that has no mapping denies a scoped token with 403 rather than allowing it. (3) A dashboard session cookie from /login, accepted in the browser's own same-origin requests. A token from WORKSPACE_TOKENS (`workspace=token` pairs) is accepted the same way as (1) but additionally scopes the request: it sees and changes only that workspace's monitors, channels, rules, alerts, saved searches and templates. `API_TOKEN`'s tokens belong to the `default` workspace, as do rows created before workspaces existed. Scoped tokens are workspace-bound too: the workspace comes from the row that stores the token's digest, not from the request. There is deliberately no X-Workspace header or query parameter \u2014 the workspace is a property of the credential, so a client cannot ask for another tenant's data."
       }
     },
     "parameters": {
@@ -2509,9 +3544,85 @@
           "type": "integer",
           "format": "int64"
         }
+      },
+      "Query": {
+        "name": "q",
+        "in": "query",
+        "description": "Case-insensitive substring match against the monitor name",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "Enabled": {
+        "name": "enabled",
+        "in": "query",
+        "description": "Tri-state: omitted = all, true = enabled only, false = disabled only",
+        "schema": {
+          "type": "boolean"
+        }
+      },
+      "Sort": {
+        "name": "sort",
+        "in": "query",
+        "description": "Allowlisted order: name (default), id (newest first), created_at",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "name",
+            "id",
+            "created_at"
+          ],
+          "default": "name"
+        }
+      },
+      "Network": {
+        "name": "network",
+        "in": "query",
+        "description": "Only monitors watching this Stellar chain. Omitted means every chain this instance polls.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "Limit": {
+        "name": "limit",
+        "in": "query",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "default": 50
+        }
+      },
+      "Cursor": {
+        "name": "cursor",
+        "in": "query",
+        "description": "Opaque continuation cursor from a previous page",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": false,
+        "description": "Optional client-generated idempotency key (up to 255 characters) for safe retries on write endpoints (POST, PUT, PATCH, DELETE). Scoped to the caller's workspace and retained for 24 hours. Repeating the same key with the same method, path, and body replays the original HTTP status code and response body with Idempotency-Replayed: true; reusing the key with a different method, path, or body returns 409 CONFLICT.",
+        "schema": {
+          "type": "string",
+          "maxLength": 255
+        }
       }
     },
     "responses": {
+      "PayloadTooLarge": {
+        "description": "Request body exceeded the allowed size limit (default 1 MiB, bulk endpoints 10 MiB, channel config 64 KiB, templates 32 KiB). Supports gzip/deflate Content-Encoding with decompressed size bounds.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
       "TokenManagementDisabled": {
         "description": "Token management is not configured on this instance: it needs a database-backed store, so an unset deployment answers this way rather than pretending to mint.",
         "content": {
@@ -2627,7 +3738,22 @@
           },
           "code": {
             "type": "string",
-            "description": "Stable status token, e.g. Not Found"
+            "description": "Stable machine-readable error code",
+            "enum": [
+              "NOT_FOUND",
+              "ALREADY_EXISTS",
+              "INVALID_ARGUMENT",
+              "CONFLICT",
+              "UNAUTHENTICATED",
+              "PERMISSION_DENIED",
+              "RATE_LIMITED",
+              "QUOTA_EXCEEDED",
+              "PAYLOAD_TOO_LARGE",
+              "METHOD_NOT_ALLOWED",
+              "NOT_IMPLEMENTED",
+              "SERVICE_UNAVAILABLE",
+              "INTERNAL_ERROR"
+            ]
           },
           "request_id": {
             "type": "string",
@@ -2683,6 +3809,13 @@
             "type": "string",
             "description": "Stellar chain this monitor watches. Empty on rows created before multi-network ingestion, which startup labels with the primary network."
           },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Free-form labels for grouping and filtering, normalised to trimmed lowercase unique strings before storage. Always an array; empty when the monitor carries no tags."
+          },
           "channel_ids": {
             "type": "array",
             "items": {
@@ -2720,7 +3853,7 @@
           "success_rate": {
             "type": "number",
             "format": "double",
-            "description": "succeeded / total as a ratio in [0, 1]. Omitted when there were no attempts in the window — an undefined rate is not 0 or 1."
+            "description": "succeeded / total as a ratio in [0, 1]. Omitted when there were no attempts in the window \u2014 an undefined rate is not 0 or 1."
           },
           "last_success_at": {
             "type": "string",
@@ -2816,7 +3949,16 @@
           },
           "network": {
             "type": "string",
-            "description": "Stellar chain these contract ids live on, chosen at creation. Omitted means the instance's primary network (the first entry in NETWORKS, or NETWORK when unset). A name this instance does not poll is rejected: the monitor would match nothing forever. A monitor's network cannot be changed afterwards — a contract id resolves to a different contract on another chain, and the alerts already stored keep their old label — so moving one means deleting and recreating it."
+            "description": "Stellar chain these contract ids live on, chosen at creation. Omitted means the instance's primary network (the first entry in NETWORKS, or NETWORK when unset). A name this instance does not poll is rejected: the monitor would match nothing forever. A monitor's network cannot be changed afterwards \u2014 a contract id resolves to a different contract on another chain, and the alerts already stored keep their old label \u2014 so moving one means deleting and recreating it."
+          },
+          "tags": {
+            "type": "array",
+            "maxItems": 25,
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "description": "Free-form labels for grouping and filtering. Values are trimmed, lowercased and deduplicated before storage, so \"Treasury\" and \"treasury\" are one tag. Omitted leaves the set unchanged on update and empty on create."
           },
           "channel_ids": {
             "type": "array",
@@ -2993,9 +4135,6 @@
               "webhook",
               "ntfy"
             ]
-          },
-          "config": {
-            "type": "object"
           },
           "enabled": {
             "type": "boolean"
@@ -3359,6 +4498,58 @@
           }
         }
       },
+      "DeliveryBudgetInput": {
+        "type": "object",
+        "required": [
+          "limit"
+        ],
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Alerts the monitor may deliver per UTC day. null clears the budget (unlimited)."
+          }
+        }
+      },
+      "DeliveryBudget": {
+        "type": "object",
+        "properties": {
+          "monitor_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Daily budget; null means unlimited."
+          },
+          "used": {
+            "type": "integer",
+            "description": "Deliveries consumed in the current window."
+          },
+          "remaining": {
+            "type": "integer",
+            "description": "Deliveries left in the window; null when unlimited."
+          },
+          "exhausted": {
+            "type": "boolean"
+          },
+          "window_start": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Start of the current UTC window; null when unlimited."
+          },
+          "resets_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the window rolls over and the budget refills; null when unlimited."
+          },
+          "exhausted_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the budget ran out in this window; null while budget remains."
+          }
+        }
+      },
       "EscalationInput": {
         "type": "object",
         "required": [
@@ -3687,6 +4878,145 @@
           "note": {
             "type": "string",
             "description": "Corpus bias and window documentation"
+          }
+        }
+      },
+      "TokenInput": {
+        "type": "object",
+        "required": [
+          "name",
+          "scopes"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "expires_in": {
+            "type": "string",
+            "description": "Go duration string (e.g. 168h); omit for a token that never expires"
+          }
+        }
+      },
+      "APIToken": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "prefix",
+          "scopes",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "prefix": {
+            "type": "string"
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_used_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "revoked_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "rotated_from_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "successor_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "rotated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CreatedAPIToken": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "prefix",
+          "scopes",
+          "created_at",
+          "token"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "prefix": {
+            "type": "string"
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_used_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "revoked_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "rotated_from_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "successor_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "rotated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "token": {
+            "type": "string",
+            "description": "Plaintext token secret, returned only once on creation or rotation"
           }
         }
       }

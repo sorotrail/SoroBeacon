@@ -257,3 +257,57 @@ func TestAuditPageDistinguishesAnEmptyLogFromAnEmptyResult(t *testing.T) {
 		t.Fatalf("a filtered empty list claimed the log was never written, got:\n%s", filtered)
 	}
 }
+
+// TestAuditWebRouteTableCoversEveryMutatingDashboardRoute walks the dashboard
+// router and fails the build if a mutating endpoint (POST/PUT/PATCH/DELETE) is
+// registered without an entry in AuditWebRouteTable or AuditExemptWebRoutes.
+func TestAuditWebRouteTableCoversEveryMutatingDashboardRoute(t *testing.T) {
+	routes := walkedDashboardRoutes(t)
+	if len(routes) < 20 {
+		t.Fatalf("expected at least 20 dashboard routes, got %d", len(routes))
+	}
+
+	tablePatterns := make(map[string]bool)
+	for _, k := range AuditWebRouteTable.Patterns() {
+		tablePatterns[k] = true
+	}
+	registeredMutating := make(map[string]bool)
+	for _, rt := range routes {
+		switch rt.Method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		default:
+			continue
+		}
+		key := rt.Method + " " + rt.Path
+		registeredMutating[key] = true
+
+		inTable := tablePatterns[key]
+		reason, inExempt := AuditExemptWebRoutes[key]
+		if inTable && inExempt {
+			t.Errorf("dashboard route %s appears in both AuditWebRouteTable and AuditExemptWebRoutes", key)
+		}
+		if !inTable && !inExempt {
+			t.Errorf("mutating dashboard route %s is missing from AuditWebRouteTable and AuditExemptWebRoutes", key)
+		}
+		if inTable {
+			spec, ok := AuditWebRouteTable.Lookup(rt.Method, rt.Path)
+			if !ok || spec.Action == "" || !store.ValidAuditTargetType(spec.TargetType) {
+				t.Errorf("dashboard route %s has invalid AuditWebSpec: %+v", key, spec)
+			}
+		}
+		if inExempt && strings.TrimSpace(reason) == "" {
+			t.Errorf("exempt dashboard route %s must state a non-empty reason", key)
+		}
+	}
+
+	for _, key := range AuditWebRouteTable.Patterns() {
+		if !registeredMutating[key] {
+			t.Errorf("AuditWebRouteTable names stale or non-mutating route %q", key)
+		}
+	}
+	for key := range AuditExemptWebRoutes {
+		if !registeredMutating[key] {
+			t.Errorf("AuditExemptWebRoutes names stale or non-mutating route %q", key)
+		}
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/apierr"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/reqid"
 	"github.com/sorotrail/sorobeacon/internal/rules"
@@ -151,8 +152,8 @@ func TestStatsEndpointStoreError(t *testing.T) {
 	if got, _ := raw["error"].(string); got != "internal error" {
 		t.Fatalf("error = %q, want internal error", raw["error"])
 	}
-	if got, _ := raw["code"].(string); got != http.StatusText(http.StatusInternalServerError) {
-		t.Fatalf("code = %q, want %q", raw["code"], http.StatusText(http.StatusInternalServerError))
+	if got, _ := raw["code"].(string); got != apierr.CodeInternalError {
+		t.Fatalf("code = %q, want %q", raw["code"], apierr.CodeInternalError)
 	}
 	reqID, _ := raw["request_id"].(string)
 	if reqID == "" {

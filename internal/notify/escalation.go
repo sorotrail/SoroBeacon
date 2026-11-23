@@ -4,9 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/telemetry"
 )
 
 // DefaultEscalationInterval is how often the scheduler looks for due
@@ -44,6 +50,18 @@ func (d *Dispatcher) startEscalation(ctx context.Context, a Alert, policy *store
 // the policy was written is skipped rather than erroring, matching the flat
 // fan-out's ListChannelsForMonitor behaviour.
 func (d *Dispatcher) deliverStep(ctx context.Context, a Alert, step store.EscalationStep) {
+	// Escalation steps fire minutes after detection, from the scheduler, so
+	// each gets its own root span linked to the alert's detection span — the
+	// relationship that is hardest to reconstruct from logs. After a restart
+	// the detection span is no longer remembered and the step span stands
+	// alone, still carrying the alert id.
+	if d.telemetry != nil {
+		cause, _ := d.alertLinks.Lookup(a.ID)
+		var span trace.Span
+		ctx, span = d.telemetry.StartLinked(ctx, "notify.escalate", cause,
+			trace.WithAttributes(attribute.Int64(telemetry.AttrAlertID, a.ID)))
+		defer span.End()
+	}
 	if len(step.ChannelIDs) == 0 {
 		return
 	}
@@ -52,9 +70,7 @@ func (d *Dispatcher) deliverStep(ctx context.Context, a Alert, step store.Escala
 		d.log.Error("list escalation channels", "alert_id", a.ID, "err", err)
 		return
 	}
-	for _, ch := range channels {
-		d.deliver(ctx, a, ch)
-	}
+	d.deliverChannelGroup(ctx, a, channels)
 }
 
 // ProcessDueEscalations fires every escalation step due at or before now and
@@ -74,6 +90,65 @@ func (d *Dispatcher) ProcessDueEscalations(ctx context.Context, now time.Time) (
 	if err != nil {
 		return 0, err
 	}
+	if len(runs) == 0 {
+		return 0, nil
+	}
+
+	var wsOrder []string
+	byWS := make(map[string][]store.EscalationRun)
+	for _, run := range runs {
+		ws := d.resolveEscalationWorkspace(ctx, run)
+		if _, ok := byWS[ws]; !ok {
+			wsOrder = append(wsOrder, ws)
+		}
+		byWS[ws] = append(byWS[ws], run)
+	}
+
+	if len(wsOrder) <= 1 {
+		return d.processEscalationSlice(ctx, now, runs)
+	}
+
+	var delivered atomic.Int64
+	var wg sync.WaitGroup
+	for _, ws := range wsOrder {
+		wsRuns := byWS[ws]
+		wg.Add(1)
+		go func(slice []store.EscalationRun) {
+			defer wg.Done()
+			n, _ := d.processEscalationSlice(ctx, now, slice)
+			delivered.Add(int64(n))
+		}(wsRuns)
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		return int(delivered.Load()), ctx.Err()
+	}
+	return int(delivered.Load()), nil
+}
+
+func (d *Dispatcher) resolveEscalationWorkspace(ctx context.Context, run store.EscalationRun) string {
+	if policy, err := d.store.GetEscalationPolicy(ctx, run.PolicyID); err == nil && policy != nil {
+		if run.NextStep >= 0 && run.NextStep < len(policy.Steps) {
+			step := policy.Steps[run.NextStep]
+			if len(step.ChannelIDs) > 0 {
+				if channels, err := d.store.ListChannelsByIDs(ctx, step.ChannelIDs); err == nil {
+					for _, ch := range channels {
+						if ws := resolveWorkspaceID(ctx, ch); ws != "default" {
+							return ws
+						}
+					}
+				}
+			}
+		}
+	}
+	var a Alert
+	if err := json.Unmarshal(run.Snapshot, &a); err == nil {
+		return d.resolveAlertWorkspace(ctx, a)
+	}
+	return "default"
+}
+
+func (d *Dispatcher) processEscalationSlice(ctx context.Context, now time.Time, runs []store.EscalationRun) (int, error) {
 	delivered := 0
 	for _, run := range runs {
 		if ctx.Err() != nil {

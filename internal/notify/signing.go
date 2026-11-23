@@ -1,76 +1,234 @@
 package notify
 
 import (
+	"bytes"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
-	"math/rand"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
 
-// signingKey represents a single active signing key for a webhook channel.
-type signingKey struct {
-	// ID is a unique key identifier (generated server-side).
-	ID string `json:"id" db:"id"`
-	// Key is the secret key material; never returned in responses.
-	Key []byte `json:"-" db:"key"`
-	// CreatedAt is when this key was first created.
-	CreatedAt time.Time `json:"created_at" db:"created_at"`
-	// IsActive reports whether this key is in the active set.
-	IsActive bool `json:"is_active" db:"is_active"`
-	// IsExpired reports whether this key has passed its expiry time.
-	IsExpired bool `json:"is_expired" db:"is_expired"`
-	// ExpiryTime, if set, is when this key expires and is no longer used
-	// for signing new payloads. If zero, the key never auto-expires.
-	ExpiryTime time.Time `json:"expiry_time" db:"expiry_time"`
+// DefaultMaxSignatureSkew is the maximum tolerated clock skew between
+// delivery generation and verification (5 minutes).
+const DefaultMaxSignatureSkew = 5 * time.Minute
+
+// CanonicalString builds the canonical byte slice to sign.
+// The signature covers:
+//   - keyID (when present)
+//   - timestamp
+//   - idempotencyKey (when present)
+//   - rawBody
+//
+// Separated by dots ('.'). When keyID and idempotencyKey are empty (legacy mode),
+// it produces the exact historical format "<timestamp>.<rawBody>".
+// Because the key identifier and idempotency headers are incorporated into the signed
+// bytes, an attacker cannot modify them in flight to steer the delivery to a weaker key
+// or alter deduplication semantics.
+func CanonicalString(keyID, timestamp, idempotencyKey string, rawBody []byte) []byte {
+	var b bytes.Buffer
+	if keyID != "" {
+		b.WriteString(keyID)
+		b.WriteByte('.')
+	}
+	b.WriteString(timestamp)
+	b.WriteByte('.')
+	if idempotencyKey != "" {
+		b.WriteString(idempotencyKey)
+		b.WriteByte('.')
+	}
+	b.Write(rawBody)
+	return b.Bytes()
 }
 
-// KeyTable manages per-channel active signing keys.
+// Sign computes the HMAC-SHA256 signature for legacy payloads ("<timestamp>.<rawBody>").
+// Preserved for full backwards compatibility.
+func Sign(key []byte, timestamp string, rawBody []byte) string {
+	return SignCanonical(key, "", timestamp, "", rawBody)
+}
+
+// SignCanonical computes the hex-encoded HMAC-SHA256 signature over the canonical string.
+func SignCanonical(key []byte, keyID, timestamp, idempotencyKey string, rawBody []byte) string {
+	mac := hmac.New(sha256.New, key)
+	mac.Write(CanonicalString(keyID, timestamp, idempotencyKey, rawBody))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// VerifyOptions holds the fields required to verify a webhook delivery.
+type VerifyOptions struct {
+	KeyID          string
+	Timestamp      string
+	IdempotencyKey string
+	Body           []byte
+	Signature      string
+	MaxSkew        time.Duration
+}
+
+// VerifySignature verifies a delivery using constant-time comparison against a set of
+// candidate keys (map of keyID -> secret bytes).
+//
+// It returns the key ID that successfully verified the signature, or "" if verification failed.
+// All comparisons use constant-time operations to prevent timing side channels.
+func VerifySignature(keys map[string][]byte, opts VerifyOptions) (string, bool) {
+	if len(keys) == 0 || opts.Signature == "" || opts.Timestamp == "" {
+		return "", false
+	}
+
+	// Replay / skew protection
+	if opts.MaxSkew > 0 {
+		ts, err := strconv.ParseInt(opts.Timestamp, 10, 64)
+		if err != nil {
+			return "", false
+		}
+		deliveryTime := time.Unix(ts, 0)
+		diff := time.Since(deliveryTime)
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff > opts.MaxSkew {
+			return "", false
+		}
+	}
+
+	sigBytes := []byte(opts.Signature)
+
+	// 1. If opts.KeyID is specified, select that key directly.
+	if opts.KeyID != "" {
+		k, ok := keys[opts.KeyID]
+		if !ok {
+			return "", false
+		}
+		expected := SignCanonical(k, opts.KeyID, opts.Timestamp, opts.IdempotencyKey, opts.Body)
+		if hmac.Equal([]byte(expected), sigBytes) {
+			return opts.KeyID, true
+		}
+		return "", false
+	}
+
+	// 2. Legacy delivery without KeyID: constant-time check over candidate keys.
+	var matchedID string
+	matched := false
+
+	// Deterministic ordering for constant-time sweep
+	keyIDs := make([]string, 0, len(keys))
+	for id := range keys {
+		keyIDs = append(keyIDs, id)
+	}
+	sort.Strings(keyIDs)
+
+	for _, id := range keyIDs {
+		k := keys[id]
+		// Try canonical string with key ID
+		exp1 := SignCanonical(k, id, opts.Timestamp, opts.IdempotencyKey, opts.Body)
+		if subtle.ConstantTimeCompare([]byte(exp1), sigBytes) == 1 {
+			if !matched {
+				matchedID = id
+				matched = true
+			}
+		}
+
+		// Try legacy format without key ID
+		exp2 := SignCanonical(k, "", opts.Timestamp, "", opts.Body)
+		if subtle.ConstantTimeCompare([]byte(exp2), sigBytes) == 1 {
+			if !matched {
+				matchedID = id
+				matched = true
+			}
+		}
+	}
+
+	return matchedID, matched
+}
+
+// GenerateSigningKeyID generates a random key identifier with a "csk_" prefix.
+func GenerateSigningKeyID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("csk_%s", hex.EncodeToString(b))
+}
+
+// GenerateSigningKeySecret generates 256 bits of cryptographically secure random key material.
+func GenerateSigningKeySecret() string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// SigningKey represents a single signing key for a webhook channel.
+type SigningKey struct {
+	ID         string     `json:"id" db:"id"`
+	Key        []byte     `json:"-" db:"key"`
+	CreatedAt  time.Time  `json:"created_at" db:"created_at"`
+	IsCurrent  bool       `json:"is_current" db:"is_current"`
+	IsActive   bool       `json:"is_active" db:"is_active"`
+	IsExpired  bool       `json:"is_expired" db:"is_expired"`
+	Status     string     `json:"status" db:"status"` // "active", "retired", "revoked"
+	LastUsedAt *time.Time `json:"last_used_at,omitempty" db:"last_used_at"`
+}
+
+// KeyTable manages per-channel active and historical signing keys in memory.
 type KeyTable struct {
 	mu       sync.Mutex
-	channels map[string]keyMap // URL -> keyMap
+	channels map[string]map[string]*SigningKey // URL -> keyID -> SigningKey
 }
-
-type keyMap map[string]*signingKey // keyID -> key
 
 // NewKeyTable returns an empty key table.
 func NewKeyTable() *KeyTable {
-	return &KeyTable{channels: make(map[string]keyMap)}
+	return &KeyTable{channels: make(map[string]map[string]*SigningKey)}
 }
 
 // AddKey adds a new signing key for a channel identified by its webhook URL.
-// The key is stored encrypted at rest (the existing crypto path handles this).
-// If a key with the same ID already exists, it is replaced.
-// The new key is immediately active; the previous active key (if any) remains
-// active until an explicit rotation step.
-func (kt *KeyTable) AddKey(url string, key []byte) (*signingKey, error) {
+func (kt *KeyTable) AddKey(url string, key []byte) (*SigningKey, error) {
 	kt.mu.Lock()
 	defer kt.mu.Unlock()
 
 	if kt.channels[url] == nil {
-		kt.channels[url] = make(keyMap)
+		kt.channels[url] = make(map[string]*SigningKey)
 	}
 
-	id := fmt.Sprintf("key-%d", time.Now().UnixNano()+rand.Int63())
-	k := &signingKey{
+	id := GenerateSigningKeyID()
+	// Demote any existing current key
+	for _, existing := range kt.channels[url] {
+		existing.IsCurrent = false
+	}
+
+	k := &SigningKey{
 		ID:        id,
 		Key:       key,
 		CreatedAt: time.Now(),
+		IsCurrent: true,
 		IsActive:  true,
+		Status:    "active",
 	}
 
 	kt.channels[url][id] = k
 	return k, nil
 }
 
-// GetActiveKeys returns all active (non-expired) signing keys for a channel.
-// The returned keys are sorted by created_at ascending so the oldest active
-// key is first. This is useful for rotation procedures where receivers need
-// to know the full set of valid keys.
-func (kt *KeyTable) GetActiveKeys(url string) []*signingKey {
+// GetCurrentKey returns the active current signing key for a channel.
+func (kt *KeyTable) GetCurrentKey(url string) *SigningKey {
+	kt.mu.Lock()
+	defer kt.mu.Unlock()
+
+	keys := kt.channels[url]
+	if keys == nil {
+		return nil
+	}
+	for _, k := range keys {
+		if k.IsCurrent && k.IsActive && k.Status == "active" {
+			return k
+		}
+	}
+	return nil
+}
+
+// GetActiveKeys returns all active (non-retired, non-revoked) signing keys for a channel.
+func (kt *KeyTable) GetActiveKeys(url string) []*SigningKey {
 	kt.mu.Lock()
 	defer kt.mu.Unlock()
 
@@ -79,9 +237,9 @@ func (kt *KeyTable) GetActiveKeys(url string) []*signingKey {
 		return nil
 	}
 
-	var active []*signingKey
+	var active []*SigningKey
 	for _, k := range keys {
-		if k.IsActive && !k.IsExpired {
+		if k.IsActive && k.Status == "active" && !k.IsExpired {
 			active = append(active, k)
 		}
 	}
@@ -92,7 +250,7 @@ func (kt *KeyTable) GetActiveKeys(url string) []*signingKey {
 }
 
 // GetKey returns the signing key with the given ID for a channel, or nil if not found.
-func (kt *KeyTable) GetKey(url, keyID string) *signingKey {
+func (kt *KeyTable) GetKey(url, keyID string) *SigningKey {
 	kt.mu.Lock()
 	defer kt.mu.Unlock()
 
@@ -103,49 +261,55 @@ func (kt *KeyTable) GetKey(url, keyID string) *signingKey {
 	return keys[keyID]
 }
 
-// RotateKey marks the key with the given ID as expired and makes it inactive.
-// It returns the key that was rotated, so the caller can record the rotation.
-// The previous key (if any) remains active for backwards compatibility.
-// After rotation, the new key (just added via AddKey) becomes the primary
-// signing key, and the rotated key is retained in the active set but marked
-// as expired so receivers that have not yet switched can still verify old deliveries.
-func (kt *KeyTable) RotateKey(url, keyID string) (*signingKey, error) {
+// RotateKey creates and activates a new signing key while keeping the existing key
+// active for the overlap period.
+func (kt *KeyTable) RotateKey(url string, newKeyBytes []byte) (*SigningKey, error) {
+	return kt.AddKey(url, newKeyBytes)
+}
+
+// RetireKey marks an active, non-current signing key as retired.
+func (kt *KeyTable) RetireKey(url, keyID string) error {
 	kt.mu.Lock()
 	defer kt.mu.Unlock()
 
 	keys := kt.channels[url]
 	if keys == nil {
-		return nil, fmt.Errorf("no keys configured for URL %s", url)
+		return fmt.Errorf("no keys configured for URL %s", url)
 	}
-
 	k, ok := keys[keyID]
 	if !ok {
-		return nil, fmt.Errorf("key %s not found for URL %s", keyID, url)
+		return fmt.Errorf("key %s not found for URL %s", keyID, url)
 	}
-
+	if k.IsCurrent {
+		return fmt.Errorf("cannot retire active current signing key %q; rotate first", keyID)
+	}
 	k.IsActive = false
 	k.IsExpired = true
-	k.CreatedAt = time.Time{} // clear, it's expired now
-
-	return k, nil
+	k.Status = "retired"
+	return nil
 }
 
-// Sign computes the HMAC-SHA256 signature of a canonical string using a given key.
-// The canonical string is "timestamp.rawBody" (timestamp dotted with raw body).
-func Sign(key []byte, timestamp string, rawBody []byte) string {
-	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte(timestamp))
-	mac.Write([]byte("."))
-	mac.Write(rawBody)
-	return hex.EncodeToString(mac.Sum(nil))
+// RevokeKey immediately invalidates a signing key (emergency path).
+func (kt *KeyTable) RevokeKey(url, keyID string) error {
+	kt.mu.Lock()
+	defer kt.mu.Unlock()
+
+	keys := kt.channels[url]
+	if keys == nil {
+		return fmt.Errorf("no keys configured for URL %s", url)
+	}
+	k, ok := keys[keyID]
+	if !ok {
+		return fmt.Errorf("key %s not found for URL %s", keyID, url)
+	}
+	k.IsActive = false
+	k.IsExpired = true
+	k.IsCurrent = false
+	k.Status = "revoked"
+	return nil
 }
 
-// VerifySignature checks whether the given signature is valid for the provided
-// timestamp and raw body under any of the active keys for the channel.
-// It also supports the "previous" signature header for rotation scenarios.
-//
-// Returns the key ID that verified the signature, or "" if no key matched.
-// If previous is true, it also checks the previous signature header.
+// VerifySignature checks whether a delivery signature is valid under any active key for the channel.
 func (kt *KeyTable) VerifySignature(url, timestamp string, rawBody []byte, signature, previousSignature string) (string, bool) {
 	kt.mu.Lock()
 	defer kt.mu.Unlock()
@@ -155,27 +319,30 @@ func (kt *KeyTable) VerifySignature(url, timestamp string, rawBody []byte, signa
 		return "", false
 	}
 
-	// Check current active keys
-	for _, k := range keys {
-		if !k.IsActive || k.IsExpired {
-			continue
-		}
-		sig := Sign(k.Key, timestamp, rawBody)
-		if hmac.Equal([]byte(sig), []byte(signature)) {
-			return k.ID, true
+	keyMap := make(map[string][]byte, len(keys))
+	for id, k := range keys {
+		if k.IsActive && k.Status == "active" {
+			keyMap[id] = k.Key
 		}
 	}
 
-	// Check previous keys (for rotation)
+	// First try primary signature
+	if id, ok := VerifySignature(keyMap, VerifyOptions{
+		Timestamp: timestamp,
+		Body:      rawBody,
+		Signature: signature,
+	}); ok {
+		return id, true
+	}
+
+	// Then try previous signature header if provided
 	if previousSignature != "" {
-		for _, k := range keys {
-			if k.ID == "" || k.IsActive || !k.IsExpired {
-				continue
-			}
-			sig := Sign(k.Key, timestamp, rawBody)
-			if hmac.Equal([]byte(sig), []byte(previousSignature)) {
-				return k.ID, true
-			}
+		if id, ok := VerifySignature(keyMap, VerifyOptions{
+			Timestamp: timestamp,
+			Body:      rawBody,
+			Signature: previousSignature,
+		}); ok {
+			return id, true
 		}
 	}
 

@@ -18,6 +18,31 @@ import (
 // rejected value is exactly the kind of string that should not be echoed.
 var ErrInvalidID = errors.New("invalid workspace id")
 
+// ErrDeletionConfirmationRequired is returned when an irreversible workspace
+// deletion is requested without a confirmation token matching the target
+// workspace id.
+var ErrDeletionConfirmationRequired = errors.New("workspace deletion requires explicit confirmation matching the workspace id")
+
+// ErrCannotDeleteDefaultWorkspace is returned when a caller attempts to
+// permanently delete the built-in default workspace.
+var ErrCannotDeleteDefaultWorkspace = errors.New("cannot delete the built-in default workspace")
+
+// ValidateDeletionConfirmation verifies that target is a deletable tenant
+// workspace and that confirm matches target exactly before an irreversible
+// workspace deletion is allowed to proceed.
+func ValidateDeletionConfirmation(target ID, confirm string) error {
+	if !Valid(string(target)) {
+		return ErrInvalidID
+	}
+	if target == Default {
+		return ErrCannotDeleteDefaultWorkspace
+	}
+	if confirm == "" || confirm != string(target) {
+		return ErrDeletionConfirmationRequired
+	}
+	return nil
+}
+
 // Default is the workspace every pre-existing row belongs to and the one an
 // unconfigured single-tenant instance uses. Its id is fixed so a migration can
 // insert it and every column default can name it without generating one.

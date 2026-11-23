@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/base64"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +50,7 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("OIDC_WORKSPACE_CLAIM", "")
 	t.Setenv("OIDC_ALLOWED_DOMAINS", "")
 	t.Setenv("OIDC_LOGIN_STATE_TTL", "")
+	t.Setenv("AUDIT_RETENTION", "")
 
 	cfg, err := Load()
 	require.NoError(t, err)
@@ -71,6 +74,7 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Zero(t, cfg.DatabaseMaxConnLifetime)
 	assert.Zero(t, cfg.DatabaseMaxConnIdleTime)
 	assert.Equal(t, time.Duration(0), cfg.AlertRetention)
+	assert.Equal(t, time.Duration(0), cfg.AuditRetention)
 	assert.Equal(t, DefaultMonitorSilentAfter, cfg.MonitorSilentAfter)
 	assert.Zero(t, cfg.NotifyRateLimitSlackRPS)
 	assert.Zero(t, cfg.NotifyRateLimitTelegramRPS)
@@ -498,24 +502,39 @@ func TestLoadAlertRetention(t *testing.T) {
 }
 
 func TestParseRetention(t *testing.T) {
-	d, err := ParseRetention("")
-	require.NoError(t, err)
-	assert.Equal(t, time.Duration(0), d)
-
-	d, err = ParseRetention("90d")
-	require.NoError(t, err)
-	assert.Equal(t, 90*24*time.Hour, d)
-
-	d, err = ParseRetention("24h")
-	require.NoError(t, err)
-	assert.Equal(t, 24*time.Hour, d)
-
-	_, err = ParseRetention("0")
-	assert.Error(t, err)
-	_, err = ParseRetention("-1h")
-	assert.Error(t, err)
-	_, err = ParseRetention("0d")
-	assert.Error(t, err)
+	tests := []struct {
+		name    string
+		in      string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "empty keeps forever", in: ""},
+		// Whitespace is the same as unset: an operator template that expands
+		// to spaces must not start pruning history.
+		{name: "whitespace only keeps forever", in: "   "},
+		{name: "days", in: "90d", want: 90 * 24 * time.Hour},
+		{name: "one day boundary", in: "1d", want: 24 * time.Hour},
+		{name: "fractional days", in: "1.5d", want: 36 * time.Hour},
+		{name: "go duration hours", in: "24h", want: 24 * time.Hour},
+		{name: "go duration minutes", in: "90m", want: 90 * time.Minute},
+		{name: "zero", in: "0", wantErr: true},
+		{name: "negative", in: "-1h", wantErr: true},
+		{name: "zero days", in: "0d", wantErr: true},
+		{name: "negative days", in: "-2d", wantErr: true},
+		{name: "day suffix without a number", in: "d", wantErr: true},
+		{name: "not a duration", in: "soon", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseRetention(tt.in)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 func TestLoadRateLimit(t *testing.T) {
@@ -704,6 +723,9 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"http_addr",
 		"source_mode",
 		"poll_interval",
+		"heartbeat_enabled",
+		"heartbeat_interval",
+		"heartbeat_failure_pings",
 		"log_level",
 		"network",
 		"rpc_url",
@@ -725,8 +747,90 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 		"graphql_playground_enabled",
 		"graphql_max_depth",
 		"graphql_max_complexity",
+		"graphql_allowlist_only",
 		"channel_disable_after_failures",
 	}, keys)
+}
+
+// The heartbeat URL is a credential: its path is what identifies the
+// monitor to the external service, so the one place configuration is
+// printed must contain neither the URL nor anything derived from it. What it
+// may print is the opt-in shape — on/off, interval, failure pings configured.
+func TestLogAttrsNeverPrintTheHeartbeatURL(t *testing.T) {
+	cfg := Config{
+		HeartbeatURL:           "https://hc.example.com/ping/deadbeef-1111-2222-3333-444444444444",
+		HeartbeatInterval:      time.Minute,
+		HeartbeatFailureSuffix: "/fail",
+	}
+	got := map[string]string{}
+	var blob strings.Builder
+	for _, a := range cfg.LogAttrs() {
+		got[a.Key] = a.Value.String()
+		blob.WriteString(a.Key + "=" + a.Value.String() + "\n")
+	}
+	assert.NotContains(t, blob.String(), "deadbeef", "the heartbeat URL must never be logged")
+	assert.NotContains(t, blob.String(), "hc.example.com", "not even the host is printed")
+	assert.Equal(t, "true", got["heartbeat_enabled"])
+	assert.Equal(t, "true", got["heartbeat_failure_pings"])
+	assert.Equal(t, "1m0s", got["heartbeat_interval"])
+}
+
+func TestLoadHeartbeat(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("HEARTBEAT_URL", "https://hc.example.com/ping/deadbeef-1111-2222-3333-444444444444")
+	t.Setenv("HEARTBEAT_INTERVAL", "30s")
+	t.Setenv("HEARTBEAT_FAILURE_SUFFIX", "/fail")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "https://hc.example.com/ping/deadbeef-1111-2222-3333-444444444444", cfg.HeartbeatURL)
+	assert.Equal(t, 30*time.Second, cfg.HeartbeatInterval)
+	assert.Equal(t, "/fail", cfg.HeartbeatFailureSuffix)
+
+	// Unset means off, exactly as before the feature existed: no URL, no
+	// failure pings, and the default interval waiting for an opt-in.
+	t.Setenv("HEARTBEAT_URL", "")
+	t.Setenv("HEARTBEAT_INTERVAL", "")
+	t.Setenv("HEARTBEAT_FAILURE_SUFFIX", "")
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.HeartbeatURL)
+	assert.Empty(t, cfg.HeartbeatFailureSuffix)
+	assert.Equal(t, DefaultHeartbeatInterval, cfg.HeartbeatInterval)
+}
+
+func TestLoadRejectsBadHeartbeatConfig(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("POLL_INTERVAL", "5s")
+
+	cases := []struct {
+		name string
+		url  string
+		iv   string
+		fail string
+	}{
+		{name: "not a URL", url: "hc.example.com", iv: "30s"},
+		{name: "wrong scheme", url: "ftp://hc.example.com/ping/x", iv: "30s"},
+		{name: "unparseable duration", url: "https://hc.example.com/ping/x", iv: "banana"},
+		{name: "zero interval", url: "https://hc.example.com/ping/x", iv: "0s"},
+		{name: "interval not above the poll interval", url: "https://hc.example.com/ping/x", iv: "5s"},
+		{name: "suffix without a leading slash", url: "https://hc.example.com/ping/x", iv: "30s", fail: "fail"},
+		{name: "suffix without a URL", iv: "30s", fail: "/fail"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HEARTBEAT_URL", tc.url)
+			t.Setenv("HEARTBEAT_INTERVAL", tc.iv)
+			t.Setenv("HEARTBEAT_FAILURE_SUFFIX", tc.fail)
+			_, err := Load()
+			require.Error(t, err)
+			// The URL is a credential even when it is rejected: the error
+			// says what is wrong without echoing the value.
+			if tc.url != "" {
+				assert.NotContains(t, err.Error(), tc.url)
+			}
+		})
+	}
 }
 
 func TestLoadAPITokens(t *testing.T) {
@@ -1309,4 +1413,110 @@ func TestLoadRejectsBadSecretsConfig(t *testing.T) {
 	for _, a := range cfg.LogAttrs() {
 		assert.NotEqual(t, "hvs.super-secret", a.Value.String())
 	}
+}
+
+func TestGraphQLAllowlistOnlyConfig(t *testing.T) {
+	for _, k := range []string{"SOROBAN_RPC_URL", "DATABASE_URL"} {
+		t.Setenv(k, "postgres://user:pass@localhost:5432/db")
+	}
+
+	t.Run("default false", func(t *testing.T) {
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.False(t, cfg.GraphQL.AllowlistOnly)
+	})
+
+	t.Run("enabled via true", func(t *testing.T) {
+		t.Setenv("GRAPHQL_ALLOWLIST_ONLY", "true")
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.True(t, cfg.GraphQL.AllowlistOnly)
+	})
+
+	t.Run("invalid value", func(t *testing.T) {
+		t.Setenv("GRAPHQL_ALLOWLIST_ONLY", "not-a-bool")
+		_, err := Load()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "GRAPHQL_ALLOWLIST_ONLY")
+	})
+}
+
+func TestSecretResolutionConfig(t *testing.T) {
+	for _, k := range []string{"SOROBAN_RPC_URL", "DATABASE_URL"} {
+		t.Setenv(k, "postgres://user:pass@localhost:5432/db")
+	}
+
+	t.Run("resolves database url from file", func(t *testing.T) {
+		dir := t.TempDir()
+		dbFile := filepath.Join(dir, "db.txt")
+		require.NoError(t, os.WriteFile(dbFile, []byte("postgres://secretuser:secretpass@dbhost:5432/secretdb\n"), 0o600))
+
+		t.Setenv("SECRETS_PROVIDER", "file")
+		t.Setenv("DATABASE_URL", "${secret:file:"+dbFile+"}")
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Equal(t, "postgres://secretuser:secretpass@dbhost:5432/secretdb", cfg.DatabaseURL)
+	})
+
+	t.Run("resolves api token and encryption key from file", func(t *testing.T) {
+		dir := t.TempDir()
+		credsFile := filepath.Join(dir, "creds.json")
+		require.NoError(t, os.WriteFile(credsFile, []byte(`{"token":"sb_admin_token","enc":"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="}`), 0o600))
+
+		t.Setenv("SECRETS_PROVIDER", "file")
+		t.Setenv("API_TOKEN", "${secret:file:"+credsFile+"#token}")
+		t.Setenv("CONFIG_ENCRYPTION_KEY", "${secret:file:"+credsFile+"#enc}")
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Contains(t, cfg.APITokens, "sb_admin_token")
+		assert.Len(t, cfg.ConfigEncryptionKey, 32)
+	})
+
+	t.Run("fails startup on missing secret file without leaking", func(t *testing.T) {
+		t.Setenv("SECRETS_PROVIDER", "file")
+		t.Setenv("DATABASE_URL", "${secret:file:/nonexistent/db.txt}")
+
+		_, err := Load()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "DATABASE_URL")
+		assert.ErrorContains(t, err, "${secret:file:/nonexistent/db.txt}")
+	})
+
+	t.Run("fails when secrets provider is unset but reference provided", func(t *testing.T) {
+		t.Setenv("SECRETS_PROVIDER", "")
+		t.Setenv("DATABASE_URL", "${secret:file:/some/path}")
+
+		_, err := Load()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "DATABASE_URL")
+		assert.ErrorContains(t, err, "SECRETS_PROVIDER is not configured")
+	})
+
+	t.Run("supports comma-separated secrets providers", func(t *testing.T) {
+		t.Setenv("SECRETS_PROVIDER", "file,env")
+		t.Setenv("MY_ENV_DB", "postgres://envuser:envpass@envhost:5432/envdb")
+		t.Setenv("DATABASE_URL", "${secret:env:MY_ENV_DB}")
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Equal(t, "postgres://envuser:envpass@envhost:5432/envdb", cfg.DatabaseURL)
+	})
+}
+
+func TestLoadAuditRetention(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("ALERT_RETENTION", "30d")
+	t.Setenv("AUDIT_RETENTION", "365d")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 30*24*time.Hour, cfg.AlertRetention)
+	assert.Equal(t, 365*24*time.Hour, cfg.AuditRetention, "AUDIT_RETENTION is independent of ALERT_RETENTION")
+
+	t.Setenv("AUDIT_RETENTION", "0s")
+	_, err = Load()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "AUDIT_RETENTION")
 }

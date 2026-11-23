@@ -2,6 +2,7 @@ package web
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -114,7 +115,15 @@ func (s *Server) importContractsWeb(w http.ResponseWriter, r *http.Request) {
 }
 
 func parseWebCSV(r io.Reader) ([]string, error) {
-	reader := csv.NewReader(bufio.NewReader(r))
+	// A spreadsheet exported as CSV carries a UTF-8 BOM, and the BOM would
+	// otherwise glue itself to the first contract ID and make an otherwise
+	// valid file fail validation on row 1. Peek three bytes and drop it
+	// before the CSV reader ever sees it.
+	buf := bufio.NewReader(r)
+	if bom, err := buf.Peek(3); err == nil && bytes.Equal(bom, []byte{0xEF, 0xBB, 0xBF}) {
+		_, _ = buf.Discard(3)
+	}
+	reader := csv.NewReader(buf)
 	reader.FieldsPerRecord = -1
 	var ids []string
 	for {

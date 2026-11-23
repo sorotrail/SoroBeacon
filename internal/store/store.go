@@ -9,9 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/workspace"
@@ -19,6 +23,9 @@ import (
 
 // ErrNotFound is returned when a requested row does not exist.
 var ErrNotFound = errors.New("not found")
+
+// ErrUnavailable is returned when the database is unreachable or operating in degraded mode.
+var ErrUnavailable = errors.New("database unavailable")
 
 // Priority ranks a monitor's contracts in the poller's schedule. It is a
 // small closed set rather than a free integer so the scheduler, the API
@@ -154,11 +161,70 @@ type Monitor struct {
 	// instance's primary network at startup; a newly created monitor always
 	// carries the network it was created for.
 	Network string `json:"network"`
+	// Tags are free-form labels for grouping and filtering. They are
+	// normalised (trimmed, lowercased, deduplicated — see NormalizeTags)
+	// before storage, and an untagged monitor keeps an empty list rather
+	// than nil so JSON output is always an array.
+	Tags []string `json:"tags"`
 	// DeletedAt is set when the monitor is soft-deleted. Nil means active.
 	// A soft-deleted monitor stops alerting immediately but can be restored
 	// within the restore window. When set, the monitor is excluded from
 	// evaluation and regular listings.
 	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+	// RunbookURL is the optional monitor-level runbook link (http or https)
+	// inherited by rules on this monitor that do not specify their own.
+	RunbookURL string `json:"runbook_url,omitempty"`
+	// ResponseGuidance is an optional short markdown/text note describing what
+	// an on-call responder should do when an alert fires on this monitor.
+	ResponseGuidance string `json:"response_guidance,omitempty"`
+	// WorkspaceID is the tenant workspace this monitor belongs to. It is populated
+	// by store reads and writes so cross-tenant background workers (poller, ingestor)
+	// can attribute rule evaluations and alerts to the owning workspace.
+	WorkspaceID string `json:"-"`
+}
+
+// MaxMonitorTags bounds how many tags one monitor may carry, and MaxTagLen
+// bounds one tag's length. Tags are free-form operator input that lands in
+// an indexed array column and in every monitor listing response, so an
+// unbounded list would be a payload-size and index-bloat footgun rather
+// than a feature.
+const (
+	MaxMonitorTags = 25
+	MaxTagLen      = 64
+)
+
+// NormalizeTags trims, lowercases and deduplicates tags, dropping empty
+// ones and any " or control characters, so "Treasury", " treasury " and
+// "treasury" are one tag and a monitor's tag set is stable under
+// reordering. Dropping quotes also keeps the SQLite filter (an instr match
+// over the quoted JSON text) an exact tag test on both backends. The result
+// is never nil, so it serialises as [] rather than null and writes cleanly
+// to a NOT NULL column.
+func NormalizeTags(tags []string) []string {
+	if len(tags) == 0 {
+		return []string{}
+	}
+	seen := make(map[string]struct{}, len(tags))
+	out := make([]string, 0, len(tags))
+	for _, t := range tags {
+		t = strings.ToLower(strings.TrimSpace(t))
+		t = strings.Map(func(r rune) rune {
+			if r < 0x20 || r == 0x7f || r == '"' {
+				return -1
+			}
+			return r
+		}, t)
+		t = strings.TrimSpace(t)
+		if t == "" {
+			continue
+		}
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
 }
 
 // Rule is one condition evaluated against every event of its monitor's
@@ -173,6 +239,246 @@ type Rule struct {
 	// SeverityWarning, so rules created before the field existed keep
 	// today's behaviour. It is validated at the API boundary.
 	Severity Severity `json:"severity"`
+	// Version is the 1-indexed revision of this rule. Every UpdateRule call
+	// increments it so alerts can record which rule revision produced them
+	// and stateful evaluators can detect mid-flight edits.
+	Version int `json:"version"`
+	// RunbookURL is an optional http/https link to the runbook for this rule.
+	// When set, it overrides the monitor-level and workspace-level defaults.
+	RunbookURL string `json:"runbook_url,omitempty"`
+	// ResponseGuidance is an optional short markdown/text note with immediate
+	// triage instructions for alerts produced by this rule.
+	ResponseGuidance string `json:"response_guidance,omitempty"`
+}
+
+// MaxRunbookURLLen and MaxResponseGuidanceLen bound operator-supplied runbook
+// links and triage guidance stored on workspaces, monitors, rules, and alerts.
+const (
+	MaxRunbookURLLen       = 2048
+	MaxResponseGuidanceLen = 500
+)
+
+// ValidateRunbookURL trims and validates an optional runbook URL. An empty or
+// whitespace-only string is valid and returns "". Non-empty URLs must be valid
+// UTF-8, at most MaxRunbookURLLen characters, free of whitespace and control
+// characters, use an explicit http or https scheme, and carry a non-empty host.
+func ValidateRunbookURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", nil
+	}
+	if !utf8.ValidString(trimmed) {
+		return "", errors.New("runbook_url must be valid UTF-8")
+	}
+	if len(trimmed) > MaxRunbookURLLen {
+		return "", fmt.Errorf("runbook_url exceeds maximum length of %d characters", MaxRunbookURLLen)
+	}
+	for _, r := range trimmed {
+		if r <= 0x20 || r == 0x7f || unicode.IsSpace(r) || unicode.IsControl(r) {
+			return "", errors.New("runbook_url must not contain whitespace or control characters")
+		}
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("invalid runbook_url: %w", err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", errors.New("runbook_url must use http or https scheme")
+	}
+	if u.Opaque != "" || u.Host == "" || u.Hostname() == "" {
+		return "", errors.New("runbook_url must include a valid host")
+	}
+	return scheme + trimmed[len(u.Scheme):], nil
+}
+
+// ValidateResponseGuidance normalizes line endings, trims surrounding
+// whitespace, and validates an optional response guidance note. An empty or
+// whitespace-only note returns "". Non-empty notes must be valid UTF-8, at most
+// MaxResponseGuidanceLen runes, and free of control characters other than
+// newline and tab.
+func ValidateResponseGuidance(raw string) (string, error) {
+	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	trimmed := strings.TrimSpace(normalized)
+	if trimmed == "" {
+		return "", nil
+	}
+	if !utf8.ValidString(trimmed) {
+		return "", errors.New("response_guidance must be valid UTF-8")
+	}
+	if utf8.RuneCountInString(trimmed) > MaxResponseGuidanceLen {
+		return "", fmt.Errorf("response_guidance exceeds maximum length of %d characters", MaxResponseGuidanceLen)
+	}
+	for _, r := range trimmed {
+		if (r < 0x20 && r != '\n' && r != '\t') || r == 0x7f || (unicode.IsControl(r) && r != '\n' && r != '\t') {
+			return "", errors.New("response_guidance must not contain control characters")
+		}
+	}
+	return trimmed, nil
+}
+
+// ResolveRunbookURL returns the first non-empty runbook URL in precedence
+// order (for example: rule -> monitor -> workspace default).
+func ResolveRunbookURL(candidates ...string) string {
+	for _, c := range candidates {
+		if trimmed := strings.TrimSpace(c); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+// ResolveResponseGuidance returns the first non-empty response guidance note
+// in precedence order (for example: rule -> monitor -> workspace default).
+func ResolveResponseGuidance(candidates ...string) string {
+	for _, c := range candidates {
+		if trimmed := strings.TrimSpace(c); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+// ResolveAlertGuidance resolves the effective runbook URL and response guidance
+// across the rule -> monitor -> workspace inheritance chain.
+func ResolveAlertGuidance(rule *Rule, monitor *Monitor, workspaceRunbookURL, workspaceResponseGuidance string) (runbookURL, responseGuidance string) {
+	var rURL, rGuidance, mURL, mGuidance string
+	if rule != nil {
+		rURL = rule.RunbookURL
+		rGuidance = rule.ResponseGuidance
+		if rURL == "" || rGuidance == "" {
+			pURL, hasURL, pGuidance, hasGuidance := extractParamsGuidance(rule.Params)
+			if rURL == "" && hasURL {
+				rURL = pURL
+			}
+			if rGuidance == "" && hasGuidance {
+				rGuidance = pGuidance
+			}
+		}
+	}
+	if monitor != nil {
+		mURL = monitor.RunbookURL
+		mGuidance = monitor.ResponseGuidance
+	}
+	return ResolveRunbookURL(rURL, mURL, workspaceRunbookURL),
+		ResolveResponseGuidance(rGuidance, mGuidance, workspaceResponseGuidance)
+}
+
+func extractParamsGuidance(raw json.RawMessage) (runbookURL string, hasURL bool, responseGuidance string, hasGuidance bool) {
+	if len(raw) == 0 {
+		return "", false, "", false
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
+		return "", false, "", false
+	}
+	if v, ok := obj["runbook_url"]; ok && len(v) > 0 && string(v) != "null" {
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil {
+			runbookURL = s
+			hasURL = true
+		}
+	}
+	if v, ok := obj["response_guidance"]; ok && len(v) > 0 && string(v) != "null" {
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil {
+			responseGuidance = s
+			hasGuidance = true
+		}
+	}
+	return runbookURL, hasURL, responseGuidance, hasGuidance
+}
+
+func normalizeMonitorGuidance(m *Monitor) error {
+	if m == nil {
+		return nil
+	}
+	u, err := ValidateRunbookURL(m.RunbookURL)
+	if err != nil {
+		return err
+	}
+	g, err := ValidateResponseGuidance(m.ResponseGuidance)
+	if err != nil {
+		return err
+	}
+	m.RunbookURL = u
+	m.ResponseGuidance = g
+	return nil
+}
+
+func normalizeRuleGuidance(r *Rule) error {
+	if r == nil {
+		return nil
+	}
+	pURL, hasURL, pGuidance, hasGuidance := extractParamsGuidance(r.Params)
+	if r.RunbookURL == "" && hasURL {
+		r.RunbookURL = pURL
+	}
+	if r.ResponseGuidance == "" && hasGuidance {
+		r.ResponseGuidance = pGuidance
+	}
+	u, err := ValidateRunbookURL(r.RunbookURL)
+	if err != nil {
+		return err
+	}
+	g, err := ValidateResponseGuidance(r.ResponseGuidance)
+	if err != nil {
+		return err
+	}
+	r.RunbookURL = u
+	r.ResponseGuidance = g
+	return nil
+}
+
+// WithGuidance annotates an alert JSON payload object with runbook_url and
+// response_guidance when non-empty. A payload that is not a JSON object is
+// returned untouched.
+func WithGuidance(payload json.RawMessage, runbookURL, responseGuidance string) json.RawMessage {
+	if runbookURL == "" && responseGuidance == "" {
+		return payload
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(payload, &obj); err != nil || obj == nil {
+		return payload
+	}
+	changed := false
+	if runbookURL != "" {
+		if existing, ok := obj["runbook_url"].(string); !ok || existing == "" {
+			obj["runbook_url"] = runbookURL
+			changed = true
+		}
+	}
+	if responseGuidance != "" {
+		if existing, ok := obj["response_guidance"].(string); !ok || existing == "" {
+			obj["response_guidance"] = responseGuidance
+			changed = true
+		}
+	}
+	if !changed {
+		return payload
+	}
+	merged, err := json.Marshal(obj)
+	if err != nil {
+		return payload
+	}
+	return merged
+}
+
+func canonicalJSONEqual(a, b []byte) bool {
+	var va, vb any
+	if err := json.Unmarshal(a, &va); err != nil {
+		return string(a) == string(b)
+	}
+	if err := json.Unmarshal(b, &vb); err != nil {
+		return string(a) == string(b)
+	}
+	ca, errA := json.Marshal(va)
+	cb, errB := json.Marshal(vb)
+	if errA != nil || errB != nil {
+		return string(a) == string(b)
+	}
+	return string(ca) == string(cb)
 }
 
 // DefaultChannelTimeout is the timeout applied to channels when unset (15s),
@@ -239,6 +545,10 @@ type Channel struct {
 	// then. It is what makes the dashboard say "auto-disabled" rather than
 	// "disabled", and it is cleared by an explicit re-enable.
 	DisabledAt *time.Time `json:"disabled_at,omitempty"`
+	// WorkspaceID is the tenant workspace this channel belongs to, populated
+	// by store reads and writes so delivery workers can attribute notifications
+	// to the owning workspace.
+	WorkspaceID string `json:"-"`
 }
 
 // TimeoutDuration returns the channel's timeout, falling back to
@@ -248,6 +558,31 @@ func (c Channel) TimeoutDuration() time.Duration {
 		return DefaultChannelTimeout
 	}
 	return c.Timeout
+}
+
+// ChannelSigningKeyStatus represents the lifecycle state of a signing key.
+type ChannelSigningKeyStatus string
+
+const (
+	SigningKeyStatusActive  = "active"
+	SigningKeyStatusRetired = "retired"
+	SigningKeyStatusRevoked = "revoked"
+)
+
+// ChannelSigningKey represents a webhook channel signing key. Secret key material
+// is shown once at creation/rotation and never returned in listings or API responses.
+type ChannelSigningKey struct {
+	ID          int64      `json:"-" db:"id"`
+	ChannelID   int64      `json:"channel_id,omitempty" db:"channel_id"`
+	WorkspaceID string     `json:"-" db:"workspace_id"`
+	KeyID       string     `json:"key_id" db:"key_id"`
+	Secret      string     `json:"secret,omitempty" db:"secret"`
+	IsCurrent   bool       `json:"is_current" db:"is_current"`
+	Status      string     `json:"status" db:"status"`
+	CreatedAt   time.Time  `json:"created_at" db:"created_at"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty" db:"expires_at"`
+	LastUsedAt  *time.Time `json:"last_used_at,omitempty" db:"last_used_at"`
+	RevokedAt   *time.Time `json:"revoked_at,omitempty" db:"revoked_at"`
 }
 
 // TimeoutSeconds returns the channel's timeout as an integer number of seconds.
@@ -397,6 +732,10 @@ type Alert struct {
 	Payload    json.RawMessage `json:"payload"`
 	Enrichment json.RawMessage `json:"enrichment,omitempty"`
 	CreatedAt  time.Time       `json:"created_at"`
+	// Archived is set only on alerts served from the archive tier rather than
+	// the database. It is the explicit indicator that lets a client tell the
+	// tiers apart; the rest of the shape is identical.
+	Archived bool `json:"archived,omitempty"`
 	// InhibitedByRuleID is set when an inhibition rule suppressed this
 	// alert's delivery. Nil means delivered (or never subjected to
 	// inhibition); the alert row itself is always stored.
@@ -471,6 +810,16 @@ type Alert struct {
 	// trip, and they are never used as local keys.
 	SourceMonitorID int64 `json:"source_monitor_id,omitempty"`
 	SourceRuleID    int64 `json:"source_rule_id,omitempty"`
+	// RuleVersion is the revision of the rule that produced this alert. It is
+	// stamped at creation time so editing a rule later does not lose which
+	// version matched historical alerts.
+	RuleVersion int `json:"rule_version,omitempty"`
+	// RunbookURL is the resolved runbook link (rule -> monitor -> workspace)
+	// captured when the alert was created.
+	RunbookURL string `json:"runbook_url,omitempty"`
+	// ResponseGuidance is the resolved triage guidance (rule -> monitor ->
+	// workspace) captured when the alert was created.
+	ResponseGuidance string `json:"response_guidance,omitempty"`
 }
 
 // Maintenance window scopes. A window suppresses matching alerts for its
@@ -613,6 +962,49 @@ func (c ChannelDeliveryStats) SuccessPercent() float64 {
 	return math.Round(*c.SuccessRate*1000) / 10
 }
 
+// ChannelAckReconciliation summarizes delivery vs human acknowledgement for one
+// channel. A channel that accepts deliveries (e.g. HTTP 200) but whose alerts
+// are never acknowledged within the SLA window is flagged as unacknowledged.
+type ChannelAckReconciliation struct {
+	ChannelID           int64     `json:"channel_id"`
+	WorkspaceID         string    `json:"workspace_id"`
+	DeliveredTotal      int64     `json:"delivered_total"`
+	AcknowledgedTotal   int64     `json:"acknowledged_total"`
+	UnacknowledgedTotal int64     `json:"unacknowledged_total"`
+	UnackRate           *float64  `json:"unack_rate,omitempty"`
+	Flagged             bool      `json:"flagged"`
+	ComputedAt          time.Time `json:"computed_at"`
+}
+
+// AckReconciliationConfig configures delivery vs acknowledgement evaluation.
+type AckReconciliationConfig struct {
+	// LookbackWindow is the evaluation duration for qualifying deliveries (default 7 days).
+	LookbackWindow time.Duration
+	// CriticalAckWindow is the duration after alert creation before an unacknowledged
+	// critical alert is considered unacknowledged (default 1 hour).
+	CriticalAckWindow time.Duration
+	// WarningAckWindow is the duration after alert creation before an unacknowledged
+	// warning alert is considered unacknowledged (default 4 hours).
+	WarningAckWindow time.Duration
+	// MinDeliveries is the minimum number of qualifying delivered alerts required
+	// before a channel can be flagged (default 3).
+	MinDeliveries int64
+	// FlagThresholdRate is the unacknowledged rate above which a channel is flagged
+	// (default 1.0, meaning 100% unacknowledged).
+	FlagThresholdRate float64
+}
+
+// DefaultAckReconciliationConfig returns production defaults for acknowledgement reconciliation.
+func DefaultAckReconciliationConfig() AckReconciliationConfig {
+	return AckReconciliationConfig{
+		LookbackWindow:    7 * 24 * time.Hour,
+		CriticalAckWindow: 1 * time.Hour,
+		WarningAckWindow:  4 * time.Hour,
+		MinDeliveries:     3,
+		FlagThresholdRate: 1.0,
+	}
+}
+
 // AbsenceState is the last time a rule saw the event it is waiting for.
 // Absence-of-event rules are driven by a periodic sweep rather than by event
 // arrival, so the sweep needs one of these per (rule, awaited pattern); there
@@ -634,6 +1026,34 @@ type IngestState struct {
 	LastLedger uint32    `json:"last_ledger"`
 	LastCursor string    `json:"last_cursor"`
 	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// RetentionGap is one recorded hole in ingest history: the checkpoint had
+// fallen outside the source's retention window, so ledgers
+// [FromLedger, ToLedger] can never be read. It is persisted rather than only
+// logged so the gap survives restarts and can be surfaced to operators —
+// silent data loss is the failure this record exists to prevent.
+type RetentionGap struct {
+	ID         int64     `json:"id"`
+	Network    string    `json:"network"`
+	FromLedger uint32    `json:"from_ledger"`
+	ToLedger   uint32    `json:"to_ledger"`
+	DetectedAt time.Time `json:"detected_at"`
+}
+
+// RetentionGaps persists holes in ingest history so they remain visible
+// after a restart. There is no read-all method: the dashboard and GET
+// /stats ask for the most recent gap, per network or across the instance,
+// and that is the question this exists to answer.
+type RetentionGaps interface {
+	// RecordRetentionGap persists one detected gap. Duplicate detections of
+	// the same hole are recorded again: each detection is a real observation
+	// and the caller only detects once per resume.
+	RecordRetentionGap(ctx context.Context, network string, fromLedger, toLedger uint32, detectedAt time.Time) error
+	// LatestRetentionGap returns the most recently detected gap for network,
+	// or ErrNotFound when none was ever recorded. An empty network asks for
+	// the most recent gap across all networks.
+	LatestRetentionGap(ctx context.Context, network string) (RetentionGap, error)
 }
 
 // ContractCursor is the inclusive ledger boundary durably processed for one
@@ -865,6 +1285,11 @@ type ListFilter struct {
 	// Network filters monitors by the Stellar network they watch. Empty
 	// means every network. Only meaningful for monitors.
 	Network string
+	// Tags filters monitors by tag. Every tag must be carried (AND, not
+	// OR), which is what a repeated ?tag= parameter means. Empty means no
+	// tag filter. Only meaningful for monitors; the store normalises them
+	// before they reach SQL.
+	Tags []string
 }
 
 // Stats is the aggregate snapshot served by GET /stats.
@@ -873,7 +1298,9 @@ type ListFilter struct {
 // network they are that network's, and with several they come from whichever
 // checkpoint advanced most recently. Networks carries the per-network detail
 // so a dashboard can tell "testnet is current, mainnet is two hours behind"
-// instead of showing one blended number that hides it.
+// instead of showing one blended number that hides it. RetentionGap, when
+// set, is the most recent detected hole in ingest history — silent data loss
+// is the failure it exists to make loud.
 type Stats struct {
 	Monitors     int64          `json:"monitors"`
 	Rules        int64          `json:"rules"`
@@ -883,6 +1310,18 @@ type Stats struct {
 	LastLedger   uint32         `json:"last_ledger"`
 	LastPollAt   time.Time      `json:"last_poll_at"`
 	Networks     []NetworkStats `json:"networks,omitempty"`
+	// RetentionGap is the most recently detected retention gap across all
+	// networks, or nil when none has ever been recorded — a nil gap is
+	// omitted from JSON so a healthy instance reports exactly the shape it
+	// always did.
+	RetentionGap *RetentionGap `json:"retention_gap,omitempty"`
+	// PrunedBefore reports the workspace's active alert retention cutoff
+	// (now - effective retention) when a retention policy is in effect.
+	PrunedBefore *time.Time `json:"pruned_before,omitempty"`
+	// RetentionPolicySource reports whether PrunedBefore came from a
+	// workspace-specific override ("workspace") or the instance default
+	// ("instance").
+	RetentionPolicySource string `json:"retention_policy_source,omitempty"`
 }
 
 // NetworkStats is one network's ingest checkpoint as stored, independent of
@@ -1060,6 +1499,38 @@ type Channels interface {
 	// channel with no attempts in the window returns explicit zero counts and
 	// nil timestamps (see ChannelDeliveryStats).
 	GetChannelDeliveryStats(ctx context.Context, channelID int64, since time.Time) (ChannelDeliveryStats, error)
+	// ChannelDeliveryChangeKey returns (maxDeliveryAttemptID, attemptCount, error) for the
+	// given channel in the context's workspace. Returns ErrNotFound if the channel does not
+	// exist in the workspace.
+	ChannelDeliveryChangeKey(ctx context.Context, channelID int64) (maxID int64, count int64, err error)
+
+	// Channel signing keys methods for multi-key overlap, rotation, retirement and emergency revocation.
+	CreateChannelSigningKey(ctx context.Context, k *ChannelSigningKey) error
+	GetChannelSigningKey(ctx context.Context, channelID int64, keyID string) (*ChannelSigningKey, error)
+	ListChannelSigningKeys(ctx context.Context, channelID int64) ([]ChannelSigningKey, error)
+	GetCurrentChannelSigningKey(ctx context.Context, channelID int64) (*ChannelSigningKey, error)
+	RotateChannelSigningKey(ctx context.Context, channelID int64, newKey *ChannelSigningKey) error
+	RetireChannelSigningKey(ctx context.Context, channelID int64, keyID string) error
+	RevokeChannelSigningKey(ctx context.Context, channelID int64, keyID string) error
+	RecordChannelSigningKeyUsage(ctx context.Context, channelID int64, keyID string, usedAt time.Time) error
+
+	// Push device registry (mobile push channel). The token is a credential:
+	// listings return it only to the delivery path, never to API callers.
+	UpsertPushDevice(ctx context.Context, channelID int64, deviceID, platform, token string) error
+	DeletePushDevice(ctx context.Context, channelID int64, deviceID string) error
+	ListPushDevices(ctx context.Context, channelID int64) ([]PushDevice, error)
+	RetirePushDevice(ctx context.Context, channelID int64, deviceID string) error
+
+	// External paging correlation (acknowledgement sync).
+	RecordAlertExternalRef(ctx context.Context, ref *AlertExternalRef) error
+	GetAlertExternalRefByDedupKey(ctx context.Context, channelID int64, provider, dedupKey string) (*AlertExternalRef, error)
+	ListAlertExternalRefs(ctx context.Context, alertID int64) ([]AlertExternalRef, error)
+	UpdateAlertExternalRef(ctx context.Context, alertID, channelID int64, incidentID, state, syncError string) error
+
+	// Channel acknowledgement reconciliation
+	ReconcileChannelAcknowledgements(ctx context.Context, cfg AckReconciliationConfig) ([]ChannelAckReconciliation, error)
+	GetChannelAckReconciliation(ctx context.Context, channelID int64) (ChannelAckReconciliation, error)
+	ListChannelAckReconciliations(ctx context.Context) (map[int64]ChannelAckReconciliation, error)
 }
 
 // Alerts persists alerts and delivery attempts.
@@ -1075,6 +1546,9 @@ type Alerts interface {
 	CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error)
 	GetAlert(ctx context.Context, id int64) (*Alert, error)
 	ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
+	// AlertChangeKey returns (maxAlertID, alertCount, error) for the context's workspace.
+	// It serves as a monotonic, deletion-aware change detector for conditional requests.
+	AlertChangeKey(ctx context.Context) (maxID int64, count int64, err error)
 	// ListAlertsStream walks the same filter as ListAlerts, calling fn per
 	// row. f.Limit caps the total rows, not the page size, so an export
 	// streams with bounded memory. See streamAlerts for the guarantees.
@@ -1093,23 +1567,72 @@ type Alerts interface {
 	ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int) ([]Alert, error)
 }
 
+// Dead letter cause categories. Coarse groupings so triage doesn't fragment into one group per unique error string.
+const (
+	DeadLetterCauseRateLimit   = "rate_limit"
+	DeadLetterCauseAuthFailure = "auth_failure"
+	DeadLetterCauseClientError = "client_error"
+	DeadLetterCauseServerError = "server_error"
+	DeadLetterCauseTimeout     = "timeout"
+	DeadLetterCauseNetwork     = "network_error"
+	DeadLetterCauseOther       = "other"
+)
+
+// ClassifyCause derives a coarse cause from the last delivery HTTP status code and error message.
+func ClassifyCause(status int, errStr string) string {
+	lower := strings.ToLower(errStr)
+	switch {
+	case status == 429 || strings.Contains(lower, "429") || strings.Contains(lower, "rate limit") || strings.Contains(lower, "too many requests"):
+		return DeadLetterCauseRateLimit
+	case status == 401 || status == 403 || strings.Contains(lower, "401") || strings.Contains(lower, "403") || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "forbidden") || strings.Contains(lower, "token"):
+		return DeadLetterCauseAuthFailure
+	case status >= 400 && status < 500:
+		return DeadLetterCauseClientError
+	case status >= 500 && status < 600:
+		return DeadLetterCauseServerError
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded") || status == 408 || status == 504:
+		return DeadLetterCauseTimeout
+	case strings.Contains(lower, "connection refused") || strings.Contains(lower, "no such host") || strings.Contains(lower, "dial tcp") || strings.Contains(lower, "network"):
+		return DeadLetterCauseNetwork
+	default:
+		return DeadLetterCauseOther
+	}
+}
+
 // DeadLetter represents a permanently failed delivery attempt.
 type DeadLetter struct {
 	ID           int64     `json:"id"`
 	AlertID      int64     `json:"alert_id"`
 	ChannelID    int64     `json:"channel_id"`
+	Cause        string    `json:"cause,omitempty"`
 	LastError    string    `json:"last_error"`
 	AttemptCount int       `json:"attempt_count"`
 	LastStatus   int       `json:"last_status"`
 	CreatedAt    time.Time `json:"created_at"`
 }
 
-// DeadLetterFilter narrows ListDeadLetters.
+// DeadLetterGroup is a rollup of dead letters by channel and cause.
+type DeadLetterGroup struct {
+	ChannelID   int64     `json:"channel_id"`
+	ChannelName string    `json:"channel_name,omitempty"`
+	ChannelType string    `json:"channel_type,omitempty"`
+	Cause       string    `json:"cause"`
+	Count       int       `json:"count"`
+	OldestAt    time.Time `json:"oldest_at"`
+	NewestAt    time.Time `json:"newest_at"`
+}
+
+// DeadLetterFilter narrows ListDeadLetters and bulk operations.
 type DeadLetterFilter struct {
-	ChannelID int64
-	AlertID   int64
-	Limit     int
-	AfterID   int64
+	ChannelID     int64
+	AlertID       int64
+	Cause         string
+	OlderThan     time.Duration
+	CreatedBefore time.Time
+	CreatedAfter  time.Time
+	Limit         int
+	AfterID       int64
+	IDs           []int64
 }
 
 // DeadLetters persists permanently failed deliveries.
@@ -1117,7 +1640,64 @@ type DeadLetters interface {
 	CreateDeadLetter(ctx context.Context, d *DeadLetter) error
 	GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, error)
 	ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error)
+	ListDeadLetterGroups(ctx context.Context, f DeadLetterFilter) ([]DeadLetterGroup, error)
 	DeleteDeadLetter(ctx context.Context, id int64) error
+	BulkDeleteDeadLetters(ctx context.Context, f DeadLetterFilter) (int64, error)
+	DeleteExpiredDeadLetters(ctx context.Context, cutoff time.Time, limit int) (int64, error)
+}
+
+// GroupDeadLetters rolls up a slice of dead letters by (channel_id, cause).
+func GroupDeadLetters(letters []DeadLetter, chMap map[int64]Channel, causeFilter string) []DeadLetterGroup {
+	type key struct {
+		channelID int64
+		cause     string
+	}
+	groups := make(map[key]*DeadLetterGroup)
+	order := make([]key, 0)
+
+	for _, dl := range letters {
+		cause := dl.Cause
+		if cause == "" {
+			cause = ClassifyCause(dl.LastStatus, dl.LastError)
+		}
+		if causeFilter != "" && cause != causeFilter {
+			continue
+		}
+		k := key{channelID: dl.ChannelID, cause: cause}
+		g, exists := groups[k]
+		if !exists {
+			ch := chMap[dl.ChannelID]
+			g = &DeadLetterGroup{
+				ChannelID:   dl.ChannelID,
+				ChannelName: ch.Name,
+				ChannelType: ch.Type,
+				Cause:       cause,
+				OldestAt:    dl.CreatedAt,
+				NewestAt:    dl.CreatedAt,
+			}
+			groups[k] = g
+			order = append(order, k)
+		}
+		g.Count++
+		if dl.CreatedAt.Before(g.OldestAt) {
+			g.OldestAt = dl.CreatedAt
+		}
+		if dl.CreatedAt.After(g.NewestAt) {
+			g.NewestAt = dl.CreatedAt
+		}
+	}
+
+	result := make([]DeadLetterGroup, 0, len(order))
+	for _, k := range order {
+		result = append(result, *groups[k])
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Count != result[j].Count {
+			return result[i].Count > result[j].Count
+		}
+		return result[i].ChannelID < result[j].ChannelID
+	})
+	return result
 }
 
 // MaintenanceWindows persists alert-silencing windows and marks suppressed
@@ -1160,6 +1740,70 @@ type ContractIngest interface {
 	RewindContractCursors(ctx context.Context, network string, lastLedger uint32) error
 }
 
+// ArchivedEvent is one ingested contract event kept for replay. It is the
+// decoded shape (the same one rule evaluators operate on), so a replay can
+// feed the production evaluator path directly instead of re-decoding XDR.
+type ArchivedEvent struct {
+	ID             int64           `json:"id"`
+	Network        string          `json:"network"`
+	EventID        string          `json:"event_id"`
+	ContractID     string          `json:"contract_id"`
+	Ledger         uint32          `json:"ledger"`
+	LedgerClosedAt *time.Time      `json:"ledger_closed_at,omitempty"`
+	TxHash         string          `json:"tx_hash"`
+	EventName      string          `json:"event_name"`
+	Topics         json.RawMessage `json:"topics"`
+	Value          json.RawMessage `json:"value,omitempty"`
+	Fields         json.RawMessage `json:"fields,omitempty"`
+	IngestedAt     time.Time       `json:"ingested_at"`
+}
+
+// EventArchiveFilter narrows ListArchivedEvents and CountArchivedEvents.
+// Zero values mean "no constraint" besides the store's page size.
+type EventArchiveFilter struct {
+	// Network restricts to one chain. Empty means every network.
+	Network string
+	// ContractIDs restricts to the given contracts (the replay caller passes
+	// its monitor's). Empty means every contract.
+	ContractIDs []string
+	// FromLedger and ToLedger are an inclusive ledger range. Zero From means
+	// no lower bound; zero To means no upper bound.
+	FromLedger uint32
+	ToLedger   uint32
+	// Limit caps the rows ListArchivedEvents returns (the store applies its
+	// own default and cap). CountArchivedEvents ignores it.
+	Limit int
+	// AfterID is the keyset cursor: events with id greater than this, oldest
+	// first, so replay pages forward through the archive.
+	AfterID int64
+}
+
+// EventArchive persists the raw event corpus replay evaluates against. The
+// poller writes every event it ingests; replay reads it back. Retention is
+// bounded (see RunEventArchivePruner), so it is a replay window rather than
+// a second copy of the chain.
+//
+// This is deliberately a separate interface from Store's other halves: the
+// poller only archives when its store implements it (see
+// poller.EventArchiver), so a store that cannot retain events keeps
+// everything else working and replay simply reports an empty corpus.
+type EventArchive interface {
+	// RecordEvents upserts archived events, keyed on (network, event_id):
+	// the poller re-reads ledger windows after a crash or a
+	// confirmation-depth hold, and the unique key turns that re-read into a
+	// no-op instead of duplicating the corpus. An empty slice is a no-op.
+	RecordEvents(ctx context.Context, network string, events []ArchivedEvent) error
+	// ListArchivedEvents returns matching events oldest-first by id, at most
+	// f.Limit of them (default and cap applied by the store).
+	ListArchivedEvents(ctx context.Context, f EventArchiveFilter) ([]ArchivedEvent, error)
+	// CountArchivedEvents returns how many events match f, so a replay can
+	// reject a range that is too expensive before evaluating anything.
+	CountArchivedEvents(ctx context.Context, f EventArchiveFilter) (int64, error)
+	// DeleteExpiredEvents removes up to limit events ingested strictly before
+	// cutoff. The bounded-retention pruner calls it in batches.
+	DeleteExpiredEvents(ctx context.Context, cutoff time.Time, limit int) (int64, error)
+}
+
 // Absence persists the last-seen clocks that absence-of-event rules measure
 // silence against.
 type Absence interface {
@@ -1173,6 +1817,9 @@ type Absence interface {
 	// baseline write must not undo a real observation. Writing an older
 	// instant is therefore a no-op rather than an error.
 	RecordAbsenceSeen(ctx context.Context, ruleID int64, eventName string, at time.Time) error
+	// DeleteAbsenceStateForRule removes any stored silence clocks for ruleID so
+	// an edited or disabled absence rule starts from a clean baseline.
+	DeleteAbsenceStateForRule(ctx context.Context, ruleID int64) error
 }
 
 // Backfills persists historical replay progress, so an interrupted backfill
@@ -1216,38 +1863,67 @@ type SavedSearches interface {
 // Audit actions persisted on audit_log.action. A small closed set so the
 // API can filter on it and clients can branch on a stable token.
 const (
-	AuditActionCreate = "create"
-	AuditActionUpdate = "update"
-	AuditActionDelete = "delete"
+	AuditActionCreate      = "create"
+	AuditActionUpdate      = "update"
+	AuditActionDelete      = "delete"
+	AuditActionRedrive     = "redrive"
+	AuditActionDiscard     = "discard"
+	AuditActionRotate      = "rotate"
+	AuditActionAbandon     = "abandon"
+	AuditActionRevoke      = "revoke"
+	AuditActionRetire      = "retire"
+	AuditActionRestore     = "restore"
+	AuditActionSoftDelete  = "soft_delete"
+	AuditActionDuplicate   = "duplicate"
+	AuditActionAcknowledge = "acknowledge"
+	AuditActionImport      = "import"
+	AuditActionInstantiate = "instantiate"
+	AuditActionLogin       = "login"
+	AuditActionLogout      = "logout"
 )
 
-// AuditEntry is one append-only record of a mutating operation on a monitor,
-// rule or channel. Diff records which fields were sent — never their values:
-// channel config holds webhook URLs, bot tokens and SMTP credentials, so only
-// the fact that a field changed is stored, never what it changed to.
-// Actor is the request ID today and will carry the authenticated principal
-// once auth identifies one; the column is a plain string so that needs no
-// migration.
+// AuditEntry is one append-only record of an administrative action across REST,
+// GraphQL, gRPC, the web dashboard, or system background tasks.
+//
+// Diff records which fields were sent — never their values: channel config
+// holds webhook URLs, bot tokens and SMTP credentials, and API token operations
+// hold token secrets, so only field names and non-secret metadata are stored.
+// PrevHash and RecordHash form a per-workspace SHA-256 tamper-evidence hash
+// chain over the stored columns.
 type AuditEntry struct {
-	ID         int64           `json:"id"`
-	Actor      string          `json:"actor"`
-	Action     string          `json:"action"`
-	TargetType string          `json:"target_type"`
-	TargetID   int64           `json:"target_id"`
-	Diff       json.RawMessage `json:"diff,omitempty"`
-	CreatedAt  time.Time       `json:"created_at"`
+	ID          int64           `json:"id"`
+	WorkspaceID string          `json:"workspace_id"`
+	Actor       string          `json:"actor"`
+	ActorType   string          `json:"actor_type"`
+	Action      string          `json:"action"`
+	TargetType  string          `json:"target_type"`
+	TargetID    int64           `json:"target_id"`
+	ResourceID  string          `json:"resource_id,omitempty"`
+	Surface     string          `json:"surface"`
+	SourceIP    string          `json:"source_ip,omitempty"`
+	Outcome     string          `json:"outcome"`
+	StatusCode  int             `json:"status_code"`
+	Reason      string          `json:"reason,omitempty"`
+	Diff        json.RawMessage `json:"diff,omitempty"`
+	PrevHash    string          `json:"prev_hash,omitempty"`
+	RecordHash  string          `json:"record_hash,omitempty"`
+	CreatedAt   time.Time       `json:"created_at"`
 }
 
 // AuditFilter narrows ListAuditEntries. Zero values mean "no constraint".
 type AuditFilter struct {
-	TargetType string
-	TargetID   int64
-	From       time.Time
-	To         time.Time
-	Limit      int
-	// Actor narrows the log to one credential's entries. Empty means every
-	// actor.
-	Actor string
+	WorkspaceID string
+	TargetType  string
+	TargetID    int64
+	ResourceID  string
+	Action      string
+	Actor       string
+	ActorType   string
+	Surface     string
+	Outcome     string
+	From        time.Time
+	To          time.Time
+	Limit       int
 	// AfterID is the keyset cursor: the id of the last entry on the previous
 	// page, so the next page continues downwards from it. The listing is id
 	// DESC, hence the strict less-than. Zero means the first page.
@@ -1387,15 +2063,141 @@ type Escalations interface {
 	AcknowledgeAlert(ctx context.Context, alertID int64, actor string) error
 }
 
+// WorkspaceDeletionStatus tracks the lifecycle of a workspace deletion.
+type WorkspaceDeletionStatus string
+
+const (
+	WorkspaceDeletionStatusPreview           WorkspaceDeletionStatus = "preview"
+	WorkspaceDeletionStatusStopping          WorkspaceDeletionStatus = "stopping"
+	WorkspaceDeletionStatusDeletingAlerts    WorkspaceDeletionStatus = "deleting_alerts"
+	WorkspaceDeletionStatusDeletingResources WorkspaceDeletionStatus = "deleting_resources"
+	WorkspaceDeletionStatusCompleted         WorkspaceDeletionStatus = "completed"
+)
+
+// DefaultWorkspaceDeleteBatchSize is the default number of alerts removed per
+// bounded batch transaction during workspace deletion.
+const DefaultWorkspaceDeleteBatchSize = 500
+
+// WorkspaceDeletionCounts holds per-table row counts for a workspace deletion
+// (either previewed via dry-run or actually removed).
+type WorkspaceDeletionCounts struct {
+	Monitors                         int64 `json:"monitors"`
+	Rules                            int64 `json:"rules"`
+	RuleAbsenceState                 int64 `json:"rule_absence_state"`
+	AlertInhibitions                 int64 `json:"alert_inhibitions"`
+	Channels                         int64 `json:"channels"`
+	MonitorChannels                  int64 `json:"monitor_channels"`
+	ChannelSigningKeys               int64 `json:"channel_signing_keys"`
+	PushDevices                      int64 `json:"push_devices"`
+	AlertExternalRefs                int64 `json:"alert_external_refs"`
+	ChannelAckReconciliations        int64 `json:"channel_ack_reconciliations"`
+	PendingDigests                   int64 `json:"pending_digests"`
+	EscalationPolicies               int64 `json:"escalation_policies"`
+	EscalationSteps                  int64 `json:"escalation_steps"`
+	EscalationStepChannels           int64 `json:"escalation_step_channels"`
+	MaintenanceWindows               int64 `json:"maintenance_windows"`
+	Backfills                        int64 `json:"backfills"`
+	Alerts                           int64 `json:"alerts"`
+	AlertDedup                       int64 `json:"alert_dedup"`
+	DeliveryAttempts                 int64 `json:"delivery_attempts"`
+	DeadLetters                      int64 `json:"dead_letters"`
+	AlertEscalations                 int64 `json:"alert_escalations"`
+	SavedSearches                    int64 `json:"saved_searches"`
+	MonitorTemplates                 int64 `json:"monitor_templates"`
+	APITokens                        int64 `json:"api_tokens"`
+	WorkspaceUsageRollups            int64 `json:"workspace_usage_rollups"`
+	WorkspaceNotificationUsageRollup int64 `json:"workspace_notification_usage_rollups"`
+	WorkspaceQuotas                  int64 `json:"workspace_quotas"`
+	WorkspaceQueryBudgetState        int64 `json:"workspace_query_budget_state"`
+	IdempotencyKeys                  int64 `json:"idempotency_keys"`
+	Workspaces                       int64 `json:"workspaces"`
+}
+
+// Total returns the total number of rows across all workspace-owned tables.
+func (c WorkspaceDeletionCounts) Total() int64 {
+	return c.Monitors + c.Rules + c.RuleAbsenceState + c.AlertInhibitions +
+		c.Channels + c.MonitorChannels + c.ChannelSigningKeys + c.ChannelAckReconciliations + c.PushDevices + c.AlertExternalRefs +
+		c.PendingDigests + c.EscalationPolicies + c.EscalationSteps + c.EscalationStepChannels +
+		c.MaintenanceWindows + c.Backfills + c.Alerts + c.AlertDedup +
+		c.DeliveryAttempts + c.DeadLetters + c.AlertEscalations + c.SavedSearches +
+		c.MonitorTemplates + c.APITokens + c.WorkspaceUsageRollups +
+		c.WorkspaceNotificationUsageRollup + c.WorkspaceQuotas +
+		c.WorkspaceQueryBudgetState + c.IdempotencyKeys + c.Workspaces
+}
+
+// WorkspaceDeletionOptions configures a DeleteWorkspace call.
+type WorkspaceDeletionOptions struct {
+	// DryRun, when true, inspects and returns the exact counts of rows that
+	// would be deleted for the workspace without modifying any state.
+	DryRun bool
+	// Confirm must equal string(id) when DryRun is false.
+	Confirm string
+	// Actor is the authenticated principal or request ID initiating the deletion.
+	Actor string
+	// BatchSize is the maximum number of alerts deleted per transaction batch
+	// (defaults to DefaultWorkspaceDeleteBatchSize when <= 0).
+	BatchSize int
+	// MaxAlertBatches, when > 0, stops after at most MaxAlertBatches alert
+	// batches so callers or tests can bound execution time per call and resume
+	// cleanly on the next call. Zero means run until all alerts are deleted.
+	MaxAlertBatches int
+	// OnStop is invoked immediately after Phase 1 (once monitors, channels,
+	// pending digests, escalations, and tokens have been disabled/cleared in the
+	// store) and before batched alert deletion begins, allowing the caller to
+	// cancel in-flight notification deliveries and drop active queues.
+	OnStop func(ctx context.Context, workspaceID string, channelIDs []int64)
+}
+
+// WorkspaceDeletionResult reports the outcome or checkpoint state of a
+// workspace deletion or dry-run preview.
+type WorkspaceDeletionResult struct {
+	WorkspaceID       string                  `json:"workspace_id"`
+	Status            WorkspaceDeletionStatus `json:"status"`
+	DryRun            bool                    `json:"dry_run"`
+	Completed         bool                    `json:"completed"`
+	IdempotentReplay  bool                    `json:"idempotent_replay,omitempty"`
+	Irreversible      bool                    `json:"irreversible"`
+	Actor             string                  `json:"actor,omitempty"`
+	BatchSize         int                     `json:"batch_size"`
+	BatchesCompleted  int64                   `json:"batches_completed"`
+	LastAlertID       int64                   `json:"last_alert_id,omitempty"`
+	MonitorsDisabled  int64                   `json:"monitors_disabled,omitempty"`
+	ChannelsDisabled  int64                   `json:"channels_disabled,omitempty"`
+	TokensRevoked     int64                   `json:"tokens_revoked,omitempty"`
+	InFlightCancelled int                     `json:"in_flight_deliveries_cancelled,omitempty"`
+	QueuedDropped     int                     `json:"queued_deliveries_dropped,omitempty"`
+	Counts            WorkspaceDeletionCounts `json:"counts"`
+	StartedAt         *time.Time              `json:"started_at,omitempty"`
+	UpdatedAt         *time.Time              `json:"updated_at,omitempty"`
+	CompletedAt       *time.Time              `json:"completed_at,omitempty"`
+}
+
 // Workspaces persists the tenant list. EnsureWorkspace is idempotent so
 // startup can assert every configured workspace exists without caring whether
 // a previous start already created it.
 type Workspaces interface {
 	EnsureWorkspace(ctx context.Context, id workspace.ID) error
+	// SetWorkspaceGuidance sets the workspace-level default runbook URL and
+	// response guidance inherited by monitors and rules that do not define
+	// their own.
+	SetWorkspaceGuidance(ctx context.Context, id workspace.ID, runbookURL, responseGuidance string) error
+	// GetWorkspaceGuidance returns the workspace-level default runbook URL and
+	// response guidance.
+	GetWorkspaceGuidance(ctx context.Context, id workspace.ID) (runbookURL, responseGuidance string, err error)
 	// AssignLegacyNetwork labels rows the network migration left unlabelled.
 	// It runs once at startup in the instance's cross-tenant scope, and its
 	// predicate is the empty network rather than a tenant, so it is idempotent.
 	AssignLegacyNetwork(ctx context.Context, network string) (int64, error)
+	// DeleteWorkspace permanently deletes a workspace and every row belonging to
+	// it across all workspace-scoped tables, or returns a read-only preview when
+	// opts.DryRun is true. Deletion is bounded and resumable across calls.
+	DeleteWorkspace(ctx context.Context, id workspace.ID, opts WorkspaceDeletionOptions) (*WorkspaceDeletionResult, error)
+	// GetWorkspaceDeletion returns the persisted deletion progress/tombstone for
+	// id, or ErrNotFound if no deletion has been initiated for id.
+	GetWorkspaceDeletion(ctx context.Context, id workspace.ID) (*WorkspaceDeletionResult, error)
+	// ExportWorkspace streams every record belonging to workspace id in a
+	// deterministic, versioned, self-describing order.
+	ExportWorkspace(ctx context.Context, id workspace.ID, opts WorkspaceExportOptions, emit func(WorkspaceExportRecord) error) error
 }
 
 // APITokens persists the scoped, database-backed API tokens. It is exactly
@@ -1409,8 +2211,255 @@ type APITokens interface {
 	CreateAPIToken(ctx context.Context, t *auth.Token) error
 	TokenByHash(ctx context.Context, hash string) (token *auth.Token, found bool, err error)
 	ListAPITokens(ctx context.Context) ([]auth.Token, error)
+	GetAPIToken(ctx context.Context, id int64) (*auth.Token, error)
 	RevokeAPIToken(ctx context.Context, id int64) error
 	TouchAPIToken(ctx context.Context, id int64, at time.Time) error
+	RotateAPIToken(ctx context.Context, predecessorID int64, successor *auth.Token, predecessorExpiry time.Time) error
+	AbandonAPITokenRotation(ctx context.Context, id int64) error
+}
+
+// PersistedOperation represents a vetted, stored GraphQL query document.
+type PersistedOperation struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Document  string    `json:"document"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// PersistedOperations persists vetted GraphQL operations by SHA-256 hash.
+type PersistedOperations interface {
+	RegisterPersistedOperation(ctx context.Context, op PersistedOperation) error
+	GetPersistedOperation(ctx context.Context, id string) (*PersistedOperation, error)
+	ListPersistedOperations(ctx context.Context) ([]PersistedOperation, error)
+	DeletePersistedOperation(ctx context.Context, id string) error
+}
+
+// WorkspaceNotificationUsage records notification volume for a single channel
+// type and delivery outcome within a usage period or summary.
+type WorkspaceNotificationUsage struct {
+	ChannelType string `json:"channel_type"`
+	Outcome     string `json:"outcome"`
+	Count       int64  `json:"count"`
+}
+
+// WorkspaceStorageCounts holds exact stored row counts per workspace across
+// tenant-owned tables. Rules and dead letters carry no workspace_id column of
+// their own and are counted via their parent monitor and alert respectively.
+type WorkspaceStorageCounts struct {
+	Monitors         int64 `json:"monitors"`
+	Rules            int64 `json:"rules"`
+	Channels         int64 `json:"channels"`
+	Alerts           int64 `json:"alerts"`
+	DeliveryAttempts int64 `json:"delivery_attempts"`
+	DeadLetters      int64 `json:"dead_letters"`
+}
+
+// Total returns the total stored rows across all tracked tenant tables.
+func (c WorkspaceStorageCounts) Total() int64 {
+	return c.Monitors + c.Rules + c.Channels + c.Alerts + c.DeliveryAttempts + c.DeadLetters
+}
+
+// WorkspaceUsagePeriod is one durable aggregated usage rollup for a workspace
+// over [PeriodStart, PeriodEnd), suitable for reporting or invoicing.
+type WorkspaceUsagePeriod struct {
+	WorkspaceID     string                       `json:"workspace_id"`
+	PeriodStart     time.Time                    `json:"period_start"`
+	PeriodEnd       time.Time                    `json:"period_end"`
+	AlertsRaised    int64                        `json:"alerts_raised"`
+	RuleEvaluations int64                        `json:"rule_evaluations"`
+	APIRequests     int64                        `json:"api_requests"`
+	Notifications   []WorkspaceNotificationUsage `json:"notifications"`
+	UpdatedAt       time.Time                    `json:"updated_at"`
+}
+
+// WorkspaceUsageDelta is an incremental batch update flushed from in-memory
+// usage counters into the durable store rollups.
+type WorkspaceUsageDelta struct {
+	WorkspaceID     string
+	PeriodStart     time.Time
+	PeriodEnd       time.Time
+	AlertsRaised    int64
+	RuleEvaluations int64
+	APIRequests     int64
+	Notifications   []WorkspaceNotificationUsage
+}
+
+// WorkspaceUsageFilter constrains ListWorkspaceUsage by workspace and period
+// bounds. When called under a tenant-scoped context, the store enforces the
+// context's workspace regardless of WorkspaceID.
+type WorkspaceUsageFilter struct {
+	WorkspaceID string
+	From        time.Time
+	To          time.Time
+}
+
+// WorkspaceUsageSummary is the aggregated usage report for one workspace across
+// the requested window, including per-period rollups and current stored rows.
+type WorkspaceUsageSummary struct {
+	WorkspaceID     string                       `json:"workspace_id"`
+	From            *time.Time                   `json:"from,omitempty"`
+	To              *time.Time                   `json:"to,omitempty"`
+	AlertsRaised    int64                        `json:"alerts_raised"`
+	RuleEvaluations int64                        `json:"rule_evaluations"`
+	APIRequests     int64                        `json:"api_requests"`
+	Notifications   []WorkspaceNotificationUsage `json:"notifications"`
+	StoredRows      WorkspaceStorageCounts       `json:"stored_rows"`
+	Periods         []WorkspaceUsagePeriod       `json:"periods"`
+}
+
+// Usage persists and queries per-workspace usage rollups and storage counts.
+type Usage interface {
+	// RecordWorkspaceUsageBatch atomically adds the given deltas into the durable
+	// per-workspace, per-period usage rollup tables.
+	RecordWorkspaceUsageBatch(ctx context.Context, deltas []WorkspaceUsageDelta) error
+	// ListWorkspaceUsage returns aggregated usage summaries and period rollups.
+	// A tenant-scoped context sees only its own workspace; a system context
+	// sees all workspaces (or filters to f.WorkspaceID when non-empty).
+	ListWorkspaceUsage(ctx context.Context, f WorkspaceUsageFilter) ([]WorkspaceUsageSummary, error)
+	// GetWorkspaceStorageCounts returns exact stored row counts for workspaceID.
+	GetWorkspaceStorageCounts(ctx context.Context, workspaceID string) (WorkspaceStorageCounts, error)
+}
+
+// Quota resource names used in QuotaExceededError and metrics.
+const (
+	QuotaResourceMonitors        = "monitors"
+	QuotaResourceRules           = "rules"
+	QuotaResourceChannels        = "channels"
+	QuotaResourceSubscriptions   = "subscriptions"
+	QuotaResourceQueryCostBudget = "query_cost_budget"
+)
+
+// ErrQuotaExceeded is the sentinel matched by errors.Is for any workspace
+// resource quota or query cost budget rejection.
+var ErrQuotaExceeded = errors.New("store: workspace quota exceeded")
+
+// QuotaExceededError describes which workspace quota or budget was exceeded.
+type QuotaExceededError struct {
+	WorkspaceID string        `json:"workspace_id"`
+	Resource    string        `json:"resource"`
+	Limit       int64         `json:"limit"`
+	Current     int64         `json:"current"`
+	Requested   int64         `json:"requested,omitempty"`
+	Cost        float64       `json:"cost,omitempty"`
+	Budget      float64       `json:"budget,omitempty"`
+	Remaining   float64       `json:"remaining,omitempty"`
+	RetryAfter  time.Duration `json:"-"`
+}
+
+func (e *QuotaExceededError) Error() string {
+	if e == nil {
+		return ErrQuotaExceeded.Error()
+	}
+	if e.Resource == QuotaResourceQueryCostBudget {
+		return fmt.Sprintf("workspace %q query cost budget exceeded (cost=%.2f, remaining=%.2f, budget=%.2f)",
+			e.WorkspaceID, e.Cost, e.Remaining, e.Budget)
+	}
+	return fmt.Sprintf("workspace %q %s quota exceeded (limit=%d, current=%d)",
+		e.WorkspaceID, e.Resource, e.Limit, e.Current)
+}
+
+func (e *QuotaExceededError) Unwrap() error { return ErrQuotaExceeded }
+
+// WorkspaceQuota holds configurable resource limits and shared REST/GraphQL
+// query cost budget settings for a workspace. Zero values mean unlimited.
+type WorkspaceQuota struct {
+	WorkspaceID           string    `json:"workspace_id"`
+	MaxMonitors           int64     `json:"max_monitors"`
+	MaxRules              int64     `json:"max_rules"`
+	MaxChannels           int64     `json:"max_channels"`
+	MaxSubscriptions      int64     `json:"max_subscriptions"`
+	QueryCostBudget       float64   `json:"query_cost_budget"`
+	QueryCostRefillPerSec float64   `json:"query_cost_refill_per_sec"`
+	UpdatedAt             time.Time `json:"updated_at"`
+}
+
+// WorkspaceQueryBudgetDecision is the result of reserving or inspecting a
+// workspace's shared query cost budget.
+type WorkspaceQueryBudgetDecision struct {
+	WorkspaceID  string        `json:"workspace_id"`
+	Allowed      bool          `json:"allowed"`
+	Configured   bool          `json:"configured"`
+	Cost         float64       `json:"cost"`
+	Limit        float64       `json:"limit"`
+	Remaining    float64       `json:"remaining"`
+	RefillPerSec float64       `json:"refill_per_sec"`
+	RetryAfter   time.Duration `json:"-"`
+}
+
+// Quotas persists and enforces per-workspace resource quotas and shared
+// REST/GraphQL query cost budgets.
+type Quotas interface {
+	GetWorkspaceQuota(ctx context.Context, workspaceID string) (WorkspaceQuota, error)
+	SetWorkspaceQuota(ctx context.Context, q WorkspaceQuota) (WorkspaceQuota, error)
+	DeleteWorkspaceQuota(ctx context.Context, workspaceID string) error
+	ListWorkspaceQuotas(ctx context.Context) ([]WorkspaceQuota, error)
+	ConsumeWorkspaceQueryBudget(ctx context.Context, workspaceID string, cost float64, now time.Time) (WorkspaceQueryBudgetDecision, error)
+	ReconcileWorkspaceQueryBudget(ctx context.Context, workspaceID string, deltaCost float64, now time.Time) (float64, error)
+}
+
+const (
+	// DefaultIdempotencyTTL is the default retention window (24 hours) for a
+	// stored idempotency key record before it expires and may be reused as new.
+	DefaultIdempotencyTTL = 24 * time.Hour
+
+	// MaxIdempotencyKeyLength bounds the length of an Idempotency-Key header.
+	MaxIdempotencyKeyLength = 255
+)
+
+var (
+	// ErrIdempotencyKeyConflict indicates that an unexpired idempotency key was
+	// reused with a different HTTP method, path, or request body digest.
+	ErrIdempotencyKeyConflict = errors.New("store: idempotency key reused with a different request")
+
+	// ErrIdempotencyKeyInProgress indicates that an identical request with the
+	// same idempotency key is currently executing.
+	ErrIdempotencyKeyInProgress = errors.New("store: request with this idempotency key is already in progress")
+)
+
+// IdempotencyClaimOutcome describes the result of claiming an idempotency key.
+type IdempotencyClaimOutcome string
+
+const (
+	IdempotencyClaimed    IdempotencyClaimOutcome = "claimed"
+	IdempotencyReplayed   IdempotencyClaimOutcome = "replayed"
+	IdempotencyInProgress IdempotencyClaimOutcome = "in_progress"
+	IdempotencyConflict   IdempotencyClaimOutcome = "conflict"
+)
+
+// IdempotencyRecord holds the persisted request fingerprint and response for an
+// idempotent write operation scoped to one workspace.
+type IdempotencyRecord struct {
+	WorkspaceID    string    `json:"workspace_id"`
+	IdempotencyKey string    `json:"idempotency_key"`
+	Method         string    `json:"method"`
+	Path           string    `json:"path"`
+	RequestHash    string    `json:"request_hash"`
+	StatusCode     int       `json:"status_code"`
+	ContentType    string    `json:"content_type"`
+	ResponseBody   []byte    `json:"response_body"`
+	Completed      bool      `json:"completed"`
+	CreatedAt      time.Time `json:"created_at"`
+	ExpiresAt      time.Time `json:"expires_at"`
+}
+
+// Idempotency persists per-workspace idempotency keys and their responses.
+type Idempotency interface {
+	ClaimIdempotencyKey(ctx context.Context, key, method, path, requestHash string, now, expiresAt time.Time) (IdempotencyClaimOutcome, *IdempotencyRecord, error)
+	CompleteIdempotencyKey(ctx context.Context, key, requestHash string, statusCode int, contentType string, responseBody []byte, expiresAt time.Time) error
+	GetIdempotencyKey(ctx context.Context, key string, now time.Time) (*IdempotencyRecord, error)
+	DeleteIdempotencyKey(ctx context.Context, key string) error
+	PruneExpiredIdempotencyKeys(ctx context.Context, before time.Time) (int64, error)
+}
+
+// RetentionPolicies persists per-workspace alert retention policies and
+// per-workspace expired alert pruning.
+type RetentionPolicies interface {
+	GetWorkspaceRetentionPolicy(ctx context.Context, ws workspace.ID) (WorkspaceRetentionPolicy, error)
+	SetWorkspaceRetentionPolicy(ctx context.Context, in SetWorkspaceRetentionInput) (WorkspaceRetentionPolicy, error)
+	DeleteWorkspaceRetentionPolicy(ctx context.Context, ws workspace.ID, confirmShorten bool, actor string) (WorkspaceRetentionPolicy, error)
+	ListWorkspaceRetentionPolicies(ctx context.Context) ([]WorkspaceRetentionPolicy, error)
+	ExpiredAlertsForWorkspace(ctx context.Context, ws workspace.ID, cutoff time.Time, limit int) ([]Alert, error)
+	DeleteExpiredAlertsForWorkspace(ctx context.Context, ws workspace.ID, cutoff time.Time, limit int) (int64, error)
 }
 
 // Store is everything the application needs from persistence.
@@ -1436,6 +2485,8 @@ type Store interface {
 	Absence
 	Backfills
 	Ledgers
+	RetentionGaps
+	EventArchive
 	SavedSearches
 	MonitorTemplates
 	Audits
@@ -1443,7 +2494,22 @@ type Store interface {
 	Workspaces
 	APITokens
 	Escalations
+	PersistedOperations
+	Usage
+	Quotas
+	DeliveryBudgets
+	RetentionPolicies
+	Idempotency
 	GetStats(ctx context.Context) (Stats, error)
+	// GetAlertStatistics returns the pre-computed alert statistics by state,
+	// severity, monitor, and rule for the caller's workspace.
+	GetAlertStatistics(ctx context.Context) (AlertStatisticsSummary, error)
+	// RecomputeAlertStatistics rebuilds the pre-computed alert statistics from
+	// the raw alerts table for the caller's workspace.
+	RecomputeAlertStatistics(ctx context.Context) (AlertStatisticsSummary, error)
+	// VerifyAlertStatistics compares the maintained rollup against a full
+	// recomputation and repairs any drift.
+	VerifyAlertStatistics(ctx context.Context) (bool, error)
 	// GetMonitorStats returns one monitor's alert, delivery and per-rule
 	// counts, or ErrNotFound when the monitor does not exist. It exists
 	// because GetStats answers "how big is this instance" and says nothing

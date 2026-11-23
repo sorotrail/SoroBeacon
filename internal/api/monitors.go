@@ -40,6 +40,51 @@ type monitorRequest struct {
 	// multi-network keeps working — and keeps meaning the chain it already
 	// polled.
 	Network *string `json:"network"`
+	// Tags are free-form labels for grouping and filtering. Omitted leaves
+	// the tag set unchanged on update and empty on create, so a client that
+	// predates tags behaves exactly as before.
+	Tags             *[]string `json:"tags"`
+	RunbookURL       *string   `json:"runbook_url"`
+	ResponseGuidance *string   `json:"response_guidance"`
+}
+
+func runbookURLDetail(raw *string) (string, *FieldError) {
+	if raw == nil {
+		return "", nil
+	}
+	u, err := store.ValidateRunbookURL(*raw)
+	if err != nil {
+		return "", &FieldError{Field: "runbook_url", Reason: err.Error()}
+	}
+	return u, nil
+}
+
+func responseGuidanceDetail(raw *string) (string, *FieldError) {
+	if raw == nil {
+		return "", nil
+	}
+	g, err := store.ValidateResponseGuidance(*raw)
+	if err != nil {
+		return "", &FieldError{Field: "response_guidance", Reason: err.Error()}
+	}
+	return g, nil
+}
+
+// tagsDetail validates and normalises a requested tag list. The length limits
+// are an API concern — a request over the limit is rejected with a field
+// error instead of being silently truncated — while normalisation (trim,
+// lowercase, dedupe, drop quotes/controls) is the store's, applied again on
+// write so every path stores one canonical set.
+func tagsDetail(raw []string) ([]string, *FieldError) {
+	if len(raw) > store.MaxMonitorTags {
+		return nil, &FieldError{Field: "tags", Reason: fmt.Sprintf("at most %d tags per monitor", store.MaxMonitorTags)}
+	}
+	for i, t := range raw {
+		if len(strings.TrimSpace(t)) > store.MaxTagLen {
+			return nil, &FieldError{Field: fmt.Sprintf("tags[%d]", i), Reason: fmt.Sprintf("tags are at most %d characters", store.MaxTagLen)}
+		}
+	}
+	return store.NormalizeTags(raw), nil
 }
 
 // networkDetail validates an optional network against the chains this instance
@@ -111,16 +156,38 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 	if nerr != nil {
 		details = append(details, *nerr)
 	}
+	// A create without a tags field stores an explicit empty list rather than
+	// nil, so the row round-trips as `[]` and no reader has to special-case a
+	// monitor that never carried tags.
+	tags := []string{}
+	if req.Tags != nil {
+		var terr *FieldError
+		tags, terr = tagsDetail(*req.Tags)
+		if terr != nil {
+			details = append(details, *terr)
+		}
+	}
+	runbookURL, rerr := runbookURLDetail(req.RunbookURL)
+	if rerr != nil {
+		details = append(details, *rerr)
+	}
+	responseGuidance, gerr := responseGuidanceDetail(req.ResponseGuidance)
+	if gerr != nil {
+		details = append(details, *gerr)
+	}
 	if len(details) > 0 {
 		writeValidation(w, r, details)
 		return
 	}
 	m := store.Monitor{
-		Name:        *req.Name,
-		ContractIDs: *req.ContractIDs,
-		Enabled:     req.Enabled == nil || *req.Enabled,
-		Priority:    priority.Normalized(),
-		Network:     network,
+		Name:             *req.Name,
+		ContractIDs:      *req.ContractIDs,
+		Enabled:          req.Enabled == nil || *req.Enabled,
+		Priority:         priority.Normalized(),
+		Network:          network,
+		Tags:             tags,
+		RunbookURL:       runbookURL,
+		ResponseGuidance: responseGuidance,
 	}
 	if err := s.store.CreateMonitor(r.Context(), &m); err != nil {
 		s.fail(w, r, err)
@@ -248,6 +315,30 @@ func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 			Field:  "network",
 			Reason: fmt.Sprintf("a monitor's network is fixed (%q): delete and recreate the monitor to move it to another chain", m.Network),
 		})
+	}
+	if req.Tags != nil {
+		tags, terr := tagsDetail(*req.Tags)
+		if terr != nil {
+			details = append(details, *terr)
+		} else {
+			m.Tags = tags
+		}
+	}
+	if req.RunbookURL != nil {
+		u, rerr := runbookURLDetail(req.RunbookURL)
+		if rerr != nil {
+			details = append(details, *rerr)
+		} else {
+			m.RunbookURL = u
+		}
+	}
+	if req.ResponseGuidance != nil {
+		g, gerr := responseGuidanceDetail(req.ResponseGuidance)
+		if gerr != nil {
+			details = append(details, *gerr)
+		} else {
+			m.ResponseGuidance = g
+		}
 	}
 	if len(details) > 0 {
 		writeValidation(w, r, details)

@@ -6,8 +6,6 @@ import (
 	"strconv"
 	"sync"
 	"time"
-
-	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
 // probeTimeout bounds each readiness check, so one hanging dependency
@@ -71,9 +69,15 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 		// the ping itself came back: the instance is degraded, and a load
 		// balancer should stop sending it traffic until the store says
 		// otherwise.
-		if degraded, ok := s.store.(store.DegradationReporter); ok && degraded.Degraded() {
+		if s.isDegraded() {
 			c.detail = "database degraded"
+			if s.metrics != nil {
+				s.metrics.SetDatabaseDegraded(true)
+			}
 			return
+		}
+		if s.metrics != nil {
+			s.metrics.SetDatabaseDegraded(false)
 		}
 		c.healthy = true
 	}()

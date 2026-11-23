@@ -72,7 +72,7 @@ func New(ctx context.Context, databaseURL string, settings PoolSettings, cipher 
 		if err != nil {
 			return nil, err
 		}
-		return s.WithConfigCipher(cipher), nil
+		return s.WithConfigCipher(cipher).WithMetrics(settings.Metrics), nil
 	default:
 		return nil, fmt.Errorf("unsupported DATABASE_URL scheme %q (supported schemes: postgres, postgresql, sqlite)", scheme)
 	}

@@ -215,3 +215,35 @@ func TestTokenSupplyChangeRegistered(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, got)
 }
+
+// TestTokenSupplyChangeEventNames pins the narrowing answer for every
+// direction shape: a restricted rule names its one event, an unrestricted
+// rule names both supply events (mint and burn, never a subset), and a
+// direction the evaluator does not know names nothing rather than guessing.
+func TestTokenSupplyChangeEventNames(t *testing.T) {
+	tests := []struct {
+		name   string
+		params string
+		want   []string
+		wantOK bool
+	}{
+		{"direction mint", `{"direction":"mint"}`, []string{"mint"}, true},
+		{"direction burn", `{"direction":"burn"}`, []string{"burn"}, true},
+		{"direction any", `{"direction":"any"}`, []string{"mint", "burn"}, true},
+		{"direction unset means any", `{}`, []string{"mint", "burn"}, true},
+		{"direction with a min_amount still names the events", `{"direction":"any","min_amount":"1000"}`, []string{"mint", "burn"}, true},
+		{"unknown direction names nothing", `{"direction":"sideways"}`, nil, false},
+		{"malformed params", `{"direction":`, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := (TokenSupplyChange{}).EventNames(json.RawMessage(tt.params))
+			require.Equal(t, tt.wantOK, ok)
+			if tt.wantOK {
+				require.Equal(t, tt.want, got)
+				return
+			}
+			require.Nil(t, got, "a rule that cannot name its events must report no names at all")
+		})
+	}
+}

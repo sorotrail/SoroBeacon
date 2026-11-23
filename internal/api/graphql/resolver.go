@@ -8,25 +8,66 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/99designs/gqlgen/graphql/playground"
+	"github.com/vektah/gqlparser/v2/ast"
 	"github.com/vektah/gqlparser/v2/gqlerror"
+	"github.com/vektah/gqlparser/v2/parser"
 
+	"github.com/sorotrail/sorobeacon/internal/apierr"
+	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
+
+func gqlErrorf(code string, format string, args ...any) *gqlerror.Error {
+	return &gqlerror.Error{
+		Message: fmt.Sprintf(format, args...),
+		Extensions: map[string]any{
+			"code": code,
+		},
+	}
+}
 
 // Resolver holds the dependencies for GraphQL resolvers.
 type Resolver struct {
-	store store.Store
-	log   *slog.Logger
+	store   store.Store
+	log     *slog.Logger
+	metrics *metrics.Metrics
+	clock   func() time.Time
 }
 
 // NewResolver creates a new GraphQL resolver.
 func NewResolver(st store.Store, log *slog.Logger) *Resolver {
 	return &Resolver{store: st, log: log}
+}
+
+// WithMetrics attaches Prometheus metrics to the GraphQL resolver.
+func (r *Resolver) WithMetrics(m *metrics.Metrics) *Resolver {
+	if r != nil {
+		r.metrics = m
+	}
+	return r
+}
+
+// WithClock overrides the clock used for GraphQL query budget accounting in tests.
+func (r *Resolver) WithClock(clock func() time.Time) *Resolver {
+	if r != nil {
+		r.clock = clock
+	}
+	return r
+}
+
+func (r *Resolver) now() time.Time {
+	if r != nil && r.clock != nil {
+		return r.clock().UTC()
+	}
+	return time.Now().UTC()
 }
 
 // Query returns the root query resolver.
@@ -60,14 +101,14 @@ type queryResolver struct{ *Resolver }
 func (r *queryResolver) Monitor(ctx context.Context, id string) (*Monitor, error) {
 	monitorID, err := strconv.ParseInt(id, 10, 64)
 	if err != nil {
-		return nil, gqlerror.Errorf("invalid monitor ID: %v", err)
+		return nil, gqlErrorf(apierr.CodeInvalidArgument, "invalid monitor ID: %v", err)
 	}
 	m, err := r.store.GetMonitor(ctx, monitorID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, nil
 		}
-		return nil, gqlerror.Errorf("monitor not found: %v", err)
+		return nil, gqlErrorf(apierr.CodeNotFound, "monitor not found: %v", err)
 	}
 	return toMonitor(m), nil
 }
@@ -105,7 +146,7 @@ func (r *queryResolver) Monitors(ctx context.Context, enabled *bool, limit *int,
 
 	monitors, err := r.store.ListMonitorsPage(ctx, f)
 	if err != nil {
-		return nil, gqlerror.Errorf("failed to list monitors: %v", err)
+		return nil, gqlErrorf(apierr.CodeInternalError, "failed to list monitors: %v", err)
 	}
 
 	edges := make([]MonitorEdge, len(monitors))
@@ -136,14 +177,14 @@ func (r *queryResolver) Monitors(ctx context.Context, enabled *bool, limit *int,
 func (r *queryResolver) Alert(ctx context.Context, id string) (*Alert, error) {
 	alertID, err := strconv.ParseInt(id, 10, 64)
 	if err != nil {
-		return nil, gqlerror.Errorf("invalid alert ID: %v", err)
+		return nil, gqlErrorf(apierr.CodeInvalidArgument, "invalid alert ID: %v", err)
 	}
 	a, err := r.store.GetAlert(ctx, alertID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, nil
 		}
-		return nil, gqlerror.Errorf("alert not found: %v", err)
+		return nil, gqlErrorf(apierr.CodeNotFound, "alert not found: %v", err)
 	}
 	return toAlert(a), nil
 }
@@ -194,7 +235,7 @@ func (r *queryResolver) Alerts(ctx context.Context, monitorID *string, ruleID *s
 
 	alerts, err := r.store.ListAlerts(ctx, f)
 	if err != nil {
-		return nil, gqlerror.Errorf("failed to list alerts: %v", err)
+		return nil, gqlErrorf(apierr.CodeInternalError, "failed to list alerts: %v", err)
 	}
 
 	edges := make([]AlertEdge, len(alerts))
@@ -225,7 +266,7 @@ func (r *queryResolver) Alerts(ctx context.Context, monitorID *string, ruleID *s
 func (r *queryResolver) Stats(ctx context.Context) (*Stats, error) {
 	s, err := r.store.GetStats(ctx)
 	if err != nil {
-		return nil, gqlerror.Errorf("failed to get stats: %v", err)
+		return nil, gqlErrorf(apierr.CodeInternalError, "failed to get stats: %v", err)
 	}
 	return toStats(s), nil
 }
@@ -241,7 +282,7 @@ func (r *queryResolver) AlertSeries(ctx context.Context, days *int) ([]AlertDayC
 	}
 	counts, err := r.store.AlertCountsByDay(ctx, d)
 	if err != nil {
-		return nil, gqlerror.Errorf("failed to get alert series: %v", err)
+		return nil, gqlErrorf(apierr.CodeInternalError, "failed to get alert series: %v", err)
 	}
 	result := make([]AlertDayCount, len(counts))
 	for i, c := range counts {
@@ -256,11 +297,11 @@ type monitorResolver struct{ *Resolver }
 func (r *monitorResolver) Rules(ctx context.Context, obj *Monitor) ([]Rule, error) {
 	monitorID, err := strconv.ParseInt(obj.ID, 10, 64)
 	if err != nil {
-		return nil, gqlerror.Errorf("invalid monitor ID: %v", err)
+		return nil, gqlErrorf(apierr.CodeInvalidArgument, "invalid monitor ID: %v", err)
 	}
 	rules, err := r.store.ListRules(ctx, monitorID, false)
 	if err != nil {
-		return nil, gqlerror.Errorf("failed to list rules: %v", err)
+		return nil, gqlErrorf(apierr.CodeInternalError, "failed to list rules: %v", err)
 	}
 	result := make([]Rule, len(rules))
 	for i := range rules {
@@ -272,11 +313,11 @@ func (r *monitorResolver) Rules(ctx context.Context, obj *Monitor) ([]Rule, erro
 func (r *monitorResolver) Channels(ctx context.Context, obj *Monitor) ([]Channel, error) {
 	monitorID, err := strconv.ParseInt(obj.ID, 10, 64)
 	if err != nil {
-		return nil, gqlerror.Errorf("invalid monitor ID: %v", err)
+		return nil, gqlErrorf(apierr.CodeInvalidArgument, "invalid monitor ID: %v", err)
 	}
 	channels, err := r.store.ListChannelsForMonitor(ctx, monitorID)
 	if err != nil {
-		return nil, gqlerror.Errorf("failed to list channels: %v", err)
+		return nil, gqlErrorf(apierr.CodeInternalError, "failed to list channels: %v", err)
 	}
 	result := make([]Channel, len(channels))
 	for i := range channels {
@@ -294,14 +335,14 @@ func (r *alertResolver) InhibitedByRule(ctx context.Context, obj *Alert) (*Rule,
 	}
 	ruleID, err := strconv.ParseInt(*obj.InhibitedByRuleID, 10, 64)
 	if err != nil {
-		return nil, gqlerror.Errorf("invalid inhibited rule ID: %v", err)
+		return nil, gqlErrorf(apierr.CodeInvalidArgument, "invalid inhibited rule ID: %v", err)
 	}
 	rule, err := r.store.GetRule(ctx, ruleID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, nil
 		}
-		return nil, gqlerror.Errorf("failed to get inhibited rule: %v", err)
+		return nil, gqlErrorf(apierr.CodeInternalError, "failed to get inhibited rule: %v", err)
 	}
 	return toRule(rule), nil
 }
@@ -317,6 +358,7 @@ type ServerConfig struct {
 	EnablePlayground bool
 	MaxDepth         int
 	MaxComplexity    int
+	AllowlistOnly    bool
 }
 
 // DefaultServerConfig returns sensible defaults.
@@ -325,16 +367,258 @@ func DefaultServerConfig() ServerConfig {
 		EnablePlayground: false,
 		MaxDepth:         10,
 		MaxComplexity:    1000,
+		AllowlistOnly:    false,
 	}
+}
+
+type graphQLRequestBody struct {
+	Query         string         `json:"query"`
+	OperationName string         `json:"operationName"`
+	Variables     map[string]any `json:"variables"`
+	ID            string         `json:"id"`
+	OperationID   string         `json:"operationId"`
+	Extensions    *struct {
+		PersistedQuery *struct {
+			Version    int    `json:"version"`
+			Sha256Hash string `json:"sha256Hash"`
+		} `json:"persistedQuery"`
+	} `json:"extensions"`
 }
 
 // NewHandler creates the GraphQL HTTP handler with middleware.
 func NewHandler(resolver *Resolver, config ServerConfig) http.Handler {
-	// Simple GraphQL endpoint that returns a basic response
-	// The actual GraphQL execution is handled by a custom executor
 	mux := http.NewServeMux()
 	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+
+		bodyBytes, _ := io.ReadAll(r.Body)
+		var req graphQLRequestBody
+		if len(bodyBytes) > 0 {
+			_ = json.Unmarshal(bodyBytes, &req)
+		}
+
+		opID := req.ID
+		if opID == "" {
+			opID = req.OperationID
+		}
+		if opID == "" && req.Extensions != nil && req.Extensions.PersistedQuery != nil {
+			opID = req.Extensions.PersistedQuery.Sha256Hash
+		}
+
+		var queryDoc string
+		switch {
+		case opID != "":
+			// Look up persisted operation
+			if resolver != nil && resolver.store != nil {
+				op, err := resolver.store.GetPersistedOperation(r.Context(), opID)
+				if err != nil {
+					w.WriteHeader(http.StatusOK)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"errors": []map[string]any{
+							{
+								"message": "PersistedQueryNotFound",
+								"extensions": map[string]any{
+									"code": CodePersistedQueryNotFound,
+								},
+							},
+						},
+					})
+					return
+				}
+				queryDoc = op.Document
+			} else {
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"errors": []map[string]any{
+						{
+							"message": "PersistedQueryNotFound",
+							"extensions": map[string]any{
+								"code": CodePersistedQueryNotFound,
+							},
+						},
+					},
+				})
+				return
+			}
+
+		case strings.TrimSpace(req.Query) != "":
+			if config.AllowlistOnly {
+				norm, err := NormalizeDocument(req.Query)
+				if err != nil {
+					w.WriteHeader(http.StatusOK)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"errors": []map[string]any{
+							{
+								"message": fmt.Sprintf("invalid query: %v", err),
+								"extensions": map[string]any{
+									"code": CodePersistedQueryNotAllowed,
+								},
+							},
+						},
+					})
+					return
+				}
+				hash := HashDocument(norm)
+				if resolver != nil && resolver.store != nil {
+					op, err := resolver.store.GetPersistedOperation(r.Context(), hash)
+					if err != nil {
+						w.WriteHeader(http.StatusOK)
+						_ = json.NewEncoder(w).Encode(map[string]any{
+							"errors": []map[string]any{
+								{
+									"message": "persisted operations only: ad-hoc queries are not permitted in allowlist mode",
+									"extensions": map[string]any{
+										"code": CodePersistedQueryNotAllowed,
+									},
+								},
+							},
+						})
+						return
+					}
+					queryDoc = op.Document
+				} else {
+					w.WriteHeader(http.StatusOK)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"errors": []map[string]any{
+							{
+								"message": "persisted operations only: ad-hoc queries are not permitted in allowlist mode",
+								"extensions": map[string]any{
+									"code": CodePersistedQueryNotAllowed,
+								},
+							},
+						},
+					})
+					return
+				}
+			} else {
+				queryDoc = req.Query
+			}
+
+		case config.AllowlistOnly:
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"errors": []map[string]any{
+					{
+						"message": "persisted operations only: operation identifier required",
+						"extensions": map[string]any{
+							"code": CodePersistedQueryNotAllowed,
+						},
+					},
+				},
+			})
+			return
+		}
+
+		// Parse query document to enforce depth, complexity, and per-workspace query cost budget.
+		if queryDoc != "" {
+			parsedDoc, err := parser.ParseQuery(&ast.Source{Input: queryDoc})
+			if err == nil {
+				if opID != "" || config.AllowlistOnly {
+					if config.MaxDepth > 0 {
+						depth := CalculateQueryDepth(parsedDoc)
+						if depth > config.MaxDepth {
+							w.WriteHeader(http.StatusOK)
+							_ = json.NewEncoder(w).Encode(map[string]any{
+								"errors": []map[string]any{
+									{
+										"message": fmt.Sprintf("query depth %d exceeds maximum allowed depth %d", depth, config.MaxDepth),
+										"extensions": map[string]any{
+											"code": CodeQueryDepthExceeded,
+										},
+									},
+								},
+							})
+							return
+						}
+					}
+					if config.MaxComplexity > 0 {
+						complexity := CalculateQueryComplexity(parsedDoc, req.Variables)
+						if complexity > config.MaxComplexity {
+							w.WriteHeader(http.StatusOK)
+							_ = json.NewEncoder(w).Encode(map[string]any{
+								"errors": []map[string]any{
+									{
+										"message": fmt.Sprintf("query complexity %d exceeds maximum allowed complexity %d", complexity, config.MaxComplexity),
+										"extensions": map[string]any{
+											"code": CodeQueryComplexityExceeded,
+										},
+									},
+								},
+							})
+							return
+						}
+					}
+				}
+
+				if resolver != nil && resolver.store != nil {
+					cost := float64(CalculateQueryComplexity(parsedDoc, req.Variables))
+					if cost < 1 {
+						cost = 1
+					}
+					ws, ok := workspace.From(r.Context())
+					if !ok || ws == "" {
+						ws = workspace.Default
+					}
+					dec, budgetErr := store.SafeConsumeWorkspaceQueryBudget(
+						workspace.WithSystem(r.Context()),
+						resolver.store,
+						string(ws),
+						cost,
+						resolver.now(),
+					)
+					if budgetErr == nil && dec.Configured {
+						w.Header().Set("X-Query-Cost-Charged", strconv.FormatFloat(cost, 'f', -1, 64))
+						w.Header().Set("X-Query-Budget-Limit", strconv.FormatFloat(dec.Limit, 'f', -1, 64))
+						w.Header().Set("X-Query-Budget-Remaining", strconv.FormatFloat(dec.Remaining, 'f', -1, 64))
+						if !dec.Allowed {
+							retrySecs := int(math.Ceil(dec.RetryAfter.Seconds()))
+							if retrySecs < 1 {
+								retrySecs = 1
+							}
+							w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
+							if resolver.metrics != nil {
+								resolver.metrics.RecordWorkspaceQueryBudgetThrottled(string(ws), "graphql")
+								resolver.metrics.SetWorkspaceQueryBudgetRemaining(string(ws), dec.Remaining)
+							}
+							msg := fmt.Sprintf("workspace %q query cost budget exceeded (cost=%.2f, remaining=%.2f, budget=%.2f)",
+								string(ws), cost, dec.Remaining, dec.Limit)
+							w.WriteHeader(http.StatusTooManyRequests)
+							_ = json.NewEncoder(w).Encode(map[string]any{
+								"error":               msg,
+								"code":                apierr.CodeQuotaExceeded,
+								"quota":               store.QuotaResourceQueryCostBudget,
+								"resource":            store.QuotaResourceQueryCostBudget,
+								"workspace_id":        string(ws),
+								"cost":                cost,
+								"budget":              dec.Limit,
+								"remaining":           dec.Remaining,
+								"retry_after_seconds": retrySecs,
+								"errors": []map[string]any{
+									{
+										"message": msg,
+										"extensions": map[string]any{
+											"code":                apierr.CodeQuotaExceeded,
+											"quota":               store.QuotaResourceQueryCostBudget,
+											"resource":            store.QuotaResourceQueryCostBudget,
+											"cost":                cost,
+											"budget":              dec.Limit,
+											"remaining":           dec.Remaining,
+											"retry_after_seconds": retrySecs,
+										},
+									},
+								},
+							})
+							return
+						}
+						if resolver.metrics != nil {
+							resolver.metrics.RecordWorkspaceQueryCostCharged(string(ws), "graphql", cost)
+							resolver.metrics.SetWorkspaceQueryBudgetRemaining(string(ws), dec.Remaining)
+						}
+					}
+				}
+			}
+		}
+
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"data": map[string]any{

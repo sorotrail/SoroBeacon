@@ -97,6 +97,10 @@ func (r *ChannelResource) Create(ctx context.Context, req resource.CreateRequest
 
 	var result apiChannel
 	if err := r.client.create(ctx, "/channels", body, &result); err != nil {
+		if IsAlreadyExists(err) {
+			resp.Diagnostics.AddError("Create channel failed: channel already exists", err.Error())
+			return
+		}
 		resp.Diagnostics.AddError("Create channel failed", err.Error())
 		return
 	}
@@ -115,6 +119,10 @@ func (r *ChannelResource) Read(ctx context.Context, req resource.ReadRequest, re
 	var result apiChannel
 	path := fmt.Sprintf("/channels/%d", state.ID.ValueInt64())
 	if err := r.client.get(ctx, path, &result); err != nil {
+		if IsNotFound(err) {
+			resp.State.RemoveResource(ctx)
+			return
+		}
 		resp.Diagnostics.AddError("Read channel failed", err.Error())
 		return
 	}
