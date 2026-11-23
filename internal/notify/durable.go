@@ -5,6 +5,8 @@ type DurableQueue struct {
 	storagePath string
 }
 
+// NewDurableQueue returns a DurableQueue that persists its backlog under path,
+// so queued messages survive a process restart.
 func NewDurableQueue(path string) *DurableQueue {
 	return &DurableQueue{storagePath: path}
 }

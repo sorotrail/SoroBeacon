@@ -48,6 +48,7 @@
 * [Federation](channels/federation.md)
 * [Matrix](channels/matrix.md)
 * [PagerDuty](channels/pagerduty.md)
+* [Mobile push (FCM)](channels/push.md)
 * [Mattermost](channels/mattermost.md)
 * [Rocket.Chat](channels/rocketchat.md)
 * [Zulip](channels/zulip.md)
@@ -59,6 +60,7 @@
 ## 📏 Operations
 
 * [Health and readiness endpoints](operations/health-checks.md)
+* [Degraded mode and database outage handling](operations/degraded-mode.md)
 * [Backing up and restoring the database](operations/backup-restore.md)
 * [Securing a SoroBeacon deployment](operations/security.md)
 * [Upgrading a running deployment](operations/upgrading.md)

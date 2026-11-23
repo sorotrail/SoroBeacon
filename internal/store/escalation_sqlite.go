@@ -198,8 +198,10 @@ func (s *SQLite) DueEscalations(ctx context.Context, now time.Time, limit int) (
 		`SELECT e.alert_id, e.policy_id, e.next_step, e.next_due_at, e.alert_snapshot
 		   FROM alert_escalations e
 		   JOIN alerts a ON a.id = e.alert_id
+		   LEFT JOIN rules r ON r.id = a.rule_id
 		  WHERE e.completed_at IS NULL
 		    AND a.acknowledged_at IS NULL
+		    AND (a.rule_id IS NULL OR (r.enabled = 1 AND r.version = a.rule_version))
 		    AND e.next_due_at <= ?
 		  ORDER BY e.next_due_at, e.alert_id
 		  LIMIT ?`, sqliteTimeString(now), limit)

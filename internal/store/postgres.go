@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -30,6 +31,10 @@ import (
 // serves reads and writes from the same file handle, so there is no replica to
 // route to.
 type PoolSettings struct {
+	// Tracer, when set, records one span per statement (telemetry's pgx
+	// tracer): the statement's verb and a hash identifying it, never the
+	// SQL's parameter values.
+	Tracer          pgx.QueryTracer
 	MaxConns        int32
 	MinConns        int32
 	MaxConnLifetime time.Duration
@@ -60,6 +65,10 @@ type PoolSettings struct {
 	// ConnectDelay is the base delay between those attempts; it doubles
 	// after every failure, with jitter. Zero means DefaultConnectDelay.
 	ConnectDelay time.Duration
+	// MaxReplicaLag bounds how far behind the primary the read replica may
+	// drift (sampled via pg_last_xact_replay_timestamp) before routed reads
+	// fall back to the primary. Zero defaults to DefaultMaxReplicaLag (30s).
+	MaxReplicaLag time.Duration
 }
 
 // Postgres implements Store on top of a pgx connection pool.
@@ -70,6 +79,11 @@ type Postgres struct {
 	// write — runs on pool, which is the behaviour of every deployment that
 	// predates replica routing.
 	replica *pgxpool.Pool
+	// maxReplicaLag is the replica lag threshold beyond which routed reads
+	// fall back to the primary pool.
+	maxReplicaLag time.Duration
+	// replicaLagNanos stores the most recently sampled replica lag in nanoseconds.
+	replicaLagNanos atomic.Int64
 	// cipher encrypts and decrypts channels.config at rest. Nil (the
 	// default) keeps the pre-encryption plaintext behaviour.
 	cipher ConfigCipher
@@ -82,6 +96,10 @@ type Postgres struct {
 	health *DatabaseHealth
 	// retry is the policy used for reads that failed transiently.
 	retry RetryPolicy
+	// breaker protects against database stampedes when unavailable.
+	breaker *StoreBreaker
+	// alertRetention holds the instance-wide fallback ALERT_RETENTION in nanoseconds.
+	alertRetention atomic.Int64
 }
 
 // WithTelemetry attaches tracing to the store's write paths. Only ids go
@@ -131,7 +149,13 @@ func NewPostgres(ctx context.Context, databaseURL string, settings PoolSettings)
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	p := &Postgres{pool: pool, metrics: settings.Metrics, health: health, retry: ReadPolicy()}
+	p := &Postgres{
+		pool:    pool,
+		metrics: settings.Metrics,
+		health:  health,
+		retry:   ReadPolicy(),
+		breaker: NewStoreBreaker(3, 5*time.Second),
+	}
 	if err := p.connectReplica(ctx, settings); err != nil {
 		pool.Close()
 		return nil, err
@@ -166,6 +190,9 @@ func buildPoolConfig(databaseURL string, settings PoolSettings) (*pgxpool.Config
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, err
+	}
+	if settings.Tracer != nil {
+		cfg.ConnConfig.Tracer = settings.Tracer
 	}
 	if settings.MaxConns > 0 {
 		cfg.MaxConns = settings.MaxConns
@@ -205,7 +232,20 @@ func (p *Postgres) Ping(ctx context.Context) error {
 // lose its database (the SQLite file) has nothing to report, and adding the
 // method to the interface would force every fake store in the tests to
 // answer for a condition that does not apply to them.
-func (p *Postgres) Degraded() bool { return p.health != nil && p.health.Degraded() }
+func (p *Postgres) Degraded() bool {
+	if p.health != nil && p.health.Degraded() {
+		return true
+	}
+	if p.breaker != nil && p.breaker.Degraded() {
+		return true
+	}
+	return false
+}
+
+// Breaker returns the underlying circuit breaker protecting Postgres operations.
+func (p *Postgres) Breaker() *StoreBreaker {
+	return p.breaker
+}
 
 // DegradedSince reports when the database became unreachable, and whether it
 // is unreachable now.
@@ -224,6 +264,9 @@ func (p *Postgres) DegradedSince() (time.Time, bool) {
 // the alert write carries its own dedup guard, but the general rule is that
 // the caller decides what a repeated write means.
 func (p *Postgres) read(ctx context.Context, fn func(context.Context) error) error {
+	if p.breaker != nil && !p.breaker.Allow() {
+		return ErrUnavailable
+	}
 	return p.retry.Do(ctx, func(ctx context.Context) error {
 		err := fn(ctx)
 		// Every attempt is observed, so a database that goes away mid-read
@@ -237,10 +280,16 @@ func (p *Postgres) read(ctx context.Context, fn func(context.Context) error) err
 // A store built without one — the tests that exercise routing — has no
 // database state to report.
 func (p *Postgres) observe(err error) {
-	if p.health == nil {
-		return
+	if p.health != nil {
+		p.health.Observe(err)
 	}
-	p.health.Observe(err)
+	if p.breaker != nil {
+		if err == nil {
+			p.breaker.RecordSuccess()
+		} else {
+			p.breaker.RecordFailure(err)
+		}
+	}
 }
 
 // Close releases both pools. The replica goes first so a query cannot be
@@ -273,6 +322,35 @@ func (p *Postgres) EnsureWorkspace(ctx context.Context, id workspace.ID) error {
 	return err
 }
 
+func (p *Postgres) SetWorkspaceGuidance(ctx context.Context, id workspace.ID, runbookURL, responseGuidance string) error {
+	u, err := ValidateRunbookURL(runbookURL)
+	if err != nil {
+		return err
+	}
+	g, err := ValidateResponseGuidance(responseGuidance)
+	if err != nil {
+		return err
+	}
+	_, err = p.pool.Exec(ctx,
+		`INSERT INTO workspaces (id, name, default_runbook_url, default_response_guidance)
+		 VALUES ($1, $1, $2, $3)
+		 ON CONFLICT (id) DO UPDATE
+		 SET default_runbook_url = EXCLUDED.default_runbook_url,
+		     default_response_guidance = EXCLUDED.default_response_guidance`,
+		string(id), u, g)
+	return mapErr(err)
+}
+
+func (p *Postgres) GetWorkspaceGuidance(ctx context.Context, id workspace.ID) (runbookURL, responseGuidance string, err error) {
+	err = p.pool.QueryRow(ctx,
+		`SELECT default_runbook_url, default_response_guidance FROM workspaces WHERE id = $1`,
+		string(id)).Scan(&runbookURL, &responseGuidance)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", nil
+	}
+	return runbookURL, responseGuidance, mapErr(err)
+}
+
 // --- monitors ---
 
 // pgCreatedAt is nil when t is zero, so the inserted row gets the column's
@@ -286,10 +364,16 @@ func pgCreatedAt(t time.Time) *time.Time {
 }
 
 func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
+	if err := normalizeMonitorGuidance(m); err != nil {
+		return err
+	}
 	ids, err := json.Marshal(m.ContractIDs)
 	if err != nil {
 		return err
 	}
+	// Normalised here rather than at each caller so every write path —
+	// API, dashboard, import — stores one canonical tag set.
+	m.Tags = NormalizeTags(m.Tags)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -298,24 +382,29 @@ func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
 	if err := lockContractCursorRefs(ctx, tx); err != nil {
 		return err
 	}
+	ws := workspaceID(ctx)
+	if err := p.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()))
+		`INSERT INTO monitors (name, contract_ids, tags, enabled, priority, workspace_id, network, created_at, runbook_url, response_guidance)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, now()), $9, $10)
 		 RETURNING id, created_at`,
-		m.Name, ids, m.Enabled, m.Priority.Normalized(), workspaceID(ctx), m.Network, pgCreatedAt(m.CreatedAt),
+		m.Name, ids, m.Tags, m.Enabled, m.Priority.Normalized(), ws, m.Network, pgCreatedAt(m.CreatedAt), m.RunbookURL, m.ResponseGuidance,
 	).Scan(&m.ID, &m.CreatedAt); err != nil {
 		// A name already taken in this workspace violates the unique index, and
 		// that is the request's fault rather than the server's: mapErr turns
 		// it into the typed constraint error the API answers 422 with.
 		return mapErr(err)
 	}
+	m.WorkspaceID = string(ws)
 	return tx.Commit(ctx)
 }
 
 func (p *Postgres) GetMonitor(ctx context.Context, id int64) (*Monitor, error) {
 	ws := workspaceID(ctx)
 	m, err := scanMonitor(p.pool.QueryRow(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
+		`SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
 	if err != nil {
 		return nil, err
 	}
@@ -342,7 +431,7 @@ func (p *Postgres) monitorChannelIDs(ctx context.Context, monitorID int64) ([]in
 func (p *Postgres) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monitor, error) {
 	var out []Monitor
 	err := p.read(ctx, func(ctx context.Context) error {
-		q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE deleted_at IS NULL`
+		q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE deleted_at IS NULL`
 		args := []any{}
 		ws, scoped := tenantWorkspace(ctx)
 		if scoped {
@@ -379,7 +468,7 @@ func (p *Postgres) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monito
 }
 
 func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE workspace_id = $1 AND deleted_at IS NULL`
+	q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE workspace_id = $1 AND deleted_at IS NULL`
 	args := []any{workspaceID(ctx)}
 	n := 1
 	arg := func(v any) string {
@@ -394,6 +483,13 @@ func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monito
 	}
 	if f.Network != "" {
 		q += ` AND network = ` + arg(f.Network)
+	}
+	for _, t := range NormalizeTags(f.Tags) {
+		// @> containment with a single-element array is exactly what the
+		// GIN index added in migration 0032 is built for, so tag filters
+		// stay indexed. Repeated tags AND together: every tag must be
+		// carried.
+		q += ` AND tags @> ` + arg([]string{t})
 	}
 	switch {
 	case f.Enabled != nil && *f.Enabled:
@@ -455,10 +551,14 @@ func monitorSort(s string) string {
 }
 
 func (p *Postgres) UpdateMonitor(ctx context.Context, m *Monitor) error {
+	if err := normalizeMonitorGuidance(m); err != nil {
+		return err
+	}
 	ids, err := json.Marshal(m.ContractIDs)
 	if err != nil {
 		return err
 	}
+	m.Tags = NormalizeTags(m.Tags)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -474,8 +574,8 @@ func (p *Postgres) UpdateMonitor(ctx context.Context, m *Monitor) error {
 		return mapErr(err)
 	}
 	tag, err := tx.Exec(ctx,
-		`UPDATE monitors SET name = $3, contract_ids = $4, enabled = $5, priority = $6 WHERE id = $1 AND workspace_id = $2`,
-		m.ID, workspaceID(ctx), m.Name, ids, m.Enabled, m.Priority.Normalized())
+		`UPDATE monitors SET name = $3, contract_ids = $4, tags = $5, enabled = $6, priority = $7, runbook_url = $8, response_guidance = $9 WHERE id = $1 AND workspace_id = $2`,
+		m.ID, workspaceID(ctx), m.Name, ids, m.Tags, m.Enabled, m.Priority.Normalized(), m.RunbookURL, m.ResponseGuidance)
 	if err != nil {
 		return err
 	}
@@ -578,21 +678,40 @@ func (p *Postgres) SoftDeleteMonitor(ctx context.Context, id int64) error {
 // RestoreMonitor restores a soft-deleted monitor. Returns ErrNotFound
 // if the monitor doesn't exist or isn't deleted.
 func (p *Postgres) RestoreMonitor(ctx context.Context, id int64) error {
-	tag, err := p.pool.Exec(ctx,
-		`UPDATE monitors SET deleted_at = NULL WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NOT NULL`,
-		id, workspaceID(ctx))
+	ws := workspaceID(ctx)
+	tx, err := p.pool.Begin(ctx)
 	if err != nil {
+		return mapErr(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	var exists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM monitors WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NOT NULL)`,
+		id, ws).Scan(&exists); err != nil {
+		return mapErr(err)
+	}
+	if !exists {
+		return ErrNotFound
+	}
+	if err := p.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
 		return err
+	}
+	tag, err := tx.Exec(ctx,
+		`UPDATE monitors SET deleted_at = NULL WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NOT NULL`,
+		id, ws)
+	if err != nil {
+		return mapErr(err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return mapErr(tx.Commit(ctx))
 }
 
 // ListDeletedMonitors returns soft-deleted monitors (the "trash").
 func (p *Postgres) ListDeletedMonitors(ctx context.Context, f ListFilter) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE workspace_id = $1 AND deleted_at IS NOT NULL`
+	q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE workspace_id = $1 AND deleted_at IS NOT NULL`
 	args := []any{workspaceID(ctx)}
 	n := 1
 	arg := func(v any) string {
@@ -688,7 +807,7 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 	}
 
 	src, err := scanMonitor(tx.QueryRow(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
+		`SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
 	if err != nil {
 		return nil, err
 	}
@@ -712,7 +831,7 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 		return nil, err
 	}
 	ruleRows, err := tx.Query(ctx,
-		`SELECT r.type, r.params, r.enabled FROM rules r
+		`SELECT r.type, r.params, r.enabled, r.runbook_url, r.response_guidance FROM rules r
 		   JOIN monitors m ON m.id = r.monitor_id
 		  WHERE r.monitor_id = $1 AND m.workspace_id = $2 ORDER BY r.id`, id, ws)
 	if err != nil {
@@ -720,10 +839,16 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 	}
 	rules, err := pgx.CollectRows(ruleRows, func(row pgx.CollectableRow) (Rule, error) {
 		var r Rule
-		err := row.Scan(&r.Type, &r.Params, &r.Enabled)
+		err := row.Scan(&r.Type, &r.Params, &r.Enabled, &r.RunbookURL, &r.ResponseGuidance)
 		return r, err
 	})
 	if err != nil {
+		return nil, err
+	}
+	if err := p.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return nil, err
+	}
+	if err := p.checkRuleQuota(ctx, tx, ws, int64(len(rules))); err != nil {
 		return nil, err
 	}
 	// Name uniqueness is a workspace question, not a global one: two teams may
@@ -750,18 +875,23 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 		// The network is not a reviewable setting: the copy watches the same
 		// contract ids, which only exist on the source's chain.
 		Network: src.Network,
+		// Tags group related monitors, so a duplicate belongs in the same
+		// groups until an operator says otherwise.
+		Tags:             NormalizeTags(src.Tags),
+		RunbookURL:       src.RunbookURL,
+		ResponseGuidance: src.ResponseGuidance,
 	}
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network) VALUES ($1, $2, $3, $4, $5, $6)
+		`INSERT INTO monitors (name, contract_ids, tags, enabled, priority, workspace_id, network, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING id, created_at`,
-		copy.Name, ids, copy.Enabled, copy.Priority, ws, copy.Network,
+		copy.Name, ids, copy.Tags, copy.Enabled, copy.Priority, ws, copy.Network, copy.RunbookURL, copy.ResponseGuidance,
 	).Scan(&copy.ID, &copy.CreatedAt); err != nil {
 		return nil, err
 	}
 	for _, r := range rules {
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES ($1, $2, $3, $4)`,
-			copy.ID, r.Type, jsonOrEmpty(r.Params), r.Enabled); err != nil {
+			`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6)`,
+			copy.ID, r.Type, jsonOrEmpty(r.Params), r.Enabled, r.RunbookURL, r.ResponseGuidance); err != nil {
 			return nil, err
 		}
 	}
@@ -776,6 +906,7 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 		return nil, err
 	}
 	copy.ChannelIDs = src.ChannelIDs
+	copy.WorkspaceID = string(ws)
 	return &copy, nil
 }
 
@@ -784,6 +915,14 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 // monitor whose rules went missing is a monitor that watches a contract and
 // never says anything, and nothing outside this call would report the gap.
 func (p *Postgres) CreateMonitorWithRules(ctx context.Context, m *Monitor, rules []*Rule, channelIDs []int64) error {
+	if err := normalizeMonitorGuidance(m); err != nil {
+		return err
+	}
+	for _, r := range rules {
+		if err := normalizeRuleGuidance(r); err != nil {
+			return err
+		}
+	}
 	ws := workspaceID(ctx)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
@@ -793,24 +932,31 @@ func (p *Postgres) CreateMonitorWithRules(ctx context.Context, m *Monitor, rules
 	if err := lockContractCursorRefs(ctx, tx); err != nil {
 		return err
 	}
+	if err := p.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	if err := p.checkRuleQuota(ctx, tx, ws, int64(len(rules))); err != nil {
+		return err
+	}
 	ids, err := json.Marshal(m.ContractIDs)
 	if err != nil {
 		return err
 	}
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()))
+		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network, created_at, runbook_url, response_guidance)
+		 VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9)
 		 RETURNING id, created_at`,
-		m.Name, ids, m.Enabled, m.Priority.Normalized(), ws, m.Network, pgCreatedAt(m.CreatedAt),
+		m.Name, ids, m.Enabled, m.Priority.Normalized(), ws, m.Network, pgCreatedAt(m.CreatedAt), m.RunbookURL, m.ResponseGuidance,
 	).Scan(&m.ID, &m.CreatedAt); err != nil {
 		return err
 	}
+	m.WorkspaceID = string(ws)
 	for _, r := range rules {
 		r.MonitorID = m.ID
 		if err := tx.QueryRow(ctx,
-			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES ($1, $2, $3, $4) RETURNING id`,
-			r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled,
-		).Scan(&r.ID); err != nil {
+			`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, version`,
+			r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled, r.RunbookURL, r.ResponseGuidance,
+		).Scan(&r.ID, &r.Version); err != nil {
 			return mapErr(err)
 		}
 	}
@@ -879,13 +1025,20 @@ type rowScanner interface{ Scan(dest ...any) error }
 func scanMonitor(r rowScanner) (*Monitor, error) {
 	var m Monitor
 	var ids []byte
+	var tags []string
 	var priority string
 	var deletedAt *time.Time
-	if err := r.Scan(&m.ID, &m.Name, &ids, &m.Enabled, &m.CreatedAt, &m.LastMatchedAt, &priority, &m.Network, &deletedAt); err != nil {
+	if err := r.Scan(&m.ID, &m.Name, &ids, &tags, &m.Enabled, &m.CreatedAt, &m.LastMatchedAt, &priority, &m.Network, &deletedAt, &m.RunbookURL, &m.ResponseGuidance, &m.WorkspaceID); err != nil {
 		return nil, mapErr(err)
 	}
 	m.Priority = Priority(priority).Normalized()
 	m.DeletedAt = deletedAt
+	m.Tags = tags
+	if m.Tags == nil {
+		// A monitor without tags reads back as an empty list, not nil, so
+		// JSON output is always an array.
+		m.Tags = []string{}
+	}
 	if err := json.Unmarshal(ids, &m.ContractIDs); err != nil {
 		return nil, fmt.Errorf("monitor %d: bad contract_ids: %w", m.ID, err)
 	}
@@ -924,18 +1077,38 @@ type rowQueryer interface {
 }
 
 func (p *Postgres) CreateRule(ctx context.Context, r *Rule) error {
-	if err := p.requireMonitorWorkspace(ctx, p.pool, r.MonitorID, workspaceID(ctx)); err != nil {
+	if err := normalizeRuleGuidance(r); err != nil {
 		return err
 	}
-	return mapErr(p.pool.QueryRow(ctx,
-		`INSERT INTO rules (monitor_id, type, params, enabled) VALUES ($1, $2, $3, $4) RETURNING id`,
-		r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled,
-	).Scan(&r.ID))
+	ws := workspaceID(ctx)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return mapErr(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := p.requireMonitorWorkspace(ctx, tx, r.MonitorID, ws); err != nil {
+		return err
+	}
+	if err := p.checkRuleQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, version`,
+		r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled, r.RunbookURL, r.ResponseGuidance,
+	).Scan(&r.ID, &r.Version); err != nil {
+		return mapErr(err)
+	}
+	return mapErr(tx.Commit(ctx))
 }
 
 func (p *Postgres) CreateRules(ctx context.Context, rules []*Rule) error {
 	if len(rules) == 0 {
 		return nil
+	}
+	for _, r := range rules {
+		if err := normalizeRuleGuidance(r); err != nil {
+			return err
+		}
 	}
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
@@ -948,10 +1121,15 @@ func (p *Postgres) CreateRules(ctx context.Context, rules []*Rule) error {
 		if err := p.requireMonitorWorkspace(ctx, tx, r.MonitorID, ws); err != nil {
 			return err
 		}
+	}
+	if err := p.checkRuleQuota(ctx, tx, ws, int64(len(rules))); err != nil {
+		return err
+	}
+	for _, r := range rules {
 		if err := tx.QueryRow(ctx,
-			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES ($1, $2, $3, $4) RETURNING id`,
-			r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled,
-		).Scan(&r.ID); err != nil {
+			`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, version`,
+			r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled, r.RunbookURL, r.ResponseGuidance,
+		).Scan(&r.ID, &r.Version); err != nil {
 			return mapErr(err)
 		}
 	}
@@ -961,10 +1139,10 @@ func (p *Postgres) CreateRules(ctx context.Context, rules []*Rule) error {
 func (p *Postgres) GetRule(ctx context.Context, id int64) (*Rule, error) {
 	var r Rule
 	err := p.pool.QueryRow(ctx,
-		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled FROM rules r
+		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version, r.runbook_url, r.response_guidance FROM rules r
 		   JOIN monitors m ON m.id = r.monitor_id
 		  WHERE r.id = $1 AND m.workspace_id = $2`, id, workspaceID(ctx),
-	).Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled)
+	).Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled, &r.Version, &r.RunbookURL, &r.ResponseGuidance)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -978,7 +1156,7 @@ func (p *Postgres) ListRules(ctx context.Context, monitorID int64, enabledOnly b
 		// different scopes: the API (one workspace) and the poller's per-monitor
 		// rule loading, which runs under the cross-tenant system scope and would
 		// otherwise find no rules for a monitor outside the default workspace.
-		q := `SELECT r.id, r.monitor_id, r.type, r.params, r.enabled FROM rules r
+		q := `SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version, r.runbook_url, r.response_guidance FROM rules r
 		         JOIN monitors m ON m.id = r.monitor_id
 		        WHERE r.monitor_id = $1`
 		args := []any{monitorID}
@@ -996,7 +1174,7 @@ func (p *Postgres) ListRules(ctx context.Context, monitorID int64, enabledOnly b
 		}
 		page, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Rule, error) {
 			var r Rule
-			err := row.Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled)
+			err := row.Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled, &r.Version, &r.RunbookURL, &r.ResponseGuidance)
 			return r, err
 		})
 		if err != nil {
@@ -1012,17 +1190,70 @@ func (p *Postgres) ListRules(ctx context.Context, monitorID int64, enabledOnly b
 }
 
 func (p *Postgres) UpdateRule(ctx context.Context, r *Rule) error {
-	tag, err := p.pool.Exec(ctx,
-		`UPDATE rules SET type = $3, params = $4, enabled = $5 WHERE id = $1
-		   AND monitor_id IN (SELECT id FROM monitors WHERE workspace_id = $2)`,
-		r.ID, workspaceID(ctx), r.Type, jsonOrEmpty(r.Params), r.Enabled)
+	if err := normalizeRuleGuidance(r); err != nil {
+		return err
+	}
+	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	ws := workspaceID(ctx)
+	var oldType string
+	var oldParams []byte
+	if err := tx.QueryRow(ctx,
+		`SELECT r.type, r.params FROM rules r
+		   JOIN monitors m ON m.id = r.monitor_id
+		  WHERE r.id = $1 AND m.workspace_id = $2
+		  FOR UPDATE OF r`,
+		r.ID, ws,
+	).Scan(&oldType, &oldParams); err != nil {
+		return mapErr(err)
 	}
-	return nil
+
+	newParams := jsonOrEmpty(r.Params)
+	conditionChanged := oldType != r.Type || !canonicalJSONEqual(oldParams, newParams)
+	disabled := !r.Enabled
+
+	if conditionChanged {
+		if err := tx.QueryRow(ctx,
+			`UPDATE rules
+			    SET type = $2, params = $3, enabled = $4, runbook_url = $5, response_guidance = $6, version = version + 1,
+			        last_alert_at = NULL, suppressed_since_last = 0
+			  WHERE id = $1
+			  RETURNING version`,
+			r.ID, r.Type, newParams, r.Enabled, r.RunbookURL, r.ResponseGuidance,
+		).Scan(&r.Version); err != nil {
+			return mapErr(err)
+		}
+	} else {
+		if err := tx.QueryRow(ctx,
+			`UPDATE rules
+			    SET type = $2, params = $3, enabled = $4, runbook_url = $5, response_guidance = $6, version = version + 1
+			  WHERE id = $1
+			  RETURNING version`,
+			r.ID, r.Type, newParams, r.Enabled, r.RunbookURL, r.ResponseGuidance,
+		).Scan(&r.Version); err != nil {
+			return mapErr(err)
+		}
+	}
+
+	if conditionChanged || disabled {
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM rule_absence_state WHERE rule_id = $1`, r.ID); err != nil {
+			return mapErr(err)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE alert_escalations
+			    SET completed_at = now(), updated_at = now()
+			  WHERE completed_at IS NULL
+			    AND alert_id IN (SELECT id FROM alerts WHERE rule_id = $1 AND workspace_id = $2)`,
+			r.ID, ws); err != nil {
+			return mapErr(err)
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 func (p *Postgres) DeleteRule(ctx context.Context, id int64) error {
@@ -1080,6 +1311,11 @@ func (p *Postgres) RecordAbsenceSeen(ctx context.Context, ruleID int64, eventNam
 	return err
 }
 
+func (p *Postgres) DeleteAbsenceStateForRule(ctx context.Context, ruleID int64) error {
+	_, err := p.pool.Exec(ctx, `DELETE FROM rule_absence_state WHERE rule_id = $1`, ruleID)
+	return err
+}
+
 // --- channels ---
 
 func (p *Postgres) CreateChannel(ctx context.Context, c *Channel) error {
@@ -1087,12 +1323,25 @@ func (p *Postgres) CreateChannel(ctx context.Context, c *Channel) error {
 	if err != nil {
 		return err
 	}
-	return p.pool.QueryRow(ctx,
+	ws := workspaceID(ctx)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return mapErr(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := p.checkChannelQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	if err := tx.QueryRow(ctx,
 		`INSERT INTO channels (name, type, config, enabled, digest_mode, digest_window_seconds, timeout, workspace_id, created_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, now()))
 		 RETURNING id, created_at`,
-		c.Name, c.Type, config, c.Enabled, c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(), workspaceID(ctx), pgCreatedAt(c.CreatedAt),
-	).Scan(&c.ID, &c.CreatedAt)
+		c.Name, c.Type, config, c.Enabled, c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(), ws, pgCreatedAt(c.CreatedAt),
+	).Scan(&c.ID, &c.CreatedAt); err != nil {
+		return mapErr(err)
+	}
+	c.WorkspaceID = string(ws)
+	return mapErr(tx.Commit(ctx))
 }
 
 func (p *Postgres) GetChannel(ctx context.Context, id int64) (*Channel, error) {
@@ -1101,11 +1350,11 @@ func (p *Postgres) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 	err := p.pool.QueryRow(ctx,
 		`SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout,
 		        consecutive_failures, consecutive_permanent_failures, last_error,
-		        last_error_at, last_success_at, disabled_at
+		        last_error_at, last_success_at, disabled_at, workspace_id
 		 FROM channels WHERE id = $1 AND workspace_id = $2`, id, workspaceID(ctx),
 	).Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.Enabled, &c.CreatedAt, &c.DigestMode, &c.DigestWindowSeconds, &timeoutSec,
 		&c.ConsecutiveFailures, &c.ConsecutivePermanentFailures, &c.LastError,
-		&c.LastErrorAt, &c.LastSuccessAt, &c.DisabledAt)
+		&c.LastErrorAt, &c.LastSuccessAt, &c.DisabledAt, &c.WorkspaceID)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -1121,7 +1370,7 @@ func (p *Postgres) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 func (p *Postgres) ListChannels(ctx context.Context, enabledOnly bool) ([]Channel, error) {
 	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout,
 		        consecutive_failures, consecutive_permanent_failures, last_error,
-		        last_error_at, last_success_at, disabled_at FROM channels WHERE TRUE`
+		        last_error_at, last_success_at, disabled_at, workspace_id FROM channels WHERE TRUE`
 	args := []any{}
 	if ws, scoped := tenantWorkspace(ctx); scoped {
 		args = append(args, ws)
@@ -1141,7 +1390,7 @@ func (p *Postgres) ListChannels(ctx context.Context, enabledOnly bool) ([]Channe
 func (p *Postgres) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel, error) {
 	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout,
 		        consecutive_failures, consecutive_permanent_failures, last_error,
-		        last_error_at, last_success_at, disabled_at FROM channels WHERE TRUE`
+		        last_error_at, last_success_at, disabled_at, workspace_id FROM channels WHERE TRUE`
 	args := []any{}
 	n := 0
 	arg := func(v any) string {
@@ -1294,7 +1543,11 @@ func (p *Postgres) RecordChannelHealth(ctx context.Context, channelID int64, u C
 func (p *Postgres) DeleteChannel(ctx context.Context, id int64) error {
 	var inUse bool
 	if err := p.pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM escalation_step_channels WHERE channel_id = $1)`, id,
+		`SELECT EXISTS (
+			SELECT 1 FROM escalation_step_channels esc
+			JOIN channels c ON c.id = esc.channel_id
+			WHERE esc.channel_id = $1 AND c.workspace_id = $2
+		)`, id, workspaceID(ctx),
 	).Scan(&inUse); err != nil {
 		return err
 	}
@@ -1306,7 +1559,7 @@ func (p *Postgres) DeleteChannel(ctx context.Context, id int64) error {
 
 func (p *Postgres) ListMonitorsForChannel(ctx context.Context, channelID int64) ([]Monitor, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT m.id, m.name, m.contract_ids, m.enabled, m.created_at, m.last_matched_at, m.priority
+		`SELECT m.id, m.name, m.contract_ids, m.tags, m.enabled, m.created_at, m.last_matched_at, m.priority, m.network, m.deleted_at, m.runbook_url, m.response_guidance, m.workspace_id
 		 FROM monitors m
 		 JOIN monitor_channels mc ON mc.monitor_id = m.id
 		 WHERE mc.channel_id = $1 AND m.workspace_id = $2
@@ -1344,7 +1597,7 @@ func (p *Postgres) ListChannelsForMonitor(ctx context.Context, monitorID int64) 
 	rows, err := p.pool.Query(ctx,
 		`SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at, c.digest_mode, c.digest_window_seconds, c.timeout,
 		        c.consecutive_failures, c.consecutive_permanent_failures, c.last_error,
-		        c.last_error_at, c.last_success_at, c.disabled_at
+		        c.last_error_at, c.last_success_at, c.disabled_at, c.workspace_id
 		 FROM channels c
 		 JOIN monitor_channels mc ON mc.channel_id = c.id
 		 JOIN monitors m ON m.id = mc.monitor_id
@@ -1367,7 +1620,7 @@ func (p *Postgres) ListChannelsByIDs(ctx context.Context, ids []int64) ([]Channe
 	rows, err := p.pool.Query(ctx,
 		`SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout,
 		        consecutive_failures, consecutive_permanent_failures, last_error,
-		        last_error_at, last_success_at, disabled_at FROM channels
+		        last_error_at, last_success_at, disabled_at, workspace_id FROM channels
 		  WHERE id = ANY($1) AND enabled ORDER BY id`, uniqueIDs(ids))
 	if err != nil {
 		return nil, err
@@ -1382,7 +1635,7 @@ func (p *Postgres) scanChannel(row pgx.CollectableRow) (Channel, error) {
 	var timeoutSec int
 	if err := row.Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.Enabled, &c.CreatedAt, &c.DigestMode, &c.DigestWindowSeconds, &timeoutSec,
 		&c.ConsecutiveFailures, &c.ConsecutivePermanentFailures, &c.LastError,
-		&c.LastErrorAt, &c.LastSuccessAt, &c.DisabledAt); err != nil {
+		&c.LastErrorAt, &c.LastSuccessAt, &c.DisabledAt, &c.WorkspaceID); err != nil {
 		return c, err
 	}
 	c.Timeout = time.Duration(timeoutSec) * time.Second
@@ -1435,6 +1688,413 @@ func (p *Postgres) GetChannelDeliveryStats(ctx context.Context, channelID int64,
 	}
 	cs.deriveSuccessRate()
 	return cs, nil
+}
+
+// ChannelDeliveryChangeKey returns the max delivery attempt ID and count for channelID in the caller's workspace.
+func (p *Postgres) ChannelDeliveryChangeKey(ctx context.Context, channelID int64) (maxID int64, count int64, err error) {
+	ws := workspaceID(ctx)
+	var exists bool
+	err = p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&exists, &maxID, &count)
+	}, `
+		SELECT
+			(SELECT count(*) FROM channels WHERE id = $1 AND workspace_id = $2) > 0,
+			COALESCE(max(da.id), 0),
+			count(*)
+		FROM delivery_attempts da
+		WHERE da.channel_id = $1`, channelID, ws)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !exists {
+		return 0, 0, ErrNotFound
+	}
+	return maxID, count, nil
+}
+
+func (p *Postgres) encryptSigningSecret(secret string) (string, error) {
+	return sealSigningSecret(p.cipher, secret)
+}
+
+func (p *Postgres) decryptSigningSecret(stored string) (string, error) {
+	return openSigningSecret(p.cipher, stored)
+}
+
+func (p *Postgres) CreateChannelSigningKey(ctx context.Context, k *ChannelSigningKey) error {
+	if k.ChannelID <= 0 {
+		return errors.New("channel_id is required")
+	}
+	if k.KeyID == "" {
+		return errors.New("key_id is required")
+	}
+	if k.Secret == "" {
+		return errors.New("secret is required")
+	}
+	if k.Status == "" {
+		k.Status = SigningKeyStatusActive
+	}
+	secret, err := p.encryptSigningSecret(k.Secret)
+	if err != nil {
+		return err
+	}
+	ws := workspaceID(ctx)
+	if k.WorkspaceID != "" {
+		ws = workspace.ID(k.WorkspaceID)
+	}
+	return p.pool.QueryRow(ctx,
+		`INSERT INTO channel_signing_keys (channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9, $10)
+		 RETURNING id, created_at`,
+		k.ChannelID, ws, k.KeyID, secret, k.IsCurrent, k.Status, pgCreatedAt(k.CreatedAt), k.ExpiresAt, k.LastUsedAt, k.RevokedAt,
+	).Scan(&k.ID, &k.CreatedAt)
+}
+
+func (p *Postgres) GetChannelSigningKey(ctx context.Context, channelID int64, keyID string) (*ChannelSigningKey, error) {
+	var k ChannelSigningKey
+	var storedSecret string
+	err := p.pool.QueryRow(ctx,
+		`SELECT id, channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at
+		 FROM channel_signing_keys
+		 WHERE channel_id = $1 AND key_id = $2 AND workspace_id = $3`,
+		channelID, keyID, workspaceID(ctx),
+	).Scan(&k.ID, &k.ChannelID, &k.WorkspaceID, &k.KeyID, &storedSecret, &k.IsCurrent, &k.Status, &k.CreatedAt, &k.ExpiresAt, &k.LastUsedAt, &k.RevokedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	dec, err := p.decryptSigningSecret(storedSecret)
+	if err != nil {
+		return nil, err
+	}
+	k.Secret = dec
+	return &k, nil
+}
+
+func (p *Postgres) ListChannelSigningKeys(ctx context.Context, channelID int64) ([]ChannelSigningKey, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT id, channel_id, workspace_id, key_id, is_current, status, created_at, expires_at, last_used_at, revoked_at
+		 FROM channel_signing_keys
+		 WHERE channel_id = $1 AND workspace_id = $2
+		 ORDER BY created_at DESC, id DESC`,
+		channelID, workspaceID(ctx),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChannelSigningKey
+	for rows.Next() {
+		var k ChannelSigningKey
+		if err := rows.Scan(&k.ID, &k.ChannelID, &k.WorkspaceID, &k.KeyID, &k.IsCurrent, &k.Status, &k.CreatedAt, &k.ExpiresAt, &k.LastUsedAt, &k.RevokedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) GetCurrentChannelSigningKey(ctx context.Context, channelID int64) (*ChannelSigningKey, error) {
+	var k ChannelSigningKey
+	var storedSecret string
+	err := p.pool.QueryRow(ctx,
+		`SELECT id, channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at
+		 FROM channel_signing_keys
+		 WHERE channel_id = $1 AND workspace_id = $2 AND is_current = TRUE AND status = 'active'
+		 ORDER BY created_at DESC, id DESC LIMIT 1`,
+		channelID, workspaceID(ctx),
+	).Scan(&k.ID, &k.ChannelID, &k.WorkspaceID, &k.KeyID, &storedSecret, &k.IsCurrent, &k.Status, &k.CreatedAt, &k.ExpiresAt, &k.LastUsedAt, &k.RevokedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	dec, err := p.decryptSigningSecret(storedSecret)
+	if err != nil {
+		return nil, err
+	}
+	k.Secret = dec
+	return &k, nil
+}
+
+func (p *Postgres) RotateChannelSigningKey(ctx context.Context, channelID int64, newKey *ChannelSigningKey) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM channels WHERE id = $1 AND workspace_id = $2)`, channelID, workspaceID(ctx)).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNotFound
+	}
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE channel_signing_keys SET is_current = FALSE WHERE channel_id = $1 AND workspace_id = $2`,
+		channelID, workspaceID(ctx),
+	); err != nil {
+		return err
+	}
+
+	secret, err := p.encryptSigningSecret(newKey.Secret)
+	if err != nil {
+		return err
+	}
+	newKey.ChannelID = channelID
+	newKey.WorkspaceID = string(workspaceID(ctx))
+	newKey.IsCurrent = true
+	newKey.Status = SigningKeyStatusActive
+
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO channel_signing_keys (channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at)
+		 VALUES ($1, $2, $3, $4, TRUE, 'active', COALESCE($5, now()), $6, $7, $8)
+		 RETURNING id, created_at`,
+		newKey.ChannelID, newKey.WorkspaceID, newKey.KeyID, secret, pgCreatedAt(newKey.CreatedAt), newKey.ExpiresAt, newKey.LastUsedAt, newKey.RevokedAt,
+	).Scan(&newKey.ID, &newKey.CreatedAt); err != nil {
+		return mapErr(err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) RetireChannelSigningKey(ctx context.Context, channelID int64, keyID string) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var isCurrent bool
+	var status string
+	err = tx.QueryRow(ctx,
+		`SELECT is_current, status FROM channel_signing_keys WHERE channel_id = $1 AND key_id = $2 AND workspace_id = $3`,
+		channelID, keyID, workspaceID(ctx),
+	).Scan(&isCurrent, &status)
+	if err != nil {
+		return mapErr(err)
+	}
+	if isCurrent {
+		return fmt.Errorf("cannot retire active current signing key %q; rotate first", keyID)
+	}
+	if status == SigningKeyStatusRevoked {
+		return fmt.Errorf("key %q is already revoked", keyID)
+	}
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE channel_signing_keys SET status = 'retired' WHERE channel_id = $1 AND key_id = $2 AND workspace_id = $3`,
+		channelID, keyID, workspaceID(ctx),
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) RevokeChannelSigningKey(ctx context.Context, channelID int64, keyID string) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE channel_signing_keys SET status = 'revoked', is_current = FALSE, revoked_at = now()
+		 WHERE channel_id = $1 AND key_id = $2 AND workspace_id = $3`,
+		channelID, keyID, workspaceID(ctx),
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) RecordChannelSigningKeyUsage(ctx context.Context, channelID int64, keyID string, usedAt time.Time) error {
+	if usedAt.IsZero() {
+		usedAt = time.Now()
+	}
+	_, err := p.pool.Exec(ctx,
+		`UPDATE channel_signing_keys SET last_used_at = $1 WHERE channel_id = $2 AND key_id = $3`,
+		usedAt, channelID, keyID,
+	)
+	return err
+}
+
+// ReconcileChannelAcknowledgements evaluates delivery vs human acknowledgement for all channels
+// in the context's workspace (or instance-wide under a system context).
+func (p *Postgres) ReconcileChannelAcknowledgements(ctx context.Context, cfg AckReconciliationConfig) ([]ChannelAckReconciliation, error) {
+	if cfg.LookbackWindow <= 0 {
+		cfg.LookbackWindow = 7 * 24 * time.Hour
+	}
+	if cfg.CriticalAckWindow <= 0 {
+		cfg.CriticalAckWindow = 1 * time.Hour
+	}
+	if cfg.WarningAckWindow <= 0 {
+		cfg.WarningAckWindow = 4 * time.Hour
+	}
+	if cfg.MinDeliveries <= 0 {
+		cfg.MinDeliveries = 3
+	}
+	if cfg.FlagThresholdRate <= 0 {
+		cfg.FlagThresholdRate = 1.0
+	}
+
+	now := time.Now().UTC()
+	lookbackCutoff := now.Add(-cfg.LookbackWindow)
+	critCutoff := now.Add(-cfg.CriticalAckWindow)
+	warnCutoff := now.Add(-cfg.WarningAckWindow)
+
+	ws, isTenant := tenantWorkspace(ctx)
+	targetWS := ""
+	if isTenant {
+		targetWS = string(ws)
+	}
+
+	query := `
+		SELECT
+			c.id,
+			c.workspace_id,
+			COUNT(q.alert_id),
+			COUNT(CASE WHEN q.alert_id IS NOT NULL AND q.acknowledged_at IS NOT NULL THEN 1 END),
+			COUNT(CASE WHEN q.alert_id IS NOT NULL AND q.acknowledged_at IS NULL THEN 1 END)
+		FROM channels c
+		LEFT JOIN (
+			SELECT DISTINCT
+				da.channel_id,
+				da.alert_id,
+				a.acknowledged_at
+			FROM delivery_attempts da
+			JOIN alerts a ON a.id = da.alert_id
+			WHERE da.status = 'success'
+			  AND a.suppressed = FALSE
+			  AND a.inhibited_by_rule_id IS NULL
+			  AND a.retracted_at IS NULL
+			  AND a.severity IN ('warning', 'critical')
+			  AND a.created_at >= $1
+			  AND (
+				  a.acknowledged_at IS NOT NULL
+				  OR (a.severity = 'critical' AND a.created_at <= $2)
+				  OR (a.severity = 'warning' AND a.created_at <= $3)
+			  )
+		) q ON q.channel_id = c.id
+		WHERE ($4 = '' OR c.workspace_id = $4)
+		GROUP BY c.id, c.workspace_id
+		ORDER BY c.id`
+
+	rows, err := p.pool.Query(ctx, query, lookbackCutoff, critCutoff, warnCutoff, targetWS)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	var reconciliations []ChannelAckReconciliation
+	for rows.Next() {
+		var r ChannelAckReconciliation
+		if err := rows.Scan(&r.ChannelID, &r.WorkspaceID, &r.DeliveredTotal, &r.AcknowledgedTotal, &r.UnacknowledgedTotal); err != nil {
+			return nil, mapErr(err)
+		}
+		r.ComputedAt = now
+		if r.DeliveredTotal > 0 {
+			rate := float64(r.UnacknowledgedTotal) / float64(r.DeliveredTotal)
+			r.UnackRate = &rate
+			if r.DeliveredTotal >= cfg.MinDeliveries && rate >= cfg.FlagThresholdRate {
+				r.Flagged = true
+			}
+		}
+		reconciliations = append(reconciliations, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapErr(err)
+	}
+
+	for _, r := range reconciliations {
+		_, err := p.pool.Exec(ctx, `
+			INSERT INTO channel_ack_reconciliations (
+				channel_id, workspace_id, delivered_total, acknowledged_total, unacknowledged_total, unack_rate, flagged, computed_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (channel_id) DO UPDATE SET
+				workspace_id = EXCLUDED.workspace_id,
+				delivered_total = EXCLUDED.delivered_total,
+				acknowledged_total = EXCLUDED.acknowledged_total,
+				unacknowledged_total = EXCLUDED.unacknowledged_total,
+				unack_rate = EXCLUDED.unack_rate,
+				flagged = EXCLUDED.flagged,
+				computed_at = EXCLUDED.computed_at`,
+			r.ChannelID, r.WorkspaceID, r.DeliveredTotal, r.AcknowledgedTotal, r.UnacknowledgedTotal, r.UnackRate, r.Flagged, r.ComputedAt,
+		)
+		if err != nil {
+			return nil, mapErr(err)
+		}
+	}
+
+	return reconciliations, nil
+}
+
+// GetChannelAckReconciliation returns the current acknowledgement reconciliation for one channel.
+func (p *Postgres) GetChannelAckReconciliation(ctx context.Context, channelID int64) (ChannelAckReconciliation, error) {
+	ws := workspaceID(ctx)
+	var r ChannelAckReconciliation
+	var exists bool
+	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&exists, &r.ChannelID, &r.WorkspaceID, &r.DeliveredTotal, &r.AcknowledgedTotal, &r.UnacknowledgedTotal, &r.UnackRate, &r.Flagged, &r.ComputedAt)
+	}, `
+		SELECT
+			(SELECT count(*) FROM channels WHERE id = $1 AND workspace_id = $2) > 0,
+			COALESCE(car.channel_id, $1),
+			COALESCE(car.workspace_id, $2),
+			COALESCE(car.delivered_total, 0),
+			COALESCE(car.acknowledged_total, 0),
+			COALESCE(car.unacknowledged_total, 0),
+			car.unack_rate,
+			COALESCE(car.flagged, FALSE),
+			COALESCE(car.computed_at, now())
+		FROM channels c
+		LEFT JOIN channel_ack_reconciliations car ON car.channel_id = c.id
+		WHERE c.id = $1 AND c.workspace_id = $2`,
+		channelID, ws)
+	if err != nil {
+		return r, mapErr(err)
+	}
+	if !exists {
+		return r, ErrNotFound
+	}
+	return r, nil
+}
+
+// ListChannelAckReconciliations returns the latest acknowledgement reconciliations for all channels.
+func (p *Postgres) ListChannelAckReconciliations(ctx context.Context) (map[int64]ChannelAckReconciliation, error) {
+	ws, isTenant := tenantWorkspace(ctx)
+	targetWS := ""
+	if isTenant {
+		targetWS = string(ws)
+	}
+
+	out := make(map[int64]ChannelAckReconciliation)
+	rows, err := p.pool.Query(ctx, `
+		SELECT channel_id, workspace_id, delivered_total, acknowledged_total, unacknowledged_total, unack_rate, flagged, computed_at
+		FROM channel_ack_reconciliations
+		WHERE ($1 = '' OR workspace_id = $1)
+		ORDER BY channel_id`, targetWS)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var r ChannelAckReconciliation
+		if err := rows.Scan(&r.ChannelID, &r.WorkspaceID, &r.DeliveredTotal, &r.AcknowledgedTotal, &r.UnacknowledgedTotal, &r.UnackRate, &r.Flagged, &r.ComputedAt); err != nil {
+			return nil, mapErr(err)
+		}
+		out[r.ChannelID] = r
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapErr(err)
+	}
+	return out, nil
 }
 
 // --- alerts ---
@@ -1568,17 +2228,40 @@ func (p *Postgres) createAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 		return "", mapErr(err)
 	}
 
+	ws := workspaceID(ctx)
+	if err := tx.QueryRow(ctx,
+		`SELECT
+			COALESCE(
+				NULLIF($1, ''),
+				NULLIF((SELECT runbook_url FROM rules WHERE id = $2), ''),
+				NULLIF((SELECT runbook_url FROM monitors WHERE id = $3), ''),
+				NULLIF((SELECT default_runbook_url FROM workspaces WHERE id = COALESCE((SELECT workspace_id FROM monitors WHERE id = $3), $4)), ''),
+				''
+			),
+			COALESCE(
+				NULLIF($5, ''),
+				NULLIF((SELECT response_guidance FROM rules WHERE id = $2), ''),
+				NULLIF((SELECT response_guidance FROM monitors WHERE id = $3), ''),
+				NULLIF((SELECT default_response_guidance FROM workspaces WHERE id = COALESCE((SELECT workspace_id FROM monitors WHERE id = $3), $4)), ''),
+				''
+			)`,
+		a.RunbookURL, a.RuleID, a.MonitorID, ws, a.ResponseGuidance,
+	).Scan(&a.RunbookURL, &a.ResponseGuidance); err != nil {
+		return "", mapErr(err)
+	}
+	a.Payload = WithGuidance(a.Payload, a.RunbookURL, a.ResponseGuidance)
+
 	err = tx.QueryRow(ctx,
 		// The network is read from the monitor rather than taken from the
 		// caller: a contract id only means anything on the chain it was
 		// deployed to, so the monitor owns the answer and an alert cannot be
 		// filed against a chain its monitor does not watch.
-		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, backfilled, ledger, network, workspace_id)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, (SELECT network FROM monitors WHERE id = $1), $8)
-			 RETURNING id, created_at, network`,
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, backfilled, ledger, network, workspace_id, rule_version, runbook_url, response_guidance)
+			 VALUES ($1, $2, $3, $4, $5, COALESCE(NULLIF($9, ''), (SELECT severity FROM rules WHERE id = $2), 'warning'), $6, $7, (SELECT network FROM monitors WHERE id = $1), COALESCE((SELECT workspace_id FROM monitors WHERE id = $1), $8), COALESCE(NULLIF($10, 0), (SELECT version FROM rules WHERE id = $2), 1), $11, $12)
+			 RETURNING id, created_at, network, severity, rule_version, runbook_url, response_guidance`,
 		a.MonitorID, a.RuleID, a.EventID, jsonOrEmpty(a.Payload), nullableJSON(a.Enrichment), a.Backfilled, int64(a.Ledger),
-		workspaceID(ctx),
-	).Scan(&a.ID, &a.CreatedAt, &a.Network)
+		ws, string(a.Severity), a.RuleVersion, a.RunbookURL, a.ResponseGuidance,
+	).Scan(&a.ID, &a.CreatedAt, &a.Network, &a.Severity, &a.RuleVersion, &a.RunbookURL, &a.ResponseGuidance)
 	if err != nil {
 		return "", mapErr(err)
 	}
@@ -1643,13 +2326,31 @@ func (p *Postgres) createFederatedAlert(ctx context.Context, tx pgx.Tx, a *Alert
 		return "", mapErr(err)
 	}
 
+	ws := workspaceID(ctx)
+	pURL, hasURL, pGuidance, hasGuidance := extractParamsGuidance(a.Payload)
+	if a.RunbookURL == "" && hasURL {
+		a.RunbookURL = pURL
+	}
+	if a.ResponseGuidance == "" && hasGuidance {
+		a.ResponseGuidance = pGuidance
+	}
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, ledger, network, workspace_id, federated, federation_origin, source_monitor_id, source_rule_id)
-		 VALUES (NULL, NULL, $1, $2, $3, $4, $5, '', $6, TRUE, $7, $8, $9)
-		 RETURNING id, created_at`,
+		`SELECT
+			COALESCE(NULLIF($1, ''), NULLIF((SELECT default_runbook_url FROM workspaces WHERE id = $2), ''), ''),
+			COALESCE(NULLIF($3, ''), NULLIF((SELECT default_response_guidance FROM workspaces WHERE id = $2), ''), '')`,
+		a.RunbookURL, ws, a.ResponseGuidance,
+	).Scan(&a.RunbookURL, &a.ResponseGuidance); err != nil {
+		return "", mapErr(err)
+	}
+	a.Payload = WithGuidance(a.Payload, a.RunbookURL, a.ResponseGuidance)
+
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, ledger, network, workspace_id, federated, federation_origin, source_monitor_id, source_rule_id, rule_version, runbook_url, response_guidance)
+		 VALUES (NULL, NULL, $1, $2, $3, $4, $5, '', $6, TRUE, $7, $8, $9, COALESCE(NULLIF($10, 0), 1), $11, $12)
+		 RETURNING id, created_at, rule_version, runbook_url, response_guidance`,
 		a.EventID, jsonOrEmpty(a.Payload), nullableJSON(a.Enrichment), NormalizedSeverity(a.Severity), int64(a.Ledger),
-		workspaceID(ctx), a.FederationOrigin, a.SourceMonitorID, a.SourceRuleID,
-	).Scan(&a.ID, &a.CreatedAt); err != nil {
+		ws, a.FederationOrigin, a.SourceMonitorID, a.SourceRuleID, a.RuleVersion, a.RunbookURL, a.ResponseGuidance,
+	).Scan(&a.ID, &a.CreatedAt, &a.RuleVersion, &a.RunbookURL, &a.ResponseGuidance); err != nil {
 		return "", mapErr(err)
 	}
 
@@ -1704,11 +2405,14 @@ func (p *Postgres) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	var origin *string
 	var sourceMonitorID, sourceRuleID *int64
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version, runbook_url, response_guidance
 		   FROM alerts WHERE id = $1 AND workspace_id = $2`, id, workspaceID(ctx),
-	).Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.AcknowledgedBy, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID)
+	).Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.AcknowledgedBy, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID, &a.RuleVersion, &a.RunbookURL, &a.ResponseGuidance)
 	if err != nil {
 		return nil, mapErr(err)
+	}
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok && a.CreatedAt.Before(cutoff) {
+		return nil, ErrNotFound
 	}
 	a.Ledger = uint32(ledger)
 	if monitorID != nil {
@@ -1744,24 +2448,61 @@ func alertSort(s string) string {
 // replica exists to make. A caller that cannot tolerate it — the rules engine
 // rebuilding a match log — uses ListAlertsPrimary.
 func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok && (f.From.IsZero() || f.From.Before(cutoff)) {
+		f.From = cutoff
+	}
 	q, args := buildAlertQuery(ctx, f)
 	rows, err := p.queryRows(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, scanAlert)
+	alerts, err := pgx.CollectRows(rows, scanAlert)
+	if err != nil {
+		return nil, err
+	}
+	// If a cursor minted against the primary has not yet replicated to the
+	// replica, the subquery `(SELECT created_at, id FROM alerts WHERE id = $N)`
+	// returns NULL on the replica and produces an empty page. Detect when the
+	// cursor anchor is absent on the replica and replay the page on the primary
+	// so pagination never skips or truncates rows (#572).
+	if f.AfterID > 0 && len(alerts) == 0 && p.replica != nil && !p.replicaLagExceeded() {
+		if !p.cursorAnchorExistsOnReplica(ctx, f.AfterID) {
+			p.metrics.RecordStoreRead(poolPrimary)
+			p.metrics.RecordReplicaFallback()
+			return p.ListAlertsPrimary(ctx, f)
+		}
+	}
+	return alerts, nil
 }
 
 // ListAlertsPrimary is ListAlerts served by the primary, whatever
 // REPLICA_DATABASE_URL says. It exists for readers that must see this
 // process's own writes — see PrimaryReader.
 func (p *Postgres) ListAlertsPrimary(ctx context.Context, f AlertFilter) ([]Alert, error) {
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok && (f.From.IsZero() || f.From.Before(cutoff)) {
+		f.From = cutoff
+	}
 	q, args := buildAlertQuery(ctx, f)
 	rows, err := p.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, scanAlert)
+}
+
+// AlertChangeKey returns the max alert ID and count for the caller's workspace.
+func (p *Postgres) AlertChangeKey(ctx context.Context) (maxID int64, count int64, err error) {
+	ws := workspaceID(ctx)
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok {
+		err = p.queryRowFallback(ctx, func(row pgx.Row) error {
+			return row.Scan(&maxID, &count)
+		}, `SELECT COALESCE(max(id), 0), count(*) FROM alerts WHERE workspace_id = $1 AND created_at >= $2`, ws, cutoff)
+		return maxID, count, err
+	}
+	err = p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&maxID, &count)
+	}, `SELECT COALESCE(max(id), 0), count(*) FROM alerts WHERE workspace_id = $1`, ws)
+	return maxID, count, err
 }
 
 // CreateDeadLetter records a delivery that exhausted its retry budget.
@@ -1795,11 +2536,12 @@ func (p *Postgres) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, er
 	if err != nil {
 		return nil, mapErr(err)
 	}
+	d.Cause = ClassifyCause(d.LastStatus, d.LastError)
 	return &d, nil
 }
 
 // ListDeadLetters returns dead-letter records in id order, applying the
-// optional channel, alert, and pagination filters. A tenant sees only records
+// optional channel, alert, age, cause and pagination filters. A tenant sees only records
 // whose alert belongs to it; the dispatcher's system context sees every row.
 func (p *Postgres) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error) {
 	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
@@ -1823,17 +2565,66 @@ func (p *Postgres) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]D
 	if f.AfterID != 0 {
 		q += ` AND id > ` + arg(f.AfterID)
 	}
+	if !f.CreatedBefore.IsZero() {
+		q += ` AND created_at < ` + arg(f.CreatedBefore)
+	}
+	if f.OlderThan > 0 {
+		cutoff := time.Now().UTC().Add(-f.OlderThan)
+		q += ` AND created_at < ` + arg(cutoff)
+	}
+	if !f.CreatedAfter.IsZero() {
+		q += ` AND created_at >= ` + arg(f.CreatedAfter)
+	}
+	if len(f.IDs) > 0 {
+		q += ` AND id = ANY(` + arg(f.IDs) + `)`
+	}
 	q += ` ORDER BY id ASC LIMIT ` + arg(pageLimit(f.Limit))
 
 	rows, err := p.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (DeadLetter, error) {
+	letters, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (DeadLetter, error) {
 		var d DeadLetter
 		err := row.Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &d.CreatedAt)
+		if err == nil {
+			d.Cause = ClassifyCause(d.LastStatus, d.LastError)
+		}
 		return d, err
 	})
+	if err != nil {
+		return nil, err
+	}
+	if f.Cause != "" {
+		filtered := make([]DeadLetter, 0, len(letters))
+		for _, dl := range letters {
+			if dl.Cause == f.Cause {
+				filtered = append(filtered, dl)
+			}
+		}
+		return filtered, nil
+	}
+	return letters, nil
+}
+
+// ListDeadLetterGroups aggregates dead letters by channel and cause.
+func (p *Postgres) ListDeadLetterGroups(ctx context.Context, f DeadLetterFilter) ([]DeadLetterGroup, error) {
+	gf := f
+	gf.Limit = 10000
+	gf.AfterID = 0
+	letters, err := p.ListDeadLetters(ctx, gf)
+	if err != nil {
+		return nil, err
+	}
+	channels, err := p.ListChannels(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	chMap := make(map[int64]Channel, len(channels))
+	for _, ch := range channels {
+		chMap[ch.ID] = ch
+	}
+	return GroupDeadLetters(letters, chMap, f.Cause), nil
 }
 
 // DeleteDeadLetter removes one record, which is what a successful redrive does.
@@ -1857,11 +2648,68 @@ func (p *Postgres) DeleteDeadLetter(ctx context.Context, id int64) error {
 	return nil
 }
 
+// BulkDeleteDeadLetters removes dead letters matching the filter within the context's workspace.
+func (p *Postgres) BulkDeleteDeadLetters(ctx context.Context, f DeadLetterFilter) (int64, error) {
+	gf := f
+	if gf.Limit <= 0 || gf.Limit > 10000 {
+		gf.Limit = 10000
+	}
+	letters, err := p.ListDeadLetters(ctx, gf)
+	if err != nil {
+		return 0, err
+	}
+	if len(letters) == 0 {
+		return 0, nil
+	}
+	ids := make([]int64, len(letters))
+	for i, dl := range letters {
+		ids[i] = dl.ID
+	}
+
+	q := `DELETE FROM dead_letters WHERE id = ANY($1)`
+	args := []any{ids}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = $2)`
+		args = append(args, ws)
+	}
+	tag, err := p.pool.Exec(ctx, q, args...)
+	if err != nil {
+		return 0, mapErr(err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// DeleteExpiredDeadLetters removes up to limit dead letters created strictly before cutoff.
+func (p *Postgres) DeleteExpiredDeadLetters(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = DefaultPruneBatch
+	}
+	var deleted int64
+	err := p.pool.QueryRow(ctx, `
+		WITH expired AS (
+			SELECT id FROM dead_letters
+			WHERE created_at < $1
+			ORDER BY created_at ASC, id ASC
+			LIMIT $2
+		),
+		deleted_rows AS (
+			DELETE FROM dead_letters dl
+			USING expired e
+			WHERE dl.id = e.id
+			RETURNING dl.id
+		)
+		SELECT count(*) FROM deleted_rows`, cutoff, limit).Scan(&deleted)
+	if err != nil {
+		return 0, mapErr(err)
+	}
+	return deleted, nil
+}
+
 // buildAlertQuery builds the ListAlerts statement and its arguments. Both
 // readers call it so the routed and primary-bound forms cannot drift into
 // returning different pages.
 func buildAlertQuery(ctx context.Context, f AlertFilter) (string, []any) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version, runbook_url, response_guidance
 		 FROM alerts WHERE TRUE`
 	args := []any{}
 	n := 0
@@ -1948,7 +2796,7 @@ func scanAlert(row pgx.CollectableRow) (Alert, error) {
 	var monitorID, ruleID *int64
 	var origin *string
 	var sourceMonitorID, sourceRuleID *int64
-	err := row.Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.AcknowledgedBy, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID)
+	err := row.Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.AcknowledgedBy, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID, &a.RuleVersion, &a.RunbookURL, &a.ResponseGuidance)
 	a.Ledger = uint32(ledger)
 	if monitorID != nil {
 		a.MonitorID = *monitorID
@@ -1978,7 +2826,7 @@ func (p *Postgres) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit in
 		limit = DefaultPruneBatch
 	}
 	rows, err := p.pool.Query(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version, runbook_url, response_guidance
 		   FROM alerts WHERE created_at < $1 ORDER BY created_at ASC, id ASC LIMIT $2`,
 		cutoff, limit)
 	if err != nil {
@@ -2429,15 +3277,173 @@ func (p *Postgres) SetIngestState(ctx context.Context, network string, s IngestS
 			int64(s.LastLedger), s.LastCursor)
 		return err
 	}
-	_, err := p.pool.Exec(ctx, `
-		INSERT INTO network_ingest_state (network, last_ledger, last_cursor, updated_at)
+	_, err := p.pool.Exec(ctx,
+		`INSERT INTO network_ingest_state (network, last_ledger, last_cursor, updated_at)
 		VALUES ($1, $2, $3, now())
 		ON CONFLICT (network) DO UPDATE
 		    SET last_ledger = EXCLUDED.last_ledger,
 		        last_cursor = EXCLUDED.last_cursor,
-		        updated_at  = EXCLUDED.updated_at`,
+		    updated_at  = EXCLUDED.updated_at`,
 		network, int64(s.LastLedger), s.LastCursor)
 	return err
+}
+
+// --- retention gaps ---
+
+// RecordRetentionGap persists one detected hole in ingest history. There is
+// no dedup: each detection is a real observation, and the poller only
+// detects once per resume.
+func (p *Postgres) RecordRetentionGap(ctx context.Context, network string, fromLedger, toLedger uint32, detectedAt time.Time) error {
+	_, err := p.pool.Exec(ctx,
+		`INSERT INTO retention_gaps (network, from_ledger, to_ledger, detected_at)
+		 VALUES ($1, $2, $3, $4)`,
+		network, int64(fromLedger), int64(toLedger), detectedAt)
+	return err
+}
+
+// LatestRetentionGap returns the most recently detected gap for network, or
+// across every network when network is empty. ErrNotFound when none was ever
+// recorded — the healthy case, which callers treat as "no gap to report"
+// rather than an error.
+func (p *Postgres) LatestRetentionGap(ctx context.Context, network string) (RetentionGap, error) {
+	var g RetentionGap
+	var from, to int64
+	scan := func(row pgx.Row) error {
+		return row.Scan(&g.ID, &g.Network, &from, &to, &g.DetectedAt)
+	}
+	var err error
+	if network == "" {
+		err = p.queryRowFallback(ctx, scan,
+			`SELECT id, network, from_ledger, to_ledger, detected_at
+		     FROM retention_gaps ORDER BY detected_at DESC, id DESC LIMIT 1`)
+	} else {
+		err = p.queryRowFallback(ctx, scan,
+			`SELECT id, network, from_ledger, to_ledger, detected_at
+		     FROM retention_gaps WHERE network = $1
+		     ORDER BY detected_at DESC, id DESC LIMIT 1`, network)
+	}
+	if err != nil {
+		return RetentionGap{}, mapErr(err)
+	}
+	g.FromLedger, g.ToLedger = uint32(from), uint32(to)
+	return g, nil
+}
+
+// --- event archive ---
+
+// RecordEvents upserts one page of decoded events into the replay archive.
+// One batched round-trip regardless of page size: a poll cycle would
+// otherwise pay one network hop per event. ON CONFLICT (network, event_id)
+// DO NOTHING makes the write idempotent under the re-reads a crash or a
+// confirmation-depth hold causes — the same event arriving twice keeps one
+// row.
+func (p *Postgres) RecordEvents(ctx context.Context, network string, events []ArchivedEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for i := range events {
+		ev := &events[i]
+		batch.Queue(
+			`INSERT INTO event_archive (network, event_id, contract_id, ledger, ledger_closed_at, tx_hash, event_name, topics, value, fields)
+		     VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, '[]'::jsonb), $9, $10)
+		     ON CONFLICT (network, event_id) DO NOTHING`,
+			network, ev.EventID, ev.ContractID, int64(ev.Ledger), ev.LedgerClosedAt, ev.TxHash, ev.EventName,
+			ev.Topics, ev.Value, ev.Fields,
+		)
+	}
+	results := p.pool.SendBatch(ctx, batch)
+	defer results.Close() //nolint:errcheck // Close after a prior failure is a no-op
+	for range events {
+		if _, err := results.Exec(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// archiveFilterClause builds the WHERE clauses shared by the archive read
+// paths, so List and Count can never disagree about what matches. arg binds
+// each value and returns its placeholder.
+func archiveFilterClause(f EventArchiveFilter, arg func(any) string) string {
+	q := ` WHERE 1 = 1`
+	if f.Network != "" {
+		q += ` AND network = ` + arg(f.Network)
+	}
+	if len(f.ContractIDs) > 0 {
+		q += ` AND contract_id = ANY(` + arg(f.ContractIDs) + `)`
+	}
+	if f.FromLedger > 0 {
+		q += ` AND ledger >= ` + arg(int64(f.FromLedger))
+	}
+	if f.ToLedger > 0 {
+		q += ` AND ledger <= ` + arg(int64(f.ToLedger))
+	}
+	if f.AfterID > 0 {
+		q += ` AND id > ` + arg(f.AfterID)
+	}
+	return q
+}
+
+// ListArchivedEvents returns matching archived events oldest-first by id, so
+// a replay walks forward through history and pages with the id keyset.
+func (p *Postgres) ListArchivedEvents(ctx context.Context, f EventArchiveFilter) ([]ArchivedEvent, error) {
+	args := []any{}
+	n := 0
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	q := `SELECT id, network, event_id, contract_id, ledger, ledger_closed_at, tx_hash, event_name, topics, value, fields, ingested_at
+	     FROM event_archive` + archiveFilterClause(f, arg) +
+		` ORDER BY id ASC LIMIT ` + arg(pageLimit(f.Limit))
+	rows, err := p.queryRows(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ArchivedEvent
+	for rows.Next() {
+		ev, err := scanArchivedEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
+// CountArchivedEvents returns how many events match f. Replay calls it first
+// so a range too expensive to evaluate is rejected before any evaluation
+// runs rather than hanging mid-request.
+func (p *Postgres) CountArchivedEvents(ctx context.Context, f EventArchiveFilter) (int64, error) {
+	args := []any{}
+	n := 0
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	var count int64
+	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&count)
+	}, `SELECT count(*) FROM event_archive`+archiveFilterClause(f, arg), args...)
+	return count, err
+}
+
+// scanArchivedEvent reads one event_archive row. Topics/value/fields are
+// JSONB columns scanned as raw JSON; value and fields are NULL for events
+// whose decode produced nothing, which stays a nil RawMessage.
+func scanArchivedEvent(r rowScanner) (ArchivedEvent, error) {
+	var ev ArchivedEvent
+	var ledger int64
+	if err := r.Scan(&ev.ID, &ev.Network, &ev.EventID, &ev.ContractID, &ledger, &ev.LedgerClosedAt,
+		&ev.TxHash, &ev.EventName, &ev.Topics, &ev.Value, &ev.Fields, &ev.IngestedAt); err != nil {
+		return ArchivedEvent{}, mapErr(err)
+	}
+	ev.Ledger = uint32(ledger)
+	return ev, nil
 }
 
 const contractCursorRefsLock int64 = 0x534f524f435552
@@ -2585,18 +3591,64 @@ func (p *Postgres) DeleteDigestAlerts(ctx context.Context, channelID int64, ids 
 // --- audit log ---
 
 func (p *Postgres) CreateAuditEntry(ctx context.Context, e *AuditEntry) error {
-	diff := e.Diff
-	if len(diff) == 0 {
-		diff = json.RawMessage(`{}`)
+	NormalizeAuditEntry(ctx, e)
+	if e.CreatedAt.IsZero() {
+		e.CreatedAt = time.Now().UTC().Truncate(time.Millisecond)
+	} else {
+		e.CreatedAt = e.CreatedAt.UTC().Truncate(time.Millisecond)
 	}
-	return p.pool.QueryRow(ctx,
-		`INSERT INTO audit_log (actor, action, target_type, target_id, diff) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
-		e.Actor, e.Action, e.TargetType, e.TargetID, diff).Scan(&e.ID, &e.CreatedAt)
+
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('audit_log:' || $1))`, e.WorkspaceID); err != nil {
+		return err
+	}
+	var prevHash string
+	if err := tx.QueryRow(ctx,
+		`SELECT COALESCE((SELECT record_hash FROM audit_log WHERE workspace_id = $1 ORDER BY id DESC LIMIT 1), '')`,
+		e.WorkspaceID).Scan(&prevHash); err != nil {
+		return err
+	}
+	e.PrevHash = prevHash
+	e.RecordHash = ComputeAuditRecordHash(*e)
+
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO audit_log (
+			workspace_id, actor, actor_type, action, target_type, target_id,
+			resource_id, surface, source_ip, outcome, status_code, reason,
+			diff, prev_hash, record_hash, created_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6,
+			$7, $8, $9, $10, $11, $12,
+			$13, $14, $15, $16
+		) RETURNING id, created_at`,
+		e.WorkspaceID, e.Actor, e.ActorType, e.Action, e.TargetType, e.TargetID,
+		e.ResourceID, e.Surface, e.SourceIP, e.Outcome, e.StatusCode, e.Reason,
+		e.Diff, e.PrevHash, e.RecordHash, e.CreatedAt,
+	).Scan(&e.ID, &e.CreatedAt); err != nil {
+		return err
+	}
+	e.CreatedAt = e.CreatedAt.UTC()
+	return tx.Commit(ctx)
 }
 
 func (p *Postgres) ListAuditEntries(ctx context.Context, f AuditFilter) ([]AuditEntry, error) {
 	where := []string{"TRUE"}
 	args := []any{}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		if f.WorkspaceID != "" && f.WorkspaceID != string(ws) {
+			return []AuditEntry{}, nil
+		}
+		args = append(args, string(ws))
+		where = append(where, fmt.Sprintf("workspace_id = $%d", len(args)))
+	} else if f.WorkspaceID != "" {
+		args = append(args, f.WorkspaceID)
+		where = append(where, fmt.Sprintf("workspace_id = $%d", len(args)))
+	}
 	if f.TargetType != "" {
 		args = append(args, f.TargetType)
 		where = append(where, fmt.Sprintf("target_type = $%d", len(args)))
@@ -2604,6 +3656,14 @@ func (p *Postgres) ListAuditEntries(ctx context.Context, f AuditFilter) ([]Audit
 	if f.TargetID != 0 {
 		args = append(args, f.TargetID)
 		where = append(where, fmt.Sprintf("target_id = $%d", len(args)))
+	}
+	if f.ResourceID != "" {
+		args = append(args, f.ResourceID)
+		where = append(where, fmt.Sprintf("resource_id = $%d", len(args)))
+	}
+	if f.Action != "" {
+		args = append(args, f.Action)
+		where = append(where, fmt.Sprintf("action = $%d", len(args)))
 	}
 	if !f.From.IsZero() {
 		args = append(args, f.From)
@@ -2617,6 +3677,18 @@ func (p *Postgres) ListAuditEntries(ctx context.Context, f AuditFilter) ([]Audit
 		args = append(args, f.Actor)
 		where = append(where, fmt.Sprintf("actor = $%d", len(args)))
 	}
+	if f.ActorType != "" {
+		args = append(args, f.ActorType)
+		where = append(where, fmt.Sprintf("actor_type = $%d", len(args)))
+	}
+	if f.Surface != "" {
+		args = append(args, f.Surface)
+		where = append(where, fmt.Sprintf("surface = $%d", len(args)))
+	}
+	if f.Outcome != "" {
+		args = append(args, f.Outcome)
+		where = append(where, fmt.Sprintf("outcome = $%d", len(args)))
+	}
 	if f.AfterID != 0 {
 		// The listing is id DESC, so the next page holds strictly smaller ids.
 		args = append(args, f.AfterID)
@@ -2624,7 +3696,10 @@ func (p *Postgres) ListAuditEntries(ctx context.Context, f AuditFilter) ([]Audit
 	}
 	limit := clampAuditLimit(f.Limit)
 	args = append(args, limit)
-	q := `SELECT id, actor, action, target_type, target_id, diff, created_at FROM audit_log WHERE ` +
+	q := `SELECT id, workspace_id, actor, actor_type, action, target_type, target_id,
+	             resource_id, surface, source_ip, outcome, status_code, reason,
+	             diff, prev_hash, record_hash, created_at
+	        FROM audit_log WHERE ` +
 		strings.Join(where, " AND ") + fmt.Sprintf(" ORDER BY id DESC LIMIT $%d", len(args))
 	rows, err := p.pool.Query(ctx, q, args...)
 	if err != nil {
@@ -2635,7 +3710,11 @@ func (p *Postgres) ListAuditEntries(ctx context.Context, f AuditFilter) ([]Audit
 	for rows.Next() {
 		var e AuditEntry
 		var diff []byte
-		if err := rows.Scan(&e.ID, &e.Actor, &e.Action, &e.TargetType, &e.TargetID, &diff, &e.CreatedAt); err != nil {
+		if err := rows.Scan(
+			&e.ID, &e.WorkspaceID, &e.Actor, &e.ActorType, &e.Action, &e.TargetType, &e.TargetID,
+			&e.ResourceID, &e.Surface, &e.SourceIP, &e.Outcome, &e.StatusCode, &e.Reason,
+			&diff, &e.PrevHash, &e.RecordHash, &e.CreatedAt,
+		); err != nil {
 			return nil, err
 		}
 		e.Diff = json.RawMessage(diff)
@@ -2704,6 +3783,14 @@ func (p *Postgres) UpsertBackfill(ctx context.Context, b *Backfill) error {
 // turn into a stale write.
 func (p *Postgres) GetStats(ctx context.Context) (Stats, error) {
 	var s Stats
+	cutoff, policy, hasCutoff := p.workspaceAlertCutoff(ctx)
+	var cutoffArg *time.Time
+	if hasCutoff {
+		c := cutoff.UTC()
+		cutoffArg = &c
+		s.PrunedBefore = &c
+		s.RetentionPolicySource = policy.PolicySource
+	}
 	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
 		return row.Scan(&s.Monitors, &s.Rules, &s.Channels, &s.Alerts, &s.AlertsLast24, &s.LastLedger, &s.LastPollAt)
 	}, `
@@ -2711,11 +3798,31 @@ func (p *Postgres) GetStats(ctx context.Context) (Stats, error) {
 			(SELECT count(*) FROM monitors WHERE workspace_id = $1),
 			(SELECT count(*) FROM rules r JOIN monitors m ON m.id = r.monitor_id WHERE m.workspace_id = $1),
 			(SELECT count(*) FROM channels WHERE workspace_id = $1),
-			(SELECT count(*) FROM alerts WHERE workspace_id = $1),
-			(SELECT count(*) FROM alerts WHERE workspace_id = $1 AND created_at > now() - interval '24 hours'),
+			CASE WHEN $2::timestamptz IS NULL THEN
+				COALESCE((SELECT sum(total_count) FROM alert_stat_rollups WHERE workspace_id = $1), 0)
+			ELSE
+				(SELECT count(*) FROM alerts WHERE workspace_id = $1 AND created_at >= $2)
+			END,
+			(SELECT count(*) FROM alerts WHERE workspace_id = $1 AND created_at > now() - interval '24 hours' AND ($2::timestamptz IS NULL OR created_at >= $2)),
 			(SELECT last_ledger FROM ingest_state WHERE id = 1),
-			(SELECT updated_at FROM ingest_state WHERE id = 1)`, workspaceID(ctx))
-	return s, err
+			(SELECT updated_at FROM ingest_state WHERE id = 1)`, workspaceID(ctx), cutoffArg)
+	if err != nil {
+		return s, err
+	}
+	// The most recent retention gap is an instance fact like last_ledger,
+	// not tenant data: if the service lost history, every operator of this
+	// instance needs to know. No recorded gap is the healthy case and leaves
+	// the field nil, which JSON omits.
+	gap, err := p.LatestRetentionGap(ctx, "")
+	switch {
+	case err == nil:
+		s.RetentionGap = &gap
+	case errors.Is(err, ErrNotFound):
+		// No gap ever recorded; report the shape GET /stats always had.
+	default:
+		return s, err
+	}
+	return s, nil
 }
 
 // AlertCountsByDay returns the daily alert totals behind the dashboard chart.
@@ -2723,6 +3830,11 @@ func (p *Postgres) GetStats(ctx context.Context) (Stats, error) {
 // behind real time, and no decision is taken from the value.
 func (p *Postgres) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCount, error) {
 	days = ClampAlertSeriesDays(days)
+	var cutoffArg *time.Time
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok {
+		c := cutoff.UTC()
+		cutoffArg = &c
+	}
 	// generate_series fills every UTC calendar day in the window, including
 	// zeroes, so a quiet day is an explicit 0 rather than a missing bar.
 	// date_trunc / ::date run on (timestamptz AT TIME ZONE 'UTC') so the
@@ -2739,8 +3851,9 @@ func (p *Postgres) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCo
 		FROM days
 		LEFT JOIN alerts a ON (a.created_at AT TIME ZONE 'UTC')::date = days.day
 			AND a.workspace_id = $2
+			AND ($3::timestamptz IS NULL OR a.created_at >= $3)
 		GROUP BY days.day
-		ORDER BY days.day`, days, workspaceID(ctx))
+		ORDER BY days.day`, days, workspaceID(ctx), cutoffArg)
 	if err != nil {
 		return nil, err
 	}
@@ -2768,9 +3881,14 @@ func (p *Postgres) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCo
 // page of zeroes that looks like a healthy but quiet monitor.
 func (p *Postgres) GetMonitorStats(ctx context.Context, monitorID int64) (MonitorStats, error) {
 	var (
-		ms     MonitorStats
-		exists bool
+		ms        MonitorStats
+		exists    bool
+		cutoffArg *time.Time
 	)
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok {
+		c := cutoff.UTC()
+		cutoffArg = &c
+	}
 	ms.MonitorID = monitorID
 	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
 		return row.Scan(&exists, &ms.Alerts, &ms.AlertsLast24h, &ms.AlertsLast7d,
@@ -2778,15 +3896,15 @@ func (p *Postgres) GetMonitorStats(ctx context.Context, monitorID int64) (Monito
 	}, `
 		SELECT
 			(SELECT count(*) FROM monitors WHERE id = $1 AND workspace_id = $4) > 0,
-			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4),
-			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4 AND created_at > now() - interval '24 hours'),
-			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4 AND created_at > now() - interval '7 days'),
-			(SELECT max(created_at) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4 AND ($5::timestamptz IS NULL OR created_at >= $5)),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4 AND created_at > now() - interval '24 hours' AND ($5::timestamptz IS NULL OR created_at >= $5)),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4 AND created_at > now() - interval '7 days' AND ($5::timestamptz IS NULL OR created_at >= $5)),
+			(SELECT max(created_at) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4 AND ($5::timestamptz IS NULL OR created_at >= $5)),
 			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
-			   WHERE a.monitor_id = $1 AND a.workspace_id = $4 AND da.status = $2),
+			   WHERE a.monitor_id = $1 AND a.workspace_id = $4 AND da.status = $2 AND ($5::timestamptz IS NULL OR a.created_at >= $5)),
 			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
-			   WHERE a.monitor_id = $1 AND a.workspace_id = $4 AND da.status = $3)`,
-		monitorID, DeliveryStatusSuccess, DeliveryStatusFailed, workspaceID(ctx))
+			   WHERE a.monitor_id = $1 AND a.workspace_id = $4 AND da.status = $3 AND ($5::timestamptz IS NULL OR a.created_at >= $5))`,
+		monitorID, DeliveryStatusSuccess, DeliveryStatusFailed, workspaceID(ctx), cutoffArg)
 	if err != nil {
 		return ms, err
 	}
@@ -2797,10 +3915,10 @@ func (p *Postgres) GetMonitorStats(ctx context.Context, monitorID int64) (Monito
 	rows, err := p.queryRows(ctx, `
 		SELECT r.id, r.type, count(a.id)
 		FROM rules r
-		LEFT JOIN alerts a ON a.rule_id = r.id
+		LEFT JOIN alerts a ON a.rule_id = r.id AND a.workspace_id = $2 AND ($3::timestamptz IS NULL OR a.created_at >= $3)
 		WHERE r.monitor_id = $1
 		GROUP BY r.id, r.type
-		ORDER BY r.id`, monitorID)
+		ORDER BY r.id`, monitorID, workspaceID(ctx), cutoffArg)
 	if err != nil {
 		return ms, err
 	}
@@ -3031,7 +4149,8 @@ func (p *Postgres) CreateAPIToken(ctx context.Context, t *auth.Token) error {
 // then gets — never anything the caller supplied.
 func (p *Postgres) TokenByHash(ctx context.Context, hash string) (*auth.Token, bool, error) {
 	t, err := scanAPIToken(p.pool.QueryRow(ctx,
-		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
+		        rotated_from_id, successor_id, rotated_at, pre_rotation_expires_at
 		   FROM api_tokens WHERE token_hash = $1`, hash))
 	if errors.Is(err, ErrNotFound) {
 		return nil, false, nil
@@ -3044,7 +4163,8 @@ func (p *Postgres) TokenByHash(ctx context.Context, hash string) (*auth.Token, b
 
 func (p *Postgres) ListAPITokens(ctx context.Context) ([]auth.Token, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
+		        rotated_from_id, successor_id, rotated_at, pre_rotation_expires_at
 		   FROM api_tokens WHERE workspace_id = $1 ORDER BY id DESC`,
 		workspaceID(ctx))
 	if err != nil {
@@ -3060,6 +4180,146 @@ func (p *Postgres) ListAPITokens(ctx context.Context) ([]auth.Token, error) {
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// GetAPIToken returns one token by id in the caller's workspace.
+func (p *Postgres) GetAPIToken(ctx context.Context, id int64) (*auth.Token, error) {
+	t, err := scanAPIToken(p.pool.QueryRow(ctx,
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
+		        rotated_from_id, successor_id, rotated_at, pre_rotation_expires_at
+		   FROM api_tokens WHERE id = $1 AND workspace_id = $2`,
+		id, workspaceID(ctx)))
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// RotateAPIToken atomically creates a successor token and updates the predecessor
+// with the successor's id, rotation timestamp, and new expiry.
+func (p *Postgres) RotateAPIToken(ctx context.Context, predecessorID int64, successor *auth.Token, predecessorExpiry time.Time) error {
+	ws := workspaceID(ctx)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	pred, err := scanAPIToken(tx.QueryRow(ctx,
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
+		        rotated_from_id, successor_id, rotated_at, pre_rotation_expires_at
+		   FROM api_tokens WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+		predecessorID, ws))
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	if !pred.RevokedAt.IsZero() {
+		return fmt.Errorf("cannot rotate a revoked token")
+	}
+	if !pred.ExpiresAt.IsZero() && now.After(pred.ExpiresAt) {
+		return fmt.Errorf("cannot rotate an expired token")
+	}
+
+	var succExpires any
+	if !successor.ExpiresAt.IsZero() {
+		succExpires = successor.ExpiresAt
+	}
+
+	var succCreated, succRotated time.Time
+	err = tx.QueryRow(ctx,
+		`INSERT INTO api_tokens (workspace_id, name, token_hash, prefix, scopes, expires_at, rotated_from_id, rotated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, created_at, rotated_at`,
+		ws, successor.Name, successor.Hash, successor.Prefix, auth.JoinScopes(successor.Scopes),
+		succExpires, predecessorID, now).Scan(&successor.ID, &succCreated, &succRotated)
+	if err != nil {
+		return mapErr(err)
+	}
+	successor.Workspace = ws
+	successor.CreatedAt = succCreated
+	successor.RotatedAt = succRotated
+	successor.RotatedFromID = &predecessorID
+
+	var predExpiry any
+	if !predecessorExpiry.IsZero() {
+		predExpiry = predecessorExpiry
+	}
+	var origPredExpires any
+	if !pred.ExpiresAt.IsZero() {
+		origPredExpires = pred.ExpiresAt
+	}
+
+	_, err = tx.Exec(ctx,
+		`UPDATE api_tokens
+		    SET successor_id = $1, rotated_at = $2, pre_rotation_expires_at = $3, expires_at = $4
+		  WHERE id = $5 AND workspace_id = $6`,
+		successor.ID, now, origPredExpires, predExpiry, predecessorID, ws)
+	if err != nil {
+		return mapErr(err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+// AbandonAPITokenRotation revokes the successor and restores predecessor's pre-rotation expiry.
+func (p *Postgres) AbandonAPITokenRotation(ctx context.Context, id int64) error {
+	ws := workspaceID(ctx)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tok, err := scanAPIToken(tx.QueryRow(ctx,
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
+		        rotated_from_id, successor_id, rotated_at, pre_rotation_expires_at
+		   FROM api_tokens WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+		id, ws))
+	if err != nil {
+		return err
+	}
+
+	var predID, succID int64
+	switch {
+	case tok.SuccessorID != nil:
+		predID = tok.ID
+		succID = *tok.SuccessorID
+	case tok.RotatedFromID != nil:
+		succID = tok.ID
+		predID = *tok.RotatedFromID
+	default:
+		return fmt.Errorf("no rotation in progress for token %d", id)
+	}
+
+	var preRotExpires *time.Time
+	err = tx.QueryRow(ctx,
+		`SELECT pre_rotation_expires_at FROM api_tokens WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+		predID, ws).Scan(&preRotExpires)
+	if err != nil {
+		return mapErr(err)
+	}
+
+	_, err = tx.Exec(ctx,
+		`UPDATE api_tokens SET revoked_at = COALESCE(revoked_at, now()) WHERE id = $1 AND workspace_id = $2`,
+		succID, ws)
+	if err != nil {
+		return mapErr(err)
+	}
+
+	var restoredExpiry any
+	if preRotExpires != nil {
+		restoredExpiry = *preRotExpires
+	}
+	_, err = tx.Exec(ctx,
+		`UPDATE api_tokens
+		    SET successor_id = NULL, rotated_at = NULL, pre_rotation_expires_at = NULL, expires_at = $1
+		  WHERE id = $2 AND workspace_id = $3`,
+		restoredExpiry, predID, ws)
+	if err != nil {
+		return mapErr(err)
+	}
+
+	return tx.Commit(ctx)
 }
 
 // RevokeAPIToken retires one of the caller's tokens. COALESCE keeps the first
@@ -3098,9 +4358,11 @@ func (p *Postgres) TouchAPIToken(ctx context.Context, id int64, at time.Time) er
 func scanAPIToken(row rowScanner) (auth.Token, error) {
 	var t auth.Token
 	var scopes string
-	var expiresAt, lastUsedAt, revokedAt *time.Time
+	var expiresAt, lastUsedAt, revokedAt, rotatedAt, preRotExpires *time.Time
+	var rotatedFromID, successorID *int64
 	err := row.Scan(&t.ID, &t.Workspace, &t.Name, &t.Hash, &t.Prefix, &scopes,
-		&expiresAt, &lastUsedAt, &revokedAt, &t.CreatedAt)
+		&expiresAt, &lastUsedAt, &revokedAt, &t.CreatedAt,
+		&rotatedFromID, &successorID, &rotatedAt, &preRotExpires)
 	if err != nil {
 		return t, mapErr(err)
 	}
@@ -3113,6 +4375,14 @@ func scanAPIToken(row rowScanner) (auth.Token, error) {
 	}
 	if revokedAt != nil {
 		t.RevokedAt = *revokedAt
+	}
+	t.RotatedFromID = rotatedFromID
+	t.SuccessorID = successorID
+	if rotatedAt != nil {
+		t.RotatedAt = *rotatedAt
+	}
+	if preRotExpires != nil {
+		t.PreRotationExpiresAt = *preRotExpires
 	}
 	return t, nil
 }
@@ -3214,4 +4484,66 @@ func mapErr(err error) error {
 // cursor, so peak memory is one page rather than the whole result set.
 func (p *Postgres) ListAlertsStream(ctx context.Context, f AlertFilter, fn func(Alert) error) error {
 	return streamAlerts(ctx, f, p.ListAlerts, fn)
+}
+
+func (p *Postgres) RegisterPersistedOperation(ctx context.Context, op PersistedOperation) error {
+	now := time.Now().UTC()
+	if op.CreatedAt.IsZero() {
+		op.CreatedAt = now
+	}
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO persisted_operations (id, name, document, created_at)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (id) DO UPDATE SET
+			name = EXCLUDED.name,
+			document = EXCLUDED.document`,
+		op.ID, op.Name, op.Document, op.CreatedAt)
+	return mapErr(err)
+}
+
+func (p *Postgres) GetPersistedOperation(ctx context.Context, id string) (*PersistedOperation, error) {
+	var op PersistedOperation
+	err := p.pool.QueryRow(ctx, `
+		SELECT id, name, document, created_at
+		FROM persisted_operations
+		WHERE id = $1`, id).Scan(&op.ID, &op.Name, &op.Document, &op.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, mapErr(err)
+	}
+	return &op, nil
+}
+
+func (p *Postgres) ListPersistedOperations(ctx context.Context) ([]PersistedOperation, error) {
+	rows, err := p.pool.Query(ctx, `
+		SELECT id, name, document, created_at
+		FROM persisted_operations
+		ORDER BY created_at DESC, id ASC`)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	var ops []PersistedOperation
+	for rows.Next() {
+		var op PersistedOperation
+		if err := rows.Scan(&op.ID, &op.Name, &op.Document, &op.CreatedAt); err != nil {
+			return nil, mapErr(err)
+		}
+		ops = append(ops, op)
+	}
+	return ops, rows.Err()
+}
+
+func (p *Postgres) DeletePersistedOperation(ctx context.Context, id string) error {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM persisted_operations WHERE id = $1`, id)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

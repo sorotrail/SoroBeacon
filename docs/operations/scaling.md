@@ -156,6 +156,14 @@ What to expect:
 - **Readiness follows the primary only.** `/readyz` stays green while the
   replica is down, because the instance can still serve traffic through the
   fallback. Watch the replica with the metrics below instead of with readiness.
+- **Bounded staleness and cursor safety.** Replication lag is sampled from the
+  replica via `pg_last_xact_replay_timestamp()`. When observed lag exceeds the
+  configured bound (`DefaultMaxReplicaLag` = `30s`), routed reads automatically
+  fall back to the primary pool until the replica catches up. For keyset
+  pagination on `ListAlerts`, if a cursor ID minted against the primary has not
+  yet replicated to the replica, `ListAlerts` detects the missing cursor anchor
+  and replays the page against the primary so pagination never skips or
+  truncates rows.
 - **The replica must be at least as new as the primary's schema.** Migrations
   run against `DATABASE_URL`; a replica created from a base backup taken before
   a migration will answer routed queries with `column does not exist`, which is
@@ -166,10 +174,14 @@ Metrics on `/metrics`:
 - `sorobeacon_store_reads_total{pool="primary|replica"}` — where routed reads
   actually landed. If the `replica` series stays flat, routing is not happening.
 - `sorobeacon_store_replica_fallbacks_total` — reads that had to be replayed on
-  the primary. A steady rate means the replica is unreachable or too far behind
-  to be worth routing to.
+  the primary (because the replica was unreachable, exceeded the `30s` lag
+  bound, or lacked a newly minted pagination cursor anchor). A steady rate means
+  the replica is unreachable or too far behind to be worth routing to.
 - `sorobeacon_store_replica_enabled` — `1` when a replica is configured, `0`
   when everything reads from the primary.
+- `sorobeacon_store_replica_lag_seconds` — observed replication lag in seconds
+  on the read replica (`now() - pg_last_xact_replay_timestamp()`); `0` when no
+  replica is configured.
 
 ## Multi-instance deployment
 
@@ -281,6 +293,7 @@ hot path in production because most `(rule, event)` pairs do not fire an alert.
 | `absence_of_event` | 765 | 681 | ~1,470,000 | 32 B / 1 alloc | **Medium** — `Spec` duration parse + topic name check |
 | `self_transfer` | 1,158 | 726 | ~1,380,000 | 80–192 B / 2–7 allocs | **Medium** — fast exit when `from != to`; `big.Int` compare on match |
 | `frequency_threshold` | 1,268 | 944 | ~1,060,000 | 112–136 B / 2–3 allocs | **Medium (stateful)** — mutex-guarded rolling-window slice prune |
+| `baseline_deviation` | 2,410 | 2,180 | ~458,000 | 320 B / 6 allocs | **Medium (stateful)** — bounded median/MAD + Welford window per bucket |
 | `token_supply_change` | 1,250 | 1,123 | ~890,000 | 136 B / 4 allocs | **Medium** — `json.NewDecoder` + `big.Int` amount threshold |
 | `time_window` | 1,241 | 1,154 | ~866,000 | 144 B / 3 allocs | **Medium** — `HH:MM` UTC clock parsing + weekday check |
 | `event_name_glob` | 1,161 | 1,760 | ~568,000 | 136 B / 4 allocs | **Medium** — `path.Match` across pattern list |

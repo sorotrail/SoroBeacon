@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/sorotrail/sorobeacon/internal/apierr"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/rules"
 )
@@ -112,3 +113,36 @@ func TestOpenAPISpecCoversAllRoutes(t *testing.T) {
 		}
 	}
 }
+
+// TestOpenAPISpecDocumentsAllErrorTaxonomyCodes ensures the error taxonomy and openapi.json
+// stay in lockstep without drift.
+func TestOpenAPISpecDocumentsAllErrorTaxonomyCodes(t *testing.T) {
+	var doc struct {
+		Components struct {
+			Schemas struct {
+				Error struct {
+					Properties struct {
+						Code struct {
+							Enum []string `json:"enum"`
+						} `json:"code"`
+					} `json:"properties"`
+				} `json:"Error"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(openapiSpec, &doc); err != nil {
+		t.Fatalf("openapi.json parse: %v", err)
+	}
+
+	docCodes := map[string]bool{}
+	for _, c := range doc.Components.Schemas.Error.Properties.Code.Enum {
+		docCodes[c] = true
+	}
+
+	for _, code := range apierr.AllCodes() {
+		if !docCodes[code] {
+			t.Errorf("taxonomy error code %q is not documented in openapi.json Error schema enum", code)
+		}
+	}
+}
+

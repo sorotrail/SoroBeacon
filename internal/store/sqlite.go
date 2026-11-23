@@ -11,10 +11,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	sqlite "modernc.org/sqlite"
 
+	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
@@ -58,7 +60,12 @@ type SQLite struct {
 	db *sql.DB
 	// cipher encrypts and decrypts channels.config at rest; nil keeps the
 	// plaintext behaviour, exactly as the Postgres store does.
-	cipher ConfigCipher
+	cipher  ConfigCipher
+	metrics *metrics.Metrics
+	// alertRetention holds the instance-default alert retention duration in
+	// nanoseconds so read-time visibility horizon checks can fall back to the
+	// global ALERT_RETENTION when a workspace has no custom policy.
+	alertRetention atomic.Int64
 }
 
 var _ Store = (*SQLite)(nil)
@@ -68,6 +75,12 @@ var _ Store = (*SQLite)(nil)
 // config as plaintext, matching the Postgres backend.
 func (s *SQLite) WithConfigCipher(c ConfigCipher) *SQLite {
 	s.cipher = c
+	return s
+}
+
+// WithMetrics attaches Prometheus instrumentation to the SQLite store.
+func (s *SQLite) WithMetrics(m *metrics.Metrics) *SQLite {
+	s.metrics = m
 	return s
 }
 
@@ -248,6 +261,16 @@ func sqliteCreatedAt(t time.Time) any {
 	return sqliteTimeString(t)
 }
 
+// sqliteNullTime renders a *time.Time for a nullable TEXT timestamp column:
+// a nil pointer stays SQL NULL, an instant becomes the fixed-width UTC
+// layout. Used by the event archive, whose ledger close time is optional.
+func sqliteNullTime(t *time.Time) any {
+	if t == nil || t.IsZero() {
+		return nil
+	}
+	return sqliteTimeString(*t)
+}
+
 // parseSQLiteTime reverses sqliteTimeString. An empty string is the zero time
 // so a NULL / absent timestamp never becomes an error.
 func parseSQLiteTime(s string) (time.Time, error) {
@@ -316,10 +339,50 @@ func (s *SQLite) EnsureWorkspace(ctx context.Context, id workspace.ID) error {
 	return mapSQLiteErr(err)
 }
 
+func (s *SQLite) SetWorkspaceGuidance(ctx context.Context, id workspace.ID, runbookURL, responseGuidance string) error {
+	var err error
+	runbookURL, err = ValidateRunbookURL(runbookURL)
+	if err != nil {
+		return err
+	}
+	responseGuidance, err = ValidateResponseGuidance(responseGuidance)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO workspaces (id, name, default_runbook_url, default_response_guidance)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT (id) DO UPDATE
+		 SET default_runbook_url = excluded.default_runbook_url,
+		     default_response_guidance = excluded.default_response_guidance`,
+		string(id), string(id), runbookURL, responseGuidance)
+	return mapSQLiteErr(err)
+}
+
+func (s *SQLite) GetWorkspaceGuidance(ctx context.Context, id workspace.ID) (runbookURL, responseGuidance string, err error) {
+	err = s.db.QueryRowContext(ctx,
+		`SELECT default_runbook_url, default_response_guidance FROM workspaces WHERE id = ?`,
+		string(id)).Scan(&runbookURL, &responseGuidance)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", nil
+	}
+	return runbookURL, responseGuidance, mapSQLiteErr(err)
+}
+
 // --- monitors ---
 
 func (s *SQLite) CreateMonitor(ctx context.Context, m *Monitor) error {
+	if err := normalizeMonitorGuidance(m); err != nil {
+		return err
+	}
 	ids, err := json.Marshal(m.ContractIDs)
+	if err != nil {
+		return err
+	}
+	// Normalised here rather than at each caller so every write path —
+	// API, dashboard, import — stores one canonical tag set.
+	m.Tags = NormalizeTags(m.Tags)
+	tagJSON, err := json.Marshal(m.Tags)
 	if err != nil {
 		return err
 	}
@@ -328,12 +391,16 @@ func (s *SQLite) CreateMonitor(ctx context.Context, m *Monitor) error {
 		return mapSQLiteErr(err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	ws := workspaceID(ctx)
+	if err := s.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
 	var created string
 	if err := tx.QueryRowContext(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+		`INSERT INTO monitors (name, contract_ids, tags, enabled, priority, workspace_id, network, created_at, runbook_url, response_guidance)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?, ?)
 		 RETURNING id, created_at`,
-		m.Name, string(ids), boolToInt(m.Enabled), string(m.Priority.Normalized()), workspaceID(ctx), m.Network, sqliteCreatedAt(m.CreatedAt),
+		m.Name, string(ids), string(tagJSON), boolToInt(m.Enabled), string(m.Priority.Normalized()), ws, m.Network, sqliteCreatedAt(m.CreatedAt), m.RunbookURL, m.ResponseGuidance,
 	).Scan(&m.ID, &created); err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -341,13 +408,14 @@ func (s *SQLite) CreateMonitor(ctx context.Context, m *Monitor) error {
 	if err != nil {
 		return err
 	}
+	m.WorkspaceID = string(ws)
 	return mapSQLiteErr(tx.Commit())
 }
 
 func (s *SQLite) GetMonitor(ctx context.Context, id int64) (*Monitor, error) {
 	ws := workspaceID(ctx)
 	m, err := scanSQLiteMonitor(s.db.QueryRowContext(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = ? AND workspace_id = ?`, id, ws))
+		`SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE id = ? AND workspace_id = ?`, id, ws))
 	if err != nil {
 		return nil, err
 	}
@@ -386,7 +454,7 @@ func (s *SQLite) monitorChannelIDs(ctx context.Context, monitorID int64, ws work
 // workspace's enabled monitors or a monitor in a second tenant would silently
 // stop being polled.
 func (s *SQLite) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE 1 = 1 AND deleted_at IS NULL`
+	q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE 1 = 1 AND deleted_at IS NULL`
 	args := []any{}
 	if ws, scoped := tenantWorkspace(ctx); scoped {
 		q += ` AND workspace_id = ?`
@@ -418,7 +486,7 @@ func (s *SQLite) queryMonitors(ctx context.Context, q string, args ...any) ([]Mo
 
 func (s *SQLite) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor, error) {
 	ws := workspaceID(ctx)
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE workspace_id = ? AND deleted_at IS NULL`
+	q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE workspace_id = ? AND deleted_at IS NULL`
 	args := []any{ws}
 	if f.Query != "" {
 		// instr + lower is a parameterized substring match without LIKE
@@ -429,6 +497,14 @@ func (s *SQLite) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor,
 	if f.Network != "" {
 		q += ` AND network = ?`
 		args = append(args, f.Network)
+	}
+	for _, t := range NormalizeTags(f.Tags) {
+		// The quoted element ("treasury") can only match one exact tag in
+		// the JSON text — the closing quote rules out partial matches —
+		// so the substring search is an exact tag test, matching the
+		// Postgres @> containment clause. Repeated tags AND together.
+		q += ` AND instr(tags, ?) > 0`
+		args = append(args, `"`+t+`"`)
 	}
 	switch {
 	case f.Enabled != nil && *f.Enabled:
@@ -469,7 +545,15 @@ func (s *SQLite) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor,
 }
 
 func (s *SQLite) UpdateMonitor(ctx context.Context, m *Monitor) error {
+	if err := normalizeMonitorGuidance(m); err != nil {
+		return err
+	}
 	ids, err := json.Marshal(m.ContractIDs)
+	if err != nil {
+		return err
+	}
+	m.Tags = NormalizeTags(m.Tags)
+	tagJSON, err := json.Marshal(m.Tags)
 	if err != nil {
 		return err
 	}
@@ -484,8 +568,8 @@ func (s *SQLite) UpdateMonitor(ctx context.Context, m *Monitor) error {
 		return mapSQLiteErr(err)
 	}
 	res, err := tx.ExecContext(ctx,
-		`UPDATE monitors SET name = ?, contract_ids = ?, enabled = ?, priority = ? WHERE id = ? AND workspace_id = ?`,
-		m.Name, string(ids), boolToInt(m.Enabled), string(m.Priority.Normalized()), m.ID, workspaceID(ctx))
+		`UPDATE monitors SET name = ?, contract_ids = ?, tags = ?, enabled = ?, priority = ?, runbook_url = ?, response_guidance = ? WHERE id = ? AND workspace_id = ?`,
+		m.Name, string(ids), string(tagJSON), boolToInt(m.Enabled), string(m.Priority.Normalized()), m.RunbookURL, m.ResponseGuidance, m.ID, workspaceID(ctx))
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -514,7 +598,7 @@ func (s *SQLite) SetMonitorsEnabled(ctx context.Context, ids []int64, enabled bo
 	}
 	args = append(args, workspaceID(ctx))
 	rows, err := s.db.QueryContext(ctx,
-		`UPDATE monitors SET enabled = ? WHERE id IN (`+placeholders(len(uniq))+`) AND workspace_id = ? RETURNING id`, args...)
+		`UPDATE monitors SET enabled = ? WHERE id IN (`+placeholders(len(uniq))+`) AND workspace_id = ? RETURNING id`, args...) // #nosec G202 -- placeholders generates only ? markers; values are bound in args
 	if err != nil {
 		return 0, nil, err
 	}
@@ -584,9 +668,28 @@ func (s *SQLite) SoftDeleteMonitor(ctx context.Context, id int64) error {
 // RestoreMonitor restores a soft-deleted monitor. Returns ErrNotFound
 // if the monitor doesn't exist or isn't deleted.
 func (s *SQLite) RestoreMonitor(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx,
+	ws := workspaceID(ctx)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var exists int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT count(*) FROM monitors WHERE id = ? AND workspace_id = ? AND deleted_at IS NOT NULL`,
+		id, ws).Scan(&exists); err != nil {
+		return mapSQLiteErr(err)
+	}
+	if exists == 0 {
+		return ErrNotFound
+	}
+	if err := s.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx,
 		`UPDATE monitors SET deleted_at = NULL WHERE id = ? AND workspace_id = ? AND deleted_at IS NOT NULL`,
-		id, workspaceID(ctx))
+		id, ws)
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -597,13 +700,13 @@ func (s *SQLite) RestoreMonitor(ctx context.Context, id int64) error {
 	if n == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return mapSQLiteErr(tx.Commit())
 }
 
 // ListDeletedMonitors returns soft-deleted monitors (the "trash").
 func (s *SQLite) ListDeletedMonitors(ctx context.Context, f ListFilter) ([]Monitor, error) {
 	ws := workspaceID(ctx)
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE workspace_id = ? AND deleted_at IS NOT NULL`
+	q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE workspace_id = ? AND deleted_at IS NOT NULL`
 	args := []any{ws}
 	if f.Query != "" {
 		q += ` AND instr(lower(name), lower(?)) > 0`
@@ -678,7 +781,7 @@ func (s *SQLite) deleteByID(ctx context.Context, table string, id int64) error {
 	if !deletableTables[table] {
 		return errUnallowlistedTable
 	}
-	res, err := s.db.ExecContext(ctx, `DELETE FROM `+table+` WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx))
+	res, err := s.db.ExecContext(ctx, `DELETE FROM `+table+` WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx)) // #nosec G202 -- table is checked against deletableTables allowlist above
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -697,6 +800,9 @@ func (s *SQLite) deleteByID(ctx context.Context, table string, id int64) error {
 // monitor whose rules went missing is a monitor that watches a contract and
 // never says anything, and nothing outside this call would report the gap.
 func (s *SQLite) CreateMonitorWithRules(ctx context.Context, m *Monitor, rules []*Rule, channelIDs []int64) error {
+	if err := normalizeMonitorGuidance(m); err != nil {
+		return err
+	}
 	ws := workspaceID(ctx)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -704,28 +810,39 @@ func (s *SQLite) CreateMonitorWithRules(ctx context.Context, m *Monitor, rules [
 	}
 	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
 
+	if err := s.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	if err := s.checkRuleQuota(ctx, tx, ws, int64(len(rules))); err != nil {
+		return err
+	}
+
 	ids, err := json.Marshal(m.ContractIDs)
 	if err != nil {
 		return err
 	}
 	var created string
 	if err := tx.QueryRowContext(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network, created_at, runbook_url, response_guidance)
+		 VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?, ?)
 		 RETURNING id, created_at`,
-		m.Name, string(ids), boolToInt(m.Enabled), string(m.Priority.Normalized()), ws, m.Network, sqliteCreatedAt(m.CreatedAt),
+		m.Name, string(ids), boolToInt(m.Enabled), string(m.Priority.Normalized()), ws, m.Network, sqliteCreatedAt(m.CreatedAt), m.RunbookURL, m.ResponseGuidance,
 	).Scan(&m.ID, &created); err != nil {
 		return mapSQLiteErr(err)
 	}
 	if m.CreatedAt, err = parseSQLiteTime(created); err != nil {
 		return err
 	}
+	m.WorkspaceID = string(ws)
 	for _, r := range rules {
 		r.MonitorID = m.ID
+		if err := normalizeRuleGuidance(r); err != nil {
+			return err
+		}
 		if err := tx.QueryRowContext(ctx,
-			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES (?, ?, ?, ?) RETURNING id`,
-			r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled),
-		).Scan(&r.ID); err != nil {
+			`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES (?, ?, ?, ?, ?, ?) RETURNING id, version`,
+			r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), r.RunbookURL, r.ResponseGuidance,
+		).Scan(&r.ID, &r.Version); err != nil {
 			return mapSQLiteErr(err)
 		}
 	}
@@ -804,7 +921,7 @@ func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, erro
 
 	ws := workspaceID(ctx)
 	src, err := scanSQLiteMonitor(tx.QueryRowContext(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = ? AND workspace_id = ?`, id, ws))
+		`SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE id = ? AND workspace_id = ?`, id, ws))
 	if err != nil {
 		return nil, err
 	}
@@ -824,10 +941,16 @@ func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, erro
 		return nil, err
 	}
 	rules, err := querySQLiteRules(ctx, tx,
-		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled FROM rules r
+		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version, r.runbook_url, r.response_guidance FROM rules r
 		   JOIN monitors m ON m.id = r.monitor_id
 		  WHERE r.monitor_id = ? AND m.workspace_id = ? ORDER BY r.id`, id, ws)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return nil, err
+	}
+	if err := s.checkRuleQuota(ctx, tx, ws, int64(len(rules))); err != nil {
 		return nil, err
 	}
 	// Name uniqueness is a workspace question, not a global one: two teams may
@@ -843,16 +966,25 @@ func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, erro
 		return nil, err
 	}
 	dup := Monitor{
-		Name:        CopyMonitorName(src.Name, names),
-		ContractIDs: src.ContractIDs,
-		Enabled:     false,                     // never inherit enabled: a duplicate must be reviewed first
-		Priority:    src.Priority.Normalized(), // priority is queue position, not a safety switch, so the copy keeps it
-		Network:     src.Network,               // the copy watches the same contract ids, which only exist on this chain
+		Name:             CopyMonitorName(src.Name, names),
+		ContractIDs:      src.ContractIDs,
+		Enabled:          false,                     // never inherit enabled: a duplicate must be reviewed first
+		Priority:         src.Priority.Normalized(), // priority is queue position, not a safety switch, so the copy keeps it
+		Network:          src.Network,               // the copy watches the same contract ids, which only exist on this chain
+		RunbookURL:       src.RunbookURL,
+		ResponseGuidance: src.ResponseGuidance,
+		// Tags group related monitors, so a duplicate belongs in the same
+		// groups until an operator says otherwise.
+		Tags: NormalizeTags(src.Tags),
+	}
+	tagJSON, err := json.Marshal(dup.Tags)
+	if err != nil {
+		return nil, err
 	}
 	var created string
 	if err := tx.QueryRowContext(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network) VALUES (?, ?, ?, ?, ?, ?) RETURNING id, created_at`,
-		dup.Name, string(ids), boolToInt(dup.Enabled), string(dup.Priority), ws, dup.Network,
+		`INSERT INTO monitors (name, contract_ids, tags, enabled, priority, workspace_id, network, runbook_url, response_guidance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id, created_at`,
+		dup.Name, string(ids), string(tagJSON), boolToInt(dup.Enabled), string(dup.Priority), ws, dup.Network, dup.RunbookURL, dup.ResponseGuidance,
 	).Scan(&dup.ID, &created); err != nil {
 		return nil, mapSQLiteErr(err)
 	}
@@ -861,8 +993,8 @@ func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, erro
 	}
 	for _, r := range rules {
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES (?, ?, ?, ?)`,
-			dup.ID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled)); err != nil {
+			`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES (?, ?, ?, ?, ?, ?)`,
+			dup.ID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), r.RunbookURL, r.ResponseGuidance); err != nil {
 			return nil, mapSQLiteErr(err)
 		}
 	}
@@ -877,6 +1009,7 @@ func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, erro
 		return nil, err
 	}
 	dup.ChannelIDs = src.ChannelIDs
+	dup.WorkspaceID = string(ws)
 	return &dup, nil
 }
 
@@ -928,18 +1061,27 @@ type queryer interface {
 func scanSQLiteMonitor(r rowScanner) (*Monitor, error) {
 	var m Monitor
 	var ids string
+	var tags string
 	var enabled int64
 	var created string
 	var lastMatched sql.NullString
 	var deleted sql.NullString
 	var priority string
-	if err := r.Scan(&m.ID, &m.Name, &ids, &enabled, &created, &lastMatched, &priority, &m.Network, &deleted); err != nil {
+	if err := r.Scan(&m.ID, &m.Name, &ids, &tags, &enabled, &created, &lastMatched, &priority, &m.Network, &deleted, &m.RunbookURL, &m.ResponseGuidance, &m.WorkspaceID); err != nil {
 		return nil, mapSQLiteErr(err)
 	}
 	m.Priority = Priority(priority).Normalized()
 	m.Enabled = enabled != 0
 	if err := json.Unmarshal([]byte(ids), &m.ContractIDs); err != nil {
 		return nil, fmt.Errorf("monitor %d: bad contract_ids: %w", m.ID, err)
+	}
+	if err := json.Unmarshal([]byte(tags), &m.Tags); err != nil {
+		return nil, fmt.Errorf("monitor %d: bad tags: %w", m.ID, err)
+	}
+	if m.Tags == nil {
+		// A monitor without tags reads back as an empty list, not nil, so
+		// JSON output is always an array.
+		m.Tags = []string{}
 	}
 	var err error
 	if m.CreatedAt, err = parseSQLiteTime(created); err != nil {
@@ -993,13 +1135,28 @@ func (s *SQLite) requireMonitorWorkspace(ctx context.Context, q rowQuerier, moni
 }
 
 func (s *SQLite) CreateRule(ctx context.Context, r *Rule) error {
-	if err := s.requireMonitorWorkspace(ctx, s.db, r.MonitorID, workspaceID(ctx)); err != nil {
+	if err := normalizeRuleGuidance(r); err != nil {
 		return err
 	}
-	return mapSQLiteErr(s.db.QueryRowContext(ctx,
-		`INSERT INTO rules (monitor_id, type, params, enabled) VALUES (?, ?, ?, ?) RETURNING id`,
-		r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled),
-	).Scan(&r.ID))
+	ws := workspaceID(ctx)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := s.requireMonitorWorkspace(ctx, tx, r.MonitorID, ws); err != nil {
+		return err
+	}
+	if err := s.checkRuleQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx,
+		`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES (?, ?, ?, ?, ?, ?) RETURNING id, version`,
+		r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), r.RunbookURL, r.ResponseGuidance,
+	).Scan(&r.ID, &r.Version); err != nil {
+		return mapSQLiteErr(err)
+	}
+	return mapSQLiteErr(tx.Commit())
 }
 
 func (s *SQLite) CreateRules(ctx context.Context, rules []*Rule) error {
@@ -1014,13 +1171,21 @@ func (s *SQLite) CreateRules(ctx context.Context, rules []*Rule) error {
 
 	ws := workspaceID(ctx)
 	for _, r := range rules {
+		if err := normalizeRuleGuidance(r); err != nil {
+			return err
+		}
 		if err := s.requireMonitorWorkspace(ctx, tx, r.MonitorID, ws); err != nil {
 			return err
 		}
+	}
+	if err := s.checkRuleQuota(ctx, tx, ws, int64(len(rules))); err != nil {
+		return err
+	}
+	for _, r := range rules {
 		if err := tx.QueryRowContext(ctx,
-			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES (?, ?, ?, ?) RETURNING id`,
-			r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled),
-		).Scan(&r.ID); err != nil {
+			`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES (?, ?, ?, ?, ?, ?) RETURNING id, version`,
+			r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), r.RunbookURL, r.ResponseGuidance,
+		).Scan(&r.ID, &r.Version); err != nil {
 			return mapSQLiteErr(err)
 		}
 	}
@@ -1029,7 +1194,7 @@ func (s *SQLite) CreateRules(ctx context.Context, rules []*Rule) error {
 
 func (s *SQLite) GetRule(ctx context.Context, id int64) (*Rule, error) {
 	rules, err := querySQLiteRules(ctx, s.db,
-		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled FROM rules r
+		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version, r.runbook_url, r.response_guidance FROM rules r
 		   JOIN monitors m ON m.id = r.monitor_id
 		  WHERE r.id = ? AND m.workspace_id = ?`, id, workspaceID(ctx))
 	if err != nil {
@@ -1046,7 +1211,7 @@ func (s *SQLite) ListRules(ctx context.Context, monitorID int64, enabledOnly boo
 	// different scopes: the API (one workspace) and the poller's per-monitor
 	// rule loading, which runs under the cross-tenant system scope and would
 	// otherwise find no rules for a monitor outside the default workspace.
-	q := `SELECT r.id, r.monitor_id, r.type, r.params, r.enabled FROM rules r
+	q := `SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version, r.runbook_url, r.response_guidance FROM rules r
 	         JOIN monitors m ON m.id = r.monitor_id
 	        WHERE r.monitor_id = ?`
 	args := []any{monitorID}
@@ -1082,30 +1247,79 @@ func scanSQLiteRule(r rowScanner) (Rule, error) {
 	var rule Rule
 	var params string
 	var enabled int64
-	if err := r.Scan(&rule.ID, &rule.MonitorID, &rule.Type, &params, &enabled); err != nil {
+	if err := r.Scan(&rule.ID, &rule.MonitorID, &rule.Type, &params, &enabled, &rule.Version, &rule.RunbookURL, &rule.ResponseGuidance); err != nil {
 		return rule, mapSQLiteErr(err)
 	}
 	rule.Enabled = enabled != 0
 	rule.Params = json.RawMessage(params)
+	_ = normalizeRuleGuidance(&rule)
 	return rule, nil
 }
 
 func (s *SQLite) UpdateRule(ctx context.Context, r *Rule) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE rules SET type = ?, params = ?, enabled = ? WHERE id = ?
-		  AND monitor_id IN (SELECT id FROM monitors WHERE workspace_id = ?)`,
-		r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), r.ID, workspaceID(ctx))
-	if err != nil {
-		return mapSQLiteErr(err)
+	if err := normalizeRuleGuidance(r); err != nil {
+		return err
 	}
-	n, err := res.RowsAffected()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if n == 0 {
-		return ErrNotFound
+	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
+
+	ws := workspaceID(ctx)
+	var oldType, oldParams string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT r.type, r.params FROM rules r
+		   JOIN monitors m ON m.id = r.monitor_id
+		  WHERE r.id = ? AND m.workspace_id = ?`,
+		r.ID, ws,
+	).Scan(&oldType, &oldParams); err != nil {
+		return mapSQLiteErr(err)
 	}
-	return nil
+
+	newParams := jsonOrEmpty(r.Params)
+	conditionChanged := oldType != r.Type || !canonicalJSONEqual([]byte(oldParams), newParams)
+	disabled := !r.Enabled
+
+	if conditionChanged {
+		if err := tx.QueryRowContext(ctx,
+			`UPDATE rules
+			    SET type = ?, params = ?, enabled = ?, runbook_url = ?, response_guidance = ?, version = version + 1,
+			        last_alert_at = NULL, suppressed_since_last = 0
+			  WHERE id = ?
+			  RETURNING version`,
+			r.Type, string(newParams), boolToInt(r.Enabled), r.RunbookURL, r.ResponseGuidance, r.ID,
+		).Scan(&r.Version); err != nil {
+			return mapSQLiteErr(err)
+		}
+	} else {
+		if err := tx.QueryRowContext(ctx,
+			`UPDATE rules
+			    SET type = ?, params = ?, enabled = ?, runbook_url = ?, response_guidance = ?, version = version + 1
+			  WHERE id = ?
+			  RETURNING version`,
+			r.Type, string(newParams), boolToInt(r.Enabled), r.RunbookURL, r.ResponseGuidance, r.ID,
+		).Scan(&r.Version); err != nil {
+			return mapSQLiteErr(err)
+		}
+	}
+
+	if conditionChanged || disabled {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM rule_absence_state WHERE rule_id = ?`, r.ID); err != nil {
+			return mapSQLiteErr(err)
+		}
+		nowStr := sqliteTimeString(time.Now())
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE alert_escalations
+			    SET completed_at = ?, updated_at = ?
+			  WHERE completed_at IS NULL
+			    AND alert_id IN (SELECT id FROM alerts WHERE rule_id = ? AND workspace_id = ?)`,
+			nowStr, nowStr, r.ID, ws); err != nil {
+			return mapSQLiteErr(err)
+		}
+	}
+	return mapSQLiteErr(tx.Commit())
 }
 
 // DeleteRule scopes through the rule's monitor, because rules carry no
@@ -1170,6 +1384,11 @@ func (s *SQLite) RecordAbsenceSeen(ctx context.Context, ruleID int64, eventName 
 	return err
 }
 
+func (s *SQLite) DeleteAbsenceStateForRule(ctx context.Context, ruleID int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM rule_absence_state WHERE rule_id = ?`, ruleID)
+	return mapSQLiteErr(err)
+}
+
 // --- channels ---
 
 // sqliteChannelCols is the column list every single-table channel read uses,
@@ -1179,24 +1398,37 @@ func (s *SQLite) RecordAbsenceSeen(ctx context.Context, ruleID int64, eventName 
 const sqliteChannelCols = `id, name, type, config, enabled, created_at,
 	 digest_mode, digest_window_seconds, timeout,
 	 consecutive_failures, consecutive_permanent_failures, last_error,
-	 last_error_at, last_success_at, disabled_at`
+	 last_error_at, last_success_at, disabled_at, workspace_id`
 
 func (s *SQLite) CreateChannel(ctx context.Context, c *Channel) error {
 	config, err := configForWrite(s.cipher, c.ID, c.Name, c.Config)
 	if err != nil {
 		return err
 	}
+	ws := workspaceID(ctx)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := s.checkChannelQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
 	var created string
-	if err := s.db.QueryRowContext(ctx,
+	if err := tx.QueryRowContext(ctx,
 		`INSERT INTO channels (name, type, config, enabled, digest_mode, digest_window_seconds, timeout, workspace_id, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
 		 RETURNING id, created_at`,
-		c.Name, c.Type, string(config), boolToInt(c.Enabled), c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(), workspaceID(ctx), sqliteCreatedAt(c.CreatedAt),
+		c.Name, c.Type, string(config), boolToInt(c.Enabled), c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(), ws, sqliteCreatedAt(c.CreatedAt),
 	).Scan(&c.ID, &created); err != nil {
 		return mapSQLiteErr(err)
 	}
+	c.WorkspaceID = string(ws)
 	c.CreatedAt, err = parseSQLiteTime(created)
-	return err
+	if err != nil {
+		return err
+	}
+	return mapSQLiteErr(tx.Commit())
 }
 
 func (s *SQLite) GetChannel(ctx context.Context, id int64) (*Channel, error) {
@@ -1266,7 +1498,7 @@ func (s *SQLite) ListChannelsForMonitor(ctx context.Context, monitorID int64) ([
 	return s.queryChannels(ctx,
 		`SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at, c.digest_mode, c.digest_window_seconds, c.timeout,
 		        c.consecutive_failures, c.consecutive_permanent_failures, c.last_error,
-		        c.last_error_at, c.last_success_at, c.disabled_at
+		        c.last_error_at, c.last_success_at, c.disabled_at, c.workspace_id
 		 FROM channels c
 		 JOIN monitor_channels mc ON mc.channel_id = c.id
 		 JOIN monitors m ON m.id = mc.monitor_id
@@ -1304,7 +1536,7 @@ func (s *SQLite) scanChannel(r rowScanner) (Channel, error) {
 	var lastErrorAt, lastSuccessAt, disabledAt sql.NullString
 	if err := r.Scan(&c.ID, &c.Name, &c.Type, &config, &enabled, &created, &c.DigestMode, &c.DigestWindowSeconds, &timeoutSec,
 		&c.ConsecutiveFailures, &c.ConsecutivePermanentFailures, &c.LastError,
-		&lastErrorAt, &lastSuccessAt, &disabledAt); err != nil {
+		&lastErrorAt, &lastSuccessAt, &disabledAt, &c.WorkspaceID); err != nil {
 		return c, mapSQLiteErr(err)
 	}
 	var err error
@@ -1390,6 +1622,27 @@ func (s *SQLite) GetChannelDeliveryStats(ctx context.Context, channelID int64, s
 	return cs, nil
 }
 
+// ChannelDeliveryChangeKey returns the max delivery attempt ID and count for channelID in the caller's workspace.
+func (s *SQLite) ChannelDeliveryChangeKey(ctx context.Context, channelID int64) (maxID int64, count int64, err error) {
+	ws := workspaceID(ctx)
+	var exists bool
+	err = s.db.QueryRowContext(ctx, `
+		SELECT
+			(SELECT count(*) FROM channels WHERE id = ? AND workspace_id = ?) > 0,
+			COALESCE(max(da.id), 0),
+			count(*)
+		FROM delivery_attempts da
+		WHERE da.channel_id = ?`, channelID, ws, channelID).
+		Scan(&exists, &maxID, &count)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !exists {
+		return 0, 0, ErrNotFound
+	}
+	return maxID, count, nil
+}
+
 // UpdateChannel mirrors the Postgres implementation, including the health
 // reset. Turning a channel back on clears the state auto-disable left behind,
 // in the same statement, so a channel cannot re-disable on its next failure
@@ -1422,7 +1675,7 @@ func (s *SQLite) SetChannelsEnabled(ctx context.Context, ids []int64, enabled bo
 		   last_error = CASE WHEN ?1 AND enabled = 0 THEN '' ELSE last_error END,
 		   last_error_at = CASE WHEN ?1 AND enabled = 0 THEN NULL ELSE last_error_at END,
 		   disabled_at = CASE WHEN ?1 AND enabled = 0 THEN NULL ELSE disabled_at END
-		 WHERE id IN (`+strings.Join(marks, ",")+`) AND workspace_id = ?`+strconv.Itoa(len(uniq)+2)+` RETURNING id`, args...)
+		 WHERE id IN (`+strings.Join(marks, ",")+`) AND workspace_id = ?`+strconv.Itoa(len(uniq)+2)+` RETURNING id`, args...) // #nosec G202 -- marks and index are integer-derived ?N placeholders; values are bound in args
 	if err != nil {
 		return 0, nil, mapSQLiteErr(err)
 	}
@@ -1517,9 +1770,497 @@ func (s *SQLite) DeleteChannel(ctx context.Context, id int64) error {
 	return s.deleteByID(ctx, "channels", id)
 }
 
+func (s *SQLite) encryptSigningSecret(secret string) (string, error) {
+	return sealSigningSecret(s.cipher, secret)
+}
+
+func (s *SQLite) decryptSigningSecret(stored string) (string, error) {
+	return openSigningSecret(s.cipher, stored)
+}
+
+func (s *SQLite) CreateChannelSigningKey(ctx context.Context, k *ChannelSigningKey) error {
+	if k.ChannelID <= 0 {
+		return errors.New("channel_id is required")
+	}
+	if k.KeyID == "" {
+		return errors.New("key_id is required")
+	}
+	if k.Secret == "" {
+		return errors.New("secret is required")
+	}
+	if k.Status == "" {
+		k.Status = SigningKeyStatusActive
+	}
+	secret, err := s.encryptSigningSecret(k.Secret)
+	if err != nil {
+		return err
+	}
+	ws := workspaceID(ctx)
+	if k.WorkspaceID != "" {
+		ws = workspace.ID(k.WorkspaceID)
+	}
+	if k.CreatedAt.IsZero() {
+		k.CreatedAt = time.Now().UTC()
+	}
+	created := sqliteTimeString(k.CreatedAt)
+
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO channel_signing_keys (channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		k.ChannelID, ws, k.KeyID, secret, boolToInt(k.IsCurrent), k.Status, created, sqliteNullTime(k.ExpiresAt), sqliteNullTime(k.LastUsedAt), sqliteNullTime(k.RevokedAt),
+	)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return err
+	}
+	k.ID = id
+	k.CreatedAt, _ = parseSQLiteTime(created)
+	return nil
+}
+
+func (s *SQLite) GetChannelSigningKey(ctx context.Context, channelID int64, keyID string) (*ChannelSigningKey, error) {
+	var k ChannelSigningKey
+	var storedSecret, created string
+	var isCurrent int
+	var expiresAt, lastUsedAt, revokedAt sql.NullString
+
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at
+		 FROM channel_signing_keys
+		 WHERE channel_id = ? AND key_id = ? AND workspace_id = ?`,
+		channelID, keyID, workspaceID(ctx),
+	).Scan(&k.ID, &k.ChannelID, &k.WorkspaceID, &k.KeyID, &storedSecret, &isCurrent, &k.Status, &created, &expiresAt, &lastUsedAt, &revokedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, mapSQLiteErr(err)
+	}
+	k.IsCurrent = isCurrent != 0
+	k.CreatedAt, _ = parseSQLiteTime(created)
+	k.ExpiresAt, _ = parseSQLiteTimePtr(expiresAt)
+	k.LastUsedAt, _ = parseSQLiteTimePtr(lastUsedAt)
+	k.RevokedAt, _ = parseSQLiteTimePtr(revokedAt)
+
+	dec, err := s.decryptSigningSecret(storedSecret)
+	if err != nil {
+		return nil, err
+	}
+	k.Secret = dec
+	return &k, nil
+}
+
+func (s *SQLite) ListChannelSigningKeys(ctx context.Context, channelID int64) ([]ChannelSigningKey, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, channel_id, workspace_id, key_id, is_current, status, created_at, expires_at, last_used_at, revoked_at
+		 FROM channel_signing_keys
+		 WHERE channel_id = ? AND workspace_id = ?
+		 ORDER BY created_at DESC, id DESC`,
+		channelID, workspaceID(ctx),
+	)
+	if err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []ChannelSigningKey
+	for rows.Next() {
+		var k ChannelSigningKey
+		var isCurrent int
+		var created string
+		var expiresAt, lastUsedAt, revokedAt sql.NullString
+		if err := rows.Scan(&k.ID, &k.ChannelID, &k.WorkspaceID, &k.KeyID, &isCurrent, &k.Status, &created, &expiresAt, &lastUsedAt, &revokedAt); err != nil {
+			return nil, err
+		}
+		k.IsCurrent = isCurrent != 0
+		k.CreatedAt, _ = parseSQLiteTime(created)
+		k.ExpiresAt, _ = parseSQLiteTimePtr(expiresAt)
+		k.LastUsedAt, _ = parseSQLiteTimePtr(lastUsedAt)
+		k.RevokedAt, _ = parseSQLiteTimePtr(revokedAt)
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) GetCurrentChannelSigningKey(ctx context.Context, channelID int64) (*ChannelSigningKey, error) {
+	var k ChannelSigningKey
+	var storedSecret, created string
+	var isCurrent int
+	var expiresAt, lastUsedAt, revokedAt sql.NullString
+
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at
+		 FROM channel_signing_keys
+		 WHERE channel_id = ? AND workspace_id = ? AND is_current = 1 AND status = 'active'
+		 ORDER BY created_at DESC, id DESC LIMIT 1`,
+		channelID, workspaceID(ctx),
+	).Scan(&k.ID, &k.ChannelID, &k.WorkspaceID, &k.KeyID, &storedSecret, &isCurrent, &k.Status, &created, &expiresAt, &lastUsedAt, &revokedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, mapSQLiteErr(err)
+	}
+	k.IsCurrent = isCurrent != 0
+	k.CreatedAt, _ = parseSQLiteTime(created)
+	k.ExpiresAt, _ = parseSQLiteTimePtr(expiresAt)
+	k.LastUsedAt, _ = parseSQLiteTimePtr(lastUsedAt)
+	k.RevokedAt, _ = parseSQLiteTimePtr(revokedAt)
+
+	dec, err := s.decryptSigningSecret(storedSecret)
+	if err != nil {
+		return nil, err
+	}
+	k.Secret = dec
+	return &k, nil
+}
+
+func (s *SQLite) RotateChannelSigningKey(ctx context.Context, channelID int64, newKey *ChannelSigningKey) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var exists int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM channels WHERE id = ? AND workspace_id = ?`, channelID, workspaceID(ctx)).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		return ErrNotFound
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE channel_signing_keys SET is_current = 0 WHERE channel_id = ? AND workspace_id = ?`,
+		channelID, workspaceID(ctx),
+	); err != nil {
+		return err
+	}
+
+	secret, err := s.encryptSigningSecret(newKey.Secret)
+	if err != nil {
+		return err
+	}
+	newKey.ChannelID = channelID
+	newKey.WorkspaceID = string(workspaceID(ctx))
+	newKey.IsCurrent = true
+	newKey.Status = SigningKeyStatusActive
+	if newKey.CreatedAt.IsZero() {
+		newKey.CreatedAt = time.Now().UTC()
+	}
+	created := sqliteTimeString(newKey.CreatedAt)
+
+	res, err := tx.ExecContext(ctx,
+		`INSERT INTO channel_signing_keys (channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at)
+		 VALUES (?, ?, ?, ?, 1, 'active', ?, ?, ?, ?)`,
+		newKey.ChannelID, newKey.WorkspaceID, newKey.KeyID, secret, created, sqliteNullTime(newKey.ExpiresAt), sqliteNullTime(newKey.LastUsedAt), sqliteNullTime(newKey.RevokedAt),
+	)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return err
+	}
+	newKey.ID = id
+	newKey.CreatedAt, _ = parseSQLiteTime(created)
+
+	return tx.Commit()
+}
+
+func (s *SQLite) RetireChannelSigningKey(ctx context.Context, channelID int64, keyID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var isCurrent int
+	var status string
+	err = tx.QueryRowContext(ctx,
+		`SELECT is_current, status FROM channel_signing_keys WHERE channel_id = ? AND key_id = ? AND workspace_id = ?`,
+		channelID, keyID, workspaceID(ctx),
+	).Scan(&isCurrent, &status)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return mapSQLiteErr(err)
+	}
+	if isCurrent != 0 {
+		return fmt.Errorf("cannot retire active current signing key %q; rotate first", keyID)
+	}
+	if status == SigningKeyStatusRevoked {
+		return fmt.Errorf("key %q is already revoked", keyID)
+	}
+
+	res, err := tx.ExecContext(ctx,
+		`UPDATE channel_signing_keys SET status = 'retired' WHERE channel_id = ? AND key_id = ? AND workspace_id = ?`,
+		channelID, keyID, workspaceID(ctx),
+	)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit()
+}
+
+func (s *SQLite) RevokeChannelSigningKey(ctx context.Context, channelID int64, keyID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	nowStr := sqliteTimeString(time.Now())
+	res, err := tx.ExecContext(ctx,
+		`UPDATE channel_signing_keys SET status = 'revoked', is_current = 0, revoked_at = ?
+		 WHERE channel_id = ? AND key_id = ? AND workspace_id = ?`,
+		nowStr, channelID, keyID, workspaceID(ctx),
+	)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit()
+}
+
+func (s *SQLite) RecordChannelSigningKeyUsage(ctx context.Context, channelID int64, keyID string, usedAt time.Time) error {
+	if usedAt.IsZero() {
+		usedAt = time.Now()
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE channel_signing_keys SET last_used_at = ? WHERE channel_id = ? AND key_id = ?`,
+		sqliteTimeString(usedAt), channelID, keyID,
+	)
+	return err
+}
+
+// ReconcileChannelAcknowledgements evaluates delivery vs human acknowledgement for all channels
+// in the context's workspace (or instance-wide under a system context).
+func (s *SQLite) ReconcileChannelAcknowledgements(ctx context.Context, cfg AckReconciliationConfig) ([]ChannelAckReconciliation, error) {
+	if cfg.LookbackWindow <= 0 {
+		cfg.LookbackWindow = 7 * 24 * time.Hour
+	}
+	if cfg.CriticalAckWindow <= 0 {
+		cfg.CriticalAckWindow = 1 * time.Hour
+	}
+	if cfg.WarningAckWindow <= 0 {
+		cfg.WarningAckWindow = 4 * time.Hour
+	}
+	if cfg.MinDeliveries <= 0 {
+		cfg.MinDeliveries = 3
+	}
+	if cfg.FlagThresholdRate <= 0 {
+		cfg.FlagThresholdRate = 1.0
+	}
+
+	now := time.Now().UTC()
+	lookbackCutoff := sqliteTimeString(now.Add(-cfg.LookbackWindow))
+	critCutoff := sqliteTimeString(now.Add(-cfg.CriticalAckWindow))
+	warnCutoff := sqliteTimeString(now.Add(-cfg.WarningAckWindow))
+
+	ws, isTenant := tenantWorkspace(ctx)
+	targetWS := ""
+	if isTenant {
+		targetWS = string(ws)
+	}
+
+	query := `
+		SELECT
+			c.id,
+			c.workspace_id,
+			COUNT(q.alert_id),
+			COUNT(CASE WHEN q.alert_id IS NOT NULL AND q.acknowledged_at IS NOT NULL AND q.acknowledged_at != '' THEN 1 END),
+			COUNT(CASE WHEN q.alert_id IS NOT NULL AND (q.acknowledged_at IS NULL OR q.acknowledged_at = '') THEN 1 END)
+		FROM channels c
+		LEFT JOIN (
+			SELECT DISTINCT
+				da.channel_id,
+				da.alert_id,
+				a.acknowledged_at
+			FROM delivery_attempts da
+			JOIN alerts a ON a.id = da.alert_id
+			WHERE da.status = 'success'
+			  AND (a.suppressed = 0 OR a.suppressed IS NULL)
+			  AND a.inhibited_by_rule_id IS NULL
+			  AND a.retracted_at IS NULL
+			  AND a.severity IN ('warning', 'critical')
+			  AND a.created_at >= ?
+			  AND (
+				  (a.acknowledged_at IS NOT NULL AND a.acknowledged_at != '')
+				  OR (a.severity = 'critical' AND a.created_at <= ?)
+				  OR (a.severity = 'warning' AND a.created_at <= ?)
+			  )
+		) q ON q.channel_id = c.id
+		WHERE (? = '' OR c.workspace_id = ?)
+		GROUP BY c.id, c.workspace_id
+		ORDER BY c.id`
+
+	rows, err := s.db.QueryContext(ctx, query, lookbackCutoff, critCutoff, warnCutoff, targetWS, targetWS)
+	if err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var reconciliations []ChannelAckReconciliation
+	for rows.Next() {
+		var r ChannelAckReconciliation
+		if err := rows.Scan(&r.ChannelID, &r.WorkspaceID, &r.DeliveredTotal, &r.AcknowledgedTotal, &r.UnacknowledgedTotal); err != nil {
+			return nil, mapSQLiteErr(err)
+		}
+		r.ComputedAt = now
+		if r.DeliveredTotal > 0 {
+			rate := float64(r.UnacknowledgedTotal) / float64(r.DeliveredTotal)
+			r.UnackRate = &rate
+			if r.DeliveredTotal >= cfg.MinDeliveries && rate >= cfg.FlagThresholdRate {
+				r.Flagged = true
+			}
+		}
+		reconciliations = append(reconciliations, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+
+	computedStr := sqliteTimeString(now)
+	for _, r := range reconciliations {
+		var rateVal sql.NullFloat64
+		if r.UnackRate != nil {
+			rateVal = sql.NullFloat64{Float64: *r.UnackRate, Valid: true}
+		}
+		flaggedInt := 0
+		if r.Flagged {
+			flaggedInt = 1
+		}
+		_, err := s.db.ExecContext(ctx, `
+			INSERT INTO channel_ack_reconciliations (
+				channel_id, workspace_id, delivered_total, acknowledged_total, unacknowledged_total, unack_rate, flagged, computed_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (channel_id) DO UPDATE SET
+				workspace_id = excluded.workspace_id,
+				delivered_total = excluded.delivered_total,
+				acknowledged_total = excluded.acknowledged_total,
+				unacknowledged_total = excluded.unacknowledged_total,
+				unack_rate = excluded.unack_rate,
+				flagged = excluded.flagged,
+				computed_at = excluded.computed_at`,
+			r.ChannelID, r.WorkspaceID, r.DeliveredTotal, r.AcknowledgedTotal, r.UnacknowledgedTotal, rateVal, flaggedInt, computedStr,
+		)
+		if err != nil {
+			return nil, mapSQLiteErr(err)
+		}
+	}
+
+	return reconciliations, nil
+}
+
+// GetChannelAckReconciliation returns the current acknowledgement reconciliation for one channel.
+func (s *SQLite) GetChannelAckReconciliation(ctx context.Context, channelID int64) (ChannelAckReconciliation, error) {
+	ws := workspaceID(ctx)
+	var r ChannelAckReconciliation
+	var exists int64
+	var rateVal sql.NullFloat64
+	var flaggedInt int64
+	var computedStr sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			(SELECT count(*) FROM channels WHERE id = ? AND workspace_id = ?),
+			COALESCE(car.channel_id, ?),
+			COALESCE(car.workspace_id, ?),
+			COALESCE(car.delivered_total, 0),
+			COALESCE(car.acknowledged_total, 0),
+			COALESCE(car.unacknowledged_total, 0),
+			car.unack_rate,
+			COALESCE(car.flagged, 0),
+			car.computed_at
+		FROM channels c
+		LEFT JOIN channel_ack_reconciliations car ON car.channel_id = c.id
+		WHERE c.id = ? AND c.workspace_id = ?`,
+		channelID, ws, channelID, ws, channelID, ws).
+		Scan(&exists, &r.ChannelID, &r.WorkspaceID, &r.DeliveredTotal, &r.AcknowledgedTotal, &r.UnacknowledgedTotal, &rateVal, &flaggedInt, &computedStr)
+	if err != nil {
+		return r, mapSQLiteErr(err)
+	}
+	if exists == 0 {
+		return r, ErrNotFound
+	}
+	if rateVal.Valid {
+		r.UnackRate = &rateVal.Float64
+	}
+	r.Flagged = flaggedInt != 0
+	if computedStr.Valid && computedStr.String != "" {
+		t, err := parseSQLiteTime(computedStr.String)
+		if err == nil {
+			r.ComputedAt = t
+		}
+	}
+	return r, nil
+}
+
+// ListChannelAckReconciliations returns the latest acknowledgement reconciliations for all channels.
+func (s *SQLite) ListChannelAckReconciliations(ctx context.Context) (map[int64]ChannelAckReconciliation, error) {
+	ws, isTenant := tenantWorkspace(ctx)
+	targetWS := ""
+	if isTenant {
+		targetWS = string(ws)
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT channel_id, workspace_id, delivered_total, acknowledged_total, unacknowledged_total, unack_rate, flagged, computed_at
+		FROM channel_ack_reconciliations
+		WHERE (? = '' OR workspace_id = ?)
+		ORDER BY channel_id`, targetWS, targetWS)
+	if err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make(map[int64]ChannelAckReconciliation)
+	for rows.Next() {
+		var r ChannelAckReconciliation
+		var rateVal sql.NullFloat64
+		var flaggedInt int64
+		var computedStr sql.NullString
+		if err := rows.Scan(&r.ChannelID, &r.WorkspaceID, &r.DeliveredTotal, &r.AcknowledgedTotal, &r.UnacknowledgedTotal, &rateVal, &flaggedInt, &computedStr); err != nil {
+			return nil, mapSQLiteErr(err)
+		}
+		if rateVal.Valid {
+			r.UnackRate = &rateVal.Float64
+		}
+		r.Flagged = flaggedInt != 0
+		if computedStr.Valid && computedStr.String != "" {
+			t, err := parseSQLiteTime(computedStr.String)
+			if err == nil {
+				r.ComputedAt = t
+			}
+		}
+		out[r.ChannelID] = r
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	return out, nil
+}
+
 func (s *SQLite) ListMonitorsForChannel(ctx context.Context, channelID int64) ([]Monitor, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT m.id, m.name, m.contract_ids, m.enabled, m.created_at, m.last_matched_at, m.priority
+		`SELECT m.id, m.name, m.contract_ids, m.tags, m.enabled, m.created_at, m.last_matched_at, m.priority, m.network, m.deleted_at, m.runbook_url, m.response_guidance, m.workspace_id
 		 FROM monitors m
 		 JOIN monitor_channels mc ON mc.monitor_id = m.id
 		 WHERE mc.channel_id = ? AND m.workspace_id = ?
@@ -1630,18 +2371,45 @@ func (s *SQLite) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error
 		a.Payload = WithSuppressed(a.Payload, suppressed)
 	}
 
+	ws := workspaceID(ctx)
+	var resolvedRunbookURL, resolvedResponseGuidance string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT
+			COALESCE(
+				NULLIF(?, ''),
+				NULLIF((SELECT runbook_url FROM rules WHERE id = ?), ''),
+				NULLIF((SELECT runbook_url FROM monitors WHERE id = ?), ''),
+				NULLIF((SELECT default_runbook_url FROM workspaces WHERE id = COALESCE((SELECT workspace_id FROM monitors WHERE id = ?), ?)), ''),
+				''
+			),
+			COALESCE(
+				NULLIF(?, ''),
+				NULLIF((SELECT response_guidance FROM rules WHERE id = ?), ''),
+				NULLIF((SELECT response_guidance FROM monitors WHERE id = ?), ''),
+				NULLIF((SELECT default_response_guidance FROM workspaces WHERE id = COALESCE((SELECT workspace_id FROM monitors WHERE id = ?), ?)), ''),
+				''
+			)`,
+		strings.TrimSpace(a.RunbookURL), a.RuleID, a.MonitorID, a.MonitorID, ws,
+		strings.TrimSpace(a.ResponseGuidance), a.RuleID, a.MonitorID, a.MonitorID, ws,
+	).Scan(&resolvedRunbookURL, &resolvedResponseGuidance); err != nil {
+		return "", mapSQLiteErr(err)
+	}
+	a.RunbookURL = resolvedRunbookURL
+	a.ResponseGuidance = resolvedResponseGuidance
+	a.Payload = WithGuidance(a.Payload, a.RunbookURL, a.ResponseGuidance)
+
 	var id int64
 	var created string
 	err = tx.QueryRowContext(ctx,
 		// The network is read from the monitor rather than taken from the
 		// caller, as on Postgres: the monitor owns which chain it watches.
-		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, ledger, network, workspace_id)
-		 VALUES (?, ?, ?, ?, ?, ?, (SELECT network FROM monitors WHERE id = ?), ?)
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, ledger, network, workspace_id, rule_version, runbook_url, response_guidance)
+		 VALUES (?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), (SELECT severity FROM rules WHERE id = ?), 'warning'), ?, (SELECT network FROM monitors WHERE id = ?), COALESCE((SELECT workspace_id FROM monitors WHERE id = ?), ?), COALESCE(NULLIF(?, 0), (SELECT version FROM rules WHERE id = ?), 1), ?, ?)
 		 ON CONFLICT (rule_id, event_id) DO NOTHING
-		 RETURNING id, created_at, network`,
-		a.MonitorID, a.RuleID, a.EventID, string(jsonOrEmpty(a.Payload)), nullableJSON(a.Enrichment), int64(a.Ledger),
-		a.MonitorID, workspaceID(ctx),
-	).Scan(&id, &created, &a.Network)
+		 RETURNING id, created_at, network, severity, rule_version`,
+		a.MonitorID, a.RuleID, a.EventID, string(jsonOrEmpty(a.Payload)), nullableJSON(a.Enrichment), string(a.Severity), a.RuleID, int64(a.Ledger),
+		a.MonitorID, a.MonitorID, ws, a.RuleVersion, a.RuleID, a.RunbookURL, a.ResponseGuidance,
+	).Scan(&id, &created, &a.Network, &a.Severity, &a.RuleVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		// No row can mean two different things: the event was already alerted
 		// on (the dedup unique index swallowed the insert), or the monitor and
@@ -1705,16 +2473,21 @@ func (s *SQLite) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error
 // The alert lands in the workspace of the credential that delivered it, which
 // is the caller's context and never anything the payload says.
 func (s *SQLite) createFederatedAlert(ctx context.Context, tx *sql.Tx, a *Alert) (AlertOutcome, error) {
+	pURL, _, pGuide, _ := extractParamsGuidance(a.Payload)
+	a.RunbookURL = ResolveRunbookURL(a.RunbookURL, pURL)
+	a.ResponseGuidance = ResolveResponseGuidance(a.ResponseGuidance, pGuide)
+	a.Payload = WithGuidance(a.Payload, a.RunbookURL, a.ResponseGuidance)
+
 	var id int64
 	var created string
 	err := tx.QueryRowContext(ctx,
-		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, ledger, network, workspace_id, federated, federation_origin, source_monitor_id, source_rule_id)
-		 VALUES (NULL, NULL, ?, ?, ?, ?, ?, '', ?, 1, ?, ?, ?)
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, ledger, network, workspace_id, federated, federation_origin, source_monitor_id, source_rule_id, rule_version, runbook_url, response_guidance)
+		 VALUES (NULL, NULL, ?, ?, ?, ?, ?, '', ?, 1, ?, ?, ?, COALESCE(NULLIF(?, 0), 1), ?, ?)
 		 ON CONFLICT DO NOTHING
-		 RETURNING id, created_at`,
+		 RETURNING id, created_at, rule_version`,
 		a.EventID, string(jsonOrEmpty(a.Payload)), nullableJSON(a.Enrichment), NormalizedSeverity(a.Severity), int64(a.Ledger),
-		workspaceID(ctx), a.FederationOrigin, a.SourceMonitorID, a.SourceRuleID,
-	).Scan(&id, &created)
+		workspaceID(ctx), a.FederationOrigin, a.SourceMonitorID, a.SourceRuleID, a.RuleVersion, a.RunbookURL, a.ResponseGuidance,
+	).Scan(&id, &created, &a.RuleVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		// The dedup index swallowed the insert: this event has already been
 		// stored for this origin.
@@ -1765,9 +2538,12 @@ func (s *SQLite) GroupAlerts(ctx context.Context, key string, windowStart time.T
 
 func (s *SQLite) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	a, err := scanSQLiteAlert(s.db.QueryRowContext(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id FROM alerts WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx)))
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version, runbook_url, response_guidance FROM alerts WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx)))
 	if err != nil {
 		return nil, err
+	}
+	if cutoff, _, ok := s.workspaceAlertCutoff(ctx); ok && a.CreatedAt.Before(cutoff.UTC().Truncate(time.Millisecond)) {
+		return nil, ErrNotFound
 	}
 	return &a, nil
 }
@@ -1812,11 +2588,12 @@ func (s *SQLite) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, erro
 	if err != nil {
 		return nil, err
 	}
+	d.Cause = ClassifyCause(d.LastStatus, d.LastError)
 	return &d, nil
 }
 
 // ListDeadLetters returns dead-letter records in id order, applying the
-// optional channel, alert, and pagination filters. A tenant sees only records
+// optional channel, alert, age, cause and pagination filters. A tenant sees only records
 // whose alert belongs to it; the dispatcher's system context sees every row.
 func (s *SQLite) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error) {
 	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
@@ -1838,6 +2615,27 @@ func (s *SQLite) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]Dea
 		q += ` AND id > ?`
 		args = append(args, f.AfterID)
 	}
+	if !f.CreatedBefore.IsZero() {
+		q += ` AND created_at < ?`
+		args = append(args, sqliteTimeString(f.CreatedBefore.UTC()))
+	}
+	if f.OlderThan > 0 {
+		cutoff := time.Now().UTC().Add(-f.OlderThan)
+		q += ` AND created_at < ?`
+		args = append(args, sqliteTimeString(cutoff))
+	}
+	if !f.CreatedAfter.IsZero() {
+		q += ` AND created_at >= ?`
+		args = append(args, sqliteTimeString(f.CreatedAfter.UTC()))
+	}
+	if len(f.IDs) > 0 {
+		placeholders := make([]string, len(f.IDs))
+		for i, id := range f.IDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		q += ` AND id IN (` + strings.Join(placeholders, ",") + `)` // #nosec G202 -- placeholders contains only ? markers; ids are bound in args
+	}
 	q += ` ORDER BY id ASC LIMIT ?`
 	args = append(args, pageLimit(f.Limit))
 
@@ -1857,9 +2655,33 @@ func (s *SQLite) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]Dea
 		if err != nil {
 			return nil, err
 		}
+		d.Cause = ClassifyCause(d.LastStatus, d.LastError)
+		if f.Cause != "" && d.Cause != f.Cause {
+			continue
+		}
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// ListDeadLetterGroups aggregates dead letters by channel and cause.
+func (s *SQLite) ListDeadLetterGroups(ctx context.Context, f DeadLetterFilter) ([]DeadLetterGroup, error) {
+	gf := f
+	gf.Limit = 10000
+	gf.AfterID = 0
+	letters, err := s.ListDeadLetters(ctx, gf)
+	if err != nil {
+		return nil, err
+	}
+	channels, err := s.ListChannels(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	chMap := make(map[int64]Channel, len(channels))
+	for _, ch := range channels {
+		chMap[ch.ID] = ch
+	}
+	return GroupDeadLetters(letters, chMap, f.Cause), nil
 }
 
 // DeleteDeadLetter removes a dead-letter record after a successful redrive.
@@ -1888,8 +2710,59 @@ func (s *SQLite) DeleteDeadLetter(ctx context.Context, id int64) error {
 	return nil
 }
 
+// BulkDeleteDeadLetters removes dead letters matching the filter within the context's workspace.
+func (s *SQLite) BulkDeleteDeadLetters(ctx context.Context, f DeadLetterFilter) (int64, error) {
+	gf := f
+	if gf.Limit <= 0 || gf.Limit > 10000 {
+		gf.Limit = 10000
+	}
+	letters, err := s.ListDeadLetters(ctx, gf)
+	if err != nil {
+		return 0, err
+	}
+	if len(letters) == 0 {
+		return 0, nil
+	}
+	placeholders := make([]string, len(letters))
+	args := make([]any, 0, len(letters)+1)
+	for i, dl := range letters {
+		placeholders[i] = "?"
+		args = append(args, dl.ID)
+	}
+
+	q := `DELETE FROM dead_letters WHERE id IN (` + strings.Join(placeholders, ",") + `)` // #nosec G202 -- placeholders contains only ? markers; ids are bound in args
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = ?)`
+		args = append(args, ws)
+	}
+	res, err := s.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return 0, mapSQLiteErr(err)
+	}
+	return res.RowsAffected()
+}
+
+// DeleteExpiredDeadLetters removes up to limit dead letters created strictly before cutoff.
+func (s *SQLite) DeleteExpiredDeadLetters(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = DefaultPruneBatch
+	}
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM dead_letters WHERE id IN (
+			SELECT id FROM dead_letters WHERE created_at < ?
+			ORDER BY created_at ASC, id ASC LIMIT ?
+		)`, sqliteTimeString(cutoff.UTC()), limit)
+	if err != nil {
+		return 0, mapSQLiteErr(err)
+	}
+	return res.RowsAffected()
+}
+
 func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id FROM alerts WHERE 1 = 1`
+	if cutoff, _, ok := s.workspaceAlertCutoff(ctx); ok && (f.From.IsZero() || f.From.Before(cutoff)) {
+		f.From = cutoff
+	}
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version, runbook_url, response_guidance FROM alerts WHERE 1 = 1`
 	args := []any{}
 	// Conditional because ListAlerts serves two callers with different scopes:
 	// the API listing (one workspace) and the frequency rule's match-log
@@ -1978,6 +2851,21 @@ func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
 	return out, rows.Err()
 }
 
+// AlertChangeKey returns the max alert ID and count for the caller's workspace.
+func (s *SQLite) AlertChangeKey(ctx context.Context) (maxID int64, count int64, err error) {
+	ws := workspaceID(ctx)
+	if cutoff, _, ok := s.workspaceAlertCutoff(ctx); ok {
+		err = s.db.QueryRowContext(ctx,
+			`SELECT COALESCE(max(id), 0), count(*) FROM alerts WHERE workspace_id = ? AND created_at >= ?`, ws, sqliteTimeString(cutoff)).
+			Scan(&maxID, &count)
+		return maxID, count, err
+	}
+	err = s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(max(id), 0), count(*) FROM alerts WHERE workspace_id = ?`, ws).
+		Scan(&maxID, &count)
+	return maxID, count, err
+}
+
 // ListAlertsStream streams alerts matching the filter to the callback.
 // It is used for large exports where loading all rows into memory is not feasible.
 // scanSQLiteAlert reads one alerts row. The monitor and rule ids are
@@ -1998,7 +2886,7 @@ func scanSQLiteAlert(r rowScanner) (Alert, error) {
 	var origin sql.NullString
 	var acknowledged, acknowledgedBy sql.NullString
 	var sourceMonitorID, sourceRuleID sql.NullInt64
-	if err := r.Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &payload, &enrichment, &created, &ledger, &retracted, &inhibited, &suppressed, &suppressionReason, &acknowledged, &acknowledgedBy, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID); err != nil {
+	if err := r.Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &payload, &enrichment, &created, &ledger, &retracted, &inhibited, &suppressed, &suppressionReason, &acknowledged, &acknowledgedBy, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID, &a.RuleVersion, &a.RunbookURL, &a.ResponseGuidance); err != nil {
 		return a, mapSQLiteErr(err)
 	}
 	if monitorID.Valid {
@@ -2147,7 +3035,7 @@ func (s *SQLite) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int)
 		limit = DefaultPruneBatch
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version, runbook_url, response_guidance
 		   FROM alerts WHERE created_at < ? ORDER BY created_at ASC, id ASC LIMIT ?`,
 		sqliteTimeString(cutoff), limit)
 	if err != nil {
@@ -2753,31 +3641,71 @@ func (s *SQLite) DeleteDigestAlerts(ctx context.Context, channelID int64, ids []
 		args = append(args, id)
 	}
 	_, err := s.db.ExecContext(ctx,
-		`DELETE FROM pending_digests WHERE channel_id = ? AND id IN (`+placeholders+`)`, args...)
+		`DELETE FROM pending_digests WHERE channel_id = ? AND id IN (`+placeholders+`)`, args...) // #nosec G202 -- placeholders contains only ? markers; values are bound in args
 	return mapSQLiteErr(err)
 }
 
 // --- audit log ---
 
 func (s *SQLite) CreateAuditEntry(ctx context.Context, e *AuditEntry) error {
-	diff := e.Diff
-	if len(diff) == 0 {
-		diff = json.RawMessage(`{}`)
+	NormalizeAuditEntry(ctx, e)
+	if e.CreatedAt.IsZero() {
+		e.CreatedAt = time.Now().UTC().Truncate(time.Millisecond)
+	} else {
+		e.CreatedAt = e.CreatedAt.UTC().Truncate(time.Millisecond)
 	}
-	var created string
-	if err := s.db.QueryRowContext(ctx,
-		`INSERT INTO audit_log (actor, action, target_type, target_id, diff) VALUES (?, ?, ?, ?, ?) RETURNING id, created_at`,
-		e.Actor, e.Action, e.TargetType, e.TargetID, string(diff)).Scan(&e.ID, &created); err != nil {
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return mapSQLiteErr(err)
 	}
-	var err error
-	e.CreatedAt, err = parseSQLiteTime(created)
-	return err
+	defer func() { _ = tx.Rollback() }()
+
+	var prevHash string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE((SELECT record_hash FROM audit_log WHERE workspace_id = ? ORDER BY id DESC LIMIT 1), '')`,
+		e.WorkspaceID).Scan(&prevHash); err != nil {
+		return mapSQLiteErr(err)
+	}
+	e.PrevHash = prevHash
+	e.RecordHash = ComputeAuditRecordHash(*e)
+
+	var created string
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO audit_log (
+			workspace_id, actor, actor_type, action, target_type, target_id,
+			resource_id, surface, source_ip, outcome, status_code, reason,
+			diff, prev_hash, record_hash, created_at
+		) VALUES (
+			?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?
+		) RETURNING id, created_at`,
+		e.WorkspaceID, e.Actor, e.ActorType, e.Action, e.TargetType, e.TargetID,
+		e.ResourceID, e.Surface, e.SourceIP, e.Outcome, e.StatusCode, e.Reason,
+		string(e.Diff), e.PrevHash, e.RecordHash, sqliteTimeString(e.CreatedAt),
+	).Scan(&e.ID, &created); err != nil {
+		return mapSQLiteErr(err)
+	}
+	if e.CreatedAt, err = parseSQLiteTime(created); err != nil {
+		return err
+	}
+	return mapSQLiteErr(tx.Commit())
 }
 
 func (s *SQLite) ListAuditEntries(ctx context.Context, f AuditFilter) ([]AuditEntry, error) {
 	where := []string{"1 = 1"}
 	args := []any{}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		if f.WorkspaceID != "" && f.WorkspaceID != string(ws) {
+			return []AuditEntry{}, nil
+		}
+		where = append(where, "workspace_id = ?")
+		args = append(args, string(ws))
+	} else if f.WorkspaceID != "" {
+		where = append(where, "workspace_id = ?")
+		args = append(args, f.WorkspaceID)
+	}
 	if f.TargetType != "" {
 		where = append(where, "target_type = ?")
 		args = append(args, f.TargetType)
@@ -2785,6 +3713,14 @@ func (s *SQLite) ListAuditEntries(ctx context.Context, f AuditFilter) ([]AuditEn
 	if f.TargetID != 0 {
 		where = append(where, "target_id = ?")
 		args = append(args, f.TargetID)
+	}
+	if f.ResourceID != "" {
+		where = append(where, "resource_id = ?")
+		args = append(args, f.ResourceID)
+	}
+	if f.Action != "" {
+		where = append(where, "action = ?")
+		args = append(args, f.Action)
 	}
 	if !f.From.IsZero() {
 		where = append(where, "created_at >= ?")
@@ -2798,14 +3734,29 @@ func (s *SQLite) ListAuditEntries(ctx context.Context, f AuditFilter) ([]AuditEn
 		where = append(where, "actor = ?")
 		args = append(args, f.Actor)
 	}
+	if f.ActorType != "" {
+		where = append(where, "actor_type = ?")
+		args = append(args, f.ActorType)
+	}
+	if f.Surface != "" {
+		where = append(where, "surface = ?")
+		args = append(args, f.Surface)
+	}
+	if f.Outcome != "" {
+		where = append(where, "outcome = ?")
+		args = append(args, f.Outcome)
+	}
 	if f.AfterID != 0 {
 		// The listing is id DESC, so the next page holds strictly smaller ids.
 		where = append(where, "id < ?")
 		args = append(args, f.AfterID)
 	}
 	args = append(args, clampAuditLimit(f.Limit))
-	q := `SELECT id, actor, action, target_type, target_id, diff, created_at FROM audit_log WHERE ` +
-		strings.Join(where, " AND ") + ` ORDER BY id DESC LIMIT ?`
+	q := `SELECT id, workspace_id, actor, actor_type, action, target_type, target_id,
+	             resource_id, surface, source_ip, outcome, status_code, reason,
+	             diff, prev_hash, record_hash, created_at
+	        FROM audit_log WHERE ` +
+		strings.Join(where, " AND ") + ` ORDER BY id DESC LIMIT ?` // #nosec G202 -- where predicates are static column=? literals; values are bound in args
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -2815,7 +3766,11 @@ func (s *SQLite) ListAuditEntries(ctx context.Context, f AuditFilter) ([]AuditEn
 	for rows.Next() {
 		var e AuditEntry
 		var diff, created string
-		if err := rows.Scan(&e.ID, &e.Actor, &e.Action, &e.TargetType, &e.TargetID, &diff, &created); err != nil {
+		if err := rows.Scan(
+			&e.ID, &e.WorkspaceID, &e.Actor, &e.ActorType, &e.Action, &e.TargetType, &e.TargetID,
+			&e.ResourceID, &e.Surface, &e.SourceIP, &e.Outcome, &e.StatusCode, &e.Reason,
+			&diff, &e.PrevHash, &e.RecordHash, &created,
+		); err != nil {
 			return nil, err
 		}
 		e.Diff = json.RawMessage(diff)
@@ -2890,13 +3845,25 @@ func (s *SQLite) GetStats(ctx context.Context) (Stats, error) {
 	// timestamp format makes that a valid chronological comparison.
 	cutoff := sqliteTimeString(time.Now().UTC().Add(-24 * time.Hour))
 	ws := workspaceID(ctx)
+	retCutoffStr := ""
+	if retCutoff, policy, hasCutoff := s.workspaceAlertCutoff(ctx); hasCutoff {
+		c := retCutoff.UTC()
+		retCutoffStr = sqliteTimeString(c)
+		st.PrunedBefore = &c
+		st.RetentionPolicySource = policy.PolicySource
+	}
 	err := s.db.QueryRowContext(ctx, `
 		SELECT
 			(SELECT count(*) FROM monitors WHERE workspace_id = ?),
 			(SELECT count(*) FROM rules r JOIN monitors m ON m.id = r.monitor_id WHERE m.workspace_id = ?),
 			(SELECT count(*) FROM channels WHERE workspace_id = ?),
-			(SELECT count(*) FROM alerts WHERE workspace_id = ?),
-			(SELECT count(*) FROM alerts WHERE workspace_id = ? AND created_at > ?)`, ws, ws, ws, ws, ws, cutoff).
+			CASE WHEN ? = '' THEN
+				COALESCE((SELECT sum(total_count) FROM alert_stat_rollups WHERE workspace_id = ?), 0)
+			ELSE
+				(SELECT count(*) FROM alerts WHERE workspace_id = ? AND created_at >= ?)
+			END,
+			(SELECT count(*) FROM alerts WHERE workspace_id = ? AND created_at > ? AND (? = '' OR created_at >= ?))`,
+		ws, ws, ws, retCutoffStr, ws, ws, retCutoffStr, ws, cutoff, retCutoffStr, retCutoffStr).
 		Scan(&st.Monitors, &st.Rules, &st.Channels, &st.Alerts, &st.AlertsLast24)
 	if err != nil {
 		return st, err
@@ -2906,7 +3873,214 @@ func (s *SQLite) GetStats(ctx context.Context) (Stats, error) {
 		return st, err
 	}
 	summarizeCheckpoints(&st, cps)
+	// The most recent retention gap is an instance fact like last_ledger,
+	// not tenant data: if the service lost history, every operator of this
+	// instance needs to know. No recorded gap is the healthy case and leaves
+	// the field nil, which JSON omits.
+	gap, err := s.LatestRetentionGap(ctx, "")
+	switch {
+	case err == nil:
+		st.RetentionGap = &gap
+	case errors.Is(err, ErrNotFound):
+		// No gap ever recorded; report the shape GET /stats always had.
+	default:
+		return st, err
+	}
 	return st, nil
+}
+
+// --- retention gaps ---
+
+// RecordRetentionGap persists one detected hole in ingest history. There is
+// no dedup: each detection is a real observation, and the poller only
+// detects once per resume.
+func (s *SQLite) RecordRetentionGap(ctx context.Context, network string, fromLedger, toLedger uint32, detectedAt time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO retention_gaps (network, from_ledger, to_ledger, detected_at)
+		 VALUES (?, ?, ?, ?)`,
+		network, int64(fromLedger), int64(toLedger), sqliteTimeString(detectedAt.UTC()))
+	return mapSQLiteErr(err)
+}
+
+// LatestRetentionGap returns the most recently detected gap for network, or
+// across every network when network is empty. ErrNotFound when none was ever
+// recorded — the healthy case, which callers treat as "no gap to report"
+// rather than an error.
+func (s *SQLite) LatestRetentionGap(ctx context.Context, network string) (RetentionGap, error) {
+	var g RetentionGap
+	var from, to int64
+	var detected string
+	query := `SELECT id, network, from_ledger, to_ledger, detected_at
+	          FROM retention_gaps ORDER BY detected_at DESC, id DESC LIMIT 1`
+	var row *sql.Row
+	if network == "" {
+		row = s.db.QueryRowContext(ctx, query)
+	} else {
+		row = s.db.QueryRowContext(ctx,
+			`SELECT id, network, from_ledger, to_ledger, detected_at
+		     FROM retention_gaps WHERE network = ?
+		     ORDER BY detected_at DESC, id DESC LIMIT 1`, network)
+	}
+	if err := row.Scan(&g.ID, &g.Network, &from, &to, &detected); err != nil {
+		return RetentionGap{}, mapSQLiteErr(err)
+	}
+	var err error
+	if g.DetectedAt, err = parseSQLiteTime(detected); err != nil {
+		return RetentionGap{}, err
+	}
+	g.FromLedger, g.ToLedger = uint32(from), uint32(to)
+	return g, nil
+}
+
+// --- event archive ---
+
+// RecordEvents upserts one page of decoded events into the replay archive.
+// INSERT OR IGNORE over the (network, event_id) unique key makes the write
+// idempotent under the re-reads a crash or a confirmation-depth hold causes
+// — the same event arriving twice keeps one row.
+func (s *SQLite) RecordEvents(ctx context.Context, network string, events []ArchivedEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for i := range events {
+		ev := &events[i]
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO event_archive
+			 (network, event_id, contract_id, ledger, ledger_closed_at, tx_hash, event_name, topics, value, fields, ingested_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			network, ev.EventID, ev.ContractID, int64(ev.Ledger), sqliteNullTime(ev.LedgerClosedAt),
+			ev.TxHash, ev.EventName, string(archivedTopics(ev.Topics)), stringOrNULL(ev.Value), stringOrNULL(ev.Fields),
+			sqliteTimeString(time.Now().UTC())); err != nil {
+			return mapSQLiteErr(err)
+		}
+	}
+	return mapSQLiteErr(tx.Commit())
+}
+
+// archivedTopics returns the JSON array to archive, defaulting to "[]" so a
+// nil RawMessage cannot violate the column's NOT NULL.
+func archivedTopics(topics json.RawMessage) json.RawMessage {
+	if len(topics) == 0 {
+		return json.RawMessage(`[]`)
+	}
+	return topics
+}
+
+// stringOrNULL renders optional JSON for a nullable TEXT column.
+func stringOrNULL(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	return string(raw)
+}
+
+// sqliteArchiveFilterClause builds the WHERE clauses shared by the archive
+// read paths, so List and Count can never disagree about what matches. Each
+// clause appends its own args in order.
+func sqliteArchiveFilterClause(f EventArchiveFilter, q *string, args *[]any) {
+	*q += ` WHERE 1 = 1`
+	if f.Network != "" {
+		*q += ` AND network = ?`
+		*args = append(*args, f.Network)
+	}
+	if len(f.ContractIDs) > 0 {
+		*q += ` AND contract_id IN (` + placeholders(len(f.ContractIDs)) + `)`
+		for _, id := range f.ContractIDs {
+			*args = append(*args, id)
+		}
+	}
+	if f.FromLedger > 0 {
+		*q += ` AND ledger >= ?`
+		*args = append(*args, int64(f.FromLedger))
+	}
+	if f.ToLedger > 0 {
+		*q += ` AND ledger <= ?`
+		*args = append(*args, int64(f.ToLedger))
+	}
+	if f.AfterID > 0 {
+		*q += ` AND id > ?`
+		*args = append(*args, f.AfterID)
+	}
+}
+
+// ListArchivedEvents returns matching archived events oldest-first by id, so
+// a replay walks forward through history and pages with the id keyset.
+func (s *SQLite) ListArchivedEvents(ctx context.Context, f EventArchiveFilter) ([]ArchivedEvent, error) {
+	q := `SELECT id, network, event_id, contract_id, ledger, ledger_closed_at, tx_hash, event_name, topics, value, fields, ingested_at
+	      FROM event_archive`
+	var args []any
+	sqliteArchiveFilterClause(f, &q, &args)
+	q += ` ORDER BY id ASC LIMIT ?`
+	args = append(args, pageLimit(f.Limit))
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []ArchivedEvent
+	for rows.Next() {
+		ev, err := scanSQLiteArchivedEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
+// CountArchivedEvents returns how many events match f. Replay calls it first
+// so a range too expensive to evaluate is rejected before any evaluation
+// runs rather than hanging mid-request.
+func (s *SQLite) CountArchivedEvents(ctx context.Context, f EventArchiveFilter) (int64, error) {
+	q := `SELECT count(*) FROM event_archive`
+	var args []any
+	sqliteArchiveFilterClause(f, &q, &args)
+	var count int64
+	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&count); err != nil {
+		return 0, mapSQLiteErr(err)
+	}
+	return count, nil
+}
+
+// scanSQLiteArchivedEvent reads one event_archive row. Timestamps are TEXT
+// in the fixed-width UTC layout and parsed; value and fields may be NULL,
+// which stays a nil RawMessage.
+func scanSQLiteArchivedEvent(r rowScanner) (ArchivedEvent, error) {
+	var ev ArchivedEvent
+	var ledger int64
+	var closed sql.NullString
+	var topics string
+	var value, fields sql.NullString
+	var ingested string
+	if err := r.Scan(&ev.ID, &ev.Network, &ev.EventID, &ev.ContractID, &ledger, &closed,
+		&ev.TxHash, &ev.EventName, &topics, &value, &fields, &ingested); err != nil {
+		return ArchivedEvent{}, mapSQLiteErr(err)
+	}
+	ev.Ledger = uint32(ledger)
+	ev.Topics = json.RawMessage(topics)
+	if value.Valid && value.String != "" {
+		ev.Value = json.RawMessage(value.String)
+	}
+	if fields.Valid && fields.String != "" {
+		ev.Fields = json.RawMessage(fields.String)
+	}
+	var err error
+	if closed.Valid && closed.String != "" {
+		closedAt, perr := parseSQLiteTime(closed.String)
+		if perr != nil {
+			return ArchivedEvent{}, perr
+		}
+		ev.LedgerClosedAt = &closedAt
+	}
+	if ev.IngestedAt, err = parseSQLiteTime(ingested); err != nil {
+		return ArchivedEvent{}, err
+	}
+	return ev, nil
 }
 
 // ingestCheckpoints reads every network's cursor, newest poll first. The legacy
@@ -2979,6 +4153,10 @@ func (s *SQLite) AssignLegacyNetwork(ctx context.Context, network string) (int64
 // prevent.
 func (s *SQLite) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCount, error) {
 	days = ClampAlertSeriesDays(days)
+	retCutoffStr := ""
+	if retCutoff, _, ok := s.workspaceAlertCutoff(ctx); ok {
+		retCutoffStr = sqliteTimeString(retCutoff)
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		WITH RECURSIVE window(day) AS (
 			SELECT date('now')
@@ -2989,8 +4167,9 @@ func (s *SQLite) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCoun
 		FROM window
 		LEFT JOIN alerts a ON substr(a.created_at, 1, 10) = window.day
 			AND a.workspace_id = ?
+			AND (? = '' OR a.created_at >= ?)
 		GROUP BY window.day
-		ORDER BY window.day`, fmt.Sprintf("-%d days", days-1), workspaceID(ctx))
+		ORDER BY window.day`, fmt.Sprintf("-%d days", days-1), workspaceID(ctx), retCutoffStr, retCutoffStr)
 	if err != nil {
 		return nil, err
 	}
@@ -3026,24 +4205,28 @@ func (s *SQLite) GetMonitorStats(ctx context.Context, monitorID int64) (MonitorS
 	day := sqliteTimeString(time.Now().UTC().Add(-24 * time.Hour))
 	week := sqliteTimeString(time.Now().UTC().Add(-7 * 24 * time.Hour))
 	ws := workspaceID(ctx)
+	retCutoffStr := ""
+	if retCutoff, _, ok := s.workspaceAlertCutoff(ctx); ok {
+		retCutoffStr = sqliteTimeString(retCutoff)
+	}
 	err := s.db.QueryRowContext(ctx, `
 		SELECT
 			(SELECT count(*) FROM monitors WHERE id = ? AND workspace_id = ?),
-			(SELECT count(*) FROM alerts WHERE monitor_id = ? AND workspace_id = ?),
-			(SELECT count(*) FROM alerts WHERE monitor_id = ? AND workspace_id = ? AND created_at > ?),
-			(SELECT count(*) FROM alerts WHERE monitor_id = ? AND workspace_id = ? AND created_at > ?),
-			(SELECT max(created_at) FROM alerts WHERE monitor_id = ? AND workspace_id = ?),
+			(SELECT count(*) FROM alerts WHERE monitor_id = ? AND workspace_id = ? AND (? = '' OR created_at >= ?)),
+			(SELECT count(*) FROM alerts WHERE monitor_id = ? AND workspace_id = ? AND created_at > ? AND (? = '' OR created_at >= ?)),
+			(SELECT count(*) FROM alerts WHERE monitor_id = ? AND workspace_id = ? AND created_at > ? AND (? = '' OR created_at >= ?)),
+			(SELECT max(created_at) FROM alerts WHERE monitor_id = ? AND workspace_id = ? AND (? = '' OR created_at >= ?)),
 			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
-			   WHERE a.monitor_id = ? AND a.workspace_id = ? AND da.status = ?),
+			   WHERE a.monitor_id = ? AND a.workspace_id = ? AND da.status = ? AND (? = '' OR a.created_at >= ?)),
 			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
-			   WHERE a.monitor_id = ? AND a.workspace_id = ? AND da.status = ?)`,
+			   WHERE a.monitor_id = ? AND a.workspace_id = ? AND da.status = ? AND (? = '' OR a.created_at >= ?))`,
 		monitorID, ws,
-		monitorID, ws,
-		monitorID, ws, day,
-		monitorID, ws, week,
-		monitorID, ws,
-		monitorID, ws, DeliveryStatusSuccess,
-		monitorID, ws, DeliveryStatusFailed).
+		monitorID, ws, retCutoffStr, retCutoffStr,
+		monitorID, ws, day, retCutoffStr, retCutoffStr,
+		monitorID, ws, week, retCutoffStr, retCutoffStr,
+		monitorID, ws, retCutoffStr, retCutoffStr,
+		monitorID, ws, DeliveryStatusSuccess, retCutoffStr, retCutoffStr,
+		monitorID, ws, DeliveryStatusFailed, retCutoffStr, retCutoffStr).
 		Scan(&exists, &ms.Alerts, &ms.AlertsLast24h, &ms.AlertsLast7d,
 			&lastAt, &ms.DeliveriesOK, &ms.DeliveriesFail)
 	if err != nil {
@@ -3063,10 +4246,10 @@ func (s *SQLite) GetMonitorStats(ctx context.Context, monitorID int64) (MonitorS
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT r.id, r.type, count(a.id)
 		FROM rules r
-		LEFT JOIN alerts a ON a.rule_id = r.id
+		LEFT JOIN alerts a ON a.rule_id = r.id AND a.workspace_id = ? AND (? = '' OR a.created_at >= ?)
 		WHERE r.monitor_id = ?
 		GROUP BY r.id, r.type
-		ORDER BY r.id`, monitorID)
+		ORDER BY r.id`, ws, retCutoffStr, retCutoffStr, monitorID)
 	if err != nil {
 		return ms, err
 	}
@@ -3312,4 +4495,70 @@ func (s *SQLite) DeleteMonitorTemplate(ctx context.Context, id int64) error {
 // cursor, so peak memory is one page rather than the whole result set.
 func (s *SQLite) ListAlertsStream(ctx context.Context, f AlertFilter, fn func(Alert) error) error {
 	return streamAlerts(ctx, f, s.ListAlerts, fn)
+}
+
+func (s *SQLite) RegisterPersistedOperation(ctx context.Context, op PersistedOperation) error {
+	now := time.Now().UTC()
+	if op.CreatedAt.IsZero() {
+		op.CreatedAt = now
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO persisted_operations (id, name, document, created_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET
+			name = excluded.name,
+			document = excluded.document`,
+		op.ID, op.Name, op.Document, op.CreatedAt)
+	return mapSQLiteErr(err)
+}
+
+func (s *SQLite) GetPersistedOperation(ctx context.Context, id string) (*PersistedOperation, error) {
+	var op PersistedOperation
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, name, document, created_at
+		FROM persisted_operations
+		WHERE id = ?`, id).Scan(&op.ID, &op.Name, &op.Document, &op.CreatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, mapSQLiteErr(err)
+	}
+	return &op, nil
+}
+
+func (s *SQLite) ListPersistedOperations(ctx context.Context) ([]PersistedOperation, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, name, document, created_at
+		FROM persisted_operations
+		ORDER BY created_at DESC, id ASC`)
+	if err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var ops []PersistedOperation
+	for rows.Next() {
+		var op PersistedOperation
+		if err := rows.Scan(&op.ID, &op.Name, &op.Document, &op.CreatedAt); err != nil {
+			return nil, mapSQLiteErr(err)
+		}
+		ops = append(ops, op)
+	}
+	return ops, rows.Err()
+}
+
+func (s *SQLite) DeletePersistedOperation(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM persisted_operations WHERE id = ?`, id)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

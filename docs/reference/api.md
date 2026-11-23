@@ -75,6 +75,61 @@ the token bucket and does not send `Retry-After`; clients should treat
 
 Probes (`/health`, `/livez`, `/readyz`) are exempt from rate limiting.
 
+## Idempotent writes
+
+Every mutating endpoint (`POST`, `PUT`, `PATCH`, `DELETE`) accepts an optional
+`Idempotency-Key` request header (at most 255 characters) so clients and
+infrastructure automation can safely retry after network timeouts or lost
+responses:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
+  -d '{"name":"USDC Vault","contract_ids":["CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"]}'
+```
+
+* **Workspace-scoped and persistent**: Keys are stored in `idempotency_keys`
+  keyed by `(workspace_id, idempotency_key)` with a 24-hour retention window,
+  so two workspaces never collide on the same key and idempotency survives
+  process restarts.
+* **Exact replay**: Repeating a request with the same key, HTTP method, path,
+  and request body within the retention window returns the stored status code,
+  `Content-Type`, and response body without re-executing the write or writing a
+  duplicate audit entry, and sets `Idempotency-Replayed: true` on the response.
+  Replayed `DELETE` calls return the original `204 No Content` rather than
+  `404 Not Found`.
+* **Payload mismatch detection**: Reusing an unexpired `Idempotency-Key` with a
+  different HTTP method, URL path, or request body digest is rejected with
+  `409 Conflict` (`"code": "CONFLICT"`).
+* **Concurrent deduplication**: Concurrent requests arriving with the same
+  `(workspace_id, Idempotency-Key)` and identical payload coalesce onto the
+  single in-flight execution and return the same created/updated resource.
+* **Terraform provider**: `terraform-provider-sorobeacon` automatically sends
+  `Idempotency-Key` on all write requests (`POST`, `PATCH`, `DELETE`) and
+  reuses the same key across transient retry attempts.
+
+## Conditional requests
+
+Read endpoints across the dominant polling surfaces — alert listings (`GET /alerts`), daily alert statistics (`GET /stats/alerts-daily`), per-channel delivery summaries (`GET /channels/{id}/stats`), and monitor/channel lists — set a strong entity tag (`ETag`) and respond to conditional requests (`If-None-Match`) with `304 Not Modified` and no body.
+
+Responses set `Cache-Control: private, no-cache` so clients revalidate before each reuse while proxies do not store responses shared across tenants.
+
+### Change detection design
+
+Rather than hashing serialised JSON responses — which still pays the full database query and serialisation penalty — entity tags are derived directly from lightweight backend change detectors:
+* **Alert surface** (`GET /alerts` and `GET /stats/alerts-daily`): A composite key of the workspace's monotonic maximum alert identifier plus total alert count. New alerts advance the monotonic identifier; retention sweeps and partition drops decrement the count. Daily alert statistics also incorporate the current UTC calendar day to invalidate the tag at day boundaries.
+* **Channel delivery summaries** (`GET /channels/{id}/stats`): A composite key of the channel ID, maximum delivery attempt identifier, and total delivery attempt count.
+
+The strong entity tag incorporates every input that influences the answer:
+* Authenticated tenant workspace (preventing cross-workspace cache collisions or information disclosure)
+* Exact URL path
+* Full sorted query string (filters, limit, cursor, and time window parameters)
+* Underlying backend change detector key
+
+When `If-None-Match` matches, the endpoint fails fast with `304 Not Modified` without running the primary database scan or allocating result buffers. Not-modified responses are tracked by the metric `sorobeacon_http_not_modified_total`.
+
 ## Monitors
 
 The **Scope** column lists the scope a scoped token needs; the full
@@ -145,6 +200,32 @@ curl -s -X PUT localhost:8080/api/v1/monitors/1/escalation -d '{
 
 `GET /rule-types` returns the parameter schema the dashboard's rule builder renders. Each field has a `type` (`string`, `number`, `boolean`, `object`, or `select`), `required`, `description`, and, where applicable, `default` and `options`. A `boolean` field is a JSON boolean in `params`; the builder renders it as a true/false select and starts it at `default` when one is declared. `select` is reserved for genuine enumerations such as `comparison`, `direction`, `match`, and `op`.
 
+## Delivery budgets
+
+A delivery budget caps how many alerts one monitor may deliver per UTC day. It
+is the backstop behind channel rate limiting: rate limiting paces a flood, a
+budget stops it. A monitor has no budget by default (unlimited), so existing
+deployments are unaffected.
+
+When the budget is spent, SoroBeacon stops delivering for that monitor and
+sends **one** critical notice through its channels saying so. Further alerts
+are still stored (and marked suppressed with the reason); only delivery stops.
+The budget refills at 00:00 UTC, or immediately on a manual reset. Consumption
+is stored in the database, so a restart does not reset it. The count is per
+alert, not per channel: one alert fanned out to three channels uses one unit.
+Escalation steps after the first delivery do not use further units.
+
+| Method & path | Description | Scope |
+| --- | --- | --- |
+| `GET /monitors/{id}/delivery-budget` | `200 {"monitor_id", "limit", "used", "remaining", "exhausted", "window_start", "resets_at", "exhausted_at"}`. `limit`, `remaining` and the window fields are `null` for an unlimited monitor. `404` for an unknown monitor. | `monitors:read` |
+| `PUT /monitors/{id}/delivery-budget` | Set the daily limit: `{"limit": 200}`. `{"limit": null}` clears it (unlimited). `limit` is required and must be positive. Raising the limit above what is already used un-exhausts the budget. `200` with the stored budget; `400` for a missing or non-positive limit; `404` for an unknown monitor. | `monitors:write` |
+| `POST /monitors/{id}/delivery-budget/reset` | Manually un-exhaust the budget by zeroing today's counter. `200` with the budget; `404` for an unknown monitor. | `monitors:write` |
+
+The remaining budget is shown on the monitor page, and
+`sorobeacon_delivery_budget_exhausted_total` counts monitors spending their
+budget (alert on its rate); suppressed alerts also increment
+`sorobeacon_alert_throttles_total{channel="delivery_budget"}`.
+
 ## Monitor templates
 
 A template is a reusable monitor shape: a name, a list of rules whose params may
@@ -204,6 +285,13 @@ curl -s -X POST localhost:8080/api/v1/templates/1/instantiate -d '{
 | `POST /channels/{id}/test` | Send a synthetic alert through the channel right now. `200 {"status":"sent"}` or `502 {"status":"failed","error":"..."}`. | `channels:write` |
 | `POST /channels/bulk` | Enable or disable up to 100 channels in one call. Body: `ids` (1–100), `enabled` (required). **Partial**, with the same contract as `POST /monitors/bulk`: unknown ids are reported in `200 {"updated", "unknown_ids", "enabled"}` and do not stop the known ones. Disabling only flips the flag — queued and in-flight deliveries are not touched. | `channels:write` |
 | `POST /channels/{id}/duplicate` | Copy a channel under a unique name, credentials in `config` included (that is the point: re-typing a webhook URL to change only the room is the toil this removes). The copy is **always created disabled** — a new destination is reviewed before it receives anything — and has no monitor attachments. `201` with the new channel; the config is decrypted and re-encrypted through the store's own paths and never reaches a log. | `channels:write` |
+| `GET /channels/{id}/keys` | List signing keys for a channel. Key secret is never returned. | `channels:read` |
+| `GET /channels/{id}/devices` | List the push devices registered for a channel. Tokens are never returned. | `channels:read` |
+| `PUT /channels/{id}/devices/{deviceID}` | Register a push device or refresh its token. | `channels:write` |
+| `DELETE /channels/{id}/devices/{deviceID}` | Remove a push device. | `channels:write` |
+| `POST /channels/{id}/keys/rotate` | Rotate channel signing key, generating a successor while maintaining overlap. Returns new secret once. | `channels:write` |
+| `POST /channels/{id}/keys/{keyID}/retire` | Retire a signing key so it is no longer used for new signing but accepted during overlap. | `channels:write` |
+| `POST /channels/{id}/keys/{keyID}/revoke` | Revoke a signing key immediately. | `channels:write` |
 
 Config shapes per type: [Discord](../channels/discord.md) · [Slack](../channels/slack.md) · [Telegram](../channels/telegram.md) · [ntfy](../channels/ntfy.md) · [Email](../channels/email.md) · [Webhook](../channels/webhook.md)
 
@@ -331,8 +419,12 @@ retention rules and the difference between a retry and a redrive are in
 
 | Method & path | Description | Scope |
 | --- | --- | --- |
-| `GET /dead-letters` | List the queue in id order. Query: `channel_id`, `alert_id`, `limit` (default 50), `after_id` (keyset cursor). | `alerts:read` |
+| `GET /dead-letters` | List the queue in id order. Query: `channel_id`, `alert_id`, `cause`, `older_than`, `created_before`, `created_after`, `limit` (default 50), `after_id` (keyset cursor). | `alerts:read` |
+| `GET /dead-letters/groups` | Roll up dead letters into groups by channel and cause. Query: `channel_id`, `cause`, `older_than`. | `alerts:read` |
 | `POST /dead-letters/{id}/redrive` | Send the stored alert to the stored channel once. | `alerts:write` |
+| `POST /dead-letters/{id}/discard` | Discard one dead letter from the backlog without sending. | `alerts:write` |
+| `POST /dead-letters/bulk/redrive` | Re-drive a batch of dead letters matching filter or IDs. Rate-limited and pacing protected. | `alerts:write` |
+| `POST /dead-letters/bulk/discard` | Discard a batch of dead letters matching filter or IDs. | `alerts:write` |
 
 Each dead letter has `id`, `alert_id`, `channel_id`, `last_error` (sanitized),
 `attempt_count`, `last_status` (HTTP status, or `0` for a transport error) and
@@ -358,7 +450,10 @@ monitor without being able to delete every channel.
 | Method & path | Description | Scope |
 | --- | --- | --- |
 | `POST /tokens` | Mint. Body: `scopes` (required, at least one), optional `name`, optional `expires_in` (a Go duration, `72h`). Returns `201` with the token fields **and `token`** — the raw secret, which appears in no other response ever. | `tokens:write` |
-| `GET /tokens` | List this workspace's tokens: `id`, `name`, `prefix` (`sb_` plus eight characters), `scopes`, `created_at`, `expires_at`, `last_used_at`, `revoked_at`. Never the secret, and never the stored digest. | `tokens:read` |
+| `GET /tokens` | List this workspace's tokens: `id`, `name`, `prefix` (`sb_` plus eight characters), `scopes`, `created_at`, `expires_at`, `last_used_at`, `revoked_at`, `rotated_from_id`, `successor_id`, `rotated_at`. Never the secret, and never the stored digest. | `tokens:read` |
+| `GET /tokens/{id}` | Get one token by ID: metadata, `last_used_at`, and rotation relationship. Secret is never returned. | `tokens:read` |
+| `POST /tokens/{id}/rotate` | Rotate with overlap. Body: optional `name`, optional `scopes` (defaults to predecessor's scopes), optional `overlap` (Go duration, e.g. `48h`, default `168h`), optional `expires_in` (for successor). Sets predecessor expiry to `now + overlap` and mints successor token. Returns `201` with successor fields and `token` secret once. | `tokens:write` |
+| `POST /tokens/{id}/abandon` | Abandon in-progress rotation. Revokes the successor token and restores the predecessor token to its pre-rotation expiry. `200 {"status":"abandoned"}`. | `tokens:write` |
 | `POST /tokens/{id}/revoke` | Revoke now. `204`; the row survives with `revoked_at` set, so the audit trail outlives the credential. Revoking twice keeps the first timestamp. Another workspace's id gets the same `404` as a nonexistent one. | `tokens:write` |
 
 ```sh
@@ -391,6 +486,9 @@ Three behaviours worth knowing before you script against this:
   from the database or the dashboard — mint another and revoke the first.
   `last_used_at` is written at most once a minute per token; treat it as
   "recently used", not as an exact audit timestamp.
+* **Immediate revocation & cache timing**: Token authentication reads directly from the database (one indexed read per request) with no caching layer in front of the lookup. Therefore, revocation and rotation take effect immediately across all replicas without invalidation delay.
+* **Rotation vs. Identity-based tokens (OIDC)**: Use overlapping token rotation for static service credentials (such as CI/CD service tokens, Terraform providers, or automated workers) where an overlap period is required to roll out the new credential without downtime. When OIDC is configured, prefer ephemeral identity-based tokens (e.g. GitHub Actions Workload Identity) rather than long-lived static tokens.
+* **Expiring token warning**: When a live token with an expiry is used close to its expiration (within 24 hours), SoroBeacon emits a structured log warning (`level=WARN msg="api token in use close to expiry"`) to alert operators before unexpected expiration causes service disruption.
 
 ## Operational
 
@@ -404,6 +502,17 @@ Three behaviours worth knowing before you script against this:
 | `GET /rule-types` | Machine-readable vocabulary of rule types: `200 {"rule_types": [{"type", "parameters": [{"name", "type", …}]}, …]}`, sorted by type — the schema `POST /monitors/{id}/rules` validates against. | `none` |
 | `GET /stats` | Counts (monitors, rules, channels, alerts, alerts last 24h), last ingested ledger, last poll time. | `stats:read` |
 | `GET /stats/alerts-daily` | Daily alert counts for the last 30 UTC calendar days. Quiet days are explicit zeroes. `{"timezone":"UTC","days":[{"day":"2026-09-01","count":0}, ...]}`. | `alerts:read` |
+| `GET /usage` | Per-workspace usage metering summary (`rule_evaluations`, `alerts_raised`, `notifications_by_type`, `storage`, and daily series). Query: `from`, `to` (`YYYY-MM-DD`, default last 30 UTC days), and optional `workspace` (`all` or workspace ID, admin-only). | `stats:read` |
+| `GET /quotas` | Per-workspace resource quotas (`max_monitors`, `max_rules`, `max_channels`, `max_subscriptions`), current live usage (`monitors`, `rules`, `channels`, `subscriptions`), and query cost budget (`query_cost_budget`, `query_cost_refill_per_sec`, `query_budget_remaining`). Optional `workspace` query parameter (admin-only across workspaces). | `stats:read` |
+| `PUT /quotas` | Configure per-workspace resource quotas and query cost budget (`max_monitors`, `max_rules`, `max_channels`, `max_subscriptions`, `query_cost_budget`, `query_cost_refill_per_sec`). Optional `workspace` query parameter (admin-only across workspaces). | `monitors:write` |
+| `DELETE /workspaces/{id}` | Permanently delete a workspace and every row belonging to it across all workspace-scoped tables, or preview exact counts when `dry_run=true`. Requires `confirm={id}` (query, `X-Confirm-Workspace` header, or JSON body) unless `dry_run=true`. Stops active evaluation and in-flight notification delivery before removing rows in bounded, resumable batches. | `*` (admin) |
+| `POST /workspaces/{id}/delete` | Action-route equivalent of `DELETE /workspaces/{id}` accepting JSON body `{"dry_run":true}` or `{"confirm":"<id>","batch_size":500,"max_alert_batches":0}`. Returns `200` on completion/preview or `202` when bounded alert batches remain. | `*` (admin) |
+| `GET /workspaces/{id}/delete` | Inspect in-progress or completed workspace deletion status and per-table deleted row counts (`workspace_deletions` tombstone). | `*` (admin) |
+| `GET /retention` | Inspect the effective per-workspace alert retention policy (`alert_retention_seconds`, `alert_retention`, `policy_source` as `workspace`, `instance`, or `unset`, `default_retention_seconds`, and `pruned_before` horizon). Optional `workspace` query parameter (admin-only across workspaces). | `stats:read` |
+| `PUT /retention` | Set or update a workspace's alert retention override (`alert_retention`, `alert_retention_seconds`, or `alert_retention_days`). Shortening an active retention window requires `confirm_shorten: true` (returns `409 CONFLICT` otherwise). Optional `workspace` query parameter (admin-only across workspaces). | `monitors:write` |
+| `DELETE /retention` | Reset a workspace's alert retention override back to the instance-wide `ALERT_RETENTION` default. If resetting shortens effective retention, `confirm_shorten=true` is required (`409 CONFLICT` otherwise). Optional `workspace` query parameter (admin-only across workspaces). | `monitors:write` |
+| `GET /workspace/export` | Stream a deterministic, versioned data export of the caller's workspace (all workspace-owned configuration, operational state, and rollups). Query: `include_secrets` (`true`\|`false`, default `false` redacts channel secrets, signing key secrets, and token hashes; `true` requires `admin` role / `*` scope), `include_alerts` (`true`\|`false`, default `false` omits alert history tables), `page_size` (`1..5000`, default `250`, keyset pagination batch size for alert history), `format` (`json`\|`ndjson`, default `json`), and optional `workspace` (instance operator only across workspaces). | `monitors:read` |
+| `GET /workspaces/{id}/export` | Stream a deterministic, versioned data export for workspace `{id}`. Allowed for `{id}`'s own credentials or an unrestricted instance operator; cross-workspace requests from another workspace return `403`. Query: `include_secrets` (`true`\|`false`, `true` requires `admin` role / `*` scope), `include_alerts` (`true`\|`false`), `page_size` (`1..5000`, default `250`), `format` (`json`\|`ndjson`). | `monitors:read` |
 | `GET /audit` | Append-only log of monitor, rule and channel changes, newest first. Query: `target_type` (`monitor`\|`rule`\|`channel`), `target_id`, `from`/`to` (RFC 3339), `limit` (≤500, default 50). Each entry has `actor` (the request ID), `action` (`create`\|`update`\|`delete`), `target_type`, `target_id`, `diff` and `created_at`. `diff` records the *names* of the fields that were sent, never their values — a channel's config holds webhook URLs and tokens and is never stored. There is no endpoint to update or delete entries. | `monitors:read` |
 
 ## Federation
@@ -433,3 +542,13 @@ attach itself to them.
 * `422` — the payload cannot be stored here: it violates a database
   constraint. It is a client error, and the sender must not retry it.
 * `500` — the receiver's own fault. The sender may retry.
+
+## GraphQL Persisted Operations
+
+| Method & path | Description | Scope |
+| --- | --- | --- |
+| `POST /graphql/operations` | Register or update a persisted GraphQL operation document (id is sha256 hex). | `monitors:write` |
+| `GET /graphql/operations` | List all registered persisted GraphQL operations. | `none` |
+| `GET /graphql/operations/{id}` | Retrieve a single registered persisted GraphQL operation by ID. | `none` |
+| `DELETE /graphql/operations/{id}` | Delete a registered persisted GraphQL operation by ID. | `monitors:write` |
+

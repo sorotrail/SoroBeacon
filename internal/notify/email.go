@@ -205,7 +205,7 @@ func (e *Email) tlsConfig() *tls.Config {
 		MinVersion: tls.VersionTLS12,
 		// Verification stays on unless the operator explicitly turned it
 		// off for a relay with a self-signed certificate.
-		InsecureSkipVerify: e.cfg.TLSSkipVerify,
+		InsecureSkipVerify: e.cfg.TLSSkipVerify, // #nosec G402 -- opt-in per-channel setting for internal SMTP relays with self-signed certificates
 	}
 }
 

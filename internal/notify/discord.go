@@ -33,6 +33,7 @@ func NewDiscord(config json.RawMessage) (Notifier, error) {
 	if err != nil {
 		return nil, fmt.Errorf("discord: %w", err)
 	}
+	tpl.kind = "markdown"
 	return &Discord{cfg: cfg, tpl: tpl}, nil
 }
 

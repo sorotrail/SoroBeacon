@@ -21,8 +21,11 @@ well). Migrations are handled by the application itself — see
 
 | Resource | Notes |
 | --- | --- |
-| `Deployment` | The SoroBeacon process. Probes, resources, security context. |
-| `Service` | ClusterIP in front of the HTTP port (API + dashboard + `/metrics`). |
+| `Deployment` (`<fullname>`) | Stateless JSON API, GraphQL, and web dashboard (`WORKLOAD_ROLE=api` when `worker.enabled=true`, or combined when `worker.enabled=false`). |
+| `Deployment` (`<fullname>-worker`, optional) | Dedicated background worker (`worker.enabled=true`, `WORKLOAD_ROLE=worker`): runs the event poller, notification dispatcher, digest flusher, escalation stepper, retention pruners, and heartbeat under the PostgreSQL leader lease. |
+| `HorizontalPodAutoscaler` (optional) | Scales only the stateless API `Deployment` (`autoscaling.enabled=true`). |
+| `PodDisruptionBudget` (optional) | Separate drain-safe disruption budgets for the API (`podDisruptionBudget.enabled=true`) and worker (`worker.podDisruptionBudget.enabled=true`). |
+| `Service` | ClusterIP in front of the HTTP port (API + dashboard + `/metrics`), selecting only API pods. |
 | `ConfigMap` | Every non-secret environment variable, so the effective configuration is readable with `kubectl describe configmap`. |
 | `Secret` | `DATABASE_URL`, and `API_TOKEN` / `CONFIG_ENCRYPTION_KEY` when set. Skipped in favour of your own Secret when `database.existingSecret` / `auth.existingSecret` is set. |
 | `ServiceAccount` | Optional; SoroBeacon calls no Kubernetes API, so it has no RBAC. |
@@ -161,10 +164,33 @@ helm upgrade --install sorobeacon deploy/helm/sorobeacon \
   --namespace sorobeacon --create-namespace -f production.yaml
 ```
 
-with a `production.yaml` such as:
+with a high-availability `production.yaml` such as:
 
 ```yaml
+# Scale the stateless API horizontally (or via autoscaling below)
 replicaCount: 3
+podAntiAffinity:
+  enabled: true
+  type: soft
+podDisruptionBudget:
+  enabled: true
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetMemoryUtilizationPercentage: 75
+  targetCPUUtilizationPercentage: 80
+
+# Separate the lease-gated background worker (1 active leader + 1 warm standby)
+worker:
+  enabled: true
+  replicaCount: 2
+  podAntiAffinity:
+    enabled: true
+    type: soft
+  podDisruptionBudget:
+    enabled: true
+
 config:
   network: mainnet
   rpcUrl: https://your-provider.example/soroban
@@ -182,12 +208,41 @@ resources:
   limits:   { cpu: 1000m, memory: 512Mi }
 ```
 
+See [`docs/operations/ha-topology.md`](../../../docs/operations/ha-topology.md) for the full operator guide on separating API and worker workloads, leader-lease constraints, autoscaling signals, drain-safe `PodDisruptionBudget`s, and rollout timing.
+
 `values.schema.json` fails the release on structural mistakes — a non-numeric
 `replicaCount`, or a `database` block with neither `url` nor `existingSecret`.
 
 The Service exposes `/metrics` on the same port as the API; scrape it from
 inside the cluster (it is unauthenticated, so do not publish the port to the
 internet).
+
+## Hardened runtime image & debugging
+
+The container image is built as a multi-stage `FROM scratch` runtime image:
+
+- **Contents:** Only `/usr/local/bin/sorobeacon` (statically linked with `CGO_ENABLED=0` and `-trimpath`), `/etc/ssl/certs/ca-certificates.crt`, `/usr/share/zoneinfo`, and minimal `/etc/passwd` + `/etc/group` entries for `10001:10001`. There is **no shell** (`/bin/sh`), **no package manager** (`apk`), and **no external network utilities** (`wget`, `curl`).
+- **Numeric non-root UID/GID:** The image sets `USER 10001:10001` and the chart pins `runAsNonRoot: true`, `runAsUser: 10001`, `runAsGroup: 10001`, and `fsGroup: 10001`, so Kubernetes enforces `runAsNonRoot` without resolving a username inside the container.
+- **Self-contained probes and migration hook:** Container healthchecks invoke `sorobeacon healthcheck`, Kubernetes probes use `httpGet` against `/api/v1/livez` and `/api/v1/readyz`, and the optional Helm migration hook (`migrations.enabled=true`) invokes `/usr/local/bin/sorobeacon migrate` directly without needing `/bin/sh` or `wget`.
+- **Pod & Container Security Context:** Both `Deployment` and the migration `Job` set `automountServiceAccountToken: false`, `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`, and `seccompProfile.type: RuntimeDefault`.
+
+### Debugging a running pod without a shell (`kubectl debug`)
+
+Because the runtime image contains no shell or diagnostic utilities, `kubectl exec -it <pod> -- /bin/sh` will fail by design. To inspect the network, filesystem, or process state of a running pod, attach a Kubernetes [ephemeral debug container](https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/#ephemeral-container) targeting the `sorobeacon` container's namespaces:
+
+```sh
+kubectl debug -it <pod-name> -n sorobeacon \
+  --image=busybox:1.36 \
+  --target=sorobeacon
+```
+
+Inside the ephemeral container, the SoroBeacon process filesystem is visible at `/proc/1/root` (when process namespace sharing is active), and local loopback endpoints (`http://127.0.0.1:8080/api/v1/readyz`, `/metrics`) can be queried directly.
+
+### Read-only root filesystem & writable paths
+
+The chart runs with `readOnlyRootFilesystem: true` and mounts a bounded `64Mi` `emptyDir` at `/tmp` so any standard library temporary file (`os.TempDir()`) has ephemeral scratch space without making the root filesystem writable.
+
+If you enable a feature that writes to the local filesystem (for example, `config.archiveUrl` pointed at a `file://` or `dir://` path instead of `s3://`, or a custom writable directory), mount a dedicated `PersistentVolumeClaim` or `emptyDir` at that path rather than setting `securityContext.readOnlyRootFilesystem=false`.
 
 ## Tests
 

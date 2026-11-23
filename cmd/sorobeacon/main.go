@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,12 +14,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/sorotrail/sorobeacon/internal/alerts"
 	"github.com/sorotrail/sorobeacon/internal/api"
@@ -41,6 +44,7 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
 	"github.com/sorotrail/sorobeacon/internal/telemetry"
+	"github.com/sorotrail/sorobeacon/internal/tlsutil"
 	"github.com/sorotrail/sorobeacon/internal/web"
 	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
@@ -71,7 +75,31 @@ func main() {
 		return
 	}
 	if len(args) > 0 {
+		if ok, roleArg, err := parseServerRoleArgs(args); ok {
+			if err != nil {
+				reportCLIError(os.Stderr, err)
+				os.Exit(1)
+			}
+			_ = os.Setenv("WORKLOAD_ROLE", string(roleArg))
+			if err := run(); err != nil {
+				slog.Error("fatal", "err", err)
+				os.Exit(1)
+			}
+			return
+		}
 		switch args[0] {
+		case "healthcheck":
+			if err := runHealthcheck(context.Background(), args[1:], os.Stdout); err != nil {
+				reportCLIError(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		case "migrate":
+			if err := runMigrate(context.Background(), args[1:], os.Stdout); err != nil {
+				reportCLIError(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
 		case "backup":
 			if err := runBackup(args[1:]); err != nil {
 				slog.Error("backup failed", "err", err)
@@ -103,6 +131,39 @@ func main() {
 	}
 }
 
+// parseServerRoleArgs recognises `sorobeacon --role=all|api|worker` (and
+// `sorobeacon serve [--role=all|api|worker]`) so the HA Helm chart can start
+// dedicated API and background-worker Deployments from the same binary.
+func parseServerRoleArgs(args []string) (bool, lease.WorkloadRole, error) {
+	if len(args) == 0 {
+		return false, lease.RoleAll, nil
+	}
+	rest := args
+	isServe := false
+	if rest[0] == "serve" {
+		isServe = true
+		rest = rest[1:]
+	}
+	if !isServe && len(rest) > 0 &&
+		rest[0] != "--role" && rest[0] != "-role" &&
+		!strings.HasPrefix(rest[0], "--role=") && !strings.HasPrefix(rest[0], "-role=") {
+		return false, "", nil
+	}
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	roleFlag := fs.String("role", os.Getenv("WORKLOAD_ROLE"), "workload role: all | api | worker")
+	if err := fs.Parse(rest); err != nil {
+		return true, "", err
+	}
+	if fs.NArg() > 0 {
+		return true, "", fmt.Errorf("unexpected argument %q for server role", fs.Arg(0))
+	}
+	role, ok := lease.ParseWorkloadRole(*roleFlag)
+	if !ok {
+		return true, "", fmt.Errorf("invalid --role %q: expected all, api, or worker", *roleFlag)
+	}
+	return true, role, nil
+}
+
 func run() error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -131,7 +192,7 @@ func run() error {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGHUP)
 	defer signal.Stop(sigs)
-	go reloadLoop(ctx, sigs, config.NewReloader(cfg), &level, srv.poller, log)
+	go reloadLoop(ctx, sigs, config.NewReloader(cfg), &level, srv.poller, log, srv.tlsReloaders...)
 
 	return srv.run(ctx)
 }
@@ -140,13 +201,13 @@ func run() error {
 // loop rather than a one-shot handler so a burst of signals is drained one
 // reload at a time instead of being collapsed by the signal coalescing a
 // channel-based Notify performs.
-func reloadLoop(ctx context.Context, sigs <-chan os.Signal, reloader *config.Reloader, level *slog.LevelVar, p *poller.Poller, log *slog.Logger) {
+func reloadLoop(ctx context.Context, sigs <-chan os.Signal, reloader *config.Reloader, level *slog.LevelVar, p *poller.Poller, log *slog.Logger, tlsReloaders ...*tlsutil.Reloader) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-sigs:
-			applyReload(reloader, level, p, log)
+			applyReload(reloader, level, p, log, tlsReloaders...)
 		}
 	}
 }
@@ -156,7 +217,17 @@ func reloadLoop(ctx context.Context, sigs <-chan os.Signal, reloader *config.Rel
 // and log what changed, old value to new value. A rejected reload logs the
 // reasons and changes nothing — a bad reload must never leave the process
 // half-configured.
-func applyReload(reloader *config.Reloader, level *slog.LevelVar, p *poller.Poller, log *slog.Logger) {
+func applyReload(reloader *config.Reloader, level *slog.LevelVar, p *poller.Poller, log *slog.Logger, tlsReloaders ...*tlsutil.Reloader) {
+	for _, tr := range tlsReloaders {
+		if tr == nil {
+			continue
+		}
+		if err := tr.Reload(); err != nil {
+			log.Error("tls certificate reload failed", "err", err)
+		} else {
+			log.Info("tls certificates reloaded")
+		}
+	}
 	changed, err := reloader.Reload()
 	if err != nil {
 		log.Error("configuration reload rejected", "err", err)
@@ -209,6 +280,17 @@ func defaultStartupDeps() startupDeps {
 			return buildSource(ctx, log, cfg)
 		},
 		newLeader: func(cfg config.Config, log *slog.Logger) (leaderLease, error) {
+			role, ok := lease.ParseWorkloadRole(os.Getenv("WORKLOAD_ROLE"))
+			if !ok {
+				return nil, fmt.Errorf("invalid WORKLOAD_ROLE %q: expected all, api, or worker", os.Getenv("WORKLOAD_ROLE"))
+			}
+			// In a split HA topology (worker.enabled=true in the Helm chart),
+			// API pods run with WORKLOAD_ROLE=api and never campaign for the
+			// poller lease, keeping advisory-lock sessions bounded to the
+			// dedicated worker Deployment regardless of API autoscaling.
+			if role == lease.RoleAPI {
+				return lease.Disabled(log), nil
+			}
 			// Leadership. Every instance serves the API and the dashboard, but
 			// only the one holding the lease runs the ingest loop: two pollers
 			// ingest the same events and race the same checkpoint, so alerts
@@ -251,13 +333,15 @@ type server struct {
 	grpcSrv      *sorogrpc.Server
 	httpListener net.Listener
 	grpcListener net.Listener
+	tlsReloaders []*tlsutil.Reloader
 
 	// Wiring decisions, set once here and used by run. Keeping them in one
 	// place means the branch that constructs a component and the loop that
 	// starts it cannot disagree about whether it is enabled.
-	prunerEnabled   bool
-	playground      bool
-	shutdownTimeout time.Duration
+	prunerEnabled      bool
+	auditPrunerEnabled bool
+	playground         bool
+	shutdownTimeout    time.Duration
 }
 
 // newServer builds the process from configuration: store and migrations,
@@ -295,6 +379,9 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 		return nil, err
 	}
 	authn := auth.NewBound(bindings, auth.DefaultSessionTTL)
+	if cfg.ServerMTLSEnabled() || len(cfg.MTLSBindings) > 0 {
+		authn.WithMTLS(cfg.ServerMTLSEnabled(), cfg.MTLSBindings)
+	}
 
 	// Single sign-on, when a provider is configured. Discovery happens here, at
 	// startup, rather than on the first visitor's click: a mistyped
@@ -345,6 +432,22 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	// database, and the store is opened before the lease, the source or any
 	// server gets a handle to it. A server wired against a database that has
 	// not been migrated would serve 500s until the operator noticed.
+	if cfg.DatabaseTLSEnabled() {
+		dbURL, err := store.ApplyDatabaseTLS(cfg.DatabaseURL, cfg.DatabaseSSLMode, cfg.DatabaseSSLCertFile, cfg.DatabaseSSLKeyFile, cfg.DatabaseSSLRootCertFile)
+		if err != nil {
+			shutdownTelemetry(log, tel)
+			return nil, err
+		}
+		cfg.DatabaseURL = dbURL
+		if cfg.ReplicaDatabaseURL != "" {
+			repURL, err := store.ApplyDatabaseTLS(cfg.ReplicaDatabaseURL, cfg.DatabaseSSLMode, cfg.DatabaseSSLCertFile, cfg.DatabaseSSLKeyFile, cfg.DatabaseSSLRootCertFile)
+			if err != nil {
+				shutdownTelemetry(log, tel)
+				return nil, err
+			}
+			cfg.ReplicaDatabaseURL = repURL
+		}
+	}
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		shutdownTelemetry(log, tel)
 		return nil, err
@@ -365,7 +468,13 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	// changes: m is still the same instance the poller, the dispatcher and the
 	// HTTP middleware use below.
 	m := metrics.New()
+	var queryTracer pgx.QueryTracer
+	if tel.Enabled() {
+		queryTracer = tel.NewQueryTracer()
+	}
+	notify.InstrumentHTTP(tel)
 	st, err := store.New(ctx, cfg.DatabaseURL, store.PoolSettings{
+		Tracer:          queryTracer,
 		MaxConns:        cfg.DatabaseMaxConns,
 		MinConns:        cfg.DatabaseMinConns,
 		MaxConnLifetime: cfg.DatabaseMaxConnLifetime,
@@ -392,6 +501,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	if p, ok := st.(*store.Postgres); ok {
 		p.WithTelemetry(tel)
 	}
+	store.SetInstanceAlertRetention(st, cfg.AlertRetention)
 	log.Info("database ready", "backend", store.BackendName(cfg.DatabaseURL))
 	if cfg.ReplicaDatabaseURL != "" {
 		// The URL itself stays out of the line: it carries credentials. The
@@ -447,6 +557,11 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 			return nil, err
 		}
 	}
+	for _, b := range cfg.MTLSBindings {
+		if err := st.EnsureWorkspace(ctx, b.Workspace); err != nil {
+			return nil, err
+		}
+	}
 
 	// Scoped API tokens. One manager, shared by the API and the dashboard, so
 	// a token minted from either is subject to the same rules about what it
@@ -489,11 +604,11 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 			}
 			records := make([]rules.MatchRecord, 0, len(alerts))
 			for _, a := range alerts {
-				records = append(records, rules.MatchRecord{At: a.CreatedAt, EventID: a.EventID})
+				records = append(records, rules.MatchRecord{At: a.CreatedAt, EventID: a.EventID, RuleVersion: a.RuleVersion})
 			}
 			return records, nil
 		})))
-	factory := notify.DefaultFactory().WithFederationOrigin(cfg.InstanceName)
+	factory := notify.DefaultFactory().WithFederationOrigin(cfg.InstanceName).WithPushDevices(st)
 	// External secrets: when a provider is configured, ${secret:...}
 	// references in channel configs resolve when a notifier is built. The
 	// stored config keeps the reference.
@@ -520,7 +635,9 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	// revoked token surfaces as a broken channel instead of as silence. The
 	// threshold is off unless the operator sets it — auto-disabling a channel
 	// is a destructive answer to a temporary problem.
+	paging := notify.NewPagingSync(st, factory, log)
 	dispatcher := notify.NewDispatcher(st, factory, log).
+		WithPaging(paging).
 		WithRateLimits(notify.RateLimits{
 			SlackRPS:     cfg.NotifyRateLimitSlackRPS,
 			TelegramRPS:  cfg.NotifyRateLimitTelegramRPS,
@@ -529,6 +646,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 		}).
 		WithMetrics(m).
 		WithDigestQueue(st).
+		WithDeliveryBudgets(st).
 		WithDisableAfterFailures(cfg.ChannelDisableAfterFailures).
 		WithFlapping(alerts.FlappingConfig{
 			Episodes:   cfg.FlappingEpisodes,
@@ -573,6 +691,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 
 	// HTTP: JSON API under /api/v1, dashboard at /.
 	apiSrv := api.New(st, registry, factory, health, log).
+		WithDispatcher(dispatcher).
 		WithPoller(p).
 		WithNetworks(config.NetworkNames(cfg.Networks)).
 		WithLeadership(leader).
@@ -583,19 +702,22 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 			TrustForwarded: cfg.RateLimitTrustForwarded,
 		}).
 		WithMaxBodyBytes(cfg.HTTPMaxBodyBytes).
+		WithMetrics(m).
 		WithBroadcaster(liveAlerts).
+		WithAlertRetention(cfg.AlertRetention).
+		WithPaging(paging).
 		WithAuth(authn)
 	webSrv, err := web.New(st, registry, factory, log)
 	if err != nil {
 		return nil, err
 	}
-	webSrv.WithPoller(p).WithLeadership(leader).WithSilentAfter(cfg.MonitorSilentAfter).WithAuth(authn).
-		WithNetworks(config.NetworkNames(cfg.Networks)).WithTokens(tokens)
+	webSrv.WithPaging(paging).WithPoller(p).WithLeadership(leader).WithSilentAfter(cfg.MonitorSilentAfter).WithAuth(authn).
+		WithNetworks(config.NetworkNames(cfg.Networks)).WithTokens(tokens).WithMaxBodyBytes(cfg.HTTPMaxBodyBytes)
 	root := chi.NewRouter()
 	// RequestLog must sit outside Recoverer so a panic still emits the
 	// access line after chi writes 500. reqid first so the line can
 	// carry the correlation id.
-	root.Use(reqid.Middleware, api.RequestLog(log), middleware.Recoverer)
+	root.Use(reqid.Middleware, tel.Middleware, api.RequestLog(log), middleware.Recoverer)
 	root.Use(api.CORSMiddleware(api.CORSConfig{Origins: cfg.CORSAllowedOrigins}))
 	// RoutePattern returns the matched chi pattern (e.g. "/api/v1/monitors/{id}")
 	// rather than the raw path, keeping metric label cardinality bounded.
@@ -607,6 +729,9 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	}
 	root.Use(m.Middleware)
 	root.Handle("/metrics", m.Handler())
+	// PagerDuty webhooks authenticate by HMAC signature, not a SoroBeacon
+	// token, so they live outside /api/v1.
+	root.Handle("/hooks/pagerduty/*", paging.WebhookHandler("/hooks/pagerduty/"))
 	root.Mount("/api/v1", apiSrv.Routes())
 	root.Mount("/", webSrv.Routes())
 
@@ -616,6 +741,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	graphqlConfig.EnablePlayground = cfg.GraphQL.EnablePlayground
 	graphqlConfig.MaxDepth = cfg.GraphQL.MaxDepth
 	graphqlConfig.MaxComplexity = cfg.GraphQL.MaxComplexity
+	graphqlConfig.AllowlistOnly = cfg.GraphQL.AllowlistOnly
 	root.Handle("/graphql", graphql.NewHandler(graphqlResolver, graphqlConfig))
 	if cfg.GraphQL.EnablePlayground {
 		root.Handle("/graphql/playground", graphql.PlaygroundHandler("/graphql"))
@@ -643,7 +769,14 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 		if err != nil {
 			return nil, err
 		}
-		archiver = pruner
+		// The same backend also serves whole-partition archives (verified
+		// before a drop) and the opt-in archived reads behind GET /alerts.
+		parts, err := archive.NewStoreFromURL(cfg.ArchiveURL)
+		if err != nil {
+			return nil, err
+		}
+		archiver = &archive.Tiered{Pruner: pruner, Store: parts}
+		apiSrv.WithArchiveReader(parts)
 		// Never log the URL: an operator may embed an endpoint or token in a
 		// query string. The scheme is enough to confirm what was selected.
 		log.Info("alert archiving enabled")
@@ -660,12 +793,70 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	srv.archiver = archiver
 	srv.httpSrv = httpSrv
 	srv.prunerEnabled = cfg.AlertRetention > 0
+	srv.auditPrunerEnabled = cfg.AuditRetention > 0
 	srv.playground = cfg.GraphQL.EnablePlayground
+
+	var srvTLSReloader *tlsutil.Reloader
+	if cfg.ServerTLSEnabled() {
+		mode, err := tlsutil.ParseClientAuthMode(cfg.TLSClientAuth, cfg.TLSClientCAFile != "")
+		if err != nil {
+			return nil, err
+		}
+		srvTLSReloader, err = tlsutil.NewReloader(tlsutil.PeerConfig{
+			Component:  "server",
+			CertFile:   cfg.TLSCertFile,
+			KeyFile:    cfg.TLSKeyFile,
+			CAFile:     cfg.TLSClientCAFile,
+			ClientAuth: mode,
+			Logger:     log,
+		})
+		if err != nil {
+			return nil, err
+		}
+		srv.tlsReloaders = append(srv.tlsReloaders, srvTLSReloader)
+		m.RegisterTLSCertificateExpiry("server", srvTLSReloader.LeafNotAfterUnix)
+	}
+	if cfg.SoroTrailTLSCertFile != "" && cfg.SoroTrailTLSKeyFile != "" {
+		stReloader, err := tlsutil.NewReloader(tlsutil.PeerConfig{
+			Component:  "sorotrail_client",
+			CertFile:   cfg.SoroTrailTLSCertFile,
+			KeyFile:    cfg.SoroTrailTLSKeyFile,
+			CAFile:     cfg.SoroTrailTLSCAFile,
+			ServerName: cfg.SoroTrailTLSServerName,
+			Logger:     log,
+		})
+		if err != nil {
+			return nil, err
+		}
+		srv.tlsReloaders = append(srv.tlsReloaders, stReloader)
+		m.RegisterTLSCertificateExpiry("sorotrail_client", stReloader.LeafNotAfterUnix)
+	}
+	if cfg.DatabaseSSLCertFile != "" && cfg.DatabaseSSLKeyFile != "" {
+		dbReloader, err := tlsutil.NewReloader(tlsutil.PeerConfig{
+			Component: "database_client",
+			CertFile:  cfg.DatabaseSSLCertFile,
+			KeyFile:   cfg.DatabaseSSLKeyFile,
+			CAFile:    cfg.DatabaseSSLRootCertFile,
+			Logger:    log,
+		})
+		if err != nil {
+			return nil, err
+		}
+		srv.tlsReloaders = append(srv.tlsReloaders, dbReloader)
+		m.RegisterTLSCertificateExpiry("database_client", dbReloader.LeafNotAfterUnix)
+	}
 
 	// gRPC serves reads exactly as the HTTP API does, so every instance runs
 	// it regardless of leadership.
 	if cfg.GRPCAddr != "" {
 		srv.grpcSrv = sorogrpc.New(st, authn, log)
+		if srvTLSReloader != nil {
+			grpcTLS, err := srvTLSReloader.ServerTLSConfig()
+			if err != nil {
+				return nil, err
+			}
+			srv.grpcSrv.WithTLSConfig(grpcTLS)
+		}
 	}
 
 	// Bind last. A listener is the first thing a failed startup could leave
@@ -674,6 +865,14 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	httpLis, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
 		return nil, fmt.Errorf("http listen %s: %w", cfg.HTTPAddr, err)
+	}
+	if srvTLSReloader != nil {
+		httpTLS, err := srvTLSReloader.ServerTLSConfig()
+		if err != nil {
+			_ = httpLis.Close()
+			return nil, err
+		}
+		httpLis = tls.NewListener(httpLis, httpTLS)
 	}
 	srv.httpListener = httpLis
 	if srv.grpcSrv != nil {
@@ -789,6 +988,23 @@ func (s *server) job(ctx context.Context) {
 		start(func(ctx context.Context) {
 			store.RunAlertPruner(ctx, s.store, s.cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, s.archiver, s.log)
 		})
+	} else {
+		// Partition creation and runway monitoring must continue across month
+		// boundaries even when ALERT_RETENTION is unset.
+		start(func(ctx context.Context) {
+			store.RunAlertPartitionLifecycle(ctx, s.store, store.PartitionLifecycleOptions{
+				RunwayMonths:  store.DefaultPartitionRunwayMonths,
+				CheckInterval: store.DefaultPartitionCheckInterval,
+				Log:           s.log,
+			})
+		})
+	}
+	if s.auditPrunerEnabled {
+		if ap, ok := s.store.(store.AuditPruner); ok {
+			start(func(ctx context.Context) {
+				store.RunAuditPruner(ctx, ap, s.cfg.AuditRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, s.log)
+			})
+		}
 	}
 	// The digest flusher and the escalation stepper are leader-gated for the
 	// same reason as the pruner: they send on a timer, and two instances
@@ -850,16 +1066,12 @@ func shutdownTelemetry(log *slog.Logger, tel *telemetry.Provider) {
 // the factory treats ${secret:...} strings as literals exactly as it did
 // before the feature. The Vault token is a credential and is never logged.
 func buildSecretResolver(cfg config.Config, log *slog.Logger) *secrets.Resolver {
-	switch cfg.SecretsProvider {
-	case "env":
-		log.Info("external secrets enabled", "secrets_provider", "env", "cache_ttl", cfg.SecretsCacheTTL.String())
-		return secrets.NewResolver(secrets.NewEnvProvider()).WithTTL(cfg.SecretsCacheTTL)
-	case "vault":
-		log.Info("external secrets enabled", "secrets_provider", "vault", "vault_addr", cfg.VaultAddr, "cache_ttl", cfg.SecretsCacheTTL.String())
-		return secrets.NewResolver(secrets.NewVaultProvider(cfg.VaultAddr, cfg.VaultToken, cfg.VaultNamespace)).WithTTL(cfg.SecretsCacheTTL)
-	default:
+	r := config.BuildResolver(cfg)
+	if r == nil {
 		return nil
 	}
+	log.Info("external secrets enabled", "secrets_provider", cfg.SecretsProvider, "cache_ttl", cfg.SecretsCacheTTL.String())
+	return r
 }
 
 // buildSource wires the configured event source and its health checker. It is
@@ -868,9 +1080,28 @@ func buildSecretResolver(cfg config.Config, log *slog.Logger) *secrets.Resolver 
 func buildSource(ctx context.Context, log *slog.Logger, cfg config.Config) (poller.EventSource, api.HealthChecker, error) {
 	switch cfg.SourceMode {
 	case "sorotrail":
-		stc := sorotrail.NewClient(cfg.SoroTrailURL, nil)
-		log.Info("upstream mode: reading events from SoroTrail", "url", cfg.SoroTrailURL)
-		return sorotrail.NewSource(stc), stc, nil
+		var stc *sorotrail.Client
+		if cfg.SoroTrailTLSEnabled() {
+			rel, err := tlsutil.NewReloader(tlsutil.PeerConfig{
+				Component:  "sorotrail_client",
+				CertFile:   cfg.SoroTrailTLSCertFile,
+				KeyFile:    cfg.SoroTrailTLSKeyFile,
+				CAFile:     cfg.SoroTrailTLSCAFile,
+				ServerName: cfg.SoroTrailTLSServerName,
+				Logger:     log,
+			})
+			if err != nil {
+				return nil, nil, err
+			}
+			stc = sorotrail.NewClientWithTLS(cfg.SoroTrailURL, rel)
+		} else {
+			stc = sorotrail.NewClient(cfg.SoroTrailURL, nil)
+		}
+		if err := verifySoroTrailEndpoint(ctx, log, stc, cfg.SoroTrailURL, cfg.Network.Passphrase); err != nil {
+			return nil, nil, err
+		}
+		log.Info("upstream mode: reading events from SoroTrail", "url", cfg.SoroTrailURL, "network", cfg.Network.Name)
+		return sorotrail.NewSource(stc).WithExpectedPassphrase(cfg.Network.Passphrase), stc, nil
 	case "horizon":
 		hc := horizon.NewClient(cfg.HorizonURL, nil)
 		log.Info("horizon mode: reading events from Horizon", "url", cfg.HorizonURL)
@@ -966,6 +1197,13 @@ func runBackfill(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if cfg.DatabaseTLSEnabled() {
+		dbURL, err := store.ApplyDatabaseTLS(cfg.DatabaseURL, cfg.DatabaseSSLMode, cfg.DatabaseSSLCertFile, cfg.DatabaseSSLKeyFile, cfg.DatabaseSSLRootCertFile)
+		if err != nil {
+			return err
+		}
+		cfg.DatabaseURL = dbURL
+	}
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		return err
 	}
@@ -1084,6 +1322,25 @@ func verifyNetworkEndpoints(ctx context.Context, log *slog.Logger, client *stell
 		}
 	}
 	return errors.Join(mismatches...)
+}
+
+// verifySoroTrailEndpoint checks at startup that the configured SoroTrail
+// endpoint speaks the SoroTrail API and serves the configured Stellar network.
+// A transient transport failure at boot logs a warning rather than crashing
+// the process so the poller can back off and verify on the first reachable
+// cycle; a wrong network passphrase or incompatible endpoint fails startup
+// immediately.
+func verifySoroTrailEndpoint(ctx context.Context, log *slog.Logger, client *sorotrail.Client, endpointURL, configured string) error {
+	ctx, cancel := context.WithTimeout(ctx, startupNetworkTimeout)
+	defer cancel()
+	if err := client.VerifyUpstream(ctx, configured); err != nil {
+		if errors.Is(err, sorotrail.ErrUpstreamUnreachable) {
+			log.Warn("could not verify upstream SoroTrail endpoint at startup", "sorotrail_url", endpointURL, "error", err)
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // startupHealthTimeout bounds the one-off health check logged at startup,

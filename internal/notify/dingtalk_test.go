@@ -121,8 +121,8 @@ func TestDingTalkSendSuccessWithoutSecret(t *testing.T) {
 	assert.NotContains(t, gotURL, "sign")
 
 	var payload struct {
-		MsgType  string                 `json:"msgtype"`
-		Markdown map[string]string      `json:"markdown"`
+		MsgType  string            `json:"msgtype"`
+		Markdown map[string]string `json:"markdown"`
 	}
 	require.NoError(t, json.Unmarshal(gotBody, &payload))
 	assert.Equal(t, "markdown", payload.MsgType)

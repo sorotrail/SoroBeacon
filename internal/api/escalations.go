@@ -62,6 +62,10 @@ func (s *Server) getMonitorEscalation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, r, http.StatusBadRequest, "invalid id")
 		return
 	}
+	if _, err := s.store.GetMonitor(r.Context(), id); err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	pol, err := s.store.GetEscalationPolicyForMonitor(r.Context(), id)
 	if err != nil {
 		s.fail(w, r, err)
@@ -159,6 +163,10 @@ func (s *Server) deleteMonitorEscalation(w http.ResponseWriter, r *http.Request)
 		writeErr(w, r, http.StatusBadRequest, "invalid id")
 		return
 	}
+	if _, err := s.store.GetMonitor(r.Context(), id); err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	if err := s.store.DeleteEscalationPolicy(r.Context(), id); err != nil {
 		s.fail(w, r, err)
 		return
@@ -185,6 +193,9 @@ func (s *Server) acknowledgeAlert(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	// The local acknowledgement has committed; the provider update is best
+	// effort and never fails it (see notify.PagingSync.Propagate).
+	s.paging.Propagate(r.Context(), id, "acknowledge")
 	a, err := s.store.GetAlert(r.Context(), id)
 	if err != nil {
 		s.fail(w, r, err)

@@ -12,7 +12,7 @@ type webexConfig struct {
 	BotToken string `json:"bot_token"`
 	RoomID   string `json:"room_id"`
 	// APIBase overrides https://webexapis.com, mainly for tests.
-	APIBase  string `json:"api_base,omitempty"`
+	APIBase string `json:"api_base,omitempty"`
 	// Template optionally overrides the plain-text message; empty uses the
 	// shared default (see RenderText and docs/channels/templates.md).
 	Template string `json:"template,omitempty"`
@@ -49,7 +49,7 @@ func (w *Webex) Send(ctx context.Context, a Alert) error {
 		return err
 	}
 	body, err := json.Marshal(map[string]string{
-		"roomId":  w.cfg.RoomID,
+		"roomId":   w.cfg.RoomID,
 		"markdown": msg,
 	})
 	if err != nil {

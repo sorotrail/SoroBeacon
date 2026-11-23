@@ -100,6 +100,10 @@ func (r *MonitorResource) Create(ctx context.Context, req resource.CreateRequest
 
 	var result apiMonitor
 	if err := r.client.create(ctx, "/monitors", body, &result); err != nil {
+		if IsAlreadyExists(err) {
+			resp.Diagnostics.AddError("Create monitor failed: monitor already exists", err.Error())
+			return
+		}
 		resp.Diagnostics.AddError("Create monitor failed", err.Error())
 		return
 	}
@@ -118,6 +122,10 @@ func (r *MonitorResource) Read(ctx context.Context, req resource.ReadRequest, re
 	var result apiMonitor
 	path := fmt.Sprintf("/monitors/%d", state.ID.ValueInt64())
 	if err := r.client.get(ctx, path, &result); err != nil {
+		if IsNotFound(err) {
+			resp.State.RemoveResource(ctx)
+			return
+		}
 		resp.Diagnostics.AddError("Read monitor failed", err.Error())
 		return
 	}

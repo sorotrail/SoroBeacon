@@ -1,0 +1,57 @@
+name: CodeQL
+
+# Security-focused static analysis of this repository's own Go code. The CI
+# workflow already covers dependencies (govulncheck) and style/correctness
+# (golangci-lint); neither looks for a vulnerability written here, which is
+# what this workflow is for. Results are uploaded to code scanning, so a new
+# finding is shown inline on the pull request rather than only in a job log.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so a query-pack update that starts flagging existing code is
+    # noticed without waiting for an unrelated change to touch that file.
+    - cron: "23 4 * * 1"
+
+# Least privilege. security-events: write is what lets the action upload
+# SARIF; nothing here reads a secret, so the workflow behaves the same on
+# pull requests from forks (code scanning accepts uploads for fork pull
+# requests through the pull_request event without exposing secrets).
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            terraform-provider-sorobeacon/go.sum
+      # Pinned to a release tag rather than a floating branch so the set of
+      # queries that runs only changes when Dependabot proposes a bump.
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: go
+          build-mode: manual
+          config-file: ./.github/codeql/codeql-config.yml
+      # A manual build rather than autobuild, so both modules are extracted:
+      # the Terraform provider carries its own go.mod and the root ./... stops
+      # at it.
+      - name: Build
+        run: |
+          go build ./...
+          (cd terraform-provider-sorobeacon && go build ./...)
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:go

@@ -97,6 +97,14 @@ var channelConformanceFixtures = map[string]channelConformanceFixture{
 			}, "template", customTpl)
 		},
 	},
+	TypeTeams: {
+		supportsTemplate: true,
+		buildConfig: func(endpoint, secret, customTpl string) json.RawMessage {
+			return withTemplateField(map[string]any{
+				"webhook_url": endpoint + "/webhookb2/" + secret,
+			}, "template", customTpl)
+		},
+	},
 	TypeTelegram: {
 		supportsTemplate: true,
 		buildConfig: func(endpoint, secret, customTpl string) json.RawMessage {
@@ -161,6 +169,23 @@ var channelConformanceFixtures = map[string]channelConformanceFixture{
 				"routing_key": secret,
 				"events_url":  endpoint + "/v2/enqueue",
 				"severity":    "critical",
+			}, "", "")
+		},
+	},
+	// Push fans out to the device tokens registered for the channel after an
+	// OAuth token exchange, so it has no single-request wire contract. Its
+	// delivery, classification, rate limiting and secret handling are covered
+	// in push_test.go.
+	TypePush: {
+		supportsTemplate: false,
+		transport:        "device-push",
+		buildConfig: func(endpoint, secret, _ string) json.RawMessage {
+			return withTemplateField(map[string]any{
+				"project_id":   "conformance",
+				"client_email": "svc@conformance.iam.example",
+				"private_key":  secret,
+				"endpoint":     endpoint,
+				"token_url":    endpoint + "/token",
 			}, "", "")
 		},
 	},
@@ -375,9 +400,9 @@ func newConformanceFactory(srvURL string, client *http.Client) *Factory {
 		}
 		s := n.(*SNS)
 		awsCfg := aws.Config{
-			Region:      s.cfg.Region,
-			Credentials: credentials.NewStaticCredentialsProvider("AKIAIOSFODNN7EXAMPLE", s.cfg.SecretAccessKey, ""),
-			HTTPClient:  client,
+			Region:           s.cfg.Region,
+			Credentials:      credentials.NewStaticCredentialsProvider("AKIAIOSFODNN7EXAMPLE", s.cfg.SecretAccessKey, ""),
+			HTTPClient:       client,
 			RetryMaxAttempts: 1,
 		}
 		s.client = sns.NewFromConfig(awsCfg, func(o *sns.Options) {
@@ -438,7 +463,7 @@ func TestChannelConformance(t *testing.T) {
 		}
 	}
 	for chType := range channelConformanceFixtures {
-		if ! slicesContains(registered, chType) {
+		if !slicesContains(registered, chType) {
 			t.Fatalf("channelConformanceFixtures contains %q which is not registered in DefaultFactory().Types()", chType)
 		}
 	}
@@ -448,6 +473,9 @@ func TestChannelConformance(t *testing.T) {
 		chType := chType
 		fix := channelConformanceFixtures[chType]
 		t.Run(chType, func(t *testing.T) {
+			if fix.transport == "device-push" {
+				t.Skip("push fans out to registered devices; covered in push_test.go")
+			}
 			t.Run("DeliverySuccess", func(t *testing.T) {
 				runConformanceDeliverySuccess(t, chType, fix)
 			})

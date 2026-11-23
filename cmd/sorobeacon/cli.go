@@ -47,10 +47,12 @@ Commands:
   channel list|create|delete|test                 notification channels
 
 Local commands (they read the environment or the database, not an instance):
-  validate   check the configuration and exit
-  backfill   replay a monitor's recent history
-  backup     dump the database
-  restore    load a dump
+  validate     check the configuration and exit
+  migrate      apply embedded database migrations and exit
+  healthcheck  probe the local HTTP health endpoint and exit
+  backfill     replay a monitor's recent history
+  backup       dump the database
+  restore      load a dump
 
 Global flags (accepted before or after the command):
   --url URL       instance base URL (default $SOROBEACON_URL, then ` +
@@ -474,6 +476,7 @@ type stringList []string
 
 func (s *stringList) String() string { return strings.Join(*s, ", ") }
 
+// Set appends value to the list, so each repeat of the flag adds one entry.
 func (s *stringList) Set(value string) error {
 	*s = append(*s, value)
 	return nil
@@ -490,6 +493,8 @@ func (l *int64List) String() string {
 	return strings.Join(parts, ", ")
 }
 
+// Set parses value as a positive id and appends it to the list. It returns
+// an error for anything parseID rejects, which flag reports as a bad value.
 func (l *int64List) Set(value string) error {
 	id, err := parseID(value)
 	if err != nil {

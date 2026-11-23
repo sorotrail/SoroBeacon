@@ -90,6 +90,10 @@ func (s *healthChannelStore) RecordChannelHealth(_ context.Context, channelID in
 	return nil
 }
 
+func (s *healthChannelStore) CreateAuditEntry(_ context.Context, _ *store.AuditEntry) error {
+	return nil
+}
+
 // healthServer wires an API server whose "mock" channel type is backed by n.
 func healthServer(t *testing.T, st store.Store, n notify.Notifier) *httptest.Server {
 	t.Helper()

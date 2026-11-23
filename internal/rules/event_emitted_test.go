@@ -149,3 +149,33 @@ func TestEventEmitted_Evaluate(t *testing.T) {
 		})
 	}
 }
+
+// TestEventEmittedEventNames pins what the poller may narrow a getEvents
+// filter on: a rule scoped to one event names it, while a rule that matches
+// by topic alone may match events of any name and must report ok=false so
+// the caller leaves the contract unfiltered.
+func TestEventEmittedEventNames(t *testing.T) {
+	tests := []struct {
+		name   string
+		params string
+		want   []string
+		wantOK bool
+	}{
+		{"scoped to one event", `{"event_name":"transfer"}`, []string{"transfer"}, true},
+		{"scoped to a different event", `{"event_name":"burn"}`, []string{"burn"}, true},
+		{"topic_equals alone matches any name", `{"topic_equals":{"0":"transfer"}}`, nil, false},
+		{"no constraints at all", `{}`, nil, false},
+		{"malformed params", `{"event_name":`, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := (EventEmitted{}).EventNames(json.RawMessage(tt.params))
+			require.Equal(t, tt.wantOK, ok)
+			if tt.wantOK {
+				require.Equal(t, tt.want, got)
+				return
+			}
+			require.Nil(t, got, "a rule that cannot name its events must report no names at all")
+		})
+	}
+}

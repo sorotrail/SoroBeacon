@@ -1148,6 +1148,7 @@ func TestQueryErrorsAreGraphQLErrors(t *testing.T) {
 			ge := requireGraphQLError(t, tc.call())
 			assert.Contains(t, ge.Message, tc.want)
 			assert.Contains(t, ge.Message, errStoreClosed.Error(), "the underlying cause must survive into the GraphQL error")
+			assert.NotEmpty(t, ge.Extensions["code"], "error must carry a machine-readable code")
 		})
 	}
 }
@@ -1194,6 +1195,7 @@ func TestInvalidIDsAreGraphQLErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ge := requireGraphQLError(t, tc.call())
 			assert.Contains(t, ge.Message, tc.want)
+			assert.Equal(t, "INVALID_ARGUMENT", ge.Extensions["code"])
 		})
 	}
 }

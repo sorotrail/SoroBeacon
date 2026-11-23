@@ -66,7 +66,7 @@ func renderChart(t *testing.T, extraArgs ...string) string {
 	}, extraArgs...)
 	out, err := exec.Command(helmPath(t), args...).CombinedOutput()
 	require.NoError(t, err, "helm template failed: %s", out)
-	return string(out)
+	return strings.ReplaceAll(string(out), "\r\n", "\n")
 }
 
 // manifest extracts the first block for the given Kind. Helm separates
@@ -85,6 +85,20 @@ func manifest(t *testing.T, rendered, kind string) string {
 	return ""
 }
 
+// manifestNamed extracts the manifest block for the given Kind and metadata.name.
+func manifestNamed(t *testing.T, rendered, kind, name string) string {
+	t.Helper()
+	wantKind := "\nkind: " + kind + "\n"
+	wantName := "\n  name: " + name + "\n"
+	for _, block := range strings.Split(rendered, "\n---\n") {
+		if strings.Contains(block, wantKind) && strings.Contains(block, wantName) {
+			return block
+		}
+	}
+	t.Fatalf("rendered output contains no %s manifest named %s:\n%s", kind, name, rendered)
+	return ""
+}
+
 func TestRender_ProbesPointAtTheRealEndpoints(t *testing.T) {
 	dep := manifest(t, renderChart(t), "Deployment")
 
@@ -100,6 +114,25 @@ func TestRender_ProbesPointAtTheRealEndpoints(t *testing.T) {
 	// Readiness is the only probe allowed to depend on the database and the
 	// event source; liveness must stay on the always-200 endpoint.
 	assert.NotContains(t, dep, "livenessProbe:\n            httpGet:\n              path: /api/v1/readyz")
+}
+
+func TestRender_HardenedSecurityContext(t *testing.T) {
+	dep := manifest(t, renderChart(t), "Deployment")
+
+	for _, want := range []string{
+		"automountServiceAccountToken: false",
+		"runAsNonRoot: true",
+		"runAsUser: 10001",
+		"runAsGroup: 10001",
+		"fsGroup: 10001",
+		"allowPrivilegeEscalation: false",
+		"readOnlyRootFilesystem: true",
+		"type: RuntimeDefault",
+		"- ALL",
+		"mountPath: /tmp",
+	} {
+		assert.Contains(t, dep, want, "the Deployment must enforce hardened Pod/Container security defaults")
+	}
 }
 
 func TestRender_HTTPPortMatchesTheService(t *testing.T) {
@@ -194,6 +227,7 @@ func TestRender_ConfigDefaultsMatchTheApplication(t *testing.T) {
 		"RATE_LIMIT_TRUST_FORWARDED":  "false",
 		"CORS_ALLOWED_ORIGINS":        "",
 		"ALERT_RETENTION":             "",
+		"AUDIT_RETENTION":             "",
 		"DATABASE_MAX_CONNS":          "0",
 		"DATABASE_MIN_CONNS":          "0",
 		"DATABASE_MAX_CONN_LIFETIME":  "",
@@ -220,6 +254,11 @@ func TestRender_MigrationHook(t *testing.T) {
 		assert.Contains(t, job, "/api/v1/livez",
 			"the hook must wait for the endpoint that only answers after migrations are applied")
 		assert.Contains(t, job, "POLL_INTERVAL")
+		assert.Contains(t, job, "/usr/local/bin/sorobeacon",
+			"the hook must invoke the binary directly without needing /bin/sh or wget")
+		assert.NotContains(t, job, "/bin/sh")
+		assert.NotContains(t, job, "wget")
+		assert.Contains(t, job, "automountServiceAccountToken: false")
 	})
 
 	t.Run("pod is not selectable by the Service", func(t *testing.T) {
@@ -245,6 +284,157 @@ func TestRender_MigrationHook(t *testing.T) {
 	})
 }
 
+func TestRender_SplitHATopologySeparatesAPIAndWorker(t *testing.T) {
+	t.Run("combined by default", func(t *testing.T) {
+		rendered := renderChart(t)
+		assert.NotContains(t, rendered, "name: sorobeacon-worker")
+		assert.NotContains(t, rendered, "WORKLOAD_ROLE")
+	})
+
+	t.Run("separately scalable API and worker when worker.enabled=true", func(t *testing.T) {
+		rendered := renderChart(t,
+			"--set", "replicaCount=4",
+			"--set", "worker.enabled=true",
+			"--set", "worker.replicaCount=2",
+		)
+		apiDep := manifestNamed(t, rendered, "Deployment", "sorobeacon")
+		workerDep := manifestNamed(t, rendered, "Deployment", "sorobeacon-worker")
+		svc := manifest(t, rendered, "Service")
+
+		assert.Contains(t, apiDep, "replicas: 4")
+		assert.Contains(t, apiDep, "--role=api")
+		assert.Contains(t, apiDep, "name: WORKLOAD_ROLE\n              value: \"api\"")
+
+		assert.Contains(t, workerDep, "replicas: 2")
+		assert.Contains(t, workerDep, "name: WORKLOAD_ROLE\n              value: \"worker\"")
+		assert.Contains(t, workerDep, "--role=worker")
+		assert.Contains(t, workerDep, "app.kubernetes.io/name: sorobeacon-worker")
+		assert.Contains(t, workerDep, "app.kubernetes.io/component: worker")
+
+		// The Service must route external traffic only to API pods, never to
+		// background worker pods.
+		assert.Contains(t, svc, "app.kubernetes.io/name: sorobeacon\n")
+		assert.NotContains(t, svc, "sorobeacon-worker")
+	})
+}
+
+func TestRender_AutoscalingTargetsAPIOnlyAndIsOffByDefault(t *testing.T) {
+	t.Run("off by default", func(t *testing.T) {
+		rendered := renderChart(t)
+		assert.NotContains(t, rendered, "kind: HorizontalPodAutoscaler")
+		assert.Contains(t, manifest(t, rendered, "Deployment"), "replicas: 1")
+	})
+
+	t.Run("scales API Deployment without touching worker replicas", func(t *testing.T) {
+		rendered := renderChart(t,
+			"--set", "autoscaling.enabled=true",
+			"--set", "autoscaling.minReplicas=3",
+			"--set", "autoscaling.maxReplicas=12",
+			"--set", "autoscaling.targetMemoryUtilizationPercentage=70",
+			"--set", "autoscaling.targetCPUUtilizationPercentage=80",
+			"--set", "worker.enabled=true",
+			"--set", "worker.replicaCount=2",
+		)
+		hpa := manifest(t, rendered, "HorizontalPodAutoscaler")
+		apiDep := manifestNamed(t, rendered, "Deployment", "sorobeacon")
+		workerDep := manifestNamed(t, rendered, "Deployment", "sorobeacon-worker")
+
+		assert.Contains(t, hpa, "kind: Deployment\n    name: sorobeacon\n")
+		assert.NotContains(t, hpa, "sorobeacon-worker", "HPA must never target the lease-bounded worker Deployment")
+		assert.Contains(t, hpa, "minReplicas: 3")
+		assert.Contains(t, hpa, "maxReplicas: 12")
+		assert.Contains(t, hpa, "name: memory")
+		assert.Contains(t, hpa, "averageUtilization: 70")
+		assert.Contains(t, hpa, "name: cpu")
+		assert.Contains(t, hpa, "averageUtilization: 80")
+		assert.Contains(t, hpa, "stabilizationWindowSeconds: 300")
+
+		// When HPA is enabled, the API Deployment omits spec.replicas so Helm
+		// upgrades do not overwrite the live replica count, while the worker
+		// Deployment keeps its explicit replica count.
+		assert.NotContains(t, apiDep, "  replicas:")
+		assert.Contains(t, workerDep, "  replicas: 2")
+	})
+}
+
+func TestRender_PodDisruptionBudgetsAreDrainSafe(t *testing.T) {
+	t.Run("off by default", func(t *testing.T) {
+		assert.NotContains(t, renderChart(t), "kind: PodDisruptionBudget")
+	})
+
+	t.Run("single-replica worker clamps to maxUnavailable 1 so node drains never block", func(t *testing.T) {
+		rendered := renderChart(t,
+			"--set", "replicaCount=1",
+			"--set", "podDisruptionBudget.enabled=true",
+			"--set", "podDisruptionBudget.minAvailable=1",
+			"--set", "worker.enabled=true",
+			"--set", "worker.replicaCount=1",
+			"--set", "worker.podDisruptionBudget.enabled=true",
+			"--set", "worker.podDisruptionBudget.minAvailable=1",
+		)
+		apiPDB := manifestNamed(t, rendered, "PodDisruptionBudget", "sorobeacon")
+		workerPDB := manifestNamed(t, rendered, "PodDisruptionBudget", "sorobeacon-worker")
+
+		assert.Contains(t, apiPDB, "maxUnavailable: 1")
+		assert.NotContains(t, apiPDB, "minAvailable:")
+		assert.Contains(t, workerPDB, "maxUnavailable: 1", "single-replica worker PDB must allow 1 unavailable pod so kubectl drain succeeds")
+		assert.NotContains(t, workerPDB, "minAvailable:")
+		assert.Contains(t, workerPDB, "app.kubernetes.io/name: sorobeacon-worker")
+	})
+
+	t.Run("multi-replica API and standby worker enforce minAvailable 1", func(t *testing.T) {
+		rendered := renderChart(t,
+			"--set", "replicaCount=3",
+			"--set", "podDisruptionBudget.enabled=true",
+			"--set", "worker.enabled=true",
+			"--set", "worker.replicaCount=2",
+			"--set", "worker.podDisruptionBudget.enabled=true",
+		)
+		apiPDB := manifestNamed(t, rendered, "PodDisruptionBudget", "sorobeacon")
+		workerPDB := manifestNamed(t, rendered, "PodDisruptionBudget", "sorobeacon-worker")
+
+		assert.Contains(t, apiPDB, "minAvailable: 1")
+		assert.Contains(t, workerPDB, "minAvailable: 1")
+	})
+}
+
+func TestRender_TerminationGracePeriodAndRollingUpdateReadinessGating(t *testing.T) {
+	rendered := renderChart(t, "--set", "worker.enabled=true")
+	apiDep := manifestNamed(t, rendered, "Deployment", "sorobeacon")
+	workerDep := manifestNamed(t, rendered, "Deployment", "sorobeacon-worker")
+
+	for _, dep := range []string{apiDep, workerDep} {
+		assert.Contains(t, dep, "minReadySeconds: 5")
+		assert.Contains(t, dep, "terminationGracePeriodSeconds: 60")
+		assert.Contains(t, dep, "maxUnavailable: 0")
+		assert.Contains(t, dep, "maxSurge: 1")
+	}
+}
+
+func TestRender_PodAntiAffinityIsOptIn(t *testing.T) {
+	t.Run("off by default", func(t *testing.T) {
+		dep := manifest(t, renderChart(t), "Deployment")
+		assert.NotContains(t, dep, "podAntiAffinity:")
+	})
+
+	t.Run("soft and hard anti-affinity render when enabled", func(t *testing.T) {
+		rendered := renderChart(t,
+			"--set", "podAntiAffinity.enabled=true",
+			"--set", "podAntiAffinity.type=soft",
+			"--set", "worker.enabled=true",
+			"--set", "worker.podAntiAffinity.enabled=true",
+			"--set", "worker.podAntiAffinity.type=hard",
+		)
+		apiDep := manifestNamed(t, rendered, "Deployment", "sorobeacon")
+		workerDep := manifestNamed(t, rendered, "Deployment", "sorobeacon-worker")
+
+		assert.Contains(t, apiDep, "preferredDuringSchedulingIgnoredDuringExecution:")
+		assert.Contains(t, apiDep, "topologyKey: kubernetes.io/hostname")
+		assert.Contains(t, workerDep, "requiredDuringSchedulingIgnoredDuringExecution:")
+		assert.Contains(t, workerDep, "app.kubernetes.io/name: sorobeacon-worker")
+	})
+}
+
 // configEnvVars scans internal/config's non-test sources for the environment
 // variables it reads. It covers the direct reads (os.Getenv) and the three
 // helpers the package funnels some of them through.
@@ -261,6 +451,7 @@ func configEnvVars(t *testing.T) []string {
 		// scan — without this pattern the loop below would find nothing and
 		// pass vacuously, which is what the guard on the caller catches.
 		regexp.MustCompile(`lookupConfigValue\("([A-Z0-9_]+)"`),
+		regexp.MustCompile(`lookupSecret\("([A-Z0-9_]+)"\)`),
 		regexp.MustCompile(`valueOrFallback\("([A-Z0-9_]+)"`),
 		regexp.MustCompile(`parseInt32EnvWithFile\("([A-Z0-9_]+)"`),
 		regexp.MustCompile(`parseDurationEnvWithFile\("([A-Z0-9_]+)"`),

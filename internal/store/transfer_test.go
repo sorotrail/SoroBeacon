@@ -309,7 +309,10 @@ func TestTransferTablesMatchSchema(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = rows.Close() }()
 
-	allowed := map[string]bool{"schema_migrations": true}
+	allowed := map[string]bool{
+		"schema_migrations":  true,
+		"alert_stat_rollups": true, // trigger-maintained rollup derived automatically as alerts are inserted
+	}
 	for _, tt := range transferTables {
 		allowed[tt.name] = true
 	}

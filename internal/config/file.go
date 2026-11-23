@@ -22,7 +22,7 @@ func loadFileValues() (map[string]string, error) {
 		return nil, nil
 	}
 
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) // #nosec G304 -- path is the operator-configured CONFIG_FILE environment variable read once at startup
 	if err != nil {
 		return nil, fmt.Errorf("invalid CONFIG_FILE %q: could not read file: %w", path, err)
 	}

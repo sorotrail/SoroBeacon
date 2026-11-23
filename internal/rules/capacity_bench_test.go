@@ -141,6 +141,12 @@ func ruleCapacityCases() []ruleCapacityCase {
 			missEv:   stdTransfer(500, contractAllow, addrBob, addrAlice, wed10UTC),
 		},
 		{
+			ruleType: TypeBaselineDeviation,
+			params:   json.RawMessage(`{"event_name":"transfer","value_path":"amount","window":"24h","warmup":"0s","min_samples":3,"sensitivity":3}`),
+			matchEv:  stdTransfer(500, contractAllow, addrAlice, addrBob, wed10UTC),
+			missEv:   stdTransfer(100, contractAllow, addrAlice, addrBob, wed10UTC),
+		},
+		{
 			ruleType: TypeAbsenceOfEvent,
 			params:   json.RawMessage(`{"event_name":"transfer","window":"30m"}`),
 			matchEv:  stdTransfer(500, contractAllow, addrAlice, addrBob, wed10UTC),
@@ -177,6 +183,12 @@ func TestCapacityCasesCoverEveryRegisteredRuleType(t *testing.T) {
 		}
 
 		ctx := WithRuleID(context.Background(), 1)
+		if rt == TypeBaselineDeviation {
+			for range 3 {
+				_, err := reg.Evaluate(ctx, rt, c.missEv, c.params)
+				require.NoError(t, err)
+			}
+		}
 		matched, err := reg.Evaluate(ctx, rt, c.matchEv, c.params)
 		require.NoErrorf(t, err, "rule type %q Evaluate(matchEv)", rt)
 		assert.Truef(t, matched, "rule type %q expected match=true on matchEv", rt)

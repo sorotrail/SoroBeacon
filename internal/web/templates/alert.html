@@ -11,6 +11,8 @@
   <tr><th>Ledger</th><td>{{.Ledger}}</td></tr>
   <tr><th>Ledger closed</th><td>{{formatTime .LedgerClosedAt .Timezone}}</td></tr>
   <tr><th>Created</th><td>{{formatTime .Alert.CreatedAt .Timezone}}</td></tr>
+  {{if .RunbookURL}}<tr><th>Runbook</th><td><a href="{{.RunbookURL}}" rel="noopener noreferrer">{{.RunbookURL}}</a></td></tr>{{end}}
+  {{if .ResponseGuidance}}<tr><th>Guidance</th><td>{{.ResponseGuidance}}</td></tr>{{end}}
   {{if .Alert.RetractedAt}}<tr><th>Retracted</th><td><span class="pill off">orphaned by a reorg</span> {{formatTime .Alert.RetractedAt .Timezone}}</td></tr>{{end}}
   {{if .Alert.AcknowledgedAt}}
   <tr><th>Acknowledged</th><td><span class="pill on">acknowledged</span> {{formatTime .Alert.AcknowledgedAt .Timezone}}{{with relTime .Alert.AcknowledgedAt}} <span class="muted">({{.}})</span>{{end}}{{if .Alert.AcknowledgedBy}} <span class="muted">by</span> <code>{{.Alert.AcknowledgedBy}}</code>{{end}}</td></tr>

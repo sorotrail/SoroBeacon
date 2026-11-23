@@ -168,10 +168,90 @@ before the drop brings that month back; restoring a later dump cannot. A
   `alerts/<utc-day>/<firstID>-<lastID>.ndjson` under the configured prefix.
   Re-running the same batch overwrites the same key.
 - There is no built-in import command. To restore, read the NDJSON with your own
-  tooling; SoroBeacon does not query the archive.
-- Because partition drops are skipped in archive mode, expired monthly
-  partitions remain attached as empty shells after their rows are deleted. The
-  partition count therefore grows; the rows themselves are gone.
+  tooling.
+- Row-batch archiving alone skips partition drops, so expired monthly
+  partitions remain attached as empty shells after their rows are deleted.
+
+### Partition archive and archived reads
+
+With `ARCHIVE_URL` set, the server also archives whole expired partitions
+before dropping them, so partition drops stay on:
+
+1. Every alert in the partition is written as per-workspace chunks
+   (`partitions/<YYYY-MM>/<workspace-hash>/<NNNNNN>.ndjson`, at most 5000
+   alerts each) and then a manifest (`manifests/<YYYY-MM>.json`) listing each
+   chunk's checksum, size, row count, id range and time range.
+2. The copy is read back and verified against the manifest. Only then does the
+   drop transaction start; inside it the partition is locked and its row count
+   must equal the archived count, or the drop is refused. Any failure leaves the
+   partition in place and the next pass retries (writes overwrite).
+3. A chunk holds exactly one workspace, and each line repeats the workspace id,
+   which the reader re-checks, so archived rows never cross tenants.
+
+`GET /alerts`, `GET /alerts.csv` and `GET /alerts/export` accept
+`include_archived=true`. The default stays database-only. A request whose range
+reaches past the retention horizon is answered as follows:
+
+- Not opted in: the answer is complete back to the horizon and says so with
+  `truncated: true`, `truncation_boundary` and `truncation_reason`
+  (`retention_horizon`), mirrored in the `X-Alerts-Truncated`,
+  `X-Alerts-Truncation-Boundary` and `X-Alerts-Truncation-Reason` headers. The
+  exports send the same headers, or as HTTP trailers when archive rows are
+  streamed. An unbounded query (no `from`) is not flagged; `X-Pruned-Before`
+  already states the horizon.
+- Opted in with no archive configured: the same, with reason
+  `archive_not_enabled`.
+- Opted in: archived rows (flagged `"archived": true`) follow the database rows
+  in the same order, shape and cursor. At most 16 chunks are fetched per
+  request (`store.DefaultArchiveMaxChunks`). Hitting the cap sets
+  `truncated: true`, reason `archive_fetch_cap` and the boundary reached;
+  `next_cursor` continues from there, and an export stops at the cap.
+- A missing or corrupt chunk or manifest fails the request with 502 naming the
+  object. It is never a short result.
+
+Limits: months with no manifest are treated as never archived, since the
+bucket is not listed; there is no separate alert-timeline endpoint to cover; the
+partition is read into memory when archived.
+
+## Per-workspace retention policies
+
+In multi-tenant deployments, each workspace can override the instance-wide
+`ALERT_RETENTION` window via `GET /api/v1/retention`, `PUT /api/v1/retention`,
+and `DELETE /api/v1/retention`:
+
+- **Effective policy resolution**: When a workspace has an explicit override in
+  `workspace_retention_policies`, its `policy_source` is `workspace`.
+  When no override is set (or after `DELETE /api/v1/retention`), the workspace
+  inherits `ALERT_RETENTION` with `policy_source: "instance"` (or `"unset"` when
+  neither a workspace policy nor `ALERT_RETENTION` is configured).
+- **Shortening confirmation guardrail**: Lowering a workspace's effective
+  retention window (for example from `90d` to `7d`, or resetting a `90d`
+  override when the instance default is `7d`) permanently prunes older alerts on
+  the next retention pass. The API rejects unconfirmed shortenings with
+  `409 CONFLICT` (`confirmation_required: true`) unless `confirm_shorten: true`
+  (or `?confirm_shorten=true`) is supplied. Every policy change or reset is
+  recorded in `audit_log` under `target_type = "workspace_retention"`.
+- **Per-workspace pruning & shared partition lifecycle**: During each prune
+  pass, `RunAlertPruner` resolves the effective retention window for every
+  workspace and deletes expired rows per workspace in bounded batches,
+  cascading to `delivery_attempts`, `alert_escalations`, `dead_letters`, and
+  `alert_dedup`. Because monthly Postgres partitions (`alerts_YYYY_MM`) are
+  shared across workspaces, a monthly partition is only detached and dropped
+  when its upper bound is older than the **longest** effective retention horizon
+  across all workspaces (`MaxEffectiveRetention`). Workspaces with shorter
+  retention windows still have their expired rows removed immediately via batched
+  per-workspace `DELETE`s and read-time cutoff filtering.
+- **Query & export horizon metadata**: Alert queries, stats, and exports enforce
+  each workspace's active retention cutoff at read time (`created_at >= now -
+  effective_retention`) so expired rows are never returned between hourly pruner
+  ticks. `GET /api/v1/alerts`, `GET /api/v1/stats`, `GET /api/v1/stats/alerts-daily`,
+  `GET /api/v1/alerts.csv`, and `GET /api/v1/alerts/export` expose the active
+  cutoff via `pruned_before` (and `X-Pruned-Before` / `X-Retention-Policy-Source`
+  response headers).
+- **Observability**: Pruner passes log structured per-workspace attributes
+  (`workspace_id`, `policy_source`, `retention`, `deleted`, `cutoff`) and export
+  `sorobeacon_alert_pruner_deleted_total{workspace_id,policy_source}` and
+  `sorobeacon_workspace_retention_seconds{workspace_id,policy_source}`.
 
 ## Choosing a window
 

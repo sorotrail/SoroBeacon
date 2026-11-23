@@ -117,3 +117,33 @@ Practical consequences:
 * More channels per alert means more outbound requests per match — this is
   where a busy rule's firehose is felt first. Suppress at the rule with a
   [cooldown](../rules/cooldown.md) before thinning channels.
+
+## Delivery acceptance vs human acknowledgement
+
+The product records that a notification was accepted by the destination endpoint (HTTP 200 or SMTP relay acceptance), and separately records whether an operator acknowledged the alert. Acceptance is not arrival:
+
+* An HTTP 200 from a webhook proves only that the consumer's web server accepted the payload, not that any human saw it.
+* A Slack or Discord message posts to an unmonitored channel.
+* An email is accepted by an SMTP relay and filtered into junk.
+* An SMS is accepted by a provider carrier gateway and undelivered to the handset.
+
+### Receipt capabilities across channel types
+
+Notification channels differ fundamentally in what feedback they can provide:
+
+| Channel Type | Strongest Receipt Available | Meaning |
+| --- | --- | --- |
+| PagerDuty, Opsgenie | `paging_ack` | Native paging incident acknowledgement: tracks explicit human acknowledgement and escalation. |
+| Twilio, Pushover | `delivery_receipt` | Provider carrier/handset status callbacks: confirms device delivery or client read receipt. |
+| Webhook, Slack, Discord, Telegram, Email, Matrix, Teams, etc. | `http_acceptance` | HTTP 2xx or relay acceptance only: downstream delivery or viewing cannot be guaranteed. |
+
+*Note on callbacks*: Where a provider (such as Twilio SMS or webhook delivery callbacks) exposes carrier/device delivery callbacks, consuming them is handled separately. SoroBeacon classifies the available receipt capability per channel type.
+
+### Acknowledgement reconciliation
+
+SoroBeacon periodically reconciles delivered alerts against human acknowledgement.
+
+* **Severity-tiered SLA windows**: Critical alerts expect acknowledgement within **1 hour**; warning alerts within **4 hours**. Informational (`info`) alerts legitimately require no acknowledgement and are excluded.
+* **Exclusions**: Alerts suppressed by maintenance windows or inhibited by suppression rules are excluded from reconciliation.
+* **Flagging silent channels**: An enabled channel that has delivered alerts (at least 3 qualifying alerts) but has **0 acknowledgements** across the evaluation window is flagged as `unacknowledged` on the Channels dashboard and in Prometheus (`sorobeacon_channel_unacknowledged_flagged`).
+* **Operational limits**: An unacknowledged alert does not prove it was unseen — a human may have read the alert and resolved the issue directly without clicking "Acknowledge" in SoroBeacon. The flag is a signal for human investigation, not an automatic disablement trigger.

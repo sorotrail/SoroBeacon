@@ -1,0 +1,166 @@
+{{- if .Values.worker.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sorobeacon.fullname" . }}-worker
+  labels:
+    {{- include "sorobeacon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicaCount }}
+  minReadySeconds: {{ .Values.worker.minReadySeconds | default 5 }}
+  selector:
+    matchLabels:
+      {{- include "sorobeacon.workerSelectorLabels" . | nindent 6 }}
+  # RollingUpdate with maxUnavailable: 0 starts the replacement worker pod and
+  # waits for its startup/readiness probes before sending SIGTERM to the active
+  # leader. On SIGTERM the leader releases its Postgres session advisory lock
+  # immediately, allowing the warm standby to promote within lease.DefaultInterval (3s).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      {{- with .Values.worker.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "sorobeacon.workerSelectorLabels" . | nindent 8 }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds | default 60 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "sorobeacon.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}-worker
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--role=worker"
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "sorobeacon.fullname" . }}
+          env:
+            - name: WORKLOAD_ROLE
+              value: "worker"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sorobeacon.databaseSecretName" . }}
+                  key: {{ include "sorobeacon.databaseSecretKey" . }}
+            {{- if or .Values.auth.apiToken .Values.auth.existingSecret }}
+            - name: API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sorobeacon.authSecretName" . }}
+                  key: {{ include "sorobeacon.authAPITokenKey" . }}
+            {{- end }}
+            {{- if or .Values.auth.configEncryptionKey .Values.auth.existingSecret }}
+            - name: CONFIG_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sorobeacon.authSecretName" . }}
+                  key: {{ include "sorobeacon.authConfigEncryptionKeyKey" . }}
+            {{- end }}
+            {{- if .Values.database.replicaUrl }}
+            - name: REPLICA_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sorobeacon.databaseSecretName" . }}
+                  key: REPLICA_DATABASE_URL
+            {{- end }}
+            {{- if .Values.secrets.vaultToken }}
+            - name: VAULT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sorobeacon.authSecretName" . }}
+                  key: VAULT_TOKEN
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /api/v1/livez
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /api/v1/livez
+              port: http
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/v1/readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.tls.secretName }}
+            - name: tls-server
+              mountPath: /etc/sorobeacon/tls/server
+              readOnly: true
+            {{- end }}
+            {{- if .Values.tls.sorotrailSecretName }}
+            - name: tls-sorotrail
+              mountPath: /etc/sorobeacon/tls/sorotrail
+              readOnly: true
+            {{- end }}
+            {{- if .Values.database.tlsSecretName }}
+            - name: tls-database
+              mountPath: /etc/sorobeacon/tls/database
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- if .Values.tls.secretName }}
+        - name: tls-server
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+        {{- end }}
+        {{- if .Values.tls.sorotrailSecretName }}
+        - name: tls-sorotrail
+          secret:
+            secretName: {{ .Values.tls.sorotrailSecretName }}
+        {{- end }}
+        {{- if .Values.database.tlsSecretName }}
+        - name: tls-database
+          secret:
+            secretName: {{ .Values.database.tlsSecretName }}
+        {{- end }}
+      {{- with .Values.worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.worker.affinity }}
+      affinity:
+        {{- toYaml .Values.worker.affinity | nindent 8 }}
+      {{- else if and .Values.worker.podAntiAffinity .Values.worker.podAntiAffinity.enabled }}
+      affinity:
+        {{- include "sorobeacon.renderPodAntiAffinity" (dict "antiAffinity" .Values.worker.podAntiAffinity "selectorLabels" (include "sorobeacon.workerSelectorLabels" .)) | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end -}}

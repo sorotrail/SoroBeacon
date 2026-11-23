@@ -19,7 +19,7 @@ package grpc
 
 import (
 	"context"
-	"errors"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net"
@@ -28,9 +28,12 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
+	"github.com/sorotrail/sorobeacon/internal/apierr"
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/store"
 	"github.com/sorotrail/sorobeacon/internal/workspace"
@@ -38,22 +41,78 @@ import (
 
 // Server implements the gRPC MonitorService alongside the existing REST API.
 type Server struct {
-	store store.Store
-	auth  *auth.Authenticator
-	log   *slog.Logger
-	srv   *grpc.Server
+	store          store.Store
+	auth           *auth.Authenticator
+	log            *slog.Logger
+	srv            *grpc.Server
+	tlsCfg         *tls.Config
+	streamInterval time.Duration
 }
 
 // New builds a gRPC server. The server is not started until Serve is called.
 func New(st store.Store, authn *auth.Authenticator, log *slog.Logger) *Server {
-	s := &Server{store: st, auth: authn, log: log}
+	s := &Server{store: st, auth: authn, log: log, streamInterval: 2 * time.Second}
+	s.initGRPCServer()
+	return s
+}
+
+func (s *Server) initGRPCServer() {
 	opts := []grpc.ServerOption{
 		grpc.UnaryInterceptor(s.authUnary),
 		grpc.StreamInterceptor(s.authStream),
 	}
+	if s.tlsCfg != nil {
+		opts = append(opts, grpc.Creds(credentials.NewTLS(s.tlsCfg)))
+	}
 	s.srv = grpc.NewServer(opts...)
 	RegisterMonitorServiceServer(s.srv, s)
+}
+
+// WithTLSConfig configures TLS / mutual TLS credentials on the gRPC server.
+func (s *Server) WithTLSConfig(tlsCfg *tls.Config) *Server {
+	if s == nil {
+		return nil
+	}
+	s.tlsCfg = tlsCfg
+	s.initGRPCServer()
 	return s
+}
+
+// WithStreamInterval overrides the poll interval for StreamAlerts. Non-positive
+// values are ignored.
+func (s *Server) WithStreamInterval(d time.Duration) *Server {
+	if d > 0 {
+		s.streamInterval = d
+	}
+	return s
+}
+
+// ServiceDesc returns the registered MonitorService gRPC descriptor so
+// surface-sweep tests can enumerate every unary and streaming RPC dynamically.
+func ServiceDesc() grpc.ServiceDesc {
+	return monitorServiceDesc
+}
+
+// AuditGRPCMethodSpec describes the administrative action and target entity
+// type a mutating gRPC method records in the audit log.
+type AuditGRPCMethodSpec struct {
+	Action     string
+	TargetType string
+}
+
+// AuditGRPCMethodTable maps mutating gRPC RPC method names on MonitorService
+// to their audit specification. MonitorService is currently read/stream-only;
+// adding a new RPC to monitorServiceDesc fails the mechanical audit coverage
+// test unless it is registered here or in AuditExemptGRPCMethods.
+var AuditGRPCMethodTable = map[string]AuditGRPCMethodSpec{}
+
+// AuditExemptGRPCMethods documents read-only and streaming RPCs on
+// MonitorService that do not mutate state and are exempt from audit logging.
+var AuditExemptGRPCMethods = map[string]string{
+	"GetMonitor":   "Read-only unary RPC fetching a single monitor by ID.",
+	"ListMonitors": "Read-only unary RPC listing monitors for the caller's workspace.",
+	"ListAlerts":   "Read-only unary RPC listing alerts for the caller's workspace.",
+	"StreamAlerts": "Read-only server-streaming RPC polling alerts for the caller's workspace.",
 }
 
 // Serve starts the gRPC server on the given address. It blocks until the
@@ -124,25 +183,39 @@ func (s *Server) authContext(ctx context.Context) (context.Context, error) {
 	if s.auth == nil || !s.auth.Enabled() {
 		return workspace.With(ctx, workspace.Default), nil
 	}
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
+	md, hasMD := metadata.FromIncomingContext(ctx)
+	if hasMD {
+		if vals := md.Get("authorization"); len(vals) > 0 {
+			token, ok := auth.Bearer(vals[0])
+			if !ok {
+				return nil, status.Error(codes.Unauthenticated, "invalid authorization header")
+			}
+			req := (&http.Request{Header: make(http.Header)}).WithContext(ctx)
+			req.Header.Set("Authorization", "Bearer "+token)
+			principal, ok := s.auth.Principal(req)
+			if !ok {
+				return nil, status.Error(codes.Unauthenticated, "invalid token")
+			}
+			return workspace.With(ctx, principal.Workspace), nil
+		}
+	}
+	if s.auth.MTLSEnabled() {
+		if p, ok := peer.FromContext(ctx); ok && p.AuthInfo != nil {
+			if tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo); ok && len(tlsInfo.State.PeerCertificates) > 0 {
+				principal, authStatus := s.auth.ResolveClientCertificate(tlsInfo.State.PeerCertificates[0])
+				if authStatus == auth.AuthForbidden {
+					return nil, status.Error(codes.PermissionDenied, "client certificate subject not permitted")
+				}
+				if authStatus == auth.AuthOK && principal != nil {
+					return workspace.With(ctx, principal.Workspace), nil
+				}
+			}
+		}
+	}
+	if !hasMD {
 		return nil, status.Error(codes.Unauthenticated, "missing metadata")
 	}
-	vals := md.Get("authorization")
-	if len(vals) == 0 {
-		return nil, status.Error(codes.Unauthenticated, "missing authorization metadata")
-	}
-	token, ok := auth.Bearer(vals[0])
-	if !ok {
-		return nil, status.Error(codes.Unauthenticated, "invalid authorization header")
-	}
-	req := (&http.Request{Header: make(http.Header)}).WithContext(ctx)
-	req.Header.Set("Authorization", "Bearer "+token)
-	principal, ok := s.auth.Principal(req)
-	if !ok {
-		return nil, status.Error(codes.Unauthenticated, "invalid token")
-	}
-	return workspace.With(ctx, principal.Workspace), nil
+	return nil, status.Error(codes.Unauthenticated, "missing authorization metadata")
 }
 
 // --- service interface ---
@@ -301,10 +374,8 @@ func streamAlertsHandler(srv any, stream grpc.ServerStream) error {
 func (s *Server) GetMonitor(ctx context.Context, req *GetMonitorRequest) (*MonitorProto, error) {
 	m, err := s.store.GetMonitor(ctx, req.ID)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, status.Error(codes.NotFound, "monitor not found")
-		}
-		return nil, status.Error(codes.Internal, "internal error")
+		c := apierr.Classify(err)
+		return nil, status.Error(c.GRPCCode, c.Message)
 	}
 	return monitorToProto(m), nil
 }
@@ -320,7 +391,8 @@ func (s *Server) ListMonitors(ctx context.Context, req *ListMonitorsRequest) (*L
 		AfterID:     req.Cursor,
 	})
 	if err != nil {
-		return nil, status.Error(codes.Internal, "internal error")
+		c := apierr.Classify(err)
+		return nil, status.Error(c.GRPCCode, c.Message)
 	}
 	resp := &ListMonitorsResponse{Monitors: make([]*MonitorProto, 0, len(monitors))}
 	for i := range monitors {
@@ -329,6 +401,9 @@ func (s *Server) ListMonitors(ctx context.Context, req *ListMonitorsRequest) (*L
 	return resp, nil
 }
 
+// ListAlerts returns one page of alerts for the caller's workspace, filtered
+// by monitor and rule and paginated by cursor (req.Cursor is the last ID seen).
+// Limits outside 1-500 are clamped to the default page size of 50.
 func (s *Server) ListAlerts(ctx context.Context, req *ListAlertsRequest) (*ListAlertsResponse, error) {
 	limit := int(req.Limit)
 	if limit <= 0 || limit > 500 {
@@ -341,7 +416,8 @@ func (s *Server) ListAlerts(ctx context.Context, req *ListAlertsRequest) (*ListA
 		AfterID:   req.Cursor,
 	})
 	if err != nil {
-		return nil, status.Error(codes.Internal, "internal error")
+		c := apierr.Classify(err)
+		return nil, status.Error(c.GRPCCode, c.Message)
 	}
 	resp := &ListAlertsResponse{Alerts: make([]*AlertProto, 0, len(alerts))}
 	for _, a := range alerts {
@@ -354,6 +430,12 @@ func (s *Server) ListAlerts(ctx context.Context, req *ListAlertsRequest) (*ListA
 // client. It terminates cleanly when the client disconnects.
 func (s *Server) StreamAlerts(req *StreamAlertsRequest, stream AlertStream) error {
 	ctx := stream.Context()
+	if req.MonitorID > 0 {
+		if _, err := s.store.GetMonitor(ctx, req.MonitorID); err != nil {
+			c := apierr.Classify(err)
+			return status.Error(c.GRPCCode, c.Message)
+		}
+	}
 	var lastID int64
 
 	// Seed with the most recent alert so the stream starts from "now"
@@ -366,7 +448,11 @@ func (s *Server) StreamAlerts(req *StreamAlertsRequest, stream AlertStream) erro
 		lastID = initial[0].ID
 	}
 
-	ticker := time.NewTicker(2 * time.Second)
+	interval := s.streamInterval
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -374,6 +460,9 @@ func (s *Server) StreamAlerts(req *StreamAlertsRequest, stream AlertStream) erro
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			if err := s.checkAuth(ctx); err != nil {
+				return err
+			}
 			alerts, err := s.store.ListAlerts(ctx, store.AlertFilter{
 				MonitorID: req.MonitorID,
 				Sort:      "created_at_asc",

@@ -61,6 +61,10 @@ var transferTables = []transferTable{
 	{name: "workspaces", key: []string{"id"}},
 	{name: "monitors", key: []string{"id"}},
 	{name: "channels", key: []string{"id"}},
+	{name: "channel_signing_keys", key: []string{"id"}},
+	{name: "channel_ack_reconciliations", key: []string{"channel_id"}},
+	{name: "push_devices", key: []string{"id"}},
+	{name: "alert_external_refs", key: []string{"alert_id", "channel_id"}},
 	{name: "monitor_channels", key: []string{"monitor_id", "channel_id"}},
 	{name: "rules", key: []string{"id"}},
 	{name: "saved_searches", key: []string{"id"}},
@@ -70,6 +74,8 @@ var transferTables = []transferTable{
 	{name: "network_ingest_state", key: []string{"network"}},
 	{name: "network_ledger_hashes", key: []string{"network", "ledger"}},
 	{name: "contract_ingest_cursors", key: []string{"network", "contract_id"}},
+	{name: "retention_gaps", key: []string{"id"}},
+	{name: "event_archive", key: []string{"id"}},
 	{name: "backfills", key: []string{"monitor_id"}},
 	{name: "maintenance_windows", key: []string{"id"}},
 	{name: "rule_absence_state", key: []string{"rule_id", "event_name"}},
@@ -84,6 +90,14 @@ var transferTables = []transferTable{
 	{name: "pending_digests", key: []string{"id"}},
 	{name: "audit_log", key: []string{"id"}},
 	{name: "api_tokens", key: []string{"id"}},
+	{name: "persisted_operations", key: []string{"id"}},
+	{name: "workspace_usage_rollups", key: []string{"workspace_id", "period_start"}},
+	{name: "workspace_notification_usage_rollups", key: []string{"workspace_id", "period_start", "channel_type", "outcome"}},
+	{name: "workspace_quotas", key: []string{"workspace_id"}},
+	{name: "workspace_query_budget_state", key: []string{"workspace_id"}},
+	{name: "workspace_retention_policies", key: []string{"workspace_id"}},
+	{name: "idempotency_keys", key: []string{"workspace_id", "idempotency_key"}},
+	{name: "workspace_deletions", key: []string{"workspace_id"}},
 }
 
 // transferDerived marks plan tables that only one backend physically has,
@@ -702,7 +716,7 @@ func (s *SQLite) transferAdvanceSequences(ctx context.Context, tables []string) 
 			continue
 		}
 		_, err := s.db.ExecContext(ctx,
-			"UPDATE sqlite_sequence SET seq = MAX(seq, COALESCE((SELECT MAX(id) FROM "+transferQuoteIdent(table)+"), 0)) WHERE name = ?",
+			"UPDATE sqlite_sequence SET seq = MAX(seq, COALESCE((SELECT MAX(id) FROM "+transferQuoteIdent(table)+"), 0)) WHERE name = ?", // #nosec G202 -- table is validated against present/autoIncrement and quoted with transferQuoteIdent
 			table)
 		if err != nil {
 			return fmt.Errorf("advance %s: %w", table, err)

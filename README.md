@@ -306,6 +306,24 @@ curl -s -X DELETE localhost:8080/api/v1/monitors/1
 `PATCH` accepts any subset of `name`, `contract_ids`, `enabled`,
 `channel_ids`; `channel_ids` replaces the monitor's channel attachments.
 
+A monitor comes back as a JSON object. This is the response to the `POST`
+above, so it doubles as the shape to assert on in a script:
+
+```json
+{
+  "id": 1,
+  "name": "My token",
+  "contract_ids": ["CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"],
+  "enabled": true,
+  "created_at": "2026-01-01T00:00:00Z",
+  "priority": "normal",
+  "last_matched_at": null,
+  "channel_ids": [1],
+  "network": "testnet",
+  "tags": []
+}
+```
+
 ### Rules
 
 The built-in rule types:
@@ -567,7 +585,8 @@ create/update and never returned in responses. Each has a page under
 [Webex](docs/channels/webex.md), [DingTalk](docs/channels/dingtalk.md),
 [Google Chat](docs/channels/googlechat.md), [Opsgenie](docs/channels/opsgenie.md),
 [Gotify](docs/channels/gotify.md), [AWS SNS](docs/channels/sns.md),
-[Lark](docs/channels/lark.md), [ntfy](docs/channels/ntfy.md) and the
+[Lark](docs/channels/lark.md), [ntfy](docs/channels/ntfy.md),
+[Microsoft Teams](docs/channels/teams.md) and the
 [generic webhook](docs/channels/webhook.md).
 For self-hosted chat and phone push there are also
 [Mattermost](docs/channels/mattermost.md), [Rocket.Chat](docs/channels/rocketchat.md),
@@ -597,6 +616,7 @@ curl -s -X POST localhost:8080/api/v1/channels -d '{
 # Opsgenie: {"api_key": "geniekey-...", "region": "us", "priority": "P3"}
 # Gotify:   {"server_url": "https://gotify.example.com", "token": "app-token", "priority": 5}
 # AWS SNS:  {"topic_arn": "arn:aws:sns:us-east-1:123456789012:sorobeacon", "region": "us-east-1"}
+# Teams:    {"webhook_url": "https://<tenant>.webhook.office.com/webhookb2/..."}
 
 curl -s localhost:8080/api/v1/channels
 curl -s -X PATCH localhost:8080/api/v1/channels/1 -d '{"enabled": false}'
@@ -604,6 +624,26 @@ curl -s -X DELETE localhost:8080/api/v1/channels/1
 
 # Send a test alert through a channel
 curl -s -X POST localhost:8080/api/v1/channels/1/test
+```
+
+A minimal end-to-end example. The create call answers with the channel and its
+new `id`; `config` is write-only, so it never comes back. Feed that `id` to the
+test endpoint to check the credentials before attaching the channel to a rule:
+
+```sh
+# 1. Create — name and type are required, config depends on the type.
+curl -s -X POST localhost:8080/api/v1/channels -d '{
+  "name": "ops-ntfy", "type": "ntfy",
+  "config": {"topic": "sorobeacon-8f3a1c"}
+}'
+# {"id":1,"name":"ops-ntfy","type":"ntfy","enabled":true,
+#  "digest_mode":"","digest_window_seconds":0,"min_severity":"",
+#  "created_at":"2026-11-20T12:00:00Z","timeout":15000000000,
+#  "consecutive_failures":0,"consecutive_permanent_failures":0}
+
+# 2. Test — sends a synthetic alert through the stored config.
+curl -s -X POST localhost:8080/api/v1/channels/1/test
+# {"status":"sent"}
 ```
 
 Generic webhook deliveries carry an `X-SoroBeacon-Timestamp` header and an
@@ -625,6 +665,22 @@ curl -s 'localhost:8080/api/v1/alerts?cursor=42'      # keyset pagination (next_
 curl -s localhost:8080/api/v1/alerts/7/deliveries     # delivery attempts for one alert
 curl -s localhost:8080/api/v1/health
 curl -s localhost:8080/api/v1/stats
+```
+
+`GET /api/v1/stats` answers with the instance's live counters and ingest
+position, which is enough for a quick "is it working?" check or a dashboard
+panel:
+
+```json
+{
+  "monitors": 3,
+  "rules": 5,
+  "channels": 2,
+  "alerts": 128,
+  "alerts_last_24h": 7,
+  "last_ledger": 1234567,
+  "last_poll_at": "2026-09-24T12:00:00Z"
+}
 ```
 
 ### Maintenance windows
@@ -794,6 +850,31 @@ func (Cooldown) Evaluate(ctx context.Context, ev *stellar.DecodedEvent, params j
 r.Register("cooldown", Cooldown{})
 ```
 
+For a complete starting point, copy this into `internal/rules/my_rule.go` and
+add the `Register` line to `NewRegistry`:
+
+```go
+package rules
+
+import (
+	"context"
+	"encoding/json"
+
+	"github.com/sorotrail/sorobeacon/internal/stellar"
+)
+
+type MyRule struct{}
+
+func (MyRule) Validate(json.RawMessage) error { return nil }
+
+func (MyRule) Evaluate(_ context.Context, ev *stellar.DecodedEvent, _ json.RawMessage) (bool, error) {
+	return ev.EventName() == "transfer", nil
+}
+
+// in NewRegistry (internal/rules/rules.go):
+// r.Register("my_rule", MyRule{})
+```
+
 Decoded events use a small value vocabulary (`nil`, `bool`, `string`,
 `*big.Int`, `[]byte`, `[]any`, `map[string]any`); `stellar.Canon`,
 `stellar.ToBigFloat` and `stellar.Lookup` are the helpers rules build on.
@@ -807,7 +888,7 @@ Decoded events use a small value vocabulary (`nil`, `bool`, `string`,
 
 ## Notification Channels
 
-Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md), [DingTalk](docs/channels/dingtalk.md), [Google Chat](docs/channels/googlechat.md), [Opsgenie](docs/channels/opsgenie.md), [Gotify](docs/channels/gotify.md), [AWS SNS](docs/channels/sns.md), [ntfy](docs/channels/ntfy.md), and generic [Webhooks](docs/channels/webhook.md).
+Supported channels include [Discord](docs/channels/discord.md), [Slack](docs/channels/slack.md), [Telegram](docs/channels/telegram.md), [Matrix](docs/channels/matrix.md), [PagerDuty](docs/channels/pagerduty.md), [Twilio SMS](docs/channels/twilio.md), [Email](docs/channels/email.md), [Signal](docs/channels/signal.md), [Webex](docs/channels/webex.md), [DingTalk](docs/channels/dingtalk.md), [Google Chat](docs/channels/googlechat.md), [Opsgenie](docs/channels/opsgenie.md), [Gotify](docs/channels/gotify.md), [AWS SNS](docs/channels/sns.md), [ntfy](docs/channels/ntfy.md), [Microsoft Teams](docs/channels/teams.md), and generic [Webhooks](docs/channels/webhook.md).
 
 ## License
 

@@ -252,6 +252,30 @@ func testWorkspaceIsolation(t *testing.T, newStore conformanceFactory) {
 	}
 	assert.Zero(t, totalBeta, "acme's alert must not appear in beta's chart")
 
+	// --- conditional change keys ---
+	maxAcme, countAcme, err := st.AlertChangeKey(acme)
+	require.NoError(t, err)
+	assert.Equal(t, acmeAlert.ID, maxAcme)
+	assert.Equal(t, int64(1), countAcme)
+
+	maxBeta, countBeta, err := st.AlertChangeKey(beta)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), maxBeta)
+	assert.Equal(t, int64(0), countBeta)
+
+	_, _, err = st.ChannelDeliveryChangeKey(beta, acmeChannel.ID)
+	assert.ErrorIs(t, err, ErrNotFound, "cross-workspace channel delivery change key is 404")
+
+	delivMax, delivCount, err := st.ChannelDeliveryChangeKey(acme, acmeChannel.ID)
+	require.NoError(t, err)
+	assert.Greater(t, delivMax, int64(0))
+	assert.Equal(t, int64(1), delivCount)
+
+	betaDelivMax, betaDelivCount, err := st.ChannelDeliveryChangeKey(beta, betaChannel.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), betaDelivMax)
+	assert.Equal(t, int64(0), betaDelivCount)
+
 	// --- saved searches and templates ---
 
 	// "At most one default search" used to be an instance-wide rule backed by a
@@ -287,6 +311,53 @@ func testWorkspaceIsolation(t *testing.T, newStore conformanceFactory) {
 	require.NoError(t, err)
 	assert.Len(t, templatesAcme, 1)
 	assert.ErrorIs(t, st.DeleteMonitorTemplate(beta, tmpl.ID), ErrNotFound)
+
+	// --- audit log ---
+
+	require.NoError(t, st.CreateAuditEntry(acme, &AuditEntry{
+		Action:     AuditActionCreate,
+		TargetType: AuditTargetMonitor,
+		TargetID:   acmeMonitor.ID,
+		Actor:      "alice@acme",
+		ActorType:  AuditActorPerson,
+		Surface:    AuditSurfaceREST,
+		Outcome:    AuditOutcomeSucceeded,
+		StatusCode: 201,
+	}))
+	require.NoError(t, st.CreateAuditEntry(beta, &AuditEntry{
+		Action:     AuditActionCreate,
+		TargetType: AuditTargetMonitor,
+		TargetID:   betaMonitor.ID,
+		Actor:      "bot-beta",
+		ActorType:  AuditActorAutomation,
+		Surface:    AuditSurfaceREST,
+		Outcome:    AuditOutcomeSucceeded,
+		StatusCode: 201,
+	}))
+	auditAcme, err := st.ListAuditEntries(acme, AuditFilter{Limit: 50})
+	require.NoError(t, err)
+	require.Len(t, auditAcme, 1)
+	assert.Equal(t, "acme", auditAcme[0].WorkspaceID)
+	assert.Equal(t, "alice@acme", auditAcme[0].Actor)
+
+	auditBeta, err := st.ListAuditEntries(beta, AuditFilter{Limit: 50})
+	require.NoError(t, err)
+	require.Len(t, auditBeta, 1)
+	assert.Equal(t, "beta", auditBeta[0].WorkspaceID)
+	assert.Equal(t, "bot-beta", auditBeta[0].Actor)
+
+	auditDefault, err := st.ListAuditEntries(bg, AuditFilter{Limit: 50})
+	require.NoError(t, err)
+	assert.Empty(t, auditDefault, "default workspace must not see acme or beta audit records")
+
+	auditSystem, err := st.ListAuditEntries(system, AuditFilter{Limit: 50})
+	require.NoError(t, err)
+	assert.Len(t, auditSystem, 2, "operator/system context sees audit records across all workspaces")
+
+	auditSystemFiltered, err := st.ListAuditEntries(system, AuditFilter{WorkspaceID: "acme", Limit: 50})
+	require.NoError(t, err)
+	require.Len(t, auditSystemFiltered, 1)
+	assert.Equal(t, "acme", auditSystemFiltered[0].WorkspaceID)
 
 	// --- the cross-tenant scope ---
 
@@ -348,7 +419,7 @@ func testDeleteByIDAllowlist(t *testing.T, newStore conformanceFactory) {
 
 // unallowlistedTableNames is checked against deleteByID's map rather than its
 // SQL, so it lives with the test that runs the method.
-var unallowlistedTableNames = []string{"workspaces", "rules", "alerts", "monitor_channels", "ingest_state"}
+var unallowlistedTableNames = []string{"workspaces", "rules", "alerts", "monitor_channels", "ingest_state", "audit_log"}
 
 // TestDeleteTableAllowlist asserts the allowlist as data, so it is enforced
 // without a database and cannot drift from a backend's SQL silently.
@@ -370,6 +441,8 @@ var unscopedStoreMethods = map[string]string{
 	"ListAlerts":                         "the frequency rule reads one rule's history; rule_id implies the tenant",
 	"ListRules":                          "the poller loads rules for a monitor it already resolved",
 	"ListChannelsForMonitor":             "the dispatcher delivers for a monitor it already resolved",
+	"ConsumeDelivery":                    "the dispatcher spends a monitor's delivery budget for an alert it already resolved; monitor ids are unique across workspaces",
+	"loadDeliveryBudgetPG":               "the locked read inside ConsumeDelivery, which is unscoped for the same reason",
 	"RecordDeliveryAttempt":              "the dispatcher writes for an alert it already resolved",
 	"CreateDeadLetter":                   "the dispatcher records a permanently failed delivery for an alert it already resolved; the row takes its tenant from that alert",
 	"CreateAlert":                        "derives the workspace from the monitor it inserts into",
@@ -381,6 +454,7 @@ var unscopedStoreMethods = map[string]string{
 	"PruneLedgerHashes":                  "the reorg window is per network, not per tenant",
 	"RetractAlertsFromLedger":            "a reorg orphans every tenant's alerts on that ledger",
 	"DeleteExpiredAlerts":                "retention sweeps every workspace, and ExpiredAlerts selects the rows it deletes",
+	"DeleteExpiredDeadLetters":           "retention sweeps every workspace",
 	"EnsureWorkspace":                    "takes the workspace as an argument",
 	"AssignLegacyNetwork":                "the one-time startup upgrade labels rows the migration left unlabelled in every workspace; its predicate is the empty network, not a tenant",
 	"TokenByHash":                        "authenticating: the token's own row is where its workspace comes from, so the read cannot be scoped to a tenant the caller does not have yet",
@@ -397,6 +471,9 @@ var unscopedStoreMethods = map[string]string{
 	"RuleFiredWithin":                    "the inhibition check asks about one rule the dispatcher already resolved; rule_id implies the tenant",
 	"transferAlertTimeRange":             "the SQLite/Postgres transfer spans every workspace: it reads the copied alerts' created_at range to size the target's partitions before any row arrives",
 	"transferDeriveTable":                "the SQLite/Postgres transfer spans every workspace: it rebuilds alert_dedup from the alerts the transfer just copied",
+	"DeleteExpiredAuditEntries":          "audit retention sweeps every workspace under AUDIT_RETENTION",
+	"ReencryptSensitiveColumns":          "key rotation re-encrypts sensitive columns across every workspace on the instance",
+	"VerifyEncryptionKey":                "startup key verification probes encrypted rows across every workspace on the instance",
 }
 
 // sqlSourceFiles lists every non-test Go source in the package directory.
@@ -438,7 +515,7 @@ func sqlSourceFiles(t *testing.T) []string {
 // the position test is only what stops a log message saying "alerts" from
 // obliging a predicate.
 func TestEveryScopedQueryCarriesWorkspace(t *testing.T) {
-	tenantTableRead := regexp.MustCompile(`(?i)\b(?:FROM|INTO|UPDATE|JOIN)\s+(?:ONLY\s+)?(monitors|channels|alerts|saved_searches|monitor_templates|api_tokens)\b`)
+	tenantTableRead := regexp.MustCompile(`(?i)\b(?:FROM|INTO|UPDATE|JOIN)\s+(?:ONLY\s+)?(monitors|channels|alerts|saved_searches|monitor_templates|api_tokens|audit_log)\b`)
 
 	for _, file := range sqlSourceFiles(t) {
 		functions := sqlFunctions(t, file)

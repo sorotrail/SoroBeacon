@@ -73,6 +73,9 @@ var routeRoles = auth.NewRouteTable(map[string]auth.Role{
 	"POST /alerts/{id}/deliveries/{channelID}/retry": auth.RoleEditor,
 	"POST /alerts/{id}/acknowledge":                  auth.RoleEditor,
 	"POST /dead-letters/{id}/redrive":                auth.RoleEditor,
+	"POST /dead-letters/{id}/discard":                auth.RoleEditor,
+	"POST /dead-letters/bulk/redrive":                auth.RoleEditor,
+	"POST /dead-letters/bulk/discard":                auth.RoleEditor,
 
 	// Saved searches are one operator's own view of the alert history, so
 	// they are an editor's to change.

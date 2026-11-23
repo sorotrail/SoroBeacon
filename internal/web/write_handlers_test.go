@@ -338,6 +338,37 @@ func (s *writeStore) DeleteDeadLetter(_ context.Context, id int64) error {
 	return nil
 }
 
+func (s *writeStore) ListDeadLetterGroups(ctx context.Context, f store.DeadLetterFilter) ([]store.DeadLetterGroup, error) {
+	if err := s.boom("ListDeadLetterGroups"); err != nil {
+		return nil, err
+	}
+	letters, err := s.ListDeadLetters(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	chMap := make(map[int64]store.Channel)
+	for id, ch := range s.channels {
+		chMap[id] = ch
+	}
+	return store.GroupDeadLetters(letters, chMap, f.Cause), nil
+}
+
+func (s *writeStore) BulkDeleteDeadLetters(ctx context.Context, f store.DeadLetterFilter) (int64, error) {
+	if err := s.boom("BulkDeleteDeadLetters"); err != nil {
+		return 0, err
+	}
+	letters, err := s.ListDeadLetters(ctx, f)
+	if err != nil {
+		return 0, err
+	}
+	var count int64
+	for _, l := range letters {
+		delete(s.deadLetters, l.ID)
+		count++
+	}
+	return count, nil
+}
+
 func (s *writeStore) CreateMonitor(_ context.Context, m *store.Monitor) error {
 	if err := s.boom("CreateMonitor"); err != nil {
 		return err
@@ -1079,6 +1110,90 @@ func TestRedriveDeadLetterErrorPages(t *testing.T) {
 			t.Errorf("attempts = %+v, want one failed row", st.attempts)
 		}
 	})
+}
+
+func TestDiscardDeadLetterWebRemovesRowAndAudits(t *testing.T) {
+	st, h, sess := newWriteDashboard(t, scriptedNotifier{})
+	st.deadLetters[1] = store.DeadLetter{ID: 1, AlertID: 1, ChannelID: 1}
+
+	rec := postWithSession(t, h, sess, "/dead-letters/1/discard", nil)
+	wantRedirect(t, rec, "/dead-letters")
+	if _, ok := st.deadLetters[1]; ok {
+		t.Fatal("a discarded dead letter must be removed from queue")
+	}
+	if len(st.audit) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(st.audit))
+	}
+	if st.audit[0].Action != store.AuditActionDiscard || st.audit[0].TargetID != 1 {
+		t.Errorf("audit entry = %+v, want action discard on target 1", st.audit[0])
+	}
+}
+
+func TestBulkDiscardDeadLettersWeb(t *testing.T) {
+	st, h, sess := newWriteDashboard(t, scriptedNotifier{})
+	st.deadLetters[1] = store.DeadLetter{ID: 1, AlertID: 1, ChannelID: 1}
+	st.deadLetters[2] = store.DeadLetter{ID: 2, AlertID: 2, ChannelID: 1}
+
+	form := url.Values{"channel_id": {"1"}}
+	rec := postWithSession(t, h, sess, "/dead-letters/bulk/discard", form)
+	wantRedirect(t, rec, "/dead-letters")
+	if len(st.deadLetters) != 0 {
+		t.Errorf("dead letters = %d, want 0", len(st.deadLetters))
+	}
+	if len(st.audit) != 1 || st.audit[0].Action != store.AuditActionDiscard {
+		t.Errorf("audit entry = %+v, want action discard", st.audit)
+	}
+}
+
+func TestBulkRedriveDeadLettersWeb(t *testing.T) {
+	n := &recordingNotifier{}
+	st, h, sess := retryFixture(t, n)
+	st.deadLetters[1] = store.DeadLetter{ID: 1, AlertID: 1, ChannelID: 1}
+
+	form := url.Values{"channel_id": {"1"}}
+	rec := postWithSession(t, h, sess, "/dead-letters/bulk/redrive", form)
+	wantRedirect(t, rec, "/dead-letters")
+	if len(st.deadLetters) != 0 {
+		t.Errorf("dead letters = %d, want 0", len(st.deadLetters))
+	}
+	if n.count() != 1 {
+		t.Errorf("notifier sends = %d, want 1", n.count())
+	}
+	if len(st.audit) != 1 || st.audit[0].Action != store.AuditActionRedrive {
+		t.Errorf("audit entry = %+v, want action redrive", st.audit)
+	}
+}
+
+func TestListDeadLettersRendersTriageViewAndNoSecretLeak(t *testing.T) {
+	st, h, sess := newWriteDashboard(t, scriptedNotifier{})
+	const secret = "SUPER-SECRET-TOKEN"
+	st.channels[1] = store.Channel{
+		ID:     1,
+		Name:   "ops",
+		Type:   "webhook",
+		Config: json.RawMessage(`{"webhook_url":"https://hooks.example/` + secret + `"}`),
+	}
+	st.deadLetters[1] = store.DeadLetter{
+		ID: 1, AlertID: 1, ChannelID: 1,
+		LastError: "status 429", AttemptCount: 3, LastStatus: 429,
+		CreatedAt: time.Now().Add(-2 * time.Hour),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/dead-letters", nil)
+	req.AddCookie(sess)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	wantStatus(t, rec, http.StatusOK)
+
+	body := rec.Body.String()
+	if strings.Contains(body, secret) {
+		t.Errorf("triage page must never leak channel secret")
+	}
+	for _, want := range []string{"Backlog by Group", "rate_limit", "2h ago", "Re-drive Group", "Discard Group"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("page missing expected string %q", want)
+		}
+	}
 }
 
 // --- import ---

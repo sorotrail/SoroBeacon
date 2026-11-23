@@ -26,6 +26,8 @@ func NewRPCSource(rpc stellar.Client, decoder stellar.Decoder) *RPCSource {
 	return &RPCSource{rpc: rpc, decoder: decoder}
 }
 
+// LatestLedger returns the chain tip sequence from the RPC's getLatestLedger
+// call, used for cold starts; a failed call yields 0 and the RPC error.
 func (s *RPCSource) LatestLedger(ctx context.Context) (uint32, error) {
 	latest, err := s.rpc.GetLatestLedger(ctx)
 	if err != nil {
@@ -73,6 +75,9 @@ func decodeCursor(cursor string) (batch int, rpcCursor string) {
 	return n, rest
 }
 
+// FetchEvents fetches one page of decoded contract events for watch from
+// Soroban RPC, starting at startLedger or resuming from cursor, and returns
+// the cursor for the next page (empty once every filter batch is drained).
 func (s *RPCSource) FetchEvents(ctx context.Context, startLedger uint32, watch []Watch, cursor string, limit int) (FetchPage, error) {
 	if limit <= 0 {
 		limit = stellar.DefaultEventsLimit

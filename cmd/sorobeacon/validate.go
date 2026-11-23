@@ -304,13 +304,17 @@ func checkRPC(ctx context.Context, cfg config.Config, timeout time.Duration) val
 	return validateCheck{Name: "rpc", OK: false, Detail: redactSecrets(detail, cfg)}
 }
 
-// checkSoroTrail verifies that the upstream indexer answers.
+// checkSoroTrail verifies that the upstream indexer answers and serves the
+// configured Stellar network.
 func checkSoroTrail(ctx context.Context, cfg config.Config, timeout time.Duration) validateCheck {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	client := sorotrail.NewClient(cfg.SoroTrailURL, nil)
 	health, err := client.GetHealth(ctx)
 	if err != nil {
+		return validateCheck{Name: "sorotrail", OK: false, Detail: redactSecrets(err.Error(), cfg)}
+	}
+	if err := client.VerifyUpstream(ctx, cfg.Network.Passphrase); err != nil {
 		return validateCheck{Name: "sorotrail", OK: false, Detail: redactSecrets(err.Error(), cfg)}
 	}
 	return validateCheck{Name: "sorotrail", OK: true, Detail: "reachable, status " + health.Status}
