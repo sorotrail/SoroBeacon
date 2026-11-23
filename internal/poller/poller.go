@@ -208,6 +208,9 @@ func (p *Poller) recordBackoff(backingOff bool) {
 // New wires a Poller. src is where events come from: NewRPCSource for a
 // Stellar RPC node, or the SoroTrail source for upstream mode.
 func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval time.Duration, log *slog.Logger) *Poller {
+	if reg != nil {
+		reg.WithLogger(log)
+	}
 	p := &Poller{
 		source:              src,
 		store:               st,
@@ -231,6 +234,18 @@ func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval 
 func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
 	p.metrics = m
 	p.ing = p.ing.WithMetrics(m)
+	if p.registry != nil && m != nil {
+		p.registry.WithPanicObserver(m.RecordPanic)
+	}
+	return p
+}
+
+// WithRuleEvalTimeout configures the per-rule evaluation timeout budget on the
+// poller's registry.
+func (p *Poller) WithRuleEvalTimeout(d time.Duration) *Poller {
+	if p.registry != nil {
+		p.registry.WithEvalTimeout(d)
+	}
 	return p
 }
 
@@ -913,26 +928,11 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 				}
 				continue
 			}
-			if p.workspaceEvalBudget > 0 && workspaceElapsed[m.WorkspaceID] >= p.workspaceEvalBudget {
-				p.metrics.RecordWorkspaceRuleBudgetExhausted(m.WorkspaceID)
-				if p.log != nil {
-					p.log.Warn("workspace rule evaluation budget exceeded; skipping rule for event",
-						"workspace_id", m.WorkspaceID,
-						"monitor_id", m.ID,
-						"rule_id", rule.ID,
-						"rule_type", rule.Type,
-						"event_id", decoded.ID,
-						"budget", p.workspaceEvalBudget,
-						"elapsed", workspaceElapsed[m.WorkspaceID],
-					)
-				}
-				continue
-			}
-			// The rule id rides in the context so a stateful evaluator (the
-			// frequency rule) can key its per-rule state.
+			// The rule and monitor ids ride in the context so stateful
+			// evaluators and the isolation boundary can attribute state,
+			// timeouts, and panics to the exact rule and workspace.
 			p.evaluations++
-			evals++
-			ruleCtx := rules.WithRuleVersion(rules.WithRuleID(ctx, rule.ID), rule.Version)
+			ruleCtx := rules.WithMonitorID(rules.WithRuleID(ctx, rule.ID), m.ID)
 			start := time.Now()
 			matched, err := p.registry.Evaluate(ruleCtx, rule.Type, decoded, rule.Params)
 			duration := time.Since(start)
@@ -940,16 +940,39 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 			if p.metrics != nil {
 				p.metrics.RecordRuleEval(rule.Type, matched, err, duration)
 			}
+			if p.slowRuleThreshold > 0 && duration >= p.slowRuleThreshold {
+				p.log.Warn("slow rule evaluation",
+					"rule_id", rule.ID,
+					"monitor_id", m.ID,
+					"rule_type", rule.Type,
+					"event_id", decoded.ID,
+					"duration", duration,
+				)
+			}
 			if err != nil {
-				if rules.IsRuleIsolatedFailure(err) {
-					logIsolatedRuleFailure(p.log, m, rule, decoded.ID, err)
+				if rules.IsRuleQuarantined(err) {
+					p.log.Debug("skipping quarantined rule",
+						"rule_id", rule.ID,
+						"monitor_id", m.ID,
+						"rule_type", rule.Type,
+						"event_id", decoded.ID,
+					)
 					continue
 				}
-				if p.log != nil {
-					p.log.Warn("rule evaluation failed due to storage error",
-						"rule_id", rule.ID, "monitor_id", m.ID, "event_id", decoded.ID, "err", err)
+				p.log.Warn("rule evaluation failed",
+					"rule_id", rule.ID,
+					"monitor_id", m.ID,
+					"rule_type", rule.Type,
+					"event_id", decoded.ID,
+					"err", err,
+				)
+				// Only hold back the contract cursor when the backing store or
+				// poll context failed; a pathological rule that panics, times
+				// out, or fails on its own logic is recorded and quarantined
+				// rather than retried forever.
+				if rules.IsDependencyAttributed(err) || ctx.Err() != nil {
+					processed = false
 				}
-				processed = false
 				continue
 			}
 			if matched {

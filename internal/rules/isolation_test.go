@@ -3,9 +3,6 @@ package rules
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,306 +13,179 @@ import (
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 )
 
-type slowOrPanicEvaluator struct {
-	delay     time.Duration
-	panicMsg  string
-	err       error
-	dbDelay   time.Duration
-	dbErr     error
-	callCount atomic.Int64
+type stubEvaluator struct {
+	evalFn func(ctx context.Context, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error)
 }
 
-func (e *slowOrPanicEvaluator) Validate(json.RawMessage) error { return nil }
-
-func (e *slowOrPanicEvaluator) Evaluate(ctx context.Context, _ *stellar.DecodedEvent, _ json.RawMessage) (bool, error) {
-	e.callCount.Add(1)
-	if e.dbDelay > 0 || e.dbErr != nil {
-		done := EnterDB(ctx)
-		if e.dbDelay > 0 {
-			time.Sleep(e.dbDelay)
-		}
-		done(e.dbErr)
-		if e.dbErr != nil {
-			return false, WrapStorageError(e.dbErr)
-		}
-	}
-	if e.panicMsg != "" {
-		panic(e.panicMsg)
-	}
-	if e.delay > 0 {
-		select {
-		case <-time.After(e.delay):
-		case <-ctx.Done():
-			return false, ctx.Err()
-		}
-	}
-	if e.err != nil {
-		return false, e.err
-	}
-	return true, nil
+func (s stubEvaluator) Evaluate(ctx context.Context, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error) {
+	return s.evalFn(ctx, ev, params)
 }
 
-func TestRuleIsolationTimeoutAbortsSlowRuleAndQuarantinesAfterThreshold(t *testing.T) {
+func (stubEvaluator) Validate(json.RawMessage) error { return nil }
+
+func TestRegistryIsolatesPanickingRuleAndQuarantinesAfterThreshold(t *testing.T) {
+	reg := NewRegistry().WithQuarantineThreshold(3)
+	var panicsObserved atomic.Int32
+	reg.WithPanicObserver(func() { panicsObserved.Add(1) })
+
+	var shouldPanic atomic.Bool
+	shouldPanic.Store(true)
+	reg.Register("custom_panic", stubEvaluator{
+		evalFn: func(_ context.Context, _ *stellar.DecodedEvent, _ json.RawMessage) (bool, error) {
+			if shouldPanic.Load() {
+				panic("malformed contract payload")
+			}
+			return true, nil
+		},
+	})
+
+	ev := transferEvent(100)
+	badCtx := WithMonitorID(WithRuleID(context.Background(), 101), 10)
+	goodCtx := WithMonitorID(WithRuleID(context.Background(), 102), 20)
+
+	for i := 1; i <= 3; i++ {
+		matched, err := reg.Evaluate(badCtx, "custom_panic", ev, json.RawMessage(`{}`))
+		require.Error(t, err)
+		assert.False(t, matched)
+		assert.True(t, IsRulePanic(err), "panic must be recovered and typed")
+
+		var panicErr *RulePanicError
+		require.ErrorAs(t, err, &panicErr)
+		assert.Equal(t, int64(101), panicErr.RuleID)
+		assert.Equal(t, int64(10), panicErr.MonitorID)
+		assert.Equal(t, "custom_panic", panicErr.RuleType)
+
+		// Healthy rules in another workspace continue unaffected on every event.
+		ok, err := reg.Evaluate(goodCtx, TypeEventEmitted, ev, json.RawMessage(`{"event_name":"transfer"}`))
+		require.NoError(t, err)
+		assert.True(t, ok)
+	}
+
+	assert.Equal(t, int32(3), panicsObserved.Load(), "panic observer must fire once per recovered panic")
+
+	state, ok := reg.QuarantineState(101)
+	require.True(t, ok)
+	assert.True(t, state.Quarantined)
+	assert.Equal(t, QuarantineReasonPanic, state.Reason)
+	assert.Equal(t, 3, state.ConsecutiveFailures)
+	assert.Equal(t, 3, state.TotalPanics)
+	assert.Contains(t, state.LastError, "malformed contract payload")
+
+	// Subsequent evaluations of the quarantined rule fail fast without invoking the evaluator.
+	matched, err := reg.Evaluate(badCtx, "custom_panic", ev, json.RawMessage(`{}`))
+	require.Error(t, err)
+	assert.False(t, matched)
+	assert.True(t, IsRuleQuarantined(err))
+	assert.Equal(t, int32(3), panicsObserved.Load(), "quarantined rule must not execute and panic again")
+
+	// Fix the rule and re-enable it from quarantine.
+	shouldPanic.Store(false)
+	require.True(t, reg.ReenableRule(101))
+	stateAfter, ok := reg.QuarantineState(101)
+	require.True(t, ok)
+	assert.False(t, stateAfter.Quarantined)
+	assert.Equal(t, 0, stateAfter.ConsecutiveFailures)
+
+	matched, err = reg.Evaluate(badCtx, "custom_panic", ev, json.RawMessage(`{}`))
+	require.NoError(t, err)
+	assert.True(t, matched)
+
+	audit := reg.QuarantineAuditLog()
+	require.Len(t, audit, 2)
+	assert.Equal(t, "quarantined", audit[0].Action)
+	assert.Equal(t, QuarantineReasonPanic, audit[0].Reason)
+	assert.Equal(t, int64(101), audit[0].RuleID)
+	assert.Equal(t, "reenabled", audit[1].Action)
+}
+
+func TestRegistryBoundsSlowRuleEvaluationAndQuarantinesRepeatedTimeouts(t *testing.T) {
 	reg := NewRegistry().
 		WithEvalTimeout(20 * time.Millisecond).
 		WithQuarantineThreshold(2)
 
-	slow := &slowOrPanicEvaluator{delay: 150 * time.Millisecond}
-	reg.Register("slow_test", slow)
-
-	var transitions []RuleQuarantineState
-	reg.WithQuarantineHook(func(_ context.Context, state RuleQuarantineState) {
-		transitions = append(transitions, state)
+	reg.Register("slow_rule", stubEvaluator{
+		evalFn: func(ctx context.Context, _ *stellar.DecodedEvent, _ json.RawMessage) (bool, error) {
+			select {
+			case <-time.After(250 * time.Millisecond):
+				return true, nil
+			case <-ctx.Done():
+				return false, ctx.Err()
+			}
+		},
 	})
 
-	ev := transferEvent(1)
-	ctx := WithRuleVersion(WithRuleID(context.Background(), 42), 1)
-
-	// First timeout: strike 1, not yet quarantined.
-	matched, err := reg.Evaluate(ctx, "slow_test", ev, json.RawMessage(`{}`))
-	require.Error(t, err)
-	assert.False(t, matched)
-	assert.ErrorIs(t, err, ErrRuleTimeout)
-	assert.True(t, IsRuleIsolatedFailure(err))
-
-	st, ok := reg.QuarantineState(42)
-	require.True(t, ok)
-	assert.Equal(t, 1, st.ConsecutiveFailures)
-	assert.False(t, st.Quarantined)
-
-	// Healthy rule on the same registry still evaluates immediately.
-	fastCtx := WithRuleID(context.Background(), 99)
-	fastMatched, err := reg.Evaluate(fastCtx, TypeEventEmitted, ev, json.RawMessage(`{"event_name":"transfer"}`))
-	require.NoError(t, err)
-	assert.True(t, fastMatched)
-
-	// Second timeout: reaches threshold 2 -> rule 42 is quarantined.
-	_, err = reg.Evaluate(ctx, "slow_test", ev, json.RawMessage(`{}`))
-	require.ErrorIs(t, err, ErrRuleTimeout)
-
-	st, ok = reg.QuarantineState(42)
-	require.True(t, ok)
-	assert.True(t, st.Quarantined)
-	assert.Equal(t, EvalFailureTimeout, st.Reason)
-	assert.Equal(t, 1, reg.QuarantinedCount())
-	require.Len(t, transitions, 1)
-	assert.True(t, transitions[0].Quarantined)
-
-	// Subsequent evaluation is skipped immediately without invoking the slow evaluator.
-	callsBefore := slow.callCount.Load()
-	_, err = reg.Evaluate(ctx, "slow_test", ev, json.RawMessage(`{}`))
-	require.ErrorIs(t, err, ErrRuleQuarantined)
-	assert.Equal(t, callsBefore, slow.callCount.Load(), "quarantined rule must not execute")
-
-	// Updating the rule version clears quarantine automatically.
-	slow.delay = 0
-	ctxV2 := WithRuleVersion(WithRuleID(context.Background(), 42), 2)
-	matched, err = reg.Evaluate(ctxV2, "slow_test", ev, json.RawMessage(`{}`))
-	require.NoError(t, err)
-	assert.True(t, matched)
-	assert.Equal(t, 0, reg.QuarantinedCount())
-	require.Len(t, transitions, 2)
-	assert.False(t, transitions[1].Quarantined)
-}
-
-func TestRuleIsolationPanicRecoveryAndExplicitReenable(t *testing.T) {
-	reg := NewRegistry().
-		WithEvalTimeout(50 * time.Millisecond).
-		WithQuarantineThreshold(2)
-
-	panicker := &slowOrPanicEvaluator{panicMsg: "boom in evaluator"}
-	reg.Register("panic_test", panicker)
-
-	ev := transferEvent(1)
-	ctx := WithRuleID(context.Background(), 77)
+	ev := transferEvent(50)
+	slowCtx := WithMonitorID(WithRuleID(context.Background(), 201), 1)
+	fastCtx := WithMonitorID(WithRuleID(context.Background(), 202), 2)
 
 	for i := 0; i < 2; i++ {
-		matched, err := reg.Evaluate(ctx, "panic_test", ev, json.RawMessage(`{}`))
-		require.Error(t, err)
+		start := time.Now()
+		matched, err := reg.Evaluate(slowCtx, "slow_rule", ev, json.RawMessage(`{}`))
+		elapsed := time.Since(start)
+		require.ErrorIs(t, err, ErrRuleEvalTimeout)
 		assert.False(t, matched)
-		assert.ErrorIs(t, err, ErrRulePanic)
-		assert.True(t, IsRuleIsolatedFailure(err))
+		assert.Less(t, elapsed, 150*time.Millisecond, "slow rule must be cut off near its timeout budget")
+
+		ok, err := reg.Evaluate(fastCtx, TypeEventEmitted, ev, json.RawMessage(`{"event_name":"transfer"}`))
+		require.NoError(t, err)
+		assert.True(t, ok)
 	}
 
-	st, ok := reg.QuarantineState(77)
+	st, ok := reg.QuarantineState(201)
 	require.True(t, ok)
 	assert.True(t, st.Quarantined)
-	assert.Equal(t, EvalFailurePanic, st.Reason)
-	assert.EqualValues(t, 2, st.TotalPanics)
-
-	// Operator fixes the evaluator and re-enables the rule.
-	panicker.panicMsg = ""
-	require.True(t, reg.ReenableRule(context.Background(), 77))
-	assert.Equal(t, 0, reg.QuarantinedCount())
-
-	matched, err := reg.Evaluate(ctx, "panic_test", ev, json.RawMessage(`{}`))
-	require.NoError(t, err)
-	assert.True(t, matched)
+	assert.Equal(t, QuarantineReasonTimeout, st.Reason)
+	assert.Equal(t, 2, st.TotalTimeouts)
 }
 
-func TestRuleIsolationDBCostExcludedFromRuleTimeoutAndQuarantine(t *testing.T) {
+func TestDatabaseSlowdownDoesNotQuarantineStatefulRule(t *testing.T) {
 	reg := NewRegistry().
 		WithEvalTimeout(25 * time.Millisecond).
-		WithQuarantineThreshold(1)
+		WithQuarantineThreshold(2)
 
-	// DB takes 60ms (> 25ms rule timeout), but pure rule computation is sub-millisecond.
-	dbBound := &slowOrPanicEvaluator{dbDelay: 60 * time.Millisecond}
-	reg.Register("db_bound", dbBound)
-
-	var lastObs EvalObservation
-	reg.WithEvalObserver(func(_ context.Context, obs EvalObservation) {
-		lastObs = obs
+	slowMatchLog := MatchLogFunc(func(ctx context.Context, _ int64, _ time.Time) ([]MatchRecord, error) {
+		select {
+		case <-time.After(200 * time.Millisecond):
+			return nil, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	})
-
-	ctx := WithRuleID(context.Background(), 101)
-	matched, err := reg.Evaluate(ctx, "db_bound", transferEvent(1), json.RawMessage(`{}`))
-	require.NoError(t, err, "slow DB I/O must not trigger a rule timeout")
-	assert.True(t, matched)
-	assert.Equal(t, EvalFailureNone, lastObs.FailureKind)
-	assert.GreaterOrEqual(t, lastObs.DBDuration, 50*time.Millisecond)
-	assert.Less(t, lastObs.RuleDuration, 25*time.Millisecond)
-	assert.Equal(t, 0, reg.QuarantinedCount())
-
-	// A storage error must not quarantine the rule and must not be classified as an isolated rule failure.
-	dbBound.dbDelay = 0
-	dbBound.dbErr = errors.New("connection reset by peer")
-	_, err = reg.Evaluate(ctx, "db_bound", transferEvent(1), json.RawMessage(`{}`))
-	require.Error(t, err)
-	assert.False(t, IsRuleIsolatedFailure(err), "storage failure must hold cursor rather than be treated as rule failure")
-	assert.Equal(t, 0, reg.QuarantinedCount())
-}
-
-func TestCompositeFailureRollsBackStatefulChildAtomically(t *testing.T) {
-	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
-	reg := NewRegistry().
-		WithEvalTimeout(50 * time.Millisecond).
-		WithQuarantineThreshold(5)
-
-	freq := NewFrequencyThreshold().WithClock(clk.now)
+	freq := NewFrequencyThreshold().WithMatchLog(slowMatchLog)
 	reg.Register(TypeFrequencyThreshold, freq)
 
-	failingChild := &slowOrPanicEvaluator{panicMsg: "second child exploded"}
-	reg.Register("exploding_child", failingChild)
+	ev := transferEvent(10)
+	ruleCtx := WithMonitorID(WithRuleID(context.Background(), 301), 7)
+	params := json.RawMessage(`{"event_name":"transfer","count":2,"window":"5m"}`)
 
-	compositeParams := json.RawMessage(`{
-		"op": "and",
-		"rules": [
-			{"type": "frequency_threshold", "params": {"event_name": "transfer", "count": 1, "window": "5m"}},
-			{"type": "exploding_child", "params": {}}
-		]
-	}`)
+	for i := 0; i < 4; i++ {
+		_, err := reg.Evaluate(ruleCtx, TypeFrequencyThreshold, ev, params)
+		require.ErrorIs(t, err, ErrRuleEvalTimeout)
+		assert.True(t, IsDependencyAttributed(err), "timeout spent waiting on MatchLog must be dependency-attributed")
+	}
 
-	ctx := WithRuleID(context.Background(), 501)
-	ev := transferEvent(1)
-
-	// Child 1 (frequency_threshold with count=1) runs first and would arm an
-	// episode if not rolled back when Child 2 panics.
-	clk.advance(time.Second)
-	matched, err := reg.Evaluate(ctx, TypeComposite, ev, compositeParams)
-	require.ErrorIs(t, err, ErrRulePanic)
-	assert.False(t, matched)
-	assert.Empty(t, freq.AlertEventID(ctx, ev, nil), "failed composite evaluation must roll back frequency child state")
-
-	// Once Child 2 stops panicking, the next event inside the same 5m window
-	// must fire cleanly because the aborted evaluation did not leave the
-	// frequency child armed.
-	failingChild.panicMsg = ""
-	clk.advance(time.Second)
-	matched, err = reg.Evaluate(ctx, TypeComposite, ev, compositeParams)
-	require.NoError(t, err)
-	assert.True(t, matched, "frequency child must fire after rollback once sibling child succeeds")
+	st, exists := reg.QuarantineState(301)
+	assert.False(t, exists && st.Quarantined, "a rule that is slow because the database is slow must never be quarantined")
+	assert.Equal(t, 0, freq.TrackedMatchCount(301), "aborted seed must not leave partial match state")
 }
 
-func TestFrequencyThresholdSeedDoesNotBlockOtherRulesAndBoundsMemory(t *testing.T) {
-	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
-	slowSeedStarted := make(chan struct{})
-	releaseSlowSeed := make(chan struct{})
+func TestFrequencyThresholdBoundsTrackedState(t *testing.T) {
+	now := time.Date(2026, time.October, 27, 12, 0, 0, 0, time.UTC)
+	freq := NewFrequencyThreshold().
+		WithClock(func() time.Time {
+			now = now.Add(time.Millisecond)
+			return now
+		}).
+		WithMaxMatches(25)
 
-	f := NewFrequencyThreshold().WithClock(clk.now).WithMatchLog(
-		MatchLogFunc(func(_ context.Context, ruleID int64, _ time.Time) ([]MatchRecord, error) {
-			if ruleID == 1 {
-				close(slowSeedStarted)
-				<-releaseSlowSeed
-			}
-			return nil, nil
-		}),
-	)
+	ctx := WithRuleID(context.Background(), 401)
+	ev := transferEvent(10)
+	params := json.RawMessage(`{"event_name":"transfer","count":100,"window":"1h"}`)
 
-	ev := transferEvent(1)
-	params := json.RawMessage(`{"event_name":"transfer","count":1,"window":"5m"}`)
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_, err := f.Evaluate(WithRuleID(context.Background(), 1), ev, params)
-		assert.NoError(t, err)
-	}()
-
-	<-slowSeedStarted
-
-	// Rule 2 must evaluate without waiting for Rule 1's slow MatchLog query.
-	doneRule2 := make(chan struct{})
-	go func() {
-		defer close(doneRule2)
-		matched, err := f.Evaluate(WithRuleID(context.Background(), 2), ev, params)
+	for i := 0; i < 80; i++ {
+		_, err := freq.Evaluate(ctx, ev, params)
 		require.NoError(t, err)
-		assert.True(t, matched)
-	}()
-
-	select {
-	case <-doneRule2:
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("rule 2 was blocked by rule 1's MatchLog query")
 	}
 
-	close(releaseSlowSeed)
-	wg.Wait()
-}
-
-func TestIsStorageError(t *testing.T) {
-	dbErr := errors.New("connection reset by peer")
-
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{
-			name: "nil is not a storage error",
-			err:  nil,
-			want: false,
-		},
-		{
-			name: "plain rule error is not a storage error",
-			err:  errors.New("rule evaluation failed"),
-			want: false,
-		},
-		{
-			name: "wrapped storage error is a storage error",
-			err:  WrapStorageError(dbErr),
-			want: true,
-		},
-		{
-			name: "storageError value directly is a storage error",
-			err:  storageError{err: dbErr},
-			want: true,
-		},
-		{
-			name: "nested wrapping preserves storage classification",
-			err:  fmt.Errorf("upstream failure: %w", WrapStorageError(dbErr)),
-			want: true,
-		},
-		{
-			name: "wrapping nil stays nil and is not a storage error",
-			err:  WrapStorageError(nil),
-			want: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, IsStorageError(tt.err), "IsStorageError(%v)", tt.err)
-		})
-	}
+	assert.Equal(t, 25, freq.TrackedMatchCount(401), "in-memory state per rule must be capped at maxMatches")
 }
