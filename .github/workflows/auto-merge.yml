@@ -87,10 +87,12 @@ jobs:
           BASE_BRANCH: main
 
           # --- policy knobs -------------------------------------------------
-          # Unlike SoroTrail, this repository requires the opt-in label. The
-          # difference is the contributor mix: nearly every open pull request
-          # here comes from a fork, by someone with no prior relationship to
-          # the project.
+          # This repository merges on green without an opt-in label, matching
+          # SoroTrail. Read the reasoning below before changing it back or
+          # touching the token's scopes, because the two are coupled.
+          #
+          # Nearly every open pull request here comes from a fork, by someone
+          # with no prior relationship to the project.
           #
           # A green CI run means the code builds and the tests pass. It does
           # not mean the change is safe — nothing here reads what the code
@@ -99,12 +101,19 @@ jobs:
           # secrets, AUTOMERGE_TOKEN included. A pull request that edits a
           # workflow file is the obvious path, and CI would be green for it.
           #
-          # So: the label is a maintainer saying "I looked at this". Authors
-          # in TRUSTED_AUTHORS skip it.
+          # Set to "false" deliberately by the repository owner: requiring a
+          # read before every merge defeats the point of the bot during a wave
+          # with hundreds of contributors. Any pull request that goes green now
+          # merges without a human looking at it.
           #
-          # To match SoroTrail's behaviour instead, set this to "false" — but
-          # do that knowing every fork pull request then merges unread.
-          REQUIRE_LABEL: "true"
+          # The mitigation for the workflow-file path described above is that
+          # AUTOMERGE_TOKEN deliberately does NOT carry the `workflow` scope.
+          # GitHub refuses to let a token without it push changes under
+          # .github/workflows/, so those pull requests fail to auto-merge and
+          # have to be merged by hand — which is exactly the set that needs
+          # reading. Do not add `workflow` scope to that token while this is
+          # "false".
+          REQUIRE_LABEL: "false"
           AUTOMERGE_LABEL: automerge
 
           # Authors whose pull requests merge without the label.

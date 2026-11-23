@@ -7,6 +7,43 @@ at startup, before the service accepts traffic.** This page describes what
 that means in practice, the order to upgrade in, and what rollback honestly
 looks like.
 
+## Preflight before deployment
+
+Run the new binary's preflight command with the same environment and config
+file the deployment will use:
+
+```sh
+./bin/sorobeacon preflight
+./bin/sorobeacon preflight --json
+./bin/sorobeacon preflight --only database,source
+```
+
+It validates configuration, reads the existing migration version without
+applying migrations, checks the configured event source and Stellar network,
+resolves every saved channel's secret references, validates channel configs,
+and checks the three-month Postgres alert-partition runway. Checks run
+concurrently under one shared deadline. SQLite is opened read-only; preflight
+never creates a database or applies schema changes.
+
+SMTP channels are checked by connecting, negotiating configured TLS and
+authenticating, then quitting before `MAIL`, `RCPT` or `DATA`. Telegram bot
+credentials use the read-only `getMe` endpoint. A channel whose provider has no
+non-delivering validation API is reported as incomplete; it is never probed by
+sending a message. Horizon and SoroTrail network identity is checked when the
+upstream includes a `network_passphrase` in its root or stats response. Older
+upstreams that omit it are reported as incomplete. Use `--send-tests` only when delivering a
+synthetic alert to every enabled channel is explicitly acceptable.
+
+The process exit codes are `0` for verified checks, `2` for command-line
+usage, `4` for invalid configuration, `5` for an unreachable or unhealthy
+dependency, and `6` when a check could not be completed safely. The JSON form
+includes each check's status, detail and remediation. Check errors redact
+database, endpoint and channel-config values.
+
+Startup reuses configuration, source-network and channel config/secret
+validation. Startup still applies migrations and creates the normal partition
+runway; preflight only inspects them.
+
 ## Migrations run on startup
 
 On every start, the process applies any pending schema migrations, then
@@ -171,6 +208,36 @@ The `.down.sql` files exist for development, not for operators.**
   nothing. Verify the old release's health checks before declaring the
   rollback done, and report the regression as an issue rather than staying
   on an unsupported version pair.
+
+## Roles are enforced now
+
+Roles (`viewer`, `editor`, `admin`) used to be defined and never checked:
+every credential that could sign in could also change the instance. They are
+now enforced on the REST API and on the dashboard, from a route table per
+surface.
+
+What this changes for an existing deployment:
+
+* **A static token without a role suffix is still an admin.** The default is
+  unchanged, so a deployment that never wrote a suffix sees no difference.
+* **A token that carried a `:viewer` suffix now really is a viewer** and can
+  no longer create, change or delete anything. If anybody relied on such a
+  token to make changes, give it `:editor` or `:admin` instead. The suffix
+  selects the role; the client still presents the token without it.
+* **A token that carried an `:editor` suffix can no longer mint API tokens or
+  read the audit log.** Those are administrator's work.
+* **A dashboard session inherits the role of the credential that signed in.**
+  A session minted from a token with no suffix is an admin, as before.
+* **An OIDC deployment can map roles** with `OIDC_ROLE_CLAIM`, naming a claim
+  in the verified ID token. Without it, every identity that signs in is an
+  admin — which is what it was before.
+* **A route with no entry in the role table is refused to every credential.**
+  The tables are checked against the routers by a test, so a new endpoint
+  cannot ship without a role decision, but an endpoint added to a router
+  outside the test's reach would be closed rather than open.
+
+The full mapping is in the
+[authorization reference](../reference/authorization.md#roles).
 
 ## See also
 

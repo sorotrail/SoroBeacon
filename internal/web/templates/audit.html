@@ -1,0 +1,47 @@
+{{define "content"}}
+<h1>Audit log</h1>
+<p class="muted">Every configuration change and alert acknowledgement, newest first. An entry records which fields changed — never their values: channel configuration holds webhook URLs, bot tokens and SMTP credentials, so what changed is kept and what it changed to is not.</p>
+<form class="filters" method="get" action="/audit">
+  <label for="target_type">Entity</label>
+  <select id="target_type" name="target_type">
+    <option value="">All entities</option>
+    <option value="monitor" {{if eq .TargetType "monitor"}}selected{{end}}>Monitor</option>
+    <option value="rule" {{if eq .TargetType "rule"}}selected{{end}}>Rule</option>
+    <option value="channel" {{if eq .TargetType "channel"}}selected{{end}}>Channel</option>
+    <option value="alert" {{if eq .TargetType "alert"}}selected{{end}}>Alert</option>
+  </select>
+  <label for="target_id">Entity id</label>
+  <input type="number" id="target_id" name="target_id" value="{{.TargetID}}" min="1" placeholder="id">
+  <label for="actor">Actor</label>
+  <input type="search" id="actor" name="actor" value="{{.Actor}}" placeholder="credential label or request id" data-shortcut-filter>
+  <button>Filter</button>
+</form>
+{{if .Note}}<p class="note">{{.Note}}</p>{{end}}
+{{if .Entries}}
+<table>
+  <tr><th>When</th><th>Actor</th><th>Action</th><th>Entity</th><th>Changed fields</th></tr>
+  {{range .Entries}}
+  <tr>
+    <td>{{formatTime .CreatedAt $.Timezone}}{{with relTime .CreatedAt}} <span class="muted">({{.}})</span>{{end}}</td>
+    <td><code>{{.Actor}}</code></td>
+    <td><span class="pill {{if eq .Action "delete"}}off{{else if eq .Action "create"}}on{{else}}never{{end}}">{{.Action}}</span></td>
+    <td>
+      {{if eq .TargetType "monitor"}}monitor <a href="/monitors/{{.TargetID}}">#{{.TargetID}}</a>
+      {{else if eq .TargetType "rule"}}rule <a href="/audit?target_type=rule&target_id={{.TargetID}}">#{{.TargetID}}</a>
+      {{else if eq .TargetType "channel"}}channel <a href="/channels/{{.TargetID}}/edit">#{{.TargetID}}</a>
+      {{else if eq .TargetType "alert"}}alert <a href="/alerts/{{.TargetID}}">#{{.TargetID}}</a>
+      {{else}}{{.TargetType}} #{{.TargetID}}{{end}}
+    </td>
+    <td>{{auditFields .Diff}}</td>
+  </tr>
+  {{end}}
+</table>
+{{if .OlderHref}}<p><a href="{{.OlderHref}}">Older →</a></p>{{end}}
+{{else if .HasFilters}}<p class="muted">No audit entries match these filters.</p>
+{{else}}
+<section class="empty">
+  <h2>No changes recorded yet</h2>
+  <p>Creating, changing or deleting a monitor, rule or channel — and acknowledging an alert — writes one entry here. An empty log means this instance's configuration has not been touched.</p>
+</section>
+{{end}}
+{{end}}

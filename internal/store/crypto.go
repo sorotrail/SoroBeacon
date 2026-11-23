@@ -192,3 +192,113 @@ func channelRef(id int64, name string) string {
 	}
 	return fmt.Sprintf("channel %d", id)
 }
+
+// KeyRingCipher supports zero-downtime key rotation: Encrypt always seals with
+// the primary (first) key and prefixes the ciphertext with its version tag
+// ("k<index>:"), while Decrypt tries the tagged key first and falls back across
+// all keys in the ring so ciphertexts produced before rotation remain readable.
+type KeyRingCipher struct {
+	ciphers []*AESGCMCipher
+}
+
+var _ ConfigCipher = (*KeyRingCipher)(nil)
+
+// NewKeyRingCipher builds a KeyRingCipher from one or more 16-, 24-, or 32-byte
+// AES keys. The first key is the active encryption key; subsequent keys are
+// retired keys kept for decrypting existing rows during rotation.
+func NewKeyRingCipher(keys ...[]byte) (*KeyRingCipher, error) {
+	if len(keys) == 0 {
+		return nil, errors.New("keyring cipher requires at least one key")
+	}
+	ciphers := make([]*AESGCMCipher, 0, len(keys))
+	for _, k := range keys {
+		c, err := NewAESGCMCipher(k)
+		if err != nil {
+			return nil, err
+		}
+		ciphers = append(ciphers, c)
+	}
+	return &KeyRingCipher{ciphers: ciphers}, nil
+}
+
+var keyVersionPrefix = []byte("kv1:")
+
+// Encrypt seals plaintext with the primary key and prepends a version header so
+// key rotation is recorded on the row.
+func (r *KeyRingCipher) Encrypt(plaintext []byte) ([]byte, error) {
+	sealed, err := r.ciphers[0].Encrypt(plaintext)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, len(keyVersionPrefix)+len(sealed))
+	out = append(out, keyVersionPrefix...)
+	out = append(out, sealed...)
+	return out, nil
+}
+
+// Decrypt opens a ciphertext using any key in the ring, trying the primary key
+// first and then retired keys.
+func (r *KeyRingCipher) Decrypt(ciphertext []byte) ([]byte, error) {
+	payload := ciphertext
+	if len(payload) >= len(keyVersionPrefix) && string(payload[:len(keyVersionPrefix)]) == string(keyVersionPrefix) {
+		payload = payload[len(keyVersionPrefix):]
+	}
+	for _, c := range r.ciphers {
+		if pt, err := c.Decrypt(payload); err == nil {
+			return pt, nil
+		}
+	}
+	return nil, errors.New("decryption failed: wrong key or corrupted ciphertext")
+}
+
+const signingSecretPrefix = "enc:v1:"
+
+// sealSigningSecret encrypts a channel signing key secret when cipher is
+// non-nil, prefixing it with signingSecretPrefix so encrypted rows are
+// unambiguously distinguished from legacy plaintext rows.
+func sealSigningSecret(cipher ConfigCipher, secret string) (string, error) {
+	if cipher == nil || secret == "" {
+		return secret, nil
+	}
+	ciphertext, err := cipher.Encrypt([]byte(secret))
+	if err != nil {
+		return "", fmt.Errorf("encrypt signing key: %w", err)
+	}
+	return signingSecretPrefix + base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
+// openSigningSecret decrypts a stored channel signing key secret. If the stored
+// value carries signingSecretPrefix (or is base64-encoded ciphertext written by
+// an earlier release), a decryption failure returns an error rather than
+// silently handing back the ciphertext as if it were the signing secret.
+func openSigningSecret(cipher ConfigCipher, stored string) (string, error) {
+	if stored == "" {
+		return "", nil
+	}
+	if after, ok := strings.CutPrefix(stored, signingSecretPrefix); ok {
+		if cipher == nil {
+			return "", errors.New("signing key is encrypted but CONFIG_ENCRYPTION_KEY is not configured")
+		}
+		data, err := base64.StdEncoding.DecodeString(after)
+		if err != nil {
+			return "", errors.New("malformed encrypted signing key envelope")
+		}
+		plaintext, err := cipher.Decrypt(data)
+		if err != nil {
+			return "", fmt.Errorf("decrypt signing key: %w", err)
+		}
+		return string(plaintext), nil
+	}
+	if cipher == nil {
+		return stored, nil
+	}
+	// Legacy unprefixed base64 ciphertext vs legacy plaintext secret.
+	if data, err := base64.StdEncoding.DecodeString(stored); err == nil && len(data) >= 28 {
+		plaintext, decErr := cipher.Decrypt(data)
+		if decErr != nil {
+			return "", fmt.Errorf("decrypt signing key: %w", decErr)
+		}
+		return string(plaintext), nil
+	}
+	return stored, nil
+}

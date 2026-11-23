@@ -70,6 +70,12 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 stroops (≈ 0.1 XLM, since XLM has 7 decimal places). Adjust `min_amount` up
 or down to match your threshold.
 
+**Alternative for supply changes:** To watch the token's total supply instead
+of individual transfers, use the
+[`token_supply_change`](../rules/token-supply-change.md) rule. It matches
+SEP-41 `mint` and `burn` events, optionally filtered by `direction` and
+`min_amount`, and never fires on `clawback` or `transfer` events.
+
 ## Step 4: Create a delivery channel
 
 Pick a channel type you have credentials for. Here we'll use Slack:

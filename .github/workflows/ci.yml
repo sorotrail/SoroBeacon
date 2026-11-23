@@ -33,8 +33,8 @@ jobs:
         run: go test ./internal/store/ -run TestSQLite -v
 
   # The same shared conformance suite again, this time with
-  # TEST_DATABASE_URL set so it runs against Postgres too instead of
-  # skipping. Both backends must pass identical assertions.
+      # TEST_DATABASE_URL set so it runs against Postgres too instead of
+      # skipping. Both backends must pass identical assertions.
   test-db:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -59,9 +59,130 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
       - name: Test (with Postgres integration tests)
-        run: go test ./...
+        run: |
+          set -o pipefail
+          go test ./... -coverprofile=coverage.out | tee coverage-packages.txt
         env:
           TEST_DATABASE_URL: postgres://sorobeacon:sorobeacon@localhost:5432/sorobeacon?sslmode=disable
+      # Coverage is reported from this job only: it is the one with Postgres,
+      # so internal/store is measured against the real backend. The no-database
+      # job would understate it badly. A job summary needs no token or external
+      # service, so it also works on pull requests from forks.
+      #
+      # Scope: the root module only. The nested Terraform provider module is a
+      # separate Go module and is not included in these figures. No threshold
+      # gate yet: with internal/grpc near 12% and internal/api/graphql untested,
+      # any gate would either block everything or be set too low to mean
+      # anything.
+      - name: Coverage report
+        run: |
+          {
+            echo "## Test coverage (root module, with Postgres)"
+            echo
+            echo "Total: $(go tool cover -func=coverage.out | awk '/^total:/ {print $3}')"
+            echo
+            echo "Excludes the nested Terraform provider module. Per-package figures:"
+            echo
+            grep -E 'coverage:|no test files' coverage-packages.txt | sed 's/^/    /'
+            echo
+            echo "<details><summary>Per-function coverage</summary>"
+            echo
+            echo '```'
+            go tool cover -func=coverage.out
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          TEST_DATABASE_URL: postgres://sorobeacon:sorobeacon@localhost:5432/sorobeacon?sslmode=disable
+
+  # Builds the image without pushing it, so a broken Dockerfile fails the pull
+  # request instead of whoever deploys next. It pushes nothing and uses no
+  # secrets, which keeps it safe on pull requests from forks.
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4.4.1
+      # Same build arguments as the Makefile, so the ldflags stamping is
+      # exercised rather than silently falling back to the Dockerfile defaults.
+      - name: Derive deterministic commit metadata
+        id: meta
+        run: |
+          echo "date=$(TZ=UTC git show -s --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ HEAD)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          push: false
+          load: true
+          platforms: linux/amd64
+          tags: sorobeacon:ci
+          build-args: |
+            VERSION=ci-${{ steps.meta.outputs.commit }}
+            COMMIT=${{ steps.meta.outputs.commit }}
+            DATE=${{ steps.meta.outputs.date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Verifies that building the same commit twice in two deliberately different
+  # environments (different checkout directory paths/depths, different HOME,
+  # GOPATH, GOCACHE, TZ, and HOSTNAME) produces byte-for-byte identical binaries
+  # for both sorobeacon and terraform-provider-sorobeacon while preserving
+  # /api/v1/version buildinfo metadata.
+  reproducible-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            terraform-provider-sorobeacon/go.sum
+      - name: Verify byte-for-byte reproducible builds
+        run: bash ./scripts/verify-reproducible-build.sh
+
+  # -race needs cgo, which ubuntu-latest provides. It runs without
+  # TEST_DATABASE_URL: the detector is about this process's shared state, and
+  # the SQLite backend plus the library suites cover the concurrent paths that
+  # need no service container. The Postgres-backed suite already runs in
+  # test-db; doubling it here would pay the race detector's cost on the
+  # slowest job. The nested Terraform provider is out of scope: it does not
+  # start the poller, dispatcher or lease.
+  race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Test (race detector)
+        run: make test-race
+
+  # A separate job from lint, so the pull request page distinguishes a code
+  # smell from a known vulnerability. `make vulncheck` is the same command a
+  # contributor runs locally; the tool version is pinned in the Makefile so an
+  # unrelated change does not turn red on the day the database updates.
+  #
+  # The Terraform provider is a separate module with its own dependency tree,
+  # so the root scan cannot see it: both modules are scanned explicitly.
+  vulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            terraform-provider-sorobeacon/go.sum
+      - name: govulncheck (root and Terraform provider modules)
+        run: make vulncheck
 
   lint:
     runs-on: ubuntu-latest
@@ -75,3 +196,133 @@ jobs:
       - uses: golangci/golangci-lint-action@v9.3.0
         with:
           version: v2.12.2
+
+  # Security-focused static analysis of this repository's own code, with the
+  # tuned gosec rule set in .golangci-security.yml. Separate from lint so the
+  # pull request page tells a security finding from a style smell. Every
+  # finding in the current tree is triaged inline, so any finding here is new
+  # and fails the job; the action reports it as an annotation on the changed
+  # line of the pull request. It needs no secrets and no write token, so it
+  # behaves identically on pull requests from forks. CodeQL (codeql.yml)
+  # covers the taint-tracking side of the same questions.
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            terraform-provider-sorobeacon/go.sum
+      - name: gosec (root module)
+        uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.12.2
+          args: --config=.golangci-security.yml
+      - name: gosec (Terraform provider module)
+        uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.12.2
+          working-directory: terraform-provider-sorobeacon
+          args: --config=../.golangci-security.yml
+
+  terraform-provider:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: terraform-provider-sorobeacon/go.mod
+          cache-dependency-path: terraform-provider-sorobeacon/go.sum
+      - name: Build
+        working-directory: terraform-provider-sorobeacon
+        run: go build ./...
+      - name: Vet
+        working-directory: terraform-provider-sorobeacon
+        run: go vet ./...
+      - name: Test
+        working-directory: terraform-provider-sorobeacon
+        run: go test ./...
+      - name: Verify tidy
+        working-directory: terraform-provider-sorobeacon
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+      - uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.12.2
+          working-directory: terraform-provider-sorobeacon
+
+  # The Helm chart is a deployment artifact like any other, so it is linted and
+  # rendered on every change instead of rotting until someone tries to install
+  # it. Mirrors the job in the sibling SoroTrail repository.
+  helm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+        with:
+          version: v3.15.0
+      # database.url is required (values.schema.json), so every render and
+      # lint below passes one unless the case is specifically about it being
+      # missing.
+      - name: Helm lint (defaults)
+        run: helm lint deploy/helm/sorobeacon --set database.url=postgres://user:pass@host:5432/db
+      # A deliberately-invalid value: values.schema.json must reject it. If
+      # lint succeeds here, the schema stopped being applied and this step
+      # fails the build.
+      - name: Helm lint (invalid replicaCount — schema must reject)
+        run: |
+          if helm lint deploy/helm/sorobeacon \
+               --set database.url=postgres://user:pass@host:5432/db \
+               --set replicaCount=not-a-number; then
+            echo "::error::values.schema.json did not reject a non-numeric replicaCount"
+            exit 1
+          fi
+      # Same for a missing database configuration: neither database.url nor
+      # database.existingSecret is set, so the schema must reject the render.
+      - name: Helm lint (missing database configuration — schema must reject)
+        run: |
+          if helm lint deploy/helm/sorobeacon; then
+            echo "::error::values.schema.json did not reject a missing database configuration"
+            exit 1
+          fi
+      - name: Helm template render (defaults)
+        run: |
+          helm template sorobeacon deploy/helm/sorobeacon \
+            --set database.url=postgres://user:pass@host:5432/db \
+            > /dev/null
+      - name: Helm template render (existing secret)
+        run: |
+          helm template sorobeacon deploy/helm/sorobeacon \
+            --set database.existingSecret=my-db-secret \
+            > /dev/null
+      - name: Helm template render (production values)
+        run: |
+          helm template sorobeacon deploy/helm/sorobeacon \
+            --set database.existingSecret=my-db-secret \
+            --set auth.existingSecret=my-auth-secret \
+            --set replicaCount=3 \
+            --set config.network=mainnet \
+            --set config.rpcUrl=https://soroban-mainnet.example.org \
+            --set config.logLevel=warn \
+            --set config.alertRetention=90d \
+            --set config.rateLimitRps=10 \
+            --set config.rateLimitBurst=20 \
+            --set migrations.enabled=true \
+            --set resources.requests.cpu=250m \
+            --set resources.requests.memory=256Mi \
+            --set resources.limits.cpu=1000m \
+            --set resources.limits.memory=512Mi \
+            > /dev/null
+      - name: Helm template render (image tag override)
+        run: |
+          helm template sorobeacon deploy/helm/sorobeacon \
+            --set database.url=postgres://user:pass@host:5432/db \
+            --set image.tag=v1.2.3 \
+            --set config.pollInterval=30s \
+            > /dev/null

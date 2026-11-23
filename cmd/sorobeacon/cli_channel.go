@@ -74,6 +74,7 @@ func channelCreate(ctx context.Context, env *cliEnv, args []string) error {
 	fs.Var(&config, "config", "config entry as key=value (repeatable)")
 	configJSON := fs.String("config-json", "", "config as a JSON object, for nested values")
 	disabled := fs.Bool("disabled", false, "create the channel disabled")
+	timeout := fs.Int("timeout", 0, "HTTP timeout in seconds (default: 15)")
 	if err := parseFlags(fs, args, channelUsage, env.out); err != nil {
 		return err
 	}
@@ -94,6 +95,9 @@ func channelCreate(ctx context.Context, env *cliEnv, args []string) error {
 	in := apiclient.ChannelCreate{Name: *name, Type: *channelType, Config: built}
 	if *disabled {
 		in.Enabled = boolPtr(false)
+	}
+	if *timeout > 0 {
+		in.Timeout = timeout
 	}
 	ch, err := env.client.CreateChannel(ctx, in)
 	if err != nil {

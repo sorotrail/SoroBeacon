@@ -99,6 +99,13 @@ func FromURL(raw string) (Archiver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("archive: invalid ARCHIVE_URL: %w", err)
 	}
+	// A Windows path carries its drive letter as what looks like a URL
+	// scheme: "C:\srv\archive" parses with Scheme "c". No real scheme is a
+	// single letter, so treat that as a local path rather than rejecting it
+	// as an unsupported backend.
+	if len(u.Scheme) == 1 {
+		return NewDir(raw)
+	}
 	switch strings.ToLower(u.Scheme) {
 	case "", "file", "dir":
 		return NewDir(localPath(raw, u))
@@ -107,6 +114,20 @@ func FromURL(raw string) (Archiver, error) {
 	default:
 		return nil, fmt.Errorf("archive: unsupported ARCHIVE_URL scheme %q (want a directory path, file://, dir:// or s3://)", u.Scheme)
 	}
+}
+
+// NewStoreFromURL builds the partition archive (writer and reader) over the
+// backend an ARCHIVE_URL selects.
+func NewStoreFromURL(raw string) (*Store, error) {
+	back, err := FromURL(raw)
+	if err != nil {
+		return nil, err
+	}
+	obj, ok := back.(ObjectStore)
+	if !ok {
+		return nil, errors.New("archive: backend cannot be read back")
+	}
+	return NewStore(obj)
 }
 
 // localPath recovers the filesystem path from a plain path or a file/dir URL.
@@ -138,6 +159,21 @@ func NewDir(root string) (*Dir, error) {
 		return nil, fmt.Errorf("archive: create directory %q: %w", root, err)
 	}
 	return &Dir{root: root}, nil
+}
+
+// Get opens the object at root/key, or returns ErrObjectNotFound.
+func (d *Dir) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f, err := os.Open(filepath.Join(d.root, filepath.FromSlash(key)))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, ErrObjectNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("archive: open %q: %w", key, err)
+	}
+	return f, nil
 }
 
 // Archive writes the object at root/key. It writes to a temporary file in the

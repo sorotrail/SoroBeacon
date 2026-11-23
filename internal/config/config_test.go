@@ -4,17 +4,23 @@ import (
 	"bytes"
 	"encoding/base64"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sorotrail/sorobeacon/internal/auth"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 func TestLoadDefaults(t *testing.T) {
 	// Pin every documented default. Clear optional vars so a leaked
 	// environment cannot masquerade as the unset path.
+	t.Setenv("CONFIG_FILE", "")
 	t.Setenv("DATABASE_URL", "postgres://x")
 	t.Setenv("RPC_URL", "")
 	t.Setenv("RPC_URLS", "")
@@ -22,12 +28,29 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("NETWORK_PASSPHRASE", "")
 	t.Setenv("POLL_INTERVAL", "")
 	t.Setenv("HTTP_ADDR", "")
+	t.Setenv("INSTANCE_NAME", "")
 	t.Setenv("LOG_LEVEL", "")
 	t.Setenv("SOURCE_MODE", "")
 	t.Setenv("SOROTRAIL_URL", "")
 	t.Setenv("CORS_ALLOWED_ORIGINS", "")
 	t.Setenv("CONFIG_ENCRYPTION_KEY", "")
 	t.Setenv("API_TOKEN", "")
+	t.Setenv("CHANNEL_DISABLE_AFTER_FAILURES", "")
+	t.Setenv("NOTIFY_RATE_LIMIT_SLACK_RPS", "")
+	t.Setenv("NOTIFY_RATE_LIMIT_TELEGRAM_RPS", "")
+	t.Setenv("NOTIFY_RATE_LIMIT_PAGERDUTY_RPS", "")
+	t.Setenv("NOTIFY_RATE_LIMIT_DEFAULT_RPS", "")
+	t.Setenv("WORKSPACE_TOKENS", "")
+	t.Setenv("OIDC_ISSUER", "")
+	t.Setenv("OIDC_CLIENT_ID", "")
+	t.Setenv("OIDC_CLIENT_SECRET", "")
+	t.Setenv("OIDC_REDIRECT_URL", "")
+	t.Setenv("OIDC_SCOPES", "")
+	t.Setenv("OIDC_WORKSPACE", "")
+	t.Setenv("OIDC_WORKSPACE_CLAIM", "")
+	t.Setenv("OIDC_ALLOWED_DOMAINS", "")
+	t.Setenv("OIDC_LOGIN_STATE_TTL", "")
+	t.Setenv("AUDIT_RETENTION", "")
 
 	cfg, err := Load()
 	require.NoError(t, err)
@@ -51,9 +74,23 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Zero(t, cfg.DatabaseMaxConnLifetime)
 	assert.Zero(t, cfg.DatabaseMaxConnIdleTime)
 	assert.Equal(t, time.Duration(0), cfg.AlertRetention)
+	assert.Equal(t, time.Duration(0), cfg.AuditRetention)
 	assert.Equal(t, DefaultMonitorSilentAfter, cfg.MonitorSilentAfter)
+	assert.Zero(t, cfg.NotifyRateLimitSlackRPS)
+	assert.Zero(t, cfg.NotifyRateLimitTelegramRPS)
+	assert.Zero(t, cfg.NotifyRateLimitPagerDutyRPS)
+	assert.Zero(t, cfg.NotifyRateLimitDefaultRPS)
+	assert.Empty(t, cfg.InstanceName)
+	assert.Equal(t, DefaultFlappingEpisodes, cfg.FlappingEpisodes)
+	assert.Equal(t, DefaultFlappingWindow, cfg.FlappingWindow)
+	assert.Equal(t, DefaultFlappingQuietAfter, cfg.FlappingQuietAfter)
 	assert.Nil(t, cfg.ConfigEncryptionKey)
 	assert.Empty(t, cfg.APITokens)
+	// Tracing defaults to entirely off.
+	assert.Empty(t, cfg.OTLP.Endpoint)
+	assert.Empty(t, cfg.OTLP.ServiceName)
+	assert.Equal(t, DefaultOTLPSampleRate, cfg.OTLP.SampleRate)
+	assert.False(t, cfg.OTLP.Enabled())
 }
 
 func TestLoadRequiresDatabaseURL(t *testing.T) {
@@ -71,11 +108,65 @@ func TestLoadRequiresSoroTrailURL(t *testing.T) {
 	assert.ErrorContains(t, err, "SOROTRAIL_URL")
 }
 
+func TestLoadOTLPOffByDefault(t *testing.T) {
+	// Clear optional vars so a leaked environment cannot turn tracing on.
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("OTLP_ENDPOINT", "")
+	t.Setenv("OTLP_SERVICE_NAME", "")
+	t.Setenv("OTLP_SAMPLE_RATE", "")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.OTLP.Endpoint, "tracing must be off unless OTLP_ENDPOINT is set")
+	assert.False(t, cfg.OTLP.Enabled())
+}
+
+func TestLoadOTLPConfig(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("OTLP_ENDPOINT", "http://localhost:4318")
+	t.Setenv("OTLP_SERVICE_NAME", "sorobeacon-staging")
+	t.Setenv("OTLP_SAMPLE_RATE", "0.25")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "http://localhost:4318", cfg.OTLP.Endpoint)
+	assert.True(t, cfg.OTLP.Enabled())
+	assert.Equal(t, "sorobeacon-staging", cfg.OTLP.ServiceName)
+	assert.Equal(t, 0.25, cfg.OTLP.SampleRate)
+}
+
+func TestLoadOTLPEndpointValidation(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	for _, bad := range []string{"localhost:4318", "ftp://collector", "http://"} {
+		t.Setenv("OTLP_ENDPOINT", bad)
+		_, err := Load()
+		assert.ErrorContains(t, err, "OTLP_ENDPOINT", "endpoint %q must be rejected", bad)
+	}
+}
+
+func TestLoadOTLPSampleRateValidation(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("OTLP_ENDPOINT", "http://localhost:4318")
+	for _, bad := range []string{"-0.1", "1.1", "abc", "NaN", "Inf"} {
+		t.Setenv("OTLP_SAMPLE_RATE", bad)
+		_, err := Load()
+		assert.ErrorContains(t, err, "OTLP_SAMPLE_RATE", "rate %q must be rejected", bad)
+	}
+
+	// The bounds themselves are valid.
+	for _, good := range []string{"0", "1"} {
+		t.Setenv("OTLP_SAMPLE_RATE", good)
+		_, err := Load()
+		assert.NoError(t, err, "rate %q must be accepted", good)
+	}
+}
+
 func TestLoadOverrides(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://custom")
 	t.Setenv("RPC_URL", "https://mainnet.example")
 	t.Setenv("POLL_INTERVAL", "30s")
 	t.Setenv("HTTP_ADDR", ":9999")
+	t.Setenv("INSTANCE_NAME", " beacon-a ")
 	t.Setenv("HTTP_MAX_BODY_BYTES", "4096")
 	t.Setenv("LOG_LEVEL", "debug")
 	t.Setenv("SOURCE_MODE", "sorotrail")
@@ -88,6 +179,7 @@ func TestLoadOverrides(t *testing.T) {
 	assert.Equal(t, "https://mainnet.example", cfg.RPCURL)
 	assert.Equal(t, 30*time.Second, cfg.PollInterval)
 	assert.Equal(t, ":9999", cfg.HTTPAddr)
+	assert.Equal(t, "beacon-a", cfg.InstanceName)
 	assert.Equal(t, int64(4096), cfg.HTTPMaxBodyBytes)
 	assert.Equal(t, slog.LevelDebug, cfg.LogLevel)
 	assert.Equal(t, "sorotrail", cfg.SourceMode)
@@ -112,6 +204,40 @@ func TestLoadRejectsInvalidMonitorSilentAfter(t *testing.T) {
 	assert.ErrorContains(t, err, "MONITOR_SILENT_AFTER")
 }
 
+func TestLoadFlappingSettings(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("FLAPPING_EPISODES", "5")
+	t.Setenv("FLAPPING_WINDOW", "20m")
+	t.Setenv("FLAPPING_QUIET_AFTER", "3m")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 5, cfg.FlappingEpisodes)
+	assert.Equal(t, 20*time.Minute, cfg.FlappingWindow)
+	assert.Equal(t, 3*time.Minute, cfg.FlappingQuietAfter)
+}
+
+func TestLoadRejectsInvalidFlappingSettings(t *testing.T) {
+	for _, tc := range []struct {
+		key   string
+		value string
+	}{
+		{key: "FLAPPING_EPISODES", value: "0"},
+		{key: "FLAPPING_WINDOW", value: "nope"},
+		{key: "FLAPPING_QUIET_AFTER", value: "0s"},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://x")
+			t.Setenv("FLAPPING_EPISODES", "")
+			t.Setenv("FLAPPING_WINDOW", "")
+			t.Setenv("FLAPPING_QUIET_AFTER", "")
+			t.Setenv(tc.key, tc.value)
+			_, err := Load()
+			assert.ErrorContains(t, err, tc.key)
+		})
+	}
+}
+
 func TestLoadReadyzLagThreshold(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://x")
 	t.Setenv("READYZ_LAG_THRESHOLD", "50")
@@ -127,6 +253,52 @@ func TestLoadRejectsInvalidReadyzLagThreshold(t *testing.T) {
 
 	_, err := Load()
 	assert.ErrorContains(t, err, "READYZ_LAG_THRESHOLD")
+}
+
+// Auto-disabling a channel is a destructive answer to a temporary problem, so
+// it is off unless an operator asks for it and nothing else can turn it on.
+func TestLoadChannelDisableAfterFailures(t *testing.T) {
+	t.Run("defaults to never auto-disabling", func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://x")
+		t.Setenv("CHANNEL_DISABLE_AFTER_FAILURES", "")
+
+		cfg, err := Load()
+
+		require.NoError(t, err)
+		assert.Zero(t, cfg.ChannelDisableAfterFailures)
+	})
+
+	t.Run("reads the threshold", func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://x")
+		t.Setenv("CHANNEL_DISABLE_AFTER_FAILURES", "5")
+
+		cfg, err := Load()
+
+		require.NoError(t, err)
+		assert.Equal(t, 5, cfg.ChannelDisableAfterFailures)
+	})
+
+	t.Run("zero is a valid way to spell off", func(t *testing.T) {
+		t.Setenv("DATABASE_URL", "postgres://x")
+		t.Setenv("CHANNEL_DISABLE_AFTER_FAILURES", "0")
+
+		cfg, err := Load()
+
+		require.NoError(t, err)
+		assert.Zero(t, cfg.ChannelDisableAfterFailures)
+	})
+
+	for _, value := range []string{"-1", "two", "2.5"} {
+		t.Run("rejects "+value, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://x")
+			t.Setenv("CHANNEL_DISABLE_AFTER_FAILURES", value)
+
+			_, err := Load()
+
+			require.Error(t, err)
+			assert.ErrorContains(t, err, "CHANNEL_DISABLE_AFTER_FAILURES")
+		})
+	}
 }
 
 func TestLoadAcceptsHTTPAndHTTPSRPCURLs(t *testing.T) {
@@ -330,24 +502,39 @@ func TestLoadAlertRetention(t *testing.T) {
 }
 
 func TestParseRetention(t *testing.T) {
-	d, err := ParseRetention("")
-	require.NoError(t, err)
-	assert.Equal(t, time.Duration(0), d)
-
-	d, err = ParseRetention("90d")
-	require.NoError(t, err)
-	assert.Equal(t, 90*24*time.Hour, d)
-
-	d, err = ParseRetention("24h")
-	require.NoError(t, err)
-	assert.Equal(t, 24*time.Hour, d)
-
-	_, err = ParseRetention("0")
-	assert.Error(t, err)
-	_, err = ParseRetention("-1h")
-	assert.Error(t, err)
-	_, err = ParseRetention("0d")
-	assert.Error(t, err)
+	tests := []struct {
+		name    string
+		in      string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "empty keeps forever", in: ""},
+		// Whitespace is the same as unset: an operator template that expands
+		// to spaces must not start pruning history.
+		{name: "whitespace only keeps forever", in: "   "},
+		{name: "days", in: "90d", want: 90 * 24 * time.Hour},
+		{name: "one day boundary", in: "1d", want: 24 * time.Hour},
+		{name: "fractional days", in: "1.5d", want: 36 * time.Hour},
+		{name: "go duration hours", in: "24h", want: 24 * time.Hour},
+		{name: "go duration minutes", in: "90m", want: 90 * time.Minute},
+		{name: "zero", in: "0", wantErr: true},
+		{name: "negative", in: "-1h", wantErr: true},
+		{name: "zero days", in: "0d", wantErr: true},
+		{name: "negative days", in: "-2d", wantErr: true},
+		{name: "day suffix without a number", in: "d", wantErr: true},
+		{name: "not a duration", in: "soon", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseRetention(tt.in)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 func TestLoadRateLimit(t *testing.T) {
@@ -365,6 +552,48 @@ func TestLoadRateLimit(t *testing.T) {
 	cfg, err = Load()
 	require.NoError(t, err)
 	assert.Equal(t, 25, cfg.RateLimitBurst)
+}
+
+func TestLoadNotifyRateLimits(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("NOTIFY_RATE_LIMIT_SLACK_RPS", "7.5")
+	t.Setenv("NOTIFY_RATE_LIMIT_TELEGRAM_RPS", "42")
+	t.Setenv("NOTIFY_RATE_LIMIT_PAGERDUTY_RPS", "3.5")
+	t.Setenv("NOTIFY_RATE_LIMIT_DEFAULT_RPS", "11")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 7.5, cfg.NotifyRateLimitSlackRPS)
+	assert.Equal(t, 42.0, cfg.NotifyRateLimitTelegramRPS)
+	assert.Equal(t, 3.5, cfg.NotifyRateLimitPagerDutyRPS)
+	assert.Equal(t, 11.0, cfg.NotifyRateLimitDefaultRPS)
+
+	// Zero is accepted and means "keep the built-in default", not "disable".
+	t.Setenv("NOTIFY_RATE_LIMIT_SLACK_RPS", "0")
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Zero(t, cfg.NotifyRateLimitSlackRPS)
+}
+
+func TestLoadRejectsBadNotifyRateLimits(t *testing.T) {
+	names := []string{
+		"NOTIFY_RATE_LIMIT_SLACK_RPS",
+		"NOTIFY_RATE_LIMIT_TELEGRAM_RPS",
+		"NOTIFY_RATE_LIMIT_PAGERDUTY_RPS",
+		"NOTIFY_RATE_LIMIT_DEFAULT_RPS",
+	}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://x")
+			for _, other := range names {
+				t.Setenv(other, "1")
+			}
+			t.Setenv(name, "-1")
+
+			_, err := Load()
+			assert.ErrorContains(t, err, name)
+		})
+	}
 }
 
 func TestLoadRejectsBadRateLimit(t *testing.T) {
@@ -434,6 +663,46 @@ func TestRedactDatabaseURLUnparseable(t *testing.T) {
 	assert.Equal(t, "", redactDatabaseURL(""))
 	assert.Equal(t, redacted, redactDatabaseURL("not a url"))
 	assert.Equal(t, redacted, redactDatabaseURL("http://["))
+	// A sqlite URL with a Windows drive path does not parse as a URL, but it
+	// carries no credentials, so the operator is still shown the file. Without
+	// this the whole startup line said "[redacted]" on Windows.
+	assert.Equal(t, `sqlite://C:\srv\sorobeacon.db`, redactDatabaseURL(`sqlite://C:\srv\sorobeacon.db`))
+}
+
+// TestLogAttrsRedactsURLCredentials covers the other two URLs in the startup
+// line. An RPC provider or a SoroTrail deployment behind basic auth puts the
+// key in the URL, and LogAttrs is the one place configuration is printed.
+func TestLogAttrsRedactsURLCredentials(t *testing.T) {
+	attrs := func(c Config) (map[string]string, string) {
+		got := map[string]string{}
+		var dump strings.Builder
+		for _, a := range c.LogAttrs() {
+			got[a.Key] = a.Value.String()
+			dump.WriteString(a.Key + "=" + a.Value.String() + "\n")
+		}
+		return got, dump.String()
+	}
+
+	got, blob := attrs(Config{
+		RPCURL:       "https://rpcuser:rpc-api-key@rpc.example.com/v1",
+		SoroTrailURL: "https://svc:trail-token@trail.example.com",
+		DatabaseURL:  "postgres://u:p@db.example:5432/beacon",
+	})
+	assert.Equal(t, "https://rpc.example.com/v1", got["rpc_url"])
+	assert.Equal(t, "https://trail.example.com", got["sorotrail_url"])
+	assert.NotContains(t, blob, "rpc-api-key")
+	assert.NotContains(t, blob, "trail-token")
+
+	// Fail closed: a valid password containing "%" defeats url.Parse, and the
+	// unparseable value must not fall through to the log verbatim.
+	got, blob = attrs(Config{
+		RPCURL:       "https://rpcuser:rpc%key@rpc.example.com/v1",
+		SoroTrailURL: "https://svc:tok en@trail.example.com",
+	})
+	assert.Equal(t, redacted, got["rpc_url"])
+	assert.Equal(t, redacted, got["sorotrail_url"])
+	assert.NotContains(t, blob, "rpc%key")
+	assert.NotContains(t, blob, "tok en")
 }
 
 func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
@@ -450,20 +719,118 @@ func TestLogAttrsOptInDoesNotDumpWholeStruct(t *testing.T) {
 	}
 	assert.Equal(t, []string{
 		"database_url",
+		"replica_database_url",
 		"http_addr",
 		"source_mode",
 		"poll_interval",
+		"heartbeat_enabled",
+		"heartbeat_interval",
+		"heartbeat_failure_pings",
 		"log_level",
 		"network",
 		"rpc_url",
 		"rpc_endpoint_count",
 		"sorotrail_url",
+		"horizon_url",
 		"cors_allowed_origins",
 		"config_encryption_enabled",
+		"secrets_provider",
+		"secrets_cache_ttl",
+		"vault_token_configured",
 		"reorg_tracking_window",
 		"reorg_confirmation_depth",
 		"api_token_count",
+		"workspaces", "sso_enabled",
+		"otlp_tracing_enabled",
+		"otlp_service_name",
+		"otlp_sample_rate",
+		"graphql_playground_enabled",
+		"graphql_max_depth",
+		"graphql_max_complexity",
+		"graphql_allowlist_only",
+		"channel_disable_after_failures",
 	}, keys)
+}
+
+// The heartbeat URL is a credential: its path is what identifies the
+// monitor to the external service, so the one place configuration is
+// printed must contain neither the URL nor anything derived from it. What it
+// may print is the opt-in shape — on/off, interval, failure pings configured.
+func TestLogAttrsNeverPrintTheHeartbeatURL(t *testing.T) {
+	cfg := Config{
+		HeartbeatURL:           "https://hc.example.com/ping/deadbeef-1111-2222-3333-444444444444",
+		HeartbeatInterval:      time.Minute,
+		HeartbeatFailureSuffix: "/fail",
+	}
+	got := map[string]string{}
+	var blob strings.Builder
+	for _, a := range cfg.LogAttrs() {
+		got[a.Key] = a.Value.String()
+		blob.WriteString(a.Key + "=" + a.Value.String() + "\n")
+	}
+	assert.NotContains(t, blob.String(), "deadbeef", "the heartbeat URL must never be logged")
+	assert.NotContains(t, blob.String(), "hc.example.com", "not even the host is printed")
+	assert.Equal(t, "true", got["heartbeat_enabled"])
+	assert.Equal(t, "true", got["heartbeat_failure_pings"])
+	assert.Equal(t, "1m0s", got["heartbeat_interval"])
+}
+
+func TestLoadHeartbeat(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("HEARTBEAT_URL", "https://hc.example.com/ping/deadbeef-1111-2222-3333-444444444444")
+	t.Setenv("HEARTBEAT_INTERVAL", "30s")
+	t.Setenv("HEARTBEAT_FAILURE_SUFFIX", "/fail")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "https://hc.example.com/ping/deadbeef-1111-2222-3333-444444444444", cfg.HeartbeatURL)
+	assert.Equal(t, 30*time.Second, cfg.HeartbeatInterval)
+	assert.Equal(t, "/fail", cfg.HeartbeatFailureSuffix)
+
+	// Unset means off, exactly as before the feature existed: no URL, no
+	// failure pings, and the default interval waiting for an opt-in.
+	t.Setenv("HEARTBEAT_URL", "")
+	t.Setenv("HEARTBEAT_INTERVAL", "")
+	t.Setenv("HEARTBEAT_FAILURE_SUFFIX", "")
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.HeartbeatURL)
+	assert.Empty(t, cfg.HeartbeatFailureSuffix)
+	assert.Equal(t, DefaultHeartbeatInterval, cfg.HeartbeatInterval)
+}
+
+func TestLoadRejectsBadHeartbeatConfig(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("POLL_INTERVAL", "5s")
+
+	cases := []struct {
+		name string
+		url  string
+		iv   string
+		fail string
+	}{
+		{name: "not a URL", url: "hc.example.com", iv: "30s"},
+		{name: "wrong scheme", url: "ftp://hc.example.com/ping/x", iv: "30s"},
+		{name: "unparseable duration", url: "https://hc.example.com/ping/x", iv: "banana"},
+		{name: "zero interval", url: "https://hc.example.com/ping/x", iv: "0s"},
+		{name: "interval not above the poll interval", url: "https://hc.example.com/ping/x", iv: "5s"},
+		{name: "suffix without a leading slash", url: "https://hc.example.com/ping/x", iv: "30s", fail: "fail"},
+		{name: "suffix without a URL", iv: "30s", fail: "/fail"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HEARTBEAT_URL", tc.url)
+			t.Setenv("HEARTBEAT_INTERVAL", tc.iv)
+			t.Setenv("HEARTBEAT_FAILURE_SUFFIX", tc.fail)
+			_, err := Load()
+			require.Error(t, err)
+			// The URL is a credential even when it is rejected: the error
+			// says what is wrong without echoing the value.
+			if tc.url != "" {
+				assert.NotContains(t, err.Error(), tc.url)
+			}
+		})
+	}
 }
 
 func TestLoadAPITokens(t *testing.T) {
@@ -492,6 +859,113 @@ func TestLoadRejectsEmptyAPITokenList(t *testing.T) {
 		_, err := Load()
 		assert.ErrorContains(t, err, "API_TOKEN")
 	}
+}
+
+func TestLoadWorkspaceTokens(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("API_TOKEN", "default-token")
+	t.Setenv("WORKSPACE_TOKENS", "acme=tok-acme, beta=tok-beta")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, []WorkspaceToken{
+		{Workspace: "acme", Token: "tok-acme"},
+		{Workspace: "beta", Token: "tok-beta"},
+	}, cfg.WorkspaceTokens)
+
+	// The bindings are what the authenticator is built from: unscoped tokens
+	// first, each one selecting the default workspace, then the scoped ones in
+	// the order they were written.
+	bindings, err := cfg.AuthBindings()
+	require.NoError(t, err)
+	assert.Equal(t, []auth.Binding{
+		{Workspace: "default", Token: "default-token"},
+		{Workspace: "acme", Token: "tok-acme"},
+		{Workspace: "beta", Token: "tok-beta"},
+	}, bindings)
+	assert.Equal(t, []workspace.ID{"default", "acme", "beta"}, cfg.Workspaces())
+}
+
+// A token cannot belong to two workspaces: resolution would then depend on
+// which configured entry the comparison happened to hit, which is the one
+// failure mode tenancy cannot have.
+func TestLoadRejectsAmbiguousWorkspaceTokens(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+
+	for name, env := range map[string][2]string{
+		"same token unscoped and scoped": {"shared-token", "acme=shared-token"},
+		"same token in two workspaces":   {"", "acme=shared-token,beta=shared-token"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("API_TOKEN", env[0])
+			t.Setenv("WORKSPACE_TOKENS", env[1])
+			_, err := Load()
+			assert.ErrorContains(t, err, "WORKSPACE_TOKENS")
+			// The conflict is reported by workspace, never by token value.
+			assert.NotContains(t, err.Error(), "shared-token")
+		})
+	}
+}
+
+func TestLoadRejectsMalformedWorkspaceTokens(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("API_TOKEN", "")
+
+	for _, tc := range []struct {
+		name, raw, wantErr string
+	}{
+		{"no separator", "just-a-token", `entry 1: no "="`},
+		// Either half can be the secret (an operator may have written the pair
+		// the other way round), so no message may echo either side.
+		{"invalid id", "Acme=Tok3nValue", "workspace id is not one"},
+		{"empty id", "=Tok3nValue", "workspace id is empty"},
+		{"empty token", "acme=", "token for workspace \"acme\" is empty"},
+		{"set but empty", ", ,", "contains no entries"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("WORKSPACE_TOKENS", tc.raw)
+			_, err := Load()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+			assert.NotContains(t, err.Error(), "Tok3nValue")
+			assert.NotContains(t, err.Error(), "just-a-token")
+			assert.NotContains(t, err.Error(), "Acme")
+		})
+	}
+}
+
+// WORKSPACE_TOKENS alone is a valid way to go multi-tenant: with no API_TOKEN
+// there is no credential for the default workspace, so its pre-existing rows
+// stop being reachable over HTTP and the table only names the tenants that
+// were configured.
+func TestLoadWorkspaceTokensWithoutAPITokens(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("API_TOKEN", "")
+	t.Setenv("WORKSPACE_TOKENS", "acme=tok-acme")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.APITokens)
+	assert.Equal(t, []workspace.ID{"acme"}, cfg.Workspaces())
+}
+
+func TestLogAttrsHidesWorkspaceTokens(t *testing.T) {
+	cfg := Config{
+		DatabaseURL:     "postgres://user:pw@host/db",
+		WorkspaceTokens: []WorkspaceToken{{Workspace: "acme", Token: "tok-acme"}},
+	}
+
+	var dump strings.Builder
+	for _, a := range cfg.LogAttrs() {
+		dump.WriteString(a.Key)
+		dump.WriteByte('=')
+		dump.WriteString(a.Value.String())
+		dump.WriteByte('\n')
+	}
+	blob := dump.String()
+
+	assert.NotContains(t, blob, "tok-acme")
+	assert.Contains(t, blob, "workspaces=[acme]")
 }
 
 // LogAttrs is the one place configuration is printed; a token is a
@@ -752,6 +1226,109 @@ func TestLoadRejectsPostgresPoolSettingsWithSQLite(t *testing.T) {
 	assert.ErrorContains(t, err, "sqlite")
 }
 
+// Read-replica routing is off unless REPLICA_DATABASE_URL says otherwise, and
+// the URL it carries is the value the store is handed.
+func TestLoadReplicaDatabaseURL(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("REPLICA_DATABASE_URL", "")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.ReplicaDatabaseURL, "no replica URL means every read stays on the primary")
+
+	t.Setenv("REPLICA_DATABASE_URL", "  postgres://replica:5432/sorobeacon  ")
+
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, "postgres://replica:5432/sorobeacon", cfg.ReplicaDatabaseURL, "surrounding space is trimmed")
+}
+
+// A replica URL has to be a Postgres URL, and it has to be a different one
+// from the primary: pointing both at the same string looks like routing is on
+// in every log line and metric while every read still lands on the primary.
+// Both are startup errors rather than warnings.
+func TestLoadRejectsInvalidReplicaDatabaseURL(t *testing.T) {
+	const secret = "s3cret-password"
+
+	tests := []struct {
+		name    string
+		replica string
+		want    []string
+	}{
+		{
+			name:    "unsupported scheme",
+			replica: "mysql://user:" + secret + "@localhost:3306/db",
+			want:    []string{"REPLICA_DATABASE_URL", "mysql", "Postgres"},
+		},
+		{
+			name:    "not a URL",
+			replica: "replica-host:5432",
+			want:    []string{"REPLICA_DATABASE_URL", "parseable"},
+		},
+		{
+			name:    "missing host",
+			replica: "postgres:///sorobeacon",
+			want:    []string{"REPLICA_DATABASE_URL", "parseable"},
+		},
+		{
+			name:    "identical to the primary",
+			replica: "postgres://x",
+			want:    []string{"REPLICA_DATABASE_URL", "identical", "DATABASE_URL"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://x")
+			t.Setenv("REPLICA_DATABASE_URL", tt.replica)
+
+			_, err := Load()
+
+			require.Error(t, err)
+			for _, want := range tt.want {
+				assert.ErrorContains(t, err, want)
+			}
+			assert.NotContains(t, err.Error(), secret, "a credential must not reach the error text")
+		})
+	}
+}
+
+// SQLite serves reads and writes from one file handle, so there is no replica
+// to route to. Carrying the variable into a SQLite deployment would silently
+// do nothing, so Load fails loudly instead — matching the pool knobs above.
+func TestLoadRejectsReplicaDatabaseURLWithSQLite(t *testing.T) {
+	t.Setenv("DATABASE_URL", "sqlite:///tmp/sorobeacon.db")
+	t.Setenv("REPLICA_DATABASE_URL", "postgres://replica:5432/sorobeacon")
+
+	_, err := Load()
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "REPLICA_DATABASE_URL")
+	assert.ErrorContains(t, err, "sqlite")
+}
+
+// The replica URL carries its own credentials, so the startup log line gets
+// the same treatment as DATABASE_URL: scheme, host and database name only.
+func TestLogAttrsRedactsReplicaDatabaseURL(t *testing.T) {
+	const secret = "s3cret-password"
+	cfg := Config{
+		DatabaseURL:        "postgres://user:" + secret + "@primary:5432/sorobeacon",
+		ReplicaDatabaseURL: "postgres://user:" + secret + "@replica:5432/sorobeacon",
+	}
+
+	var dump strings.Builder
+	for _, a := range cfg.LogAttrs() {
+		dump.WriteString(a.Key)
+		dump.WriteByte('=')
+		dump.WriteString(a.Value.String())
+		dump.WriteByte('\n')
+	}
+	blob := dump.String()
+
+	assert.NotContains(t, blob, secret, "a replica credential must not reach the log line")
+	assert.Contains(t, blob, "replica_database_url=postgres://replica:5432/sorobeacon")
+}
+
 // A SQLite URL holds no credentials, so the log line keeps the file path
 // rather than replacing the whole URL with [redacted].
 func TestRedactDatabaseURLSQLiteKeepsPath(t *testing.T) {
@@ -784,4 +1361,162 @@ func TestLoadRejectsInvalidDatabaseURL(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLoadSecretsProvider(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+
+	// Disabled by default: references stay literals.
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.SecretsProvider)
+
+	t.Setenv("SECRETS_PROVIDER", "env")
+	t.Setenv("SECRETS_CACHE_TTL", "90s")
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, "env", cfg.SecretsProvider)
+	assert.Equal(t, 90*time.Second, cfg.SecretsCacheTTL)
+
+	// A disabled cache is allowed.
+	t.Setenv("SECRETS_CACHE_TTL", "0s")
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Zero(t, cfg.SecretsCacheTTL)
+}
+
+func TestLoadRejectsBadSecretsConfig(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+
+	t.Setenv("SECRETS_PROVIDER", "aws")
+	_, err := Load()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "SECRETS_PROVIDER")
+
+	t.Setenv("SECRETS_PROVIDER", "")
+	t.Setenv("SECRETS_CACHE_TTL", "-1s")
+	_, err = Load()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "SECRETS_CACHE_TTL")
+
+	t.Setenv("SECRETS_CACHE_TTL", "")
+	t.Setenv("SECRETS_PROVIDER", "vault")
+	_, err = Load()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "VAULT_ADDR")
+
+	// The token is a credential and must never reach LogAttrs.
+	t.Setenv("VAULT_ADDR", "https://vault.example:8200")
+	t.Setenv("VAULT_TOKEN", "hvs.super-secret")
+	cfg, err := Load()
+	require.NoError(t, err)
+	for _, a := range cfg.LogAttrs() {
+		assert.NotEqual(t, "hvs.super-secret", a.Value.String())
+	}
+}
+
+func TestGraphQLAllowlistOnlyConfig(t *testing.T) {
+	for _, k := range []string{"SOROBAN_RPC_URL", "DATABASE_URL"} {
+		t.Setenv(k, "postgres://user:pass@localhost:5432/db")
+	}
+
+	t.Run("default false", func(t *testing.T) {
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.False(t, cfg.GraphQL.AllowlistOnly)
+	})
+
+	t.Run("enabled via true", func(t *testing.T) {
+		t.Setenv("GRAPHQL_ALLOWLIST_ONLY", "true")
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.True(t, cfg.GraphQL.AllowlistOnly)
+	})
+
+	t.Run("invalid value", func(t *testing.T) {
+		t.Setenv("GRAPHQL_ALLOWLIST_ONLY", "not-a-bool")
+		_, err := Load()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "GRAPHQL_ALLOWLIST_ONLY")
+	})
+}
+
+func TestSecretResolutionConfig(t *testing.T) {
+	for _, k := range []string{"SOROBAN_RPC_URL", "DATABASE_URL"} {
+		t.Setenv(k, "postgres://user:pass@localhost:5432/db")
+	}
+
+	t.Run("resolves database url from file", func(t *testing.T) {
+		dir := t.TempDir()
+		dbFile := filepath.Join(dir, "db.txt")
+		require.NoError(t, os.WriteFile(dbFile, []byte("postgres://secretuser:secretpass@dbhost:5432/secretdb\n"), 0o600))
+
+		t.Setenv("SECRETS_PROVIDER", "file")
+		t.Setenv("DATABASE_URL", "${secret:file:"+dbFile+"}")
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Equal(t, "postgres://secretuser:secretpass@dbhost:5432/secretdb", cfg.DatabaseURL)
+	})
+
+	t.Run("resolves api token and encryption key from file", func(t *testing.T) {
+		dir := t.TempDir()
+		credsFile := filepath.Join(dir, "creds.json")
+		require.NoError(t, os.WriteFile(credsFile, []byte(`{"token":"sb_admin_token","enc":"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="}`), 0o600))
+
+		t.Setenv("SECRETS_PROVIDER", "file")
+		t.Setenv("API_TOKEN", "${secret:file:"+credsFile+"#token}")
+		t.Setenv("CONFIG_ENCRYPTION_KEY", "${secret:file:"+credsFile+"#enc}")
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Contains(t, cfg.APITokens, "sb_admin_token")
+		assert.Len(t, cfg.ConfigEncryptionKey, 32)
+	})
+
+	t.Run("fails startup on missing secret file without leaking", func(t *testing.T) {
+		t.Setenv("SECRETS_PROVIDER", "file")
+		t.Setenv("DATABASE_URL", "${secret:file:/nonexistent/db.txt}")
+
+		_, err := Load()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "DATABASE_URL")
+		assert.ErrorContains(t, err, "${secret:file:/nonexistent/db.txt}")
+	})
+
+	t.Run("fails when secrets provider is unset but reference provided", func(t *testing.T) {
+		t.Setenv("SECRETS_PROVIDER", "")
+		t.Setenv("DATABASE_URL", "${secret:file:/some/path}")
+
+		_, err := Load()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "DATABASE_URL")
+		assert.ErrorContains(t, err, "SECRETS_PROVIDER is not configured")
+	})
+
+	t.Run("supports comma-separated secrets providers", func(t *testing.T) {
+		t.Setenv("SECRETS_PROVIDER", "file,env")
+		t.Setenv("MY_ENV_DB", "postgres://envuser:envpass@envhost:5432/envdb")
+		t.Setenv("DATABASE_URL", "${secret:env:MY_ENV_DB}")
+
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Equal(t, "postgres://envuser:envpass@envhost:5432/envdb", cfg.DatabaseURL)
+	})
+}
+
+func TestLoadAuditRetention(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("ALERT_RETENTION", "30d")
+	t.Setenv("AUDIT_RETENTION", "365d")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 30*24*time.Hour, cfg.AlertRetention)
+	assert.Equal(t, 365*24*time.Hour, cfg.AuditRetention, "AUDIT_RETENTION is independent of ALERT_RETENTION")
+
+	t.Setenv("AUDIT_RETENTION", "0s")
+	_, err = Load()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "AUDIT_RETENTION")
 }

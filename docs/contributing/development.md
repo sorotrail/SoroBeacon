@@ -20,6 +20,8 @@ make build && make test
 | `make test` | Unit tests. Store integration tests **skip** without a database. |
 | `make test-db` | All tests, including store integration tests against the compose Postgres (`TEST_DATABASE_URL` overridable). |
 | `make lint` | `golangci-lint run` (v2 config). |
+| `make build-tf` | Builds the Terraform provider → `bin/terraform-provider-sorobeacon`. |
+| `make test-tf` / `make lint-tf` / `make tidy-tf` | The same for the provider module: it is a nested `go.mod`, so the targets above never reach it. |
 | `make up` / `make down` | Full docker-compose stack. |
 
 ## Layout
@@ -34,6 +36,7 @@ internal/notify     channel notifiers + retrying dispatcher
 internal/poller     the ingest loop
 internal/api        chi JSON API
 internal/web        html/template + htmx dashboard
+terraform-provider-sorobeacon   its own module; excluded from ./... by design
 ```
 
 ## Conventions

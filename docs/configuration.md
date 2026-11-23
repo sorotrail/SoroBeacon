@@ -1,8 +1,11 @@
 # Environment variable reference
 
-All runtime configuration is environment variables. There is no config
-file. Copy [`.env.example`](../.env.example) and edit it, or set the
-variables in the process environment / systemd `EnvironmentFile=`.
+All runtime configuration is loaded from the environment and an optional
+YAML config file. Copy [`.env.example`](../.env.example) and edit it, or
+set the variables in the process environment / systemd `EnvironmentFile=`.
+If `CONFIG_FILE` is set, its values are used as defaults and environment
+variables override them; the built-in defaults are used only when neither
+layer sets a value.
 
 This page is the operator reference for **every variable
 `internal/config` actually reads**. Channel secrets (webhook URLs, bot
@@ -14,6 +17,40 @@ returned by the API, or pasted into a ticket.
 authoritative source. If this page and the code disagree, the code wins
 and this page should be updated.
 
+## Checking a configuration before deploying
+
+`config.Load` runs at startup, so a typo in a variable is found when the
+process starts — in a deployment pipeline, after the old version has already
+been stopped. `sorobeacon validate` runs the same checks without starting
+anything:
+
+```sh
+sorobeacon validate                      # syntax only, no network
+sorobeacon validate --connectivity       # also reach the database and the RPC
+sorobeacon validate --json               # machine-readable
+```
+
+Every problem is reported in one run, not just the first, so an operator
+fixing four typos does not need four runs. The exit code tells a pipeline
+which kind of problem it is:
+
+| Exit code | Meaning | Fixed by |
+| --- | --- | --- |
+| `0` | the configuration is valid | — |
+| `1` | the configuration is invalid | editing the environment or the config file |
+| `2` | a dependency named by the configuration could not be reached | waiting for the database, or fixing the network |
+
+The connectivity checks are opt-in because they make the command slow and
+network-dependent: a configuration that names a database on another host
+cannot be checked from a machine that cannot route to it. When they run,
+they also report the database's migration version (a database behind the
+binary's migrations is reported as a problem, not silently accepted) and
+whether the RPC endpoint serves the configured network.
+
+No secret is ever printed: not the database password, not an API token, not
+the config encryption key. Values are redacted on the way out, in every
+output mode.
+
 ## Secrets
 
 | Variable | Secret? | Notes |
@@ -21,8 +58,12 @@ and this page should be updated.
 | `DATABASE_URL` | **yes** | Connection string often embeds a password. Mode `0600` on disk; never commit a filled `.env`. |
 | `CONFIG_ENCRYPTION_KEY` | **yes** | Base64 AES-GCM key that encrypts channel `config` at rest. Losing it makes encrypted configs unrecoverable — back it up with the database. |
 | `API_TOKEN` | **yes** | Bearer token(s) for `/api/v1` and the dashboard sign-in. Anyone holding one can read and mutate everything, so treat it like a password: mode `0600` on disk, a secret manager in production, and never in a log line, ticket or shell history. |
+| `WORKSPACE_TOKENS` | **yes** | Same shape of credential as `API_TOKEN`, one per workspace. The whole value is a list of secrets; the workspace ids in it are not. |
+| `OIDC_CLIENT_SECRET` | **yes** | The provider's secret for this instance. Sent only to the provider's token endpoint, and never logged, rendered or echoed in an error. It authorises nothing at SoroBeacon's own API — a signed-in browser holds a session cookie, not this. |
 | `NETWORK_PASSPHRASE` | no (public nets) | SDF passphrases are public. For `NETWORK=custom` it identifies a private network — treat it as operational config, not a credential. |
+| `VAULT_TOKEN` | **yes** | Credential for the Vault secret provider. Never logged; a resolved secret is never returned by the API. |
 | `RPC_URL` / `RPC_URLS` / `SOROTRAIL_URL` | maybe | A URL is not a password, but provider URLs sometimes embed tokens in the path or query. Do not commit those. |
+| `ALERT_ENRICHMENT_URL` | maybe | Off by default and not a credential itself, but the enrichment service's token often rides in the userinfo or query string. If yours does, treat it like `API_TOKEN`: mode `0600`, a secret manager in production, never in a log line or ticket. |
 | `CORS_ALLOWED_ORIGINS` | no | An allow-list, not a credential. Think hard before allowing a third-party origin: whatever credential that origin's users hold can act through their browser. |
 | everything else | no | |
 
@@ -35,7 +76,15 @@ column; see [Channel config encryption](#channel-config-encryption).
 
 | Variable | Type | Default | Required | What it does |
 | --- | --- | --- | --- | --- |
+| `CONFIG_FILE` | file path | empty (environment only) | optional | Optional YAML configuration file whose keys supply defaults beneath environment variables. Malformed or unreadable files fail startup without echoing secret values. |
 | `DATABASE_URL` | URL string | _(none)_ | **required** | Connection string whose scheme selects the backend. `postgres` / `postgresql` → a Postgres server (pgx pool), e.g. `postgres://user:pass@host:5432/sorobeacon?sslmode=disable`. `sqlite` → a single database file, e.g. `sqlite:///var/lib/sorobeacon/sorobeacon.db`, with no server to run. Load fails if it is empty; a Postgres URL must carry a host and a SQLite URL a file path. Errors never echo a password. |
+| `DATABASE_MAX_CONNS` | integer | `0` (pgx driver default) | optional | Maximum Postgres pool size (`MaxConns`). Must not be below `DATABASE_MIN_CONNS` when both are set; rejected on SQLite. |
+| `DATABASE_MIN_CONNS` | integer | `0` (pgx driver default) | optional | Minimum Postgres pool size (`MinConns`). Rejected on SQLite. |
+| `DATABASE_MAX_CONN_LIFETIME` | Go duration | `0s` (pgx driver default) | optional | Maximum lifetime of a connection in the Postgres pool (`MaxConnLifetime`). Rejected on SQLite. |
+| `DATABASE_MAX_CONN_IDLE_TIME` | Go duration | `0s` (pgx driver default) | optional | Maximum idle time of a connection in the Postgres pool (`MaxConnIdleTime`). Rejected on SQLite. |
+| `DATABASE_CONNECT_ATTEMPTS` | integer (`1`–`100`) | `0` (store default) | optional | Number of startup connection attempts to Postgres before giving up, including the first attempt. |
+| `DATABASE_CONNECT_DELAY` | Go duration | `0s` (store default) | optional | Base delay between startup connection attempts to Postgres; doubles after each failure with jitter. Must be greater than `0` when set. |
+| `REPLICA_DATABASE_URL` | URL string | empty (no replica) | optional | Postgres read-replica connection string used for read-only queries. Must differ from `DATABASE_URL`; rejected on SQLite. |
 
 ### SQLite backend
 
@@ -56,6 +105,19 @@ The `DATABASE_MAX_CONNS`, `DATABASE_MIN_CONNS`,
 `DATABASE_MAX_CONN_LIFETIME` and `DATABASE_MAX_CONN_IDLE_TIME` variables tune
 the **Postgres** pool. Setting any of them with a `sqlite` URL is a startup
 error rather than a setting that silently does nothing.
+
+`REPLICA_DATABASE_URL` points the read-only dashboard queries at a Postgres
+read replica and is likewise rejected with a `sqlite` URL. It is off by
+default; see [Read replicas](operations/scaling.md#read-replicas).
+
+A SQLite deployment is also exempt from leader election. Several SoroBeacon
+instances sharing a Postgres database elect a single poller between them with a
+session-level advisory lock, which SQLite does not have — and a SQLite file
+cannot be shared between machines anyway. So the instance polls
+unconditionally, and `GET /api/v1/health` reports `"leader": true` alongside
+`"leader_election": false` to say that nothing was elected. See
+[Deployment](../README.md#deployment) for the Postgres behaviour and its
+failover timings.
 
 ## API authentication
 
@@ -101,6 +163,126 @@ dashboard's state-changing forms cannot be forged from another origin. The
 cookie's `Secure` flag follows the request, so it is set when SoroBeacon
 terminates TLS itself and absent on a plain-HTTP deployment.
 
+## Workspaces
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `WORKSPACE_TOKENS` | comma-separated `workspace=token` pairs | empty (single workspace) | optional | Bearer tokens scoped to a named workspace. Each pair is a credential like `API_TOKEN`'s — accepted on `/api/v1` and at `/login` — but the request it authenticates can only see and change that workspace's monitors, channels, rules, alerts, saved searches and templates. |
+
+```sh
+# two teams, one instance, no shared data
+export WORKSPACE_TOKENS="acme=$(openssl rand -hex 32),beta=$(openssl rand -hex 32)"
+curl -s localhost:8080/api/v1/monitors -H "Authorization: Bearer $ACME_TOKEN"
+```
+
+A workspace id is 1–40 characters of `[a-z0-9_-]`, starting with a letter or a
+digit. The narrow grammar is the injection guard for the scoping predicate, so
+anything else — `Acme`, `acme eu`, `acme;drop` — is rejected at startup rather
+than reaching SQL. The separator is the **first** `=`: write `acme=a=b` and the
+token is `a=b`. A token that appears under two workspaces is an error, because
+the request it authenticates could not be given one scope.
+
+`API_TOKEN` still works and holds the unscoped credentials: every token in it
+belongs to the `default` workspace, which is also where every row written before
+this feature existed already lives. So an existing single-tenant deployment
+upgrades with no change at all, and adding `WORKSPACE_TOKENS` alongside it
+creates a second, separate view of the same instance rather than moving anyone's
+data.
+
+**The workspace is a property of the credential.** There is no `X-Workspace`
+header and no `?workspace=` parameter, on purpose: a client that could name its
+own workspace could read another team's monitors by changing a header. Signing
+in to the dashboard with a workspace token scopes the whole session the same
+way.
+
+The one exception is work the instance does on its own behalf — the retention
+pruner, ingestion and reorg handling — which runs outside any request and sees
+every workspace at once. Alert deduplication is also global (`rule_id`,
+`event_id`): two teams watching the same contract through the same rule text
+share the fingerprint space, which is what prevents one team's event from
+alerting twice. Credentials, rule definitions and channel types are code, not
+tenant data; only the rows you create through the API or dashboard are scoped.
+
+## Single sign-on (OIDC)
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `OIDC_ISSUER` | URL | empty (single sign-on off) | optional | The provider's base URL. `GET /login` then also offers a **Sign in with `<issuer host>`** button that runs an authorization-code login with PKCE. `/.well-known/openid-configuration` under this URL is read **at startup**, so a mistyped issuer or an unreachable provider fails the deploy rather than the first sign-in. Setting it is what switches SSO on. |
+| `OIDC_CLIENT_ID` | string | _(none)_ | **required when `OIDC_ISSUER` is set** | This instance's registration at the provider. The ID token's audience is checked against it, so another client's tokens are refused even when they are signed by the same provider. |
+| `OIDC_CLIENT_SECRET` | string | empty | optional | Credential sent to the provider's token endpoint. A secret: never logged, rendered, or echoed in an error. Empty is what a public client (or a private_key_jwt/mTLS registration) expects, and SoroBeacon does not second-guess it. |
+| `OIDC_REDIRECT_URL` | URL | _(none)_ | **required when `OIDC_ISSUER` is set** | This instance's absolute callback URL (`https://beacon.example.com/login/oidc/callback`), which must match a redirect URI registered at the provider. Configured rather than derived from the `Host` header so the provider's allow-list still means something behind a proxy. |
+| `OIDC_SCOPES` | space- or comma-separated list | `openid profile email` | optional | Scopes to ask for. `openid` is always included, with or without it being written; `email` only matters when `OIDC_ALLOWED_DOMAINS` is set. |
+| `OIDC_WORKSPACE` | workspace id | `default` | optional | Which workspace a signed-in user lands in. Seeded into the workspace list at startup like a `WORKSPACE_TOKENS` entry, so the tenant exists before its first user arrives. |
+| `OIDC_WORKSPACE_CLAIM` | claim name | empty (no claim mapping) | optional | Read the workspace from this ID-token claim instead, for one instance serving several teams from one provider. A value outside `[a-z0-9_-]`, or a token without the claim, falls back to `OIDC_WORKSPACE` rather than becoming a workspace of its own. A tenant named this way is not in the `workspaces` registry — startup cannot know its names — which is harmless because the scoping predicate matches the `workspace_id` column directly and 0012 deliberately adds no foreign key to it. |
+| `OIDC_ROLE_CLAIM` | claim name | empty (`admin`) | optional | Read the session role (`viewer`, `editor` or `admin`) from this ID-token claim when `OIDC_GROUP_MAPPINGS` is not set. |
+| `OIDC_GROUP_CLAIM` | claim name | `groups` (when `OIDC_GROUP_MAPPINGS` is set) | optional | Name of the ID-token claim holding group memberships (supports top-level or dot-separated claim paths, string arrays or a single string). |
+| `OIDC_GROUP_MAPPINGS` | comma-separated `<group>=<workspace>:<role>` list | empty (group mapping off) | optional | Declarative mapping from provider group claims to a `(workspace, role)` pair. When set, group resolution is **fail-closed**: a token whose claims do not match any configured mapping is denied (`403 Forbidden` on the API, rejected on the OIDC callback) and never defaults to `OIDC_WORKSPACE` or `admin`. |
+| `OIDC_GROUP_CACHE_TTL` | Go duration | `5m` | optional | Bounded lifetime for cached OIDC group resolutions and session group grants before re-evaluation against reloaded mappings or the provider. Must be greater than 0. |
+| `OIDC_ALLOWED_DOMAINS` | comma- or space-separated list | empty (every account the provider admits) | optional | E-mail domain allow-list, compared case-insensitively after the ID token is verified. Refusing an account is deliberate configuration, not a default: a provider that only admits your own users needs no list. |
+| `OIDC_LOGIN_STATE_TTL` | Go duration | `10m` | optional | How long an unfinished login stays completable. A login in flight is a nonce, a PKCE verifier and a redirect target sitting in this process's memory, so this bounds how long they can wait to be used. Must be greater than 0. |
+
+```sh
+# Keycloak, one instance, one team
+OIDC_ISSUER=https://accounts.example.com/realms/soro
+OIDC_CLIENT_ID=sorobeacon-dashboard
+OIDC_CLIENT_SECRET=<from the provider>
+OIDC_REDIRECT_URL=https://beacon.example.com/login/oidc/callback
+OIDC_ALLOWED_DOMAINS=example.com
+```
+
+**Authorization code with PKCE, not implicit.** The dashboard is a
+server-rendered app with a secret-bearing backend, so it can keep a
+`client_secret` and finish the flow over a back channel where a URL bar cannot.
+The implicit flow hands an ID token to the browser through a fragment, where it
+lands in history, in referers and in every extension that watches the page — and
+it has no PKCE, so the token cannot be bound to the login that asked for it. New
+providers deprecate it for exactly that reason. What SoroBeacon asks for is
+`response_type=code` with `code_challenge_method=S256`, and the code is
+exchanged by this process, not the browser.
+
+**What a callback has to survive.** Verification is not hand-rolled: the
+`github.com/coreos/go-oidc/v3` verifier checks the signature against the
+provider's JWKS (rotating as keys are published), the issuer, the audience
+against `OIDC_CLIENT_ID`, and the expiry. On top of that this package checks the
+**nonce**, which the library deliberately leaves to the caller: the value is
+generated when the login starts, sent to the provider, and required to appear
+unchanged in the ID token, so a token captured from some other login cannot be
+presented here. The `state` that ties a callback to its login is single-use and
+held server-side (nonce, verifier and post-login target all live under it), and
+the browser also gets an `HttpOnly`, `SameSite=Lax` cookie holding the same
+value — a callback must present it in both places, which is what stops an
+attacker who signed in themselves from handing a victim the session for it.
+
+**First login auto-provisions, because there is nothing to provision.** SoroBeacon
+has no user table, and adding one was the rejected alternative: it would need a
+migration, an admin screen, a deprovisioning story, and a place to store
+passwords this feature exists to stop storing. A verified identity from an
+admitted domain simply mints the same in-memory dashboard session a token
+mints — 12 hours, cleared by a restart, scoped to the mapped workspace. Revocation
+therefore belongs to the provider: deactivate the account there and the next
+login fails, while a session already issued runs out on its own. That window is
+the honest cost of not having a user database; a shorter session TTL is not
+configurable today, so an operator who needs instant revocation should keep
+`API_TOKEN` as the credential and treat SSO as the convenience path — or file the
+gap, because it is real.
+
+**A session is a session.** An SSO login cannot be told apart from a token login
+downstream, and it inherits the same properties: it acts on one workspace, which
+the credential chose and the request cannot; and it is **unrestricted** within
+it, holding no scope list. That is why a scoped API token cannot sign in at
+`/login` (see [Scoped, expiring tokens](operations/security.md#scoped-expiring-tokens))
+— and why an SSO session
+is a dashboard and API credential, not a read-only one.
+
+Local login is untouched. `API_TOKEN` and `WORKSPACE_TOKENS` keep working
+beside a provider, so the switch is incremental and a broken registration never
+locks the operator out. With `OIDC_ISSUER` unset the `/login/oidc` routes answer
+404 and the sign-in page shows the token form alone. A setting that names SSO
+without an issuer (`OIDC_CLIENT_ID` on its own, say) is a startup error rather
+than a half-configured login page.
+
+
+
 ## Channel config encryption
 
 | Variable | Type | Default | Required | What it does |
@@ -114,6 +296,23 @@ write. Losing the key makes encrypted rows undecryptable: reads fail with an
 error naming the channel and never echo ciphertext or key material. Back the
 key up alongside your database backups.
 
+## External secrets
+
+A channel config value can reference a secret held outside SoroBeacon — in
+Vault or the process environment — instead of storing the value in the
+database. The value is resolved when a notifier is constructed and is never
+written back, logged or returned by the API. See
+[External secrets in channel config](channels/secrets.md) for the reference
+syntax and providers.
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `SECRETS_PROVIDER` | string | empty (disabled) | optional | `env` or `vault`; selects the provider that resolves `${secret:...}` references. Unset treats references as literals, so an upgrade changes nothing. |
+| `SECRETS_CACHE_TTL` | duration | `5m` | optional | How long a resolved secret is reused so every alert does not hit the provider. `0s` disables caching. The cache is dropped whenever a channel is created, updated or deleted. |
+| `VAULT_ADDR` | URL string | _(none)_ | required when `SECRETS_PROVIDER=vault` | Vault base URL, e.g. `https://vault.example:8200`. |
+| `VAULT_TOKEN` | secret string | _(none)_ | optional | Vault token sent as `X-Vault-Token`. Never logged. |
+| `VAULT_NAMESPACE` | string | empty | optional | Vault Enterprise namespace sent as `X-Vault-Namespace`. |
+
 ## RPC / event source
 
 These select **where events come from** and **which Stellar network**
@@ -122,9 +321,11 @@ which network it is on and **refuses to start on a mismatch**.
 
 | Variable | Type | Default | Required | What it does |
 | --- | --- | --- | --- | --- |
-| `SOURCE_MODE` | enum | `rpc` | optional | `rpc` — poll a Stellar RPC node (standalone). `sorotrail` — read a [SoroTrail](https://github.com/sorotrail/SoroTrail) indexer (upstream). Any other value is a startup error. |
+| `SOURCE_MODE` | enum | `rpc` | optional | `rpc` — poll a Stellar RPC node (standalone). `sorotrail` — read a [SoroTrail](https://github.com/sorotrail/SoroTrail) indexer (upstream). `horizon` — read contract events from a Horizon server. Any other value is a startup error. |
 | `SOROTRAIL_URL` | URL string | _(none)_ | **required when `SOURCE_MODE=sorotrail`**; ignored in `rpc` mode | Base URL of the SoroTrail indexer. Load fails if this is empty in sorotrail mode. |
+| `HORIZON_URL` | URL string | _(none)_ | **required when `SOURCE_MODE=horizon`**; ignored otherwise | Base URL of the Horizon server when `SOURCE_MODE=horizon`. |
 | `NETWORK` | enum | `testnet` | optional | `testnet` \| `mainnet` \| `futurenet` \| `custom`. Selects the preset RPC endpoint and passphrase. |
+| `NETWORKS` | comma-separated list of `NETWORK` names | _(none — only `NETWORK` is polled)_ | optional | Poll several Stellar chains from one instance, primary first. Each chain after the first reads its own suffixed variables (`RPC_URL_MAINNET`, `RPC_URLS_MAINNET`, `NETWORK_PASSPHRASE_MAINNET`). See [Polling several networks](#polling-several-networks). |
 | `RPC_URL` | URL string | per `NETWORK` (testnet: `https://soroban-testnet.stellar.org`) | required when `NETWORK=custom`; optional override otherwise | Stellar RPC endpoint (JSON-RPC 2.0 over HTTP/HTTPS). Must be an absolute `http` or `https` URL when set. |
 | `RPC_URLS` | comma-separated URL list | _(none — `RPC_URL` is used)_ | optional | Ordered RPC endpoints to fail over between, highest priority first. **Takes priority over `RPC_URL` when set**, so you never need both; entries are trimmed, so `a, b` and `a,b` are the same list. Every entry must be an absolute `http` or `https` URL, and one endpoint that names no URL at all (`RPC_URLS=,,`) is a startup error rather than a silent fallback. |
 | `NETWORK_PASSPHRASE` | string | per `NETWORK` | **required when `NETWORK=custom`**; optional override otherwise | Network passphrase. Always wins over the preset, so a named network with a local quickstart passphrase works. |
@@ -170,18 +371,91 @@ backoff, and the same per-endpoint failure counts are exposed by
 `stellar.FailoverClient.Stats()` for the metrics work tracked in
 [#26](https://github.com/sorotrail/SoroBeacon/issues/26).
 
+### Polling several networks
+
+`NETWORKS` is a comma-separated list of the same names `NETWORK` takes, **primary
+first**:
+
+```sh
+NETWORKS=testnet,mainnet
+# the primary keeps the unsuffixed variables
+RPC_URL=https://soroban-testnet.stellar.org
+# every later chain reads its own suffixed names, else its public preset
+RPC_URLS_MAINNET=https://my-paid-mainnet.example,https://soroban-mainnet.stellar.org
+```
+
+One poller per chain runs in the one process, each with its own RPC client, its
+own contract-spec decoder, its own cursor and its own backoff. The isolation is
+the point: a chain whose node is unreachable, rate-limiting, or whose event
+stream makes a poller panic stops only that chain. The panic is recovered,
+counted (`sorobeacon_poll_panics_total{network=…}`) and that one loop restarts
+after `POLL_INTERVAL`; the other chains keep ingesting.
+
+Chains number their ledgers independently, so `CABC…` on testnet and the same
+address on mainnet are two different contracts. That is why:
+
+- **a monitor belongs to one network, fixed at creation.** `POST /monitors` takes
+  `network` (omitted means the primary) and rejects a chain this instance does
+  not poll, rather than creating a monitor that matches nothing forever.
+  `PATCH` refuses to change it: re-homing a monitor would silently repoint its
+  rules at whatever those ids resolve to on the other chain, and leave its
+  stored alerts labelled with the old one. Delete and recreate to switch.
+- **reorg detection is per chain.** A shared ledger-hash window would see
+  mainnet ledger 100 overwrite testnet ledger 100 and call it a divergence — a
+  false positive that retracts valid alerts.
+- **`GET /monitors?network=testnet` and `GET /alerts?network=testnet`** filter,
+  and the dashboard's monitors, alerts and index pages carry the same filter and
+  a per-network ingest table.
+
+Every ingest metric is labelled `network`, and `/metrics` stays one scrape target
+because the label is applied per poller over one registry.
+
+`GET /health` gains a `networks` array (processed ledger, chain tip, lag, last
+poll, source state) and reports `degraded` when any chain's source is failing —
+`rpc` on its own is only ever the primary chain. `/readyz` keeps its `rpc` check
+and adds one per chain (`rpc_testnet`, `rpc_mainnet`). The aggregate lag reported
+at the top level is the **worst** chain's, so a proxy that only reads the summary
+cannot see a stalled network as in sync.
+
+Two mistakes are startup errors rather than quiet behaviour:
+
+- `NETWORK=mainnet` with `NETWORKS=testnet,mainnet`. The unsuffixed `RPC_URL` and
+  `NETWORK_PASSPHRASE` configure the **primary**, so a `NETWORK` that is not the
+  first entry would leave one chain's endpoint serving another chain's monitors.
+  Put `NETWORK`'s value first, or unset it.
+- `SOURCE_MODE=sorotrail` with more than one entry. One upstream deployment reads
+  one chain, so the second poller could never advance.
+
+Rows written before this feature have no network label, and the migration
+deliberately does not guess one. At startup the instance labels them with the
+primary network — the chain they really were polled from — so upgrading a
+single-network deployment neither loses its monitors from the listings nor
+strands its alert history outside every filter.
+
 ## HTTP
 
 | Variable | Type | Default | Required | What it does |
 | --- | --- | --- | --- | --- |
 | `HTTP_ADDR` | listen address | `:8080` | optional | Bind address for the API and dashboard (and `/metrics`). |
+| `HTTP_MAX_BODY_BYTES` | integer (bytes) | `1048576` (1 MiB) | optional | Maximum accepted request body size for write endpoints (`POST`/`PATCH`/`PUT`). Bulk endpoints default to 10 MiB. Decompression (`gzip`/`deflate`) is bounded by decompressed size. |
 | `CORS_ALLOWED_ORIGINS` | comma-separated origins | empty (CORS disabled) | optional | Browser Origins allowed to call the API cross-origin. Empty disables CORS. The dashboard is same-origin and never needs this. Do not allow origins you do not control: whatever credential their users hold can act through their browser. |
+| `GRPC_ADDR` | listen address | empty (gRPC disabled) | optional | Bind address for the [gRPC API](reference/grpc.md). Empty binds nothing, so an existing deployment opens no new port until it opts in. Cleartext HTTP/2 only — there is no TLS option — so anything that can reach the port reads the traffic in the clear; terminate TLS in front of it. |
+| `RATE_LIMIT_RPS` | float | `0` (rate limiter off) | optional | Per-client API token-bucket refill rate (requests per second). `0` disables the limiter; negative, NaN or infinite values fail startup. |
+| `RATE_LIMIT_BURST` | integer | `ceil(RATE_LIMIT_RPS)` when `RATE_LIMIT_RPS > 0`, else `0` | optional | Per-client token-bucket burst capacity. Must be a non-negative integer. |
+| `RATE_LIMIT_TRUST_FORWARDED` | boolean | `false` | optional | Key rate-limit buckets by the first `X-Forwarded-For` address instead of `RemoteAddr`. Only enable behind a trusted proxy that overwrites the header. |
+| `GRAPHQL_PLAYGROUND` | boolean | `false` | optional | Serve the interactive GraphQL playground at `/graphql/playground`. Disabled by default for security. |
+| `GRAPHQL_MAX_DEPTH` | integer (`1`–`50`) | `10` | optional | Maximum allowed nesting depth for GraphQL queries. |
+| `GRAPHQL_MAX_COMPLEXITY` | integer (`1`–`10000`) | `1000` | optional | Maximum allowed query complexity score for GraphQL queries. |
+| `GRAPHQL_ALLOWLIST_ONLY` | boolean | `false` | optional | Require all executed GraphQL queries to match a registered persisted operation. |
 
 ## Polling
 
 | Variable | Type | Default | Required | What it does |
 | --- | --- | --- | --- | --- |
 | `POLL_INTERVAL` | Go duration | `5s` | optional | How often the poller calls `getEvents`. Parsed with `time.ParseDuration`. **Minimum `1s`** — a smaller value is a startup error. |
+| `READYZ_LAG_THRESHOLD` | uint32 (ledgers) | `0` (lag check disabled) | optional | Ledger lag threshold at which `GET /readyz` reports not ready. `0` disables the lag gate. |
+| `MONITOR_SILENT_AFTER` | Go duration | `24h` | optional | Duration since `last_matched_at` after which the dashboard marks a monitor as silent. Must be greater than `0`. |
+| `SHUTDOWN_GRACE_PERIOD` | Go duration | `30s` | optional | How long shutdown waits for in-flight alert deliveries to complete before persisting them as retries and exiting. Must be greater than `0`. |
 
 Only applies to `SOURCE_MODE=rpc` in practice (the standalone poller).
 Upstream (`sorotrail`) reads the indexer; this interval is still loaded
@@ -200,20 +474,233 @@ at `warn` and counted in `sorobeacon_reorgs_total`.
 | `REORG_TRACKING_WINDOW` | integer (ledgers) | `128` | optional | How many recent ledger hashes to keep and re-check. `0` disables detection (the behaviour before the feature). Roughly ten minutes of Stellar history at the default, and one `getLedgers` call per cycle. A source that cannot report ledger hashes (SoroTrail, or an RPC node too old for `getLedgers`) simply has no detection. |
 | `REORG_CONFIRMATION_DEPTH` | integer (ledgers) | `0` | optional | Hold an event until it is this many ledgers behind the tip before evaluating it. Trades alert latency for fewer retractions; `0` alerts immediately, the historical default. |
 
+## Heartbeat (dead-man's switch)
+
+SoroBeacon cannot alert you about its own silence: if the process dies, the
+poller wedges, or the RPC stops returning events, no alert fires — the
+silence looks exactly like a quiet chain. `HEARTBEAT_URL` closes that gap by
+pinging an external dead-man's-switch service (Healthchecks.io, Cronitor,
+Better Stack, an Uptime Kuma push monitor, or any HTTP endpoint) while ingest
+is demonstrably healthy; the external service alerts when the pings stop.
+
+The ping is tied to **ingest progress, not to a timer**: it is sent only when
+the poller has completed a new successful cycle since the last check, when
+ledger lag is within `READYZ_LAG_THRESHOLD` (if one is set), and when the
+store answers a ping. A wedged poller therefore stops the pings within one
+interval — which is the signal the external service watches for. See the
+[health and readiness guide](operations/health-checks.md#heartbeat--an-external-dead-mans-switch)
+for a worked example.
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `HEARTBEAT_URL` | http(s) URL | unset (off) | optional | The ping endpoint. Treated as a **credential**: its path identifies your monitor, so it is never logged, never printed in the startup configuration line, and never appears in an error message. Validated at load (shape only — the value is not echoed on failure). |
+| `HEARTBEAT_INTERVAL` | Go duration | `1m` | optional | How often ingest health is re-evaluated and a healthy instance pings. Must be **longer than `POLL_INTERVAL`**: a ping requires a new successful poll since the previous check, so an interval at or below the poll cycle would read as no progress and is rejected at startup. |
+| `HEARTBEAT_FAILURE_SUFFIX` | path suffix | unset (success pings only) | optional | When set (e.g. `/fail`), one failure ping per outage goes to `HEARTBEAT_URL` + suffix, for services that accept an explicit down signal. Unset means success pings only: the external service notices the silence itself. Requires `HEARTBEAT_URL`. |
+
+With several replicas behind the lease, only the leader pings, and a
+leadership hand-over starts the new leader with an immediate check — a
+change of leader cannot open a gap longer than one interval.
+`sorobeacon_heartbeat_last_success_timestamp_seconds` records the time of the
+last successful ping so `/metrics` can confirm the external service was
+being fed (see the [metrics reference](reference/metrics.md)).
+
 ## Retention and archiving
 
 | Variable | Type | Default | Required | What it does |
 | --- | --- | --- | --- | --- |
 | `ALERT_RETENTION` | duration or `<n>d` | empty (keep forever) | optional | How long alerts (and their delivery attempts) are kept. Unset keeps history forever, so an upgrade never starts deleting. On Postgres, retention first drops whole expired monthly partitions (effectively free) and then deletes the ragged edge in batches of 1000. |
-| `ARCHIVE_URL` | URL or path | empty (archiving off) | optional | Where retention copies a batch of expired alerts before deleting them. A local directory path, `file://`, `dir://`, or `s3://bucket/prefix` (region from `?region=` or `AWS_REGION`; credentials from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`; `?endpoint=` for MinIO or a test server). A failed archive blocks that batch's delete, so nothing is dropped un-archived. Requires `ALERT_RETENTION` to have any effect. Archive objects are NDJSON, one alert per line, keyed by the batch's own id range so re-running is idempotent. |
+| `AUDIT_RETENTION` | duration or `<n>d` | empty (keep forever) | optional | How long administrative `audit_log` records are kept. Configured separately from `ALERT_RETENTION` so compliance trails and alert history can age on independent schedules. |
+| `ARCHIVE_URL` | URL or path | empty (archiving off) | optional | Where retention copies a batch of expired alerts before deleting them. A local directory path, `file://`, `dir://`, or `s3://bucket/prefix` (region from `?region=` or `AWS_REGION`; credentials from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`; `?endpoint=` for MinIO or a test server). A failed archive blocks that batch's delete, so nothing is dropped un-archived. Requires `ALERT_RETENTION` to have any effect. Archive objects are NDJSON, one alert per line, keyed by the batch's own id range so re-running is idempotent. Whole partitions are also archived (verified) before they are dropped, and `include_archived=true` on the alert listing and exports reads them back; see docs/operations/retention.md. |
 
 Archive objects contain only alert rows (contract id, event, payload, ledger); channel `config` — the webhook URLs, bot tokens and SMTP credentials — is never read by the archiver and can never appear in one.
+
+## Flapping detection
+
+Flapping is derived from persisted alert times, grouped into episodes separated
+by a quiet period. Alert rows remain in history. When the threshold is reached,
+the second alert in an episode is delivered as a cumulative summary and later
+alerts in that episode are marked suppressed; a later episode is delivered
+normally when the threshold is no longer met.
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `FLAPPING_EPISODES` | positive integer | `3` | optional | Number of episodes in the window that trigger damping. |
+| `FLAPPING_WINDOW` | Go duration | `15m` | optional | Window used to count alert episodes. |
+| `FLAPPING_QUIET_AFTER` | Go duration | `2m` | optional | Gap greater than this starts a new episode. |
+
+## Alert enrichment
+
+Optional HTTP JSON context fetched for an alert as it is created, before delivery. The full contract, failure behaviour, caching and an example service are in the [alert enrichment guide](guides/alert-enrichment.md); the variables:
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `ALERT_ENRICHMENT_URL` | absolute `http(s)` URL | empty (off) | optional | Endpoint called with `?contract_id=<id>&event_name=<name>` on every alert. Must be an absolute HTTP(S) URL; anything else fails at startup. The response must be a 2xx JSON object of at most 64 KiB; anything else is a soft failure and the alert is delivered unenriched. |
+| `ALERT_ENRICHMENT_TIMEOUT` | duration | `2s` | optional | Budget for one enrichment call. The client's whole-request timeout; `<= 0` falls back to the default. |
+| `ALERT_ENRICHMENT_CACHE_TTL` | duration | `5m` | optional | How long a response is reused per contract (in-memory, per process; the cache key is the contract id, not the event). `<= 0` falls back to the default. |
 
 ## Logging
 
 | Variable | Type | Default | Required | What it does |
 | --- | --- | --- | --- | --- |
 | `LOG_LEVEL` | enum | `info` | optional | Minimum `log/slog` level: `debug` \| `info` \| `warn` (or `warning`) \| `error`. Logs are structured JSON on stdout. |
+
+## Tracing (OpenTelemetry)
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `OTLP_ENDPOINT` | URL string | empty (tracing off) | optional | OTLP/HTTP base URL spans are shipped to (e.g. `http://localhost:4318` for a local Jaeger). Must be an absolute `http`/`https` URL when set; empty disables tracing entirely — no exporter, no goroutines, no measurable overhead. |
+| `OTLP_SERVICE_NAME` | string | `sorobeacon` | optional | `service.name` resource attribute reported with every trace. |
+| `OTLP_SAMPLE_RATE` | float | `1` | optional | Fraction of traces kept, in `[0, 1]`. Sampling is parent-based, so a whole poll-cycle trace is kept or dropped as a unit — never half a trace. Out-of-range or non-numeric values fail startup. |
+
+When enabled, one trace covers each poll cycle: `poller.poll` (root) →
+`poller.fetch_events` per page (RPC fetch + local decode) →
+`rules.evaluate` per rule → `poller.create_alert` → `store.create_alert`,
+with a `db.<verb>` span for each SQL statement.
+
+What happens after detection is not request-driven, so it is **linked**
+rather than nested:
+
+- Each channel delivery is a `notify.deliver` root span with a span link
+  (`link_kind=caused_by`) to the alert span that caused it. Delivery runs on
+  another goroutine and can outlive the cycle; as a child it would hold the
+  detection trace open.
+- Each escalation step, fired minutes later by the scheduler, is a
+  `notify.escalate` root span linked back to the alert's detection span, and
+  the step's deliveries link to it. The link comes from an in-memory, bounded
+  record of recent alerts (10,000), so after a restart a step's span carries
+  the alert id but no link.
+- Outbound channel calls over HTTP get an `HTTP <METHOD>` client span and send
+  a W3C `traceparent` header, so a traced endpoint continues the trace.
+- Inbound API requests continue a caller's `traceparent` and are named by the
+  route pattern (`GET /api/v1/alerts/{id}`), never the raw path.
+
+Every span carries a `request_id` attribute (the ambient `X-Request-ID`), so a
+log line and its trace can be joined. Sampling is parent-based: a kept root
+keeps its whole tree, and a linked delivery or escalation is sampled as its
+own root.
+
+Span attributes hold identifiers only (alert, monitor, rule, channel and
+event ids, channel type, outcome), and span names come from bounded sets
+(stage names, route patterns, SQL verbs): no contract address, alert id or raw
+path ever names a span. **Channel config — webhook URLs, bot tokens, SMTP
+credentials — never enters a span**, the same rule that applies to logs and
+API responses. That is why outbound HTTP spans record only the method and
+status code, never the URL. Database spans record the statement's verb and a
+short hash identifying the statement text; parameter values, which include
+tenant data, are never recorded.
+
+Shutdown flushes pending spans to the collector (bounded to 5 seconds) so
+the last moments of a deployment are exported rather than dropped.
+
+```sh
+# Local collector: Jaeger all-in-one (OTLP/HTTP on :4318, UI on :16686)
+docker run --rm -p 16686:16686 -p 4318:4318 jaegertracing/all-in-one:latest
+
+export OTLP_ENDPOINT=http://localhost:4318
+# OTLP_SERVICE_NAME=sorobeacon-staging   # optional
+# OTLP_SAMPLE_RATE=0.25                  # keep a quarter of traces
+```
+
+## Notification rate limits
+
+The dispatcher keeps one token bucket per channel, keyed by channel ID, so two
+channels of the same type do not share a budget. These variables change the
+per-type defaults; they do not limit the API or the dashboard.
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `NOTIFY_RATE_LIMIT_SLACK_RPS` | float | `1` | optional | Maximum Slack deliveries per second. The default follows Slack's webhook guidance of roughly one message per second. |
+| `NOTIFY_RATE_LIMIT_TELEGRAM_RPS` | float | `30` | optional | Maximum Telegram deliveries per second, matching the Bot API's 30 messages-per-second limit. |
+| `NOTIFY_RATE_LIMIT_PAGERDUTY_RPS` | float | `2` | optional | Maximum PagerDuty deliveries per second, matching the Events API v2 rate limit. |
+| `NOTIFY_RATE_LIMIT_DEFAULT_RPS` | float | `5` | optional | Fallback for channel types without a dedicated limit (Discord, email, webhook, and any future type). |
+
+Unset or `0` keeps the built-in default; zero does **not** disable delivery.
+Negative, non-numeric, NaN and infinite values fail startup. These are
+client-side buckets, not a promise that the provider accepts every request: a
+provider-side `429` is still possible and is retried using its `Retry-After`
+when one is present.
+
+## Federation
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `INSTANCE_NAME` | string | empty | optional | Stable identity for this deployment, stamped as the `origin` on every federated alert. It must be unique across instances that federate with each other. Empty is fine for a standalone instance, but creating a `federation` channel then fails with an actionable error; the process still starts. |
+
+## Mutual TLS (mTLS) and component TLS
+
+SoroBeacon supports TLS 1.2+ (preferring TLS 1.3) and mutual TLS (mTLS) across the HTTP API and dashboard, the gRPC server, the upstream SoroTrail client, and PostgreSQL connections. Certificates, private keys, and CA bundles are validated at startup (failing fast on mismatched, unreadable, or expired files) and hot-reloaded on `SIGHUP` without dropping active connections. The operational runbook for certificate generation, rotation, and principal mapping is in [Mutual TLS (mTLS) Operations](operations/mtls.md).
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `TLS_CERT_FILE` | file path | empty (HTTP plaintext) | optional | PEM-encoded server certificate chain served by the HTTP API, dashboard, and gRPC server. Must be paired with `TLS_KEY_FILE`. |
+| `TLS_KEY_FILE` | file path | empty | optional | PEM-encoded private key matching `TLS_CERT_FILE`. |
+| `TLS_CLIENT_CA_FILE` | file path | empty | optional | PEM-encoded CA bundle used to verify client certificates presented to the HTTP API and gRPC server. |
+| `TLS_CLIENT_AUTH` | enum | `none` (`require` when `TLS_CLIENT_CA_FILE` is set) | optional | Client certificate verification mode: `none` \| `request` \| `require`. |
+| `MTLS_PRINCIPAL_MAP` | comma-separated list | empty | optional | Maps verified client certificate identities (SPIFFE URI SANs, DNS SANs, email SANs, or `cn:<CommonName>`) to `<workspace>[:<role>]` (e.g. `spiffe://cluster.local/ns/prod/sa/ingestor=acme:editor,cn:ops=default:admin`). |
+| `SOROTRAIL_TLS_CERT_FILE` | file path | empty | optional | PEM-encoded client certificate presented when polling an upstream SoroTrail indexer over HTTPS. Must be paired with `SOROTRAIL_TLS_KEY_FILE`. |
+| `SOROTRAIL_TLS_KEY_FILE` | file path | empty | optional | PEM-encoded private key matching `SOROTRAIL_TLS_CERT_FILE`. |
+| `SOROTRAIL_TLS_CA_FILE` | file path | empty | optional | PEM-encoded root CA bundle used to verify the upstream SoroTrail server certificate. |
+| `SOROTRAIL_TLS_SERVER_NAME` | string | empty (derived from URL host) | optional | Optional SNI / server hostname override used when verifying the upstream SoroTrail certificate. |
+| `DATABASE_SSL_MODE` | enum | empty (URL query default) | optional | PostgreSQL SSL mode (`disable` \| `allow` \| `prefer` \| `require` \| `verify-ca` \| `verify-full`) applied to `DATABASE_URL` and `REPLICA_DATABASE_URL`. Rejected on SQLite. |
+| `DATABASE_SSL_CERT_FILE` | file path | empty | optional | PEM-encoded client certificate presented to PostgreSQL (`sslcert`). Must be paired with `DATABASE_SSL_KEY_FILE`. |
+| `DATABASE_SSL_KEY_FILE` | file path | empty | optional | PEM-encoded private key matching `DATABASE_SSL_CERT_FILE` (`sslkey`). |
+| `DATABASE_SSL_ROOT_CERT_FILE` | file path | empty | optional | PEM-encoded CA bundle used to verify the PostgreSQL server certificate (`sslrootcert`). |
+
+## Channel health
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `CHANNEL_DISABLE_AFTER_FAILURES` | integer | `0` (never auto-disable) | optional | How many consecutive **permanent** channel failures take a channel out of rotation. Negative, fractional and non-numeric values are a startup error. |
+
+### What channel health tracks
+
+A channel whose bot token was revoked fails on every alert, forever, and
+nothing used to surface that short of reading `delivery_attempts` one alert at
+a time. So the usual discovery route was "we noticed we stopped getting
+alerts". Every delivery now folds its outcome into the channel:
+
+| Field | Meaning |
+| --- | --- |
+| `consecutive_failures` | Deliveries that have failed since the last success. One success resets it to 0. |
+| `consecutive_permanent_failures` | Permanent failures (401/403/404) since the last success. This is what auto-disable counts. A transient failure neither increments *nor* clears it, so an unrelated 5xx cannot hide a revoked credential behind it. |
+| `last_error` | The most recent failure message, cleared by the next success. Notifiers redact URLs and tokens before building these, so it never contains channel config. |
+| `last_error_at` / `last_success_at` | When that failure or success happened. |
+| `disabled_at` | Set only when health tracking turned the channel off. This is what makes the dashboard say *auto-disabled* rather than *disabled*. |
+
+All of it is derived, so it can always be rebuilt from delivery history, and it
+is exposed on `GET /api/v1/channels` and on the dashboard's
+[channels page](guides/dashboard.md).
+
+### Permanent versus transient
+
+Failures are split by kind, because auto-disabling is a destructive answer to a
+temporary problem:
+
+- **Permanent** — `401`, `403`, `404`, and SMTP 5xx replies. The credential or
+the endpoint is gone and retrying can only ever fail again. Only these count
+toward `CHANNEL_DISABLE_AFTER_FAILURES`.
+- **Transient** — `5xx`, `429`, timeouts, connection errors, and anything
+unrecognised. They are counted and reported, but never held against the
+channel: taking a channel out of rotation because a provider had a bad
+afternoon turns a short outage into silently lost alerts.
+
+### Auto-disable and re-enabling
+
+The threshold defaults to **off**, and turning it on is a deliberate act. When
+the threshold is reached the channel is disabled, stamped with `disabled_at`,
+and removed from the delivery path; the dashboard marks the row and repeats the
+last error.
+
+Getting back is **explicit**: `PATCH /api/v1/channels/{id}` with
+`{"enabled": true}` (or the *Enable* button on the dashboard). That write clears
+the counters and `disabled_at` in the same statement, so the channel does not
+immediately re-disable on its next failure. Renaming a channel, or editing its
+config, deliberately does **not** clear anything — otherwise a cosmetic edit
+would wipe the evidence of a channel that is still dropping alerts. A
+delivery retried by hand, or a test send, does move the counters, so an
+operator who has just fixed a channel can watch it clear; a test send never
+carries the disable threshold, so a diagnostic click cannot switch alerting
+off.
 
 ## Not environment variables
 
@@ -227,6 +714,6 @@ Archive objects contain only alert rows (contract id, event, payload, ledger); c
 ## Drift vs `.env.example`
 
 `.env.example` is the copy-paste template. This reference was written
-against `internal/config` on the same commit; `.env.example` already
-listed every runtime variable (including `CORS_ALLOWED_ORIGINS`) with
-matching defaults, so it was not changed in this PR.
+against `internal/config` on the same commit; `.env.example` lists every
+runtime variable with matching defaults, including the tracing trio
+(`OTLP_ENDPOINT`, `OTLP_SERVICE_NAME`, `OTLP_SAMPLE_RATE`).

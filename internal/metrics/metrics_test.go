@@ -1,0 +1,595 @@
+package metrics
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	dto "github.com/prometheus/client_model/go"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// The store cannot import these names (they are its own unexported constants),
+// so the test and the store agree on the label values by string. If either
+// side renames one, these tests fail rather than the dashboard silently going
+// blank.
+const (
+	poolNamePrimary = "primary"
+	poolNameReplica = "replica"
+
+	storeReadsName         = "sorobeacon_store_reads_total"
+	storeFallbacksName     = "sorobeacon_store_replica_fallbacks_total"
+	replicaEnabledName     = "sorobeacon_store_replica_enabled"
+	replicaLagName         = "sorobeacon_store_replica_lag_seconds"
+	pollsName              = "sorobeacon_polls_total"
+	pollDurationName       = "sorobeacon_poll_duration_seconds"
+	pollLagName            = "sorobeacon_poll_lag_ledgers"
+	pollAgeName            = "sorobeacon_seconds_since_last_poll"
+	eventsScannedName      = "sorobeacon_events_scanned_total"
+	eventsMatchedName      = "sorobeacon_events_matched_total"
+	ruleEvaluationsName    = "sorobeacon_rule_evaluations_total"
+	alertsFiredName        = "sorobeacon_alerts_fired_total"
+	deliveriesName         = "sorobeacon_alert_deliveries_total"
+	priorityContractsName  = "sorobeacon_poll_priority_contracts"
+	priorityLagName        = "sorobeacon_poll_lag_ledgers_by_priority"
+	reorgsName             = "sorobeacon_reorgs_total"
+	lastReorgLedgerName    = "sorobeacon_last_reorg_ledger"
+	throttlesName          = "sorobeacon_alert_throttles_total"
+	breakerStateName       = "sorobeacon_channel_breaker_state"
+	httpDurationName       = "sorobeacon_http_request_duration_seconds"
+	streamDroppedName      = "sorobeacon_alerts_stream_dropped_total"
+	deadLettersName        = "sorobeacon_dead_letters_total"
+	deadLettersChannelName = "sorobeacon_dead_letters"
+	pollPanicsName         = "sorobeacon_poll_panics_total"
+)
+
+func TestRecordPollTracksOutcomesAndDuration(t *testing.T) {
+	m := New()
+	m.TickPollAge(10)
+
+	m.RecordPoll(true, 1250*time.Millisecond)
+	m.RecordPoll(false, 2*time.Second)
+
+	assert.Equal(t, float64(1), m.sampleValue(t, pollsName, map[string]string{"outcome": "ok"}))
+	assert.Equal(t, float64(1), m.sampleValue(t, pollsName, map[string]string{"outcome": "error"}))
+	histogram := m.sampleHistogram(t, pollDurationName, nil)
+	assert.Equal(t, uint64(2), histogram.GetSampleCount())
+	assert.InDelta(t, 3.25, histogram.GetSampleSum(), 0.000001)
+	assert.Equal(t, float64(0), m.sampleValue(t, pollAgeName, nil))
+}
+
+func TestSetPollLagRecordsGauge(t *testing.T) {
+	m := New()
+
+	m.SetPollLag(17)
+
+	assert.Equal(t, float64(17), m.sampleValue(t, pollLagName, nil))
+}
+
+func TestUpstreamGauges(t *testing.T) {
+	m := New()
+
+	m.SetUpstreamLag(42)
+	m.SetUpstreamFailures(3)
+
+	assert.Equal(t, float64(42), m.sampleValue(t, "sorobeacon_upstream_lag_ledgers", nil))
+	assert.Equal(t, float64(3), m.sampleValue(t, "sorobeacon_upstream_consecutive_failures", nil))
+
+	m.SetUpstreamLag(-5)
+	m.SetUpstreamFailures(-1)
+	assert.Equal(t, float64(0), m.sampleValue(t, "sorobeacon_upstream_lag_ledgers", nil))
+	assert.Equal(t, float64(0), m.sampleValue(t, "sorobeacon_upstream_consecutive_failures", nil))
+}
+
+func TestTickPollAgeRecordsGauge(t *testing.T) {
+	m := New()
+
+	m.TickPollAge(4.5)
+
+	assert.Equal(t, float64(4.5), m.sampleValue(t, pollAgeName, nil))
+}
+
+func TestRecordEventsCountsScannedAndMatched(t *testing.T) {
+	m := New()
+
+	m.RecordEvents(9, 3)
+
+	assert.Equal(t, float64(9), m.sampleValue(t, eventsScannedName, nil))
+	assert.Equal(t, float64(3), m.sampleValue(t, eventsMatchedName, nil))
+}
+
+// Rule evaluations are counted separately from events so a monitor with many
+// rules is distinguishable from a busy contract: the same three events give a
+// different evaluation count depending on how many rules they are checked
+// against.
+func TestRecordRuleEvaluationsCountsEvaluations(t *testing.T) {
+	m := New()
+
+	m.RecordEvents(3, 1)
+	m.RecordRuleEvaluations(9)
+
+	assert.Equal(t, float64(3), m.sampleValue(t, eventsScannedName, nil))
+	assert.Equal(t, float64(9), m.sampleValue(t, ruleEvaluationsName, nil))
+}
+
+func TestRecordRuleEvaluationsIsNilSafe(t *testing.T) {
+	var m *Metrics
+
+	assert.NotPanics(t, func() { m.RecordRuleEvaluations(5) })
+}
+
+func TestRecordAlertCountsAlerts(t *testing.T) {
+	m := New()
+
+	m.RecordAlert()
+	m.RecordAlert()
+
+	assert.Equal(t, float64(2), m.sampleValue(t, alertsFiredName, nil))
+}
+
+func TestRecordDeliveryLabelsByChannelType(t *testing.T) {
+	m := New()
+
+	m.RecordDelivery("slack", true)
+	m.RecordDelivery("slack", true)
+	m.RecordDelivery("email", false)
+
+	assert.Equal(t, float64(2), m.sampleValue(t, deliveriesName, map[string]string{"channel": "slack", "outcome": "ok"}))
+	assert.Equal(t, float64(1), m.sampleValue(t, deliveriesName, map[string]string{"channel": "email", "outcome": "error"}))
+}
+
+func TestHandlerServesMetrics(t *testing.T) {
+	m := New()
+	m.RecordAlert()
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+
+	m.Handler().ServeHTTP(response, request)
+
+	assert.Equal(t, http.StatusOK, response.Code)
+	assert.Contains(t, response.Body.String(), alertsFiredName)
+}
+
+func TestPriorityRecorders(t *testing.T) {
+	m := New()
+
+	m.SetPriorityContracts("high", 7)
+	m.SetPollLagByPriority("normal", -5)
+	m.SetPollLagByPriority("normal", 3)
+
+	assert.Equal(t, float64(7), m.sampleValue(t, priorityContractsName, map[string]string{"priority": "high"}))
+	assert.Equal(t, float64(3), m.sampleValue(t, priorityLagName, map[string]string{"priority": "normal"}))
+}
+
+func TestRecordReorg(t *testing.T) {
+	m := New()
+
+	m.RecordReorg(321)
+
+	assert.Equal(t, float64(1), m.sampleValue(t, reorgsName, nil))
+	assert.Equal(t, float64(321), m.sampleValue(t, lastReorgLedgerName, nil))
+}
+
+func TestRecordThrottleLabelsByChannelType(t *testing.T) {
+	m := New()
+
+	m.RecordThrottle("slack")
+	m.RecordThrottle("slack")
+	m.RecordThrottle("email")
+
+	assert.Equal(t, float64(2), m.sampleValue(t, throttlesName, map[string]string{"channel": "slack"}))
+	assert.Equal(t, float64(1), m.sampleValue(t, throttlesName, map[string]string{"channel": "email"}))
+}
+
+func TestSetBreakerState(t *testing.T) {
+	m := New()
+
+	m.SetBreakerState("channel-1", "slack", "open")
+
+	labels := map[string]string{"channel_id": "channel-1", "channel_type": "slack", "state": "open"}
+	assert.Equal(t, float64(1), m.sampleValue(t, breakerStateName, labels))
+	labels["state"] = "closed"
+	assert.Equal(t, float64(0), m.sampleValue(t, breakerStateName, labels))
+	labels["state"] = "half-open"
+	assert.Equal(t, float64(0), m.sampleValue(t, breakerStateName, labels))
+}
+
+func TestRegisterStreamDropped(t *testing.T) {
+	m := New()
+	m.RegisterStreamDropped(func() uint64 { return 4 })
+	m.RegisterStreamDropped(nil)
+
+	assert.Equal(t, float64(4), m.sampleValue(t, streamDroppedName, nil))
+}
+
+func TestMiddlewareRecordsHTTPDuration(t *testing.T) {
+	m := New()
+	previousRoutePattern := RoutePattern
+	RoutePattern = func(*http.Request) string { return "/health" }
+	t.Cleanup(func() { RoutePattern = previousRoutePattern })
+	handler := m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/health", nil)
+
+	handler.ServeHTTP(response, request)
+
+	assert.Equal(t, http.StatusCreated, response.Code)
+	histogram := m.sampleHistogram(t, httpDurationName, map[string]string{
+		"route": "/health", "method": http.MethodGet, "status": "201",
+	})
+	assert.Equal(t, uint64(1), histogram.GetSampleCount())
+}
+
+// TestRecordStoreReadLabelsByPool checks that a routed read is attributable:
+// the pool label is what tells an operator whether routing is actually sending
+// reads to the replica, and an unlabelled counter would make the metric
+// useless for that one job.
+func TestRecordStoreReadLabelsByPool(t *testing.T) {
+	m := New()
+
+	m.RecordStoreRead(poolNamePrimary)
+	m.RecordStoreRead(poolNamePrimary)
+	m.RecordStoreRead(poolNameReplica)
+
+	assert.Equal(t, float64(2), m.sampleValue(t, storeReadsName, map[string]string{"pool": poolNamePrimary}))
+	assert.Equal(t, float64(1), m.sampleValue(t, storeReadsName, map[string]string{"pool": poolNameReplica}))
+}
+
+func TestRecordReplicaFallbackCounts(t *testing.T) {
+	m := New()
+
+	m.RecordReplicaFallback()
+	m.RecordReplicaFallback()
+	m.RecordReplicaFallback()
+
+	assert.Equal(t, float64(3), m.sampleValue(t, storeFallbacksName, nil))
+}
+
+// TestSetReplicaEnabledTracksBothDirections covers the gauge an operator reads
+// to confirm the replica URL took effect, in both directions: it has to go
+// back to 0 when routing is off, or a deployment that removed the replica
+// would keep reporting one.
+func TestSetReplicaEnabledTracksBothDirections(t *testing.T) {
+	m := New()
+
+	require.Equal(t, float64(0), m.sampleValue(t, replicaEnabledName, nil), "a fresh process reports no replica")
+
+	m.SetReplicaEnabled(true)
+	assert.Equal(t, float64(1), m.sampleValue(t, replicaEnabledName, nil))
+
+	m.SetReplicaEnabled(false)
+	assert.Equal(t, float64(0), m.sampleValue(t, replicaEnabledName, nil))
+}
+
+func TestSetReplicaLagTracksSecondsAndClampsNegative(t *testing.T) {
+	m := New()
+
+	require.Equal(t, float64(0), m.sampleValue(t, replicaLagName, nil))
+	m.SetReplicaLag(4.25)
+	assert.InDelta(t, 4.25, m.sampleValue(t, replicaLagName, nil), 0.0001)
+	m.SetReplicaLag(-1.5)
+	assert.Equal(t, float64(0), m.sampleValue(t, replicaLagName, nil))
+}
+
+// TestReadMetricsAreNilSafe pins the package contract that a nil *Metrics
+// records nothing rather than panicking. The store holds a *Metrics it was
+// handed without a nil check, so this is load-bearing for every embedder and
+// every test that constructs a store with no instrumentation.
+func TestReadMetricsAreNilSafe(t *testing.T) {
+	var m *Metrics
+
+	assert.NotPanics(t, func() {
+		m.RecordStoreRead(poolNamePrimary)
+		m.RecordStoreRead(poolNameReplica)
+		m.RecordReplicaFallback()
+		m.SetReplicaEnabled(true)
+		m.SetReplicaEnabled(false)
+		m.SetReplicaLag(1.5)
+	})
+}
+
+// sampleValue returns the current value of the named metric, read out of the
+// instance's own registry — what a scrape would see. It reads the gatherer
+// directly rather than taking on prometheus/testutil (and the godebug module
+// it pulls in) for a handful of numbers.
+func (m *Metrics) sampleValue(t *testing.T, name string, labels map[string]string) float64 {
+	t.Helper()
+	families, err := m.registry.Gather()
+	require.NoError(t, err)
+
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, sample := range family.GetMetric() {
+			if !hasLabels(sample, labels) {
+				continue
+			}
+			if c := sample.GetCounter(); c != nil {
+				return c.GetValue()
+			}
+			if g := sample.GetGauge(); g != nil {
+				return g.GetValue()
+			}
+			t.Fatalf("%s is neither a counter nor a gauge", name)
+		}
+	}
+	t.Fatalf("no sample for %s with labels %v", name, labels)
+	return 0
+}
+
+func (m *Metrics) sampleHistogram(t *testing.T, name string, labels map[string]string) *dto.Histogram {
+	t.Helper()
+	families, err := m.registry.Gather()
+	require.NoError(t, err)
+
+	for _, family := range families {
+		if family.GetName() == name {
+			for _, sample := range family.GetMetric() {
+				if !hasLabels(sample, labels) {
+					continue
+				}
+				histogram := sample.GetHistogram()
+				require.NotNil(t, histogram)
+				return histogram
+			}
+		}
+	}
+	t.Fatalf("no histogram for %s with labels %v", name, labels)
+	return nil
+}
+
+// hasLabels reports whether sample carries exactly the wanted label pairs.
+// Labels are compared as a set because prometheus does not promise an order.
+func hasLabels(sample *dto.Metric, want map[string]string) bool {
+	for _, pair := range sample.GetLabel() {
+		if _, asked := want[pair.GetName()]; !asked {
+			// Every ingest metric carries the network label, and on a
+			// single-network instance its value is the empty string. A test
+			// that does not name it is asking about that instance, so an
+			// empty network is not a distinguishing label. Any other
+			// unasked-for label still fails: it would mean the metric gained
+			// a dimension the test has not been reviewed for.
+			if pair.GetName() == networkLabel && pair.GetValue() == "" {
+				continue
+			}
+			return false
+		}
+		if want[pair.GetName()] != pair.GetValue() {
+			return false
+		}
+	}
+	// Every label the caller named has to be present, so a typo in a test is
+	// still a failure rather than a match against the first sample.
+	for name := range want {
+		found := false
+		for _, pair := range sample.GetLabel() {
+			if pair.GetName() == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// RecordDeadLetter, ClearDeadLetter and SetDeadLetters all drive one gauge, so
+// they are asserted together: SetDeadLetters is authoritative (it overwrites
+// whatever the increments accumulated), and a record followed by a clear must
+// return the gauge to where it started or the alert never resolves.
+func TestDeadLetterGaugeRecordClearAndSetAgree(t *testing.T) {
+	m := New()
+	assert.Equal(t, float64(0), m.sampleValue(t, deadLettersName, nil))
+
+	m.RecordDeadLetter()
+	m.RecordDeadLetter()
+	assert.Equal(t, float64(2), m.sampleValue(t, deadLettersName, nil))
+
+	m.ClearDeadLetter()
+	assert.Equal(t, float64(1), m.sampleValue(t, deadLettersName, nil))
+
+	m.SetDeadLetters(7)
+	assert.Equal(t, float64(7), m.sampleValue(t, deadLettersName, nil), "Set overwrites the incremented value")
+
+	m.RecordDeadLetter()
+	m.ClearDeadLetter()
+	assert.Equal(t, float64(7), m.sampleValue(t, deadLettersName, nil), "record then clear returns to the starting value")
+
+	m.SetDeadLetters(0)
+	assert.Equal(t, float64(0), m.sampleValue(t, deadLettersName, nil))
+}
+
+// The dead-letter gauge is exported without labels; a label added later would
+// silently break the alert rule that watches it.
+func TestDeadLetterGaugeHasNoLabels(t *testing.T) {
+	m := New()
+	m.RecordDeadLetter()
+
+	families, err := m.registry.Gather()
+	require.NoError(t, err)
+	for _, family := range families {
+		if family.GetName() != deadLettersName {
+			continue
+		}
+		require.Len(t, family.GetMetric(), 1)
+		assert.Empty(t, family.GetMetric()[0].GetLabel())
+		return
+	}
+	t.Fatalf("%s was not exported", deadLettersName)
+}
+
+func TestDeadLettersByWorkspaceAndChannel(t *testing.T) {
+	m := New()
+
+	m.RecordDeadLetterFor("acme", "slack")
+	m.RecordDeadLetterFor("acme", "slack")
+	m.RecordDeadLetterFor("beta", "pagerduty")
+
+	assert.Equal(t, float64(2), m.sampleValue(t, deadLettersChannelName, map[string]string{"workspace": "acme", "channel": "slack"}))
+	assert.Equal(t, float64(1), m.sampleValue(t, deadLettersChannelName, map[string]string{"workspace": "beta", "channel": "pagerduty"}))
+	assert.Equal(t, float64(3), m.sampleValue(t, deadLettersName, nil), "global unlabelled count also increments")
+
+	m.ClearDeadLetterFor("acme", "slack")
+	assert.Equal(t, float64(1), m.sampleValue(t, deadLettersChannelName, map[string]string{"workspace": "acme", "channel": "slack"}))
+	assert.Equal(t, float64(2), m.sampleValue(t, deadLettersName, nil))
+
+	m.SetDeadLettersFor("acme", "slack", 10)
+	assert.Equal(t, float64(10), m.sampleValue(t, deadLettersChannelName, map[string]string{"workspace": "acme", "channel": "slack"}))
+}
+
+func TestRecordPanicCountsPerNetwork(t *testing.T) {
+	m := New()
+	m.WithNetwork("testnet").RecordPanic()
+	m.WithNetwork("testnet").RecordPanic()
+	m.WithNetwork("mainnet").RecordPanic()
+
+	assert.Equal(t, float64(2), m.sampleValue(t, pollPanicsName, map[string]string{"network": "testnet"}))
+	assert.Equal(t, float64(1), m.sampleValue(t, pollPanicsName, map[string]string{"network": "mainnet"}))
+}
+
+// Two networks must produce separate series that share one registry, rather
+// than the later view overwriting the earlier one.
+func TestWithNetworkKeepsNetworksSeparate(t *testing.T) {
+	m := New()
+	testnet := m.WithNetwork("testnet")
+	mainnet := m.WithNetwork("mainnet")
+
+	testnet.SetPollLag(3)
+	mainnet.SetPollLag(90)
+
+	assert.Equal(t, float64(3), m.sampleValue(t, pollLagName, map[string]string{"network": "testnet"}))
+	assert.Equal(t, float64(90), m.sampleValue(t, pollLagName, map[string]string{"network": "mainnet"}))
+	assert.Equal(t, "testnet", testnet.network)
+	assert.Equal(t, "", m.network, "the parent is not mutated by deriving a view")
+}
+
+func TestDeadLetterPanicAndNetworkAreNilSafe(t *testing.T) {
+	var m *Metrics
+
+	assert.NotPanics(t, func() {
+		assert.Nil(t, m.WithNetwork("testnet"))
+		m.RecordPanic()
+		m.SetDeadLetters(3)
+		m.RecordDeadLetter()
+		m.ClearDeadLetter()
+		m.RecordHeartbeatSuccess()
+		m.RecordBodyRejection("max_body")
+	})
+}
+
+func TestRecordBodyRejection(t *testing.T) {
+	m := New()
+	m.RecordBodyRejection("max_body")
+	m.RecordBodyRejection("max_body")
+	m.RecordBodyRejection("template_size")
+
+	gotMax := m.sampleValue(t, "sorobeacon_request_body_rejections_total", map[string]string{"limit": "max_body"})
+	assert.Equal(t, float64(2), gotMax)
+
+	gotTmpl := m.sampleValue(t, "sorobeacon_request_body_rejections_total", map[string]string{"limit": "template_size"})
+	assert.Equal(t, float64(1), gotTmpl)
+}
+
+// The heartbeat metric is the inside-the-instance record that the external
+// dead-man's switch was being fed: it is zero until the first successful
+// ping and stamps the time on every one after that, so an operator can see
+// from /metrics when the external service last heard from this instance.
+func TestRecordHeartbeatSuccess(t *testing.T) {
+	m := New()
+
+	// A metrics handler scrape is what a dashboard would see; reading the
+	// registry directly is the same value without the HTTP round-trip.
+	m.RecordHeartbeatSuccess()
+	got := m.sampleValue(t, "sorobeacon_heartbeat_last_success_timestamp_seconds", nil)
+	assert.InDelta(t, float64(time.Now().Unix()), got, 5,
+		"the gauge should stamp the moment of the last successful ping")
+}
+
+func TestRecordNotModified(t *testing.T) {
+	m := New()
+	m.RecordNotModified("/api/v1/alerts")
+	m.RecordNotModified("/api/v1/alerts")
+	m.RecordNotModified("/api/v1/stats/alerts-daily")
+
+	assert.Equal(t, float64(2), m.sampleValue(t, "sorobeacon_http_not_modified_total", map[string]string{"route": "/api/v1/alerts"}))
+	assert.Equal(t, float64(1), m.sampleValue(t, "sorobeacon_http_not_modified_total", map[string]string{"route": "/api/v1/stats/alerts-daily"}))
+
+	// Test via Middleware with 304 response
+	handler := m.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	req := httptest.NewRequest("GET", "/api/v1/channels/1/stats", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, float64(1), m.sampleValue(t, "sorobeacon_http_not_modified_total", map[string]string{"route": "/api/v1/channels/1/stats"}))
+}
+
+func TestSetChannelUnacknowledgedFlagged(t *testing.T) {
+	tests := []struct {
+		name        string
+		channelID   string
+		channelType string
+		flagged     bool
+		want        float64
+	}{
+		{
+			name:        "flagged true sets gauge to 1",
+			channelID:   "ch-1",
+			channelType: "webhook",
+			flagged:     true,
+			want:        1.0,
+		},
+		{
+			name:        "flagged false sets gauge to 0",
+			channelID:   "ch-2",
+			channelType: "slack",
+			flagged:     false,
+			want:        0.0,
+		},
+	}
+
+	m := New()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m.SetChannelUnacknowledgedFlagged(tc.channelID, tc.channelType, tc.flagged)
+			got := m.sampleValue(t, "sorobeacon_channel_unacknowledged_flagged", map[string]string{
+				"channel_id":   tc.channelID,
+				"channel_type": tc.channelType,
+			})
+			assert.Equal(t, tc.want, got)
+		})
+	}
+
+	// Clearing a previously flagged channel updates the gauge back to 0.
+	m.SetChannelUnacknowledgedFlagged("ch-1", "webhook", false)
+	got := m.sampleValue(t, "sorobeacon_channel_unacknowledged_flagged", map[string]string{
+		"channel_id":   "ch-1",
+		"channel_type": "webhook",
+	})
+	assert.Equal(t, 0.0, got)
+
+	// Nil receiver must not panic.
+	var nilMetrics *Metrics
+	assert.NotPanics(t, func() {
+		nilMetrics.SetChannelUnacknowledgedFlagged("ch-1", "webhook", true)
+	})
+}
+
+func TestRecordDeliveryBudgetExhaustedCountsAndIsExported(t *testing.T) {
+	m := New()
+	m.RecordDeliveryBudgetExhausted()
+	m.RecordDeliveryBudgetExhausted()
+	assert.Equal(t, float64(2), m.sampleValue(t, "sorobeacon_delivery_budget_exhausted_total", nil))
+	assert.Contains(t, ExportedMetricNames(), "sorobeacon_delivery_budget_exhausted_total")
+
+	var nilMetrics *Metrics
+	nilMetrics.RecordDeliveryBudgetExhausted() // must not panic: metrics are optional
+}

@@ -12,6 +12,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestRequiredAlertPartitionsAcrossYearBoundary(t *testing.T) {
+	got := requiredAlertPartitions(time.Date(2026, time.December, 15, 0, 0, 0, 0, time.UTC), 3)
+	require.Equal(t, []string{"alerts_2026_12", "alerts_2027_01", "alerts_2027_02"}, got)
+}
+
 // newPartitionStore returns a migrated Postgres store, skipping without a
 // database like the rest of the integration suite.
 func newPartitionStore(t *testing.T) *Postgres {

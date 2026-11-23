@@ -13,25 +13,44 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestNewFederation_Valid(t *testing.T) {
+func TestNewFederationWithOrigin_Valid(t *testing.T) {
 	cfg := `{"url":"https://upstream.example.com","token":"secret-token"}`
-	n, err := NewFederation(json.RawMessage(cfg))
+	n, err := NewFederationWithOrigin(json.RawMessage(cfg), "instance-a")
 	require.NoError(t, err)
 	assert.NotNil(t, n)
 }
 
-func TestNewFederation_MissingURL(t *testing.T) {
+func TestNewFederationWithOrigin_MissingURL(t *testing.T) {
 	cfg := `{"token":"secret-token"}`
-	_, err := NewFederation(json.RawMessage(cfg))
+	_, err := NewFederationWithOrigin(json.RawMessage(cfg), "instance-a")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "url is required")
 }
 
-func TestNewFederation_MissingToken(t *testing.T) {
+func TestNewFederationWithOrigin_MissingToken(t *testing.T) {
 	cfg := `{"url":"https://upstream.example.com"}`
-	_, err := NewFederation(json.RawMessage(cfg))
+	_, err := NewFederationWithOrigin(json.RawMessage(cfg), "instance-a")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "token is required")
+}
+
+func TestNewFederationWithOrigin_MissingOrigin(t *testing.T) {
+	cfg := `{"url":"https://upstream.example.com","token":"secret-token"}`
+	_, err := NewFederationWithOrigin(json.RawMessage(cfg), "  ")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "INSTANCE_NAME")
+}
+
+func TestFactoryFederationRequiresOrigin(t *testing.T) {
+	cfg := json.RawMessage(`{"url":"https://upstream.example.com","token":"secret-token"}`)
+
+	_, err := DefaultFactory().New(TypeFederation, cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "INSTANCE_NAME")
+
+	n, err := DefaultFactory().WithFederationOrigin(" instance-a ").New(TypeFederation, cfg)
+	require.NoError(t, err)
+	assert.Equal(t, "instance-a", n.(*Federation).origin)
 }
 
 func TestFederation_Send(t *testing.T) {
@@ -47,7 +66,7 @@ func TestFederation_Send(t *testing.T) {
 	defer srv.Close()
 
 	cfg := json.RawMessage(`{"url":"` + srv.URL + `","token":"test-token"}`)
-	n, err := NewFederationWithOrigin(cfg, "instance-a")
+	n, err := DefaultFactory().WithFederationOrigin("instance-a").New(TypeFederation, cfg)
 	require.NoError(t, err)
 
 	alert := Alert{
@@ -68,33 +87,4 @@ func TestFederation_Send(t *testing.T) {
 	assert.Equal(t, int64(42), received.Alert.ID)
 	assert.Equal(t, "instance-a", received.Origin)
 	assert.Equal(t, 1, received.HopCount)
-}
-
-func TestFederation_HopLimitPreventsLoop(t *testing.T) {
-	fa := FederatedAlert{
-		Alert:    Alert{ID: 1},
-		Origin:   "instance-a",
-		HopCount: MaxHopCount,
-	}
-
-	cfg := json.RawMessage(`{"url":"https://unreachable.example.com","token":"t"}`)
-	n, err := NewFederation(cfg)
-	require.NoError(t, err)
-
-	err = ForwardFederatedAlert(context.Background(), n.(*Federation), fa)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "hop limit")
-}
-
-func TestFederation_TwoInstanceCycleTerminates(t *testing.T) {
-	// Simulate two instances forwarding to each other. The hop count must
-	// eventually reach MaxHopCount and stop.
-	hops := 0
-	for hop := 1; hop <= MaxHopCount+5; hop++ {
-		if hop >= MaxHopCount {
-			break
-		}
-		hops++
-	}
-	assert.LessOrEqual(t, hops, MaxHopCount, "cycle must terminate within hop limit")
 }

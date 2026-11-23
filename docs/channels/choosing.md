@@ -7,7 +7,9 @@ which to attach to which job.
 
 Everything on this page is described from `internal/notify/` —
 `dispatcher.go` for retries and attempt records, `http.go` for the shared
-HTTP behaviour, and each channel's own file for its failure mode.
+HTTP behaviour, and each channel's own file for its failure mode. For the
+automated 7-point verification contract covering every registered channel in
+`DefaultFactory()`, see [Channel conformance](conformance.md).
 
 ## The comparison
 
@@ -20,6 +22,7 @@ HTTP behaviour, and each channel's own file for its failure mode.
 | [Email](email.md) | moderate | SMTP host + credentials, from, to list | `net/smtp` has no context support — the send runs to completion (or the 15s HTTP timeout does not apply); the dispatcher's backoff still applies | `email: <smtp error>` — often connection-level text, not a status code |
 | [PagerDuty](pagerduty.md) | moderate | Events API v2 routing key (secret) | same HTTP path; `dedup_key` is `(rule_id, event_id)`, so redeliveries do not open a second incident | `pagerduty: status %d: <body>` or redacted network error |
 | [Webhook](webhook.md) | easy, but the receiver is yours | endpoint URL + HMAC secret (both secret) | whatever your endpoint does is what you get: slow endpoint, slow delivery (up to the 15s timeout, per attempt) | the raw status and a 300-byte slice of your endpoint's response body |
+| [Federation](federation.md) | moderate, and it needs two instances | `INSTANCE_NAME`, the other instance's URL, and a token (URL and token secret) | the same HTTP path; the receiver requires a non-empty origin and answers `201` when it stores the alert | the other instance's status and its error body |
 
 `trivial` means one paste-a-URL step; `easy` one bot creation step;
 `moderate` means several required config fields or an account on the target
@@ -55,6 +58,14 @@ and every one of those shows up in SoroBeacon's delivery records.
 external stakeholders, compliance archives. It is the slowest and least
 structured path (no status codes, no rate-limit feedback) and mail itself is
 lossy; do not build an on-call flow on it.
+
+**Another SoroBeacon instance** — the `federation` type, for a fleet that
+wants one instance to collect the alerts of others. It is the only channel
+that talks to SoroBeacon itself. Set `INSTANCE_NAME` on the sender so every
+alert carries a non-empty origin, then give the channel the receiving
+instance's URL and a token. The receiver stores the alert against the
+sender's ids without re-evaluating its own rules. Read the
+[federation page](federation.md) for setup and the wire format.
 
 A common shape: Discord/Slack for the team, PagerDuty on the few monitors
 that page, and a webhook into the ops data pipeline — all on the same
@@ -106,3 +117,33 @@ Practical consequences:
 * More channels per alert means more outbound requests per match — this is
   where a busy rule's firehose is felt first. Suppress at the rule with a
   [cooldown](../rules/cooldown.md) before thinning channels.
+
+## Delivery acceptance vs human acknowledgement
+
+The product records that a notification was accepted by the destination endpoint (HTTP 200 or SMTP relay acceptance), and separately records whether an operator acknowledged the alert. Acceptance is not arrival:
+
+* An HTTP 200 from a webhook proves only that the consumer's web server accepted the payload, not that any human saw it.
+* A Slack or Discord message posts to an unmonitored channel.
+* An email is accepted by an SMTP relay and filtered into junk.
+* An SMS is accepted by a provider carrier gateway and undelivered to the handset.
+
+### Receipt capabilities across channel types
+
+Notification channels differ fundamentally in what feedback they can provide:
+
+| Channel Type | Strongest Receipt Available | Meaning |
+| --- | --- | --- |
+| PagerDuty, Opsgenie | `paging_ack` | Native paging incident acknowledgement: tracks explicit human acknowledgement and escalation. |
+| Twilio, Pushover | `delivery_receipt` | Provider carrier/handset status callbacks: confirms device delivery or client read receipt. |
+| Webhook, Slack, Discord, Telegram, Email, Matrix, Teams, etc. | `http_acceptance` | HTTP 2xx or relay acceptance only: downstream delivery or viewing cannot be guaranteed. |
+
+*Note on callbacks*: Where a provider (such as Twilio SMS or webhook delivery callbacks) exposes carrier/device delivery callbacks, consuming them is handled separately. SoroBeacon classifies the available receipt capability per channel type.
+
+### Acknowledgement reconciliation
+
+SoroBeacon periodically reconciles delivered alerts against human acknowledgement.
+
+* **Severity-tiered SLA windows**: Critical alerts expect acknowledgement within **1 hour**; warning alerts within **4 hours**. Informational (`info`) alerts legitimately require no acknowledgement and are excluded.
+* **Exclusions**: Alerts suppressed by maintenance windows or inhibited by suppression rules are excluded from reconciliation.
+* **Flagging silent channels**: An enabled channel that has delivered alerts (at least 3 qualifying alerts) but has **0 acknowledgements** across the evaluation window is flagged as `unacknowledged` on the Channels dashboard and in Prometheus (`sorobeacon_channel_unacknowledged_flagged`).
+* **Operational limits**: An unacknowledged alert does not prove it was unseen — a human may have read the alert and resolved the issue directly without clicking "Acknowledge" in SoroBeacon. The flag is a signal for human investigation, not an automatic disablement trigger.

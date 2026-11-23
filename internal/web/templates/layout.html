@@ -84,6 +84,10 @@
     button { cursor: pointer; padding: .3rem .8rem; background: var(--bg); color: var(--fg);
              border: 1px solid var(--line); }
     .muted { opacity: .65; font-size: .9rem; }
+    /* A filter the page could not apply, said loudly enough that an empty
+       table underneath it is not read as an empty database. */
+    .note { border: 1px solid var(--line); border-left: 3px solid #854d0e;
+            border-radius: .3rem; padding: .6rem .9rem; margin: 1rem 0; max-width: 48rem; }
     .empty { border: 1px dashed color-mix(in srgb, currentColor 30%, transparent);
              border-radius: .5rem; padding: 1.25rem 1.5rem; margin: 1rem 0; max-width: 40rem; }
     .empty h2 { margin: 0 0 .4rem; font-size: 1.1rem; }
@@ -98,6 +102,11 @@
     .off { background: #7f1d1d; color: #fee2e2; }
     .never { background: #7c2d12; color: #ffedd5; }
     .silent { background: #854d0e; color: #fef9c3; }
+    /* An auto-disabled channel is the one row an operator needs to notice:
+       its alerts have stopped arriving, and nothing else on the page says so.
+       The tint is mixed from the off-pill red so it stays readable on both
+       themes instead of being a fixed colour that fails on one of them. */
+    tr.attention td { background: color-mix(in srgb, #7f1d1d 14%, transparent); }
     .stats { display: flex; gap: 1rem; flex-wrap: wrap; }
     .stat { border: 1px solid var(--line); border-radius: .5rem; padding: .75rem 1.25rem;
             min-width: 8rem; }
@@ -115,6 +124,14 @@
                        width: 1%; padding-right: 1rem; }
     .copy-id { display: inline; }
     .copy-btn { font-size: .75rem; padding: .1rem .45rem; margin-left: .25rem; vertical-align: baseline; }
+    .shortcuts-dialog { position: fixed; inset: 0; z-index: 10; padding: 1rem; background: rgb(0 0 0 / .55);
+              color: inherit; }
+    .shortcuts-panel { background: var(--bg); border: 1px solid var(--line); padding: 1.25rem;
+               max-width: 32rem; color: var(--fg); }
+    .shortcuts-panel h2 { margin-top: 0; }
+    .shortcuts-list { display: grid; grid-template-columns: auto 1fr; gap: .5rem 1.25rem; }
+    .shortcuts-list kbd { border: 1px solid var(--line); border-radius: .25rem; padding: .1rem .35rem;
+                font-family: inherit; white-space: nowrap; }
   </style>
 </head>
 <body>
@@ -124,6 +141,9 @@
   <a href="/monitors" {{if eq .Active "monitors"}}class="active"{{end}}>Monitors</a>
   <a href="/channels" {{if eq .Active "channels"}}class="active"{{end}}>Channels</a>
   <a href="/alerts" {{if eq .Active "alerts"}}class="active"{{end}}>Alerts</a>
+  <a href="/maintenance" {{if eq .Active "maintenance"}}class="active"{{end}}>Maintenance</a>
+  <a href="/tokens" {{if eq .Active "tokens"}}class="active"{{end}}>Tokens</a>
+  {{if .CanAdmin}}<a href="/audit" {{if eq .Active "audit"}}class="active"{{end}}>Audit</a>{{end}}
   <form class="theme" method="post" action="/theme">
     <label>Theme
       <select name="theme" aria-label="Theme" onchange="this.form.submit()">
@@ -141,12 +161,14 @@
       </select>
     </label>
   </form>
+  <button type="button" id="shortcuts-open" aria-haspopup="dialog" aria-controls="shortcuts-dialog">Keyboard shortcuts</button>
   {{if .AuthEnabled}}
   <form class="signout" method="post" action="/logout">
     <button type="submit">Sign out</button>
   </form>
   {{end}}
 </header>
+{{template "shortcuts" .}}
 <main>
 {{template "content" .}}
 </main>
@@ -168,6 +190,96 @@
   }
   apply();
   document.body.addEventListener("htmx:afterSwap", apply);
+})();
+</script>
+
+<script>
+(function () {
+  var dialog = document.getElementById('shortcuts-dialog');
+  var openButton = document.getElementById('shortcuts-open');
+  if (!dialog || !openButton) return;
+  var closeButton = dialog.querySelector('[data-shortcuts-close]');
+  var previousFocus;
+  var pendingNavigation = false;
+  var pendingTimer;
+
+  function focusable() {
+    return dialog.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+  }
+  function close() {
+    dialog.hidden = true;
+    dialog.setAttribute('aria-hidden', 'true');
+    if (previousFocus && document.contains(previousFocus)) previousFocus.focus();
+  }
+  function open() {
+    previousFocus = document.activeElement;
+    dialog.hidden = false;
+    dialog.setAttribute('aria-hidden', 'false');
+    closeButton.focus();
+  }
+  function isTyping(target) {
+    return target && (target.matches('input, textarea, select') || target.isContentEditable);
+  }
+
+  openButton.addEventListener('click', open);
+  closeButton.addEventListener('click', close);
+  dialog.addEventListener('click', function (event) {
+    if (event.target === dialog) close();
+  });
+  document.addEventListener('focusin', function (event) {
+    if (!dialog.hidden && !dialog.contains(event.target)) closeButton.focus();
+  });
+  document.addEventListener('keydown', function (event) {
+    if (!dialog.hidden) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close();
+        return;
+      }
+      if (event.key === 'Tab') {
+        var items = focusable();
+        if (!items.length) return;
+        var first = items[0];
+        var last = items[items.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+      return;
+    }
+    if (isTyping(event.target)) return;
+    if (event.key === '?') {
+      event.preventDefault();
+      open();
+      return;
+    }
+    if (event.key === '/') {
+      var filter = document.querySelector('[data-shortcut-filter], form.filters input, form.filters select');
+      if (filter) {
+        event.preventDefault();
+        filter.focus();
+      }
+      return;
+    }
+    if (pendingNavigation) {
+      var destinations = {o: '/', m: '/monitors', c: '/channels', a: '/alerts'};
+      if (destinations[event.key]) {
+        event.preventDefault();
+        window.location.href = destinations[event.key];
+      }
+      pendingNavigation = false;
+      window.clearTimeout(pendingTimer);
+      return;
+    }
+    if (event.key === 'g') {
+      pendingNavigation = true;
+      pendingTimer = window.setTimeout(function () { pendingNavigation = false; }, 800);
+    }
+  });
 })();
 </script>
 

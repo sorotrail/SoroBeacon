@@ -165,6 +165,124 @@ func (TokenEvent) Evaluate(_ context.Context, ev *stellar.DecodedEvent, params j
 	return true, nil
 }
 
+// Explain returns a detailed explanation of why the event matched or didn't match.
+func (TokenEvent) Explain(ctx context.Context, ev *stellar.DecodedEvent, params json.RawMessage) (*RuleExplanation, error) {
+	p, err := parseTokenEvent(params)
+	if err != nil {
+		return &RuleExplanation{Error: err.Error()}, err
+	}
+
+	var conditions []ConditionExplanation
+	matched := true
+
+	// Check event name
+	name := ev.EventName()
+	slots, isSep41 := sep41Events[name]
+	if p.Event != "*" {
+		passed := isSep41 && name == p.Event
+		if !passed {
+			matched = false
+		}
+		conditions = append(conditions, ConditionExplanation{
+			Name:     "event",
+			Expected: p.Event,
+			Actual:   name,
+			Passed:   passed,
+			Reason:   fmt.Sprintf("event %q %s expected %q", name, ternary(passed, "matches", "does not match"), p.Event),
+		})
+	} else if !isSep41 {
+		conditions = append(conditions, ConditionExplanation{
+			Name:     "event",
+			Expected: "a SEP-41 event",
+			Actual:   name,
+			Passed:   false,
+			Reason:   fmt.Sprintf("event %q is not a recognized SEP-41 event", name),
+		})
+		matched = false
+	}
+
+	// Check from address
+	if p.From != "" {
+		actual := addr(ev.Topics[slots[0]])
+		passed := actual == p.From
+		if !passed {
+			matched = false
+		}
+		conditions = append(conditions, ConditionExplanation{
+			Name:     "from",
+			Expected: p.From,
+			Actual:   actual,
+			Passed:   passed,
+			Reason:   fmt.Sprintf("from address %q %s expected %q", actual, ternary(passed, "matches", "does not match"), p.From),
+		})
+	}
+
+	// Check to address
+	if p.To != "" {
+		actual := addr(ev.Topics[slots[1]])
+		passed := actual == p.To
+		if !passed {
+			matched = false
+		}
+		conditions = append(conditions, ConditionExplanation{
+			Name:     "to",
+			Expected: p.To,
+			Actual:   actual,
+			Passed:   passed,
+			Reason:   fmt.Sprintf("to address %q %s expected %q", actual, ternary(passed, "matches", "does not match"), p.To),
+		})
+	}
+
+	// Check amount thresholds
+	if p.MinAmount != "" || p.MaxAmount != "" {
+		amt, ok := amount(ev.Value)
+		if !ok {
+			conditions = append(conditions, ConditionExplanation{
+				Name:     "amount",
+				Expected: "a valid i128 amount",
+				Actual:   ev.Value,
+				Passed:   false,
+				Reason:   "event value does not contain a valid i128 amount",
+			})
+			matched = false
+		} else {
+			if p.MinAmount != "" {
+				min := parseBig(p.MinAmount)
+				passed := amt.Cmp(min) >= 0
+				if !passed {
+					matched = false
+				}
+				conditions = append(conditions, ConditionExplanation{
+					Name:     "min_amount",
+					Expected: fmt.Sprintf(">= %s", min.String()),
+					Actual:   amt.String(),
+					Passed:   passed,
+					Reason:   fmt.Sprintf("amount %s %s minimum %s", amt.String(), ternary(passed, "meets", "below"), min.String()),
+				})
+			}
+			if p.MaxAmount != "" {
+				max := parseBig(p.MaxAmount)
+				passed := amt.Cmp(max) <= 0
+				if !passed {
+					matched = false
+				}
+				conditions = append(conditions, ConditionExplanation{
+					Name:     "max_amount",
+					Expected: fmt.Sprintf("<= %s", max.String()),
+					Actual:   amt.String(),
+					Passed:   passed,
+					Reason:   fmt.Sprintf("amount %s %s maximum %s", amt.String(), ternary(passed, "meets", "exceeds"), max.String()),
+				})
+			}
+		}
+	}
+
+	return &RuleExplanation{
+		Matched:    matched,
+		Conditions: conditions,
+	}, nil
+}
+
 // addr extracts the address string from a decoded topic value, which may be
 // the single-key wrapper ({"address": "G..."}) or a bare string.
 func addr(topic any) string {

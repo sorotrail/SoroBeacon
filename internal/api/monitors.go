@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
@@ -34,6 +35,89 @@ type monitorRequest struct {
 	// Priority is "low", "normal" or "high". Omitted means normal, so a
 	// client that predates priorities creates a middle-tier monitor.
 	Priority *string `json:"priority"`
+	// Network is the Stellar chain this monitor's contract ids live on.
+	// Omitted means the instance's primary network, so a client that predates
+	// multi-network keeps working — and keeps meaning the chain it already
+	// polled.
+	Network *string `json:"network"`
+	// Tags are free-form labels for grouping and filtering. Omitted leaves
+	// the tag set unchanged on update and empty on create, so a client that
+	// predates tags behaves exactly as before.
+	Tags             *[]string `json:"tags"`
+	RunbookURL       *string   `json:"runbook_url"`
+	ResponseGuidance *string   `json:"response_guidance"`
+}
+
+func runbookURLDetail(raw *string) (string, *FieldError) {
+	if raw == nil {
+		return "", nil
+	}
+	u, err := store.ValidateRunbookURL(*raw)
+	if err != nil {
+		return "", &FieldError{Field: "runbook_url", Reason: err.Error()}
+	}
+	return u, nil
+}
+
+func responseGuidanceDetail(raw *string) (string, *FieldError) {
+	if raw == nil {
+		return "", nil
+	}
+	g, err := store.ValidateResponseGuidance(*raw)
+	if err != nil {
+		return "", &FieldError{Field: "response_guidance", Reason: err.Error()}
+	}
+	return g, nil
+}
+
+// tagsDetail validates and normalises a requested tag list. The length limits
+// are an API concern — a request over the limit is rejected with a field
+// error instead of being silently truncated — while normalisation (trim,
+// lowercase, dedupe, drop quotes/controls) is the store's, applied again on
+// write so every path stores one canonical set.
+func tagsDetail(raw []string) ([]string, *FieldError) {
+	if len(raw) > store.MaxMonitorTags {
+		return nil, &FieldError{Field: "tags", Reason: fmt.Sprintf("at most %d tags per monitor", store.MaxMonitorTags)}
+	}
+	for i, t := range raw {
+		if len(strings.TrimSpace(t)) > store.MaxTagLen {
+			return nil, &FieldError{Field: fmt.Sprintf("tags[%d]", i), Reason: fmt.Sprintf("tags are at most %d characters", store.MaxTagLen)}
+		}
+	}
+	return store.NormalizeTags(raw), nil
+}
+
+// networkDetail validates an optional network against the chains this instance
+// polls. It rejects an unknown name rather than defaulting it: a monitor aimed
+// at a chain nobody configured would sit there matching nothing forever, which
+// is indistinguishable from a contract that never emits events.
+func (s *Server) networkDetail(raw *string) (string, *FieldError) {
+	if raw == nil {
+		return s.defaultNetwork(), nil
+	}
+	n := strings.ToLower(strings.TrimSpace(*raw))
+	if n == "" {
+		return "", &FieldError{Field: "network", Reason: "network must not be empty; omit it to use the primary network"}
+	}
+	// An instance with no list is the single-network shape: its poller is not
+	// scoped to a name, so accepting one would create a monitor nobody reads.
+	// Naming the unset variable is the fix, and saying so beats a list of
+	// nothing.
+	if len(s.networkNames) == 0 {
+		return "", &FieldError{
+			Field:  "network",
+			Reason: "this instance polls one unnamed network; set NETWORKS to poll by name, or omit network",
+		}
+	}
+	for _, cfg := range s.networkNames {
+		if cfg == n {
+			return n, nil
+		}
+	}
+	return "", &FieldError{
+		Field:  "network",
+		Reason: fmt.Sprintf("this instance does not poll %q (configured networks: %s)", n, strings.Join(s.networkNames, ", ")),
+	}
 }
 
 // priorityDetail validates an optional priority, returning a FieldError for an
@@ -68,15 +152,42 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 	if perr != nil {
 		details = append(details, *perr)
 	}
+	network, nerr := s.networkDetail(req.Network)
+	if nerr != nil {
+		details = append(details, *nerr)
+	}
+	// A create without a tags field stores an explicit empty list rather than
+	// nil, so the row round-trips as `[]` and no reader has to special-case a
+	// monitor that never carried tags.
+	tags := []string{}
+	if req.Tags != nil {
+		var terr *FieldError
+		tags, terr = tagsDetail(*req.Tags)
+		if terr != nil {
+			details = append(details, *terr)
+		}
+	}
+	runbookURL, rerr := runbookURLDetail(req.RunbookURL)
+	if rerr != nil {
+		details = append(details, *rerr)
+	}
+	responseGuidance, gerr := responseGuidanceDetail(req.ResponseGuidance)
+	if gerr != nil {
+		details = append(details, *gerr)
+	}
 	if len(details) > 0 {
 		writeValidation(w, r, details)
 		return
 	}
 	m := store.Monitor{
-		Name:        *req.Name,
-		ContractIDs: *req.ContractIDs,
-		Enabled:     req.Enabled == nil || *req.Enabled,
-		Priority:    priority.Normalized(),
+		Name:             *req.Name,
+		ContractIDs:      *req.ContractIDs,
+		Enabled:          req.Enabled == nil || *req.Enabled,
+		Priority:         priority.Normalized(),
+		Network:          network,
+		Tags:             tags,
+		RunbookURL:       runbookURL,
+		ResponseGuidance: responseGuidance,
 	}
 	if err := s.store.CreateMonitor(r.Context(), &m); err != nil {
 		s.fail(w, r, err)
@@ -126,6 +237,34 @@ func (s *Server) getMonitor(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, m)
 }
 
+// monitorStats serves GET /monitors/{id}/stats — the per-monitor counts
+// GET /stats cannot answer, because an instance-wide total says nothing about
+// whether one particular monitor is doing any work.
+//
+// An unknown monitor is a 404 rather than a body of zeroes: "this monitor has
+// not fired" and "there is no such monitor" are different answers to the same
+// question, and a caller that cannot tell them apart will conclude a deleted
+// monitor is a healthy quiet one.
+func (s *Server) monitorStats(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
+		return
+	}
+	stats, err := s.store.GetMonitorStats(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	// A monitor with no rules serialises as an empty array. The counts are
+	// explicit zeroes for the same reason: absence and zero mean different
+	// things to a client, and this endpoint only promises numbers.
+	if stats.Rules == nil {
+		stats.Rules = []store.RuleMatchCount{}
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
 func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
@@ -164,6 +303,42 @@ func (s *Server) updateMonitor(w http.ResponseWriter, r *http.Request) {
 		details = append(details, *perr)
 	} else if req.Priority != nil {
 		m.Priority = priority
+	}
+	// A monitor's network is fixed at creation. Its contract ids only exist on
+	// the chain they were deployed to, so re-pointing the monitor at another
+	// network would mean "watch these ids where they resolve to something
+	// else, or nothing" — and the alerts already stored would keep the old
+	// label, so the history and the subscription would disagree about which
+	// chain they describe. Recreating the monitor is the honest move.
+	if req.Network != nil && !strings.EqualFold(strings.TrimSpace(*req.Network), m.Network) {
+		details = append(details, FieldError{
+			Field:  "network",
+			Reason: fmt.Sprintf("a monitor's network is fixed (%q): delete and recreate the monitor to move it to another chain", m.Network),
+		})
+	}
+	if req.Tags != nil {
+		tags, terr := tagsDetail(*req.Tags)
+		if terr != nil {
+			details = append(details, *terr)
+		} else {
+			m.Tags = tags
+		}
+	}
+	if req.RunbookURL != nil {
+		u, rerr := runbookURLDetail(req.RunbookURL)
+		if rerr != nil {
+			details = append(details, *rerr)
+		} else {
+			m.RunbookURL = u
+		}
+	}
+	if req.ResponseGuidance != nil {
+		g, gerr := responseGuidanceDetail(req.ResponseGuidance)
+		if gerr != nil {
+			details = append(details, *gerr)
+		} else {
+			m.ResponseGuidance = g
+		}
 	}
 	if len(details) > 0 {
 		writeValidation(w, r, details)
@@ -235,10 +410,24 @@ func (s *Server) bulkMonitors(w http.ResponseWriter, r *http.Request) {
 func (s *Server) deleteMonitor(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
+		s.log.Error("deleteMonitor: pathID error", "err", err)
 		writeErr(w, r, http.StatusBadRequest, "invalid id")
 		return
 	}
-	if err := s.store.DeleteMonitor(r.Context(), id); err != nil {
+	s.log.Info("deleteMonitor called", "id", id, "method", r.Method, "permanent", r.URL.Query().Get("permanent"))
+	// Default DELETE is now soft-delete. Use ?permanent=true for hard delete.
+	permanent := r.URL.Query().Get("permanent")
+	if permanent == "true" {
+		if err := s.store.HardDeleteMonitor(r.Context(), id); err != nil {
+			s.log.Error("hard delete monitor", "id", id, "err", err)
+			s.fail(w, r, err)
+			return
+		}
+		writeNoContent(w)
+		return
+	}
+	if err := s.store.SoftDeleteMonitor(r.Context(), id); err != nil {
+		s.log.Error("soft delete monitor", "id", id, "err", err)
 		s.fail(w, r, err)
 		return
 	}

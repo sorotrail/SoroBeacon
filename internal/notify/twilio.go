@@ -60,6 +60,11 @@ func NewTwilio(config json.RawMessage) (Notifier, error) {
 
 // Send sends the alert via SMS to each recipient in the to list.
 func (t *Twilio) Send(ctx context.Context, a Alert) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, DefaultTimeout)
+		defer cancel()
+	}
 	msg, err := t.tpl.render(a)
 	if err != nil {
 		return err

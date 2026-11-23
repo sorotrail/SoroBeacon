@@ -1,0 +1,38 @@
+SoroBeacon is deployed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+Watch the pods:
+
+  kubectl --namespace {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+The dashboard and JSON API listen on container port {{ .Values.service.targetPort }}.
+Reach them from your workstation with:
+
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "sorobeacon.fullname" . }} 8080:{{ .Values.service.port }}
+
+Then browse to http://localhost:8080.
+
+Configuration lives in ConfigMap {{ include "sorobeacon.fullname" . }} — every
+environment variable the process reads is there, so `kubectl describe configmap`
+answers "what is this instance actually running with?".
+
+{{- if not .Values.auth.apiToken }}
+{{- if not .Values.auth.existingSecret }}
+
+WARNING: no API_TOKEN is configured, so the API and dashboard are open to
+anything that can reach the Service. Set auth.apiToken (or auth.existingSecret)
+before exposing this release outside a trusted network.
+{{- end }}
+{{- end }}
+
+{{- if .Values.migrations.enabled }}
+
+Migrations run in a pre-install/pre-upgrade hook Job, before the Deployment is
+rolled. A broken migration fails the release while the previous version keeps
+serving.
+{{- else }}
+
+Migrations are applied by each pod during startup, before it binds its
+listener — no pod serves traffic on a stale schema. Set migrations.enabled=true
+to run them once in a pre-upgrade hook instead, so a broken migration fails the
+release rather than crash-looping the new pods.
+{{- end }}

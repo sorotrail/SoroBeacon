@@ -1,0 +1,262 @@
+groups:
+  - name: sorobeacon.slo.alerts
+    interval: 30s
+    rules:
+      # -----------------------------------------------------------------------
+      # SLO 1: Evaluation Freshness (99% target, error budget = 0.01)
+      # Fast burn (page): 14.4x budget (error_ratio > 0.144) over 1h AND 5m
+      # Slow burn (ticket): 6x budget (error_ratio > 0.06) over 6h AND 30m
+      # -----------------------------------------------------------------------
+      - alert: SoroBeaconEvaluationFreshnessBurnFast
+        expr: |
+          sorobeacon:sli_evaluation_freshness:error_ratio1h > (14.4 * 0.01)
+          and
+          sorobeacon:sli_evaluation_freshness:error_ratio5m > (14.4 * 0.01)
+        for: 2m
+        labels:
+          severity: page
+          slo: evaluation_freshness
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "SoroBeacon evaluation freshness is burning error budget at >14.4x"
+          description: "Poller lag exceeds 10 ledgers (excluding backfill) over both 1h and 5m windows, threatening the 99% freshness SLO."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconevaluationfreshnessburnfast"
+
+      - alert: SoroBeaconEvaluationFreshnessBurnSlow
+        expr: |
+          sorobeacon:sli_evaluation_freshness:error_ratio6h > (6.0 * 0.01)
+          and
+          sorobeacon:sli_evaluation_freshness:error_ratio30m > (6.0 * 0.01)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: evaluation_freshness
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "SoroBeacon evaluation freshness is burning error budget at >6x"
+          description: "Sustained poller lag above 10 ledgers over 6h and 30m windows requires capacity or RPC upstream investigation."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconevaluationfreshnessburnslow"
+
+      # -----------------------------------------------------------------------
+      # SLO 2: Delivery Success (99.5% target, error budget = 0.005)
+      # Fast burn (page): 14.4x budget (error_ratio > 0.072) over 1h AND 5m
+      # Slow burn (ticket): 6x budget (error_ratio > 0.03) over 6h AND 30m
+      # -----------------------------------------------------------------------
+      - alert: SoroBeaconDeliverySuccessBurnFast
+        expr: |
+          sorobeacon:sli_delivery_success:error_ratio1h > (14.4 * 0.005)
+          and
+          sorobeacon:sli_delivery_success:error_ratio5m > (14.4 * 0.005)
+        for: 2m
+        labels:
+          severity: page
+          slo: delivery_success
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "SoroBeacon notification delivery error budget is burning at >14.4x"
+          description: "Alert notification failure rate exceeds 7.2% over both 1h and 5m windows."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeacondeliverysuccessburnfast"
+
+      - alert: SoroBeaconDeliverySuccessBurnSlow
+        expr: |
+          sorobeacon:sli_delivery_success:error_ratio6h > (6.0 * 0.005)
+          and
+          sorobeacon:sli_delivery_success:error_ratio30m > (6.0 * 0.005)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: delivery_success
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "SoroBeacon notification delivery error budget is burning at >6x"
+          description: "Alert notification failure rate exceeds 3.0% over both 6h and 30m windows."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeacondeliverysuccessburnslow"
+
+      # -----------------------------------------------------------------------
+      # SLO 3: Delivery Latency (99% target, error budget = 0.01)
+      # Fast burn (page): 14.4x budget (error_ratio > 0.144) over 1h AND 5m
+      # Slow burn (ticket): 6x budget (error_ratio > 0.06) over 6h AND 30m
+      # -----------------------------------------------------------------------
+      - alert: SoroBeaconDeliveryLatencyBurnFast
+        expr: |
+          sorobeacon:sli_delivery_latency:error_ratio1h > (14.4 * 0.01)
+          and
+          sorobeacon:sli_delivery_latency:error_ratio5m > (14.4 * 0.01)
+        for: 2m
+        labels:
+          severity: page
+          slo: delivery_latency
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "SoroBeacon cycle and delivery latency is burning error budget at >14.4x"
+          description: "More than 14.4% of poll and dispatch cycles exceed the 10s latency threshold over both 1h and 5m windows."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeacondeliverylatencyburnfast"
+
+      - alert: SoroBeaconDeliveryLatencyBurnSlow
+        expr: |
+          sorobeacon:sli_delivery_latency:error_ratio6h > (6.0 * 0.01)
+          and
+          sorobeacon:sli_delivery_latency:error_ratio30m > (6.0 * 0.01)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: delivery_latency
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "SoroBeacon cycle and delivery latency is burning error budget at >6x"
+          description: "More than 6% of poll and dispatch cycles exceed the 10s latency threshold over both 6h and 30m windows."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeacondeliverylatencyburnslow"
+
+      # -----------------------------------------------------------------------
+      # SLO 4: HTTP Read Availability (99.9% target, error budget = 0.001)
+      # Fast burn (page): 14.4x budget (error_ratio > 0.0144) over 1h AND 5m
+      # Slow burn (ticket): 6x budget (error_ratio > 0.006) over 6h AND 30m
+      # -----------------------------------------------------------------------
+      - alert: SoroBeaconHTTPReadAvailabilityBurnFast
+        expr: |
+          sorobeacon:sli_http_read_availability:error_ratio1h > (14.4 * 0.001)
+          and
+          sorobeacon:sli_http_read_availability:error_ratio5m > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: page
+          slo: http_read_availability
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "SoroBeacon HTTP read availability is burning error budget at >14.4x"
+          description: "GET API 5xx error ratio exceeds 1.44% over both 1h and 5m windows."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconhttpreadavailabilityburnfast"
+
+      - alert: SoroBeaconHTTPReadAvailabilityBurnSlow
+        expr: |
+          sorobeacon:sli_http_read_availability:error_ratio6h > (6.0 * 0.001)
+          and
+          sorobeacon:sli_http_read_availability:error_ratio30m > (6.0 * 0.001)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: http_read_availability
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "SoroBeacon HTTP read availability is burning error budget at >6x"
+          description: "GET API 5xx error ratio exceeds 0.6% over both 6h and 30m windows."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconhttpreadavailabilityburnslow"
+
+  - name: sorobeacon.deadman.and.operational
+    interval: 30s
+    rules:
+      # -----------------------------------------------------------------------
+      # Dead-Man / Heartbeat Signals
+      # -----------------------------------------------------------------------
+      - alert: SoroBeaconWatchdog
+        expr: vector(1)
+        labels:
+          severity: none
+          component: deadman
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "Always-firing dead-man's switch heartbeat for Alertmanager pipeline verification"
+          description: "This alert intentionally fires continuously. Route it to PagerDuty Dead Man's Snitch, Healthchecks.io, or Cronitor so silent Prometheus/Alertmanager failure pages on-call."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconwatchdog"
+
+      - alert: SoroBeaconScrapeMissing
+        expr: absent(up{job=~".*sorobeacon.*"} == 1)
+        for: 2m
+        labels:
+          severity: page
+          component: ingest
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "Prometheus cannot scrape any healthy SoroBeacon instance"
+          description: "No SoroBeacon target is reporting up == 1 for at least 2 minutes. An alerting daemon that stops emitting metrics fails silently unless paged."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconscrapemissing"
+
+      - alert: SoroBeaconPollerStalled
+        expr: |
+          max by (network) (sorobeacon_seconds_since_last_poll) > 120
+          or
+          sum by (network) (increase(sorobeacon_polls_total[5m])) == 0
+        for: 2m
+        labels:
+          severity: page
+          component: poller
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "SoroBeacon poller has stalled and is not advancing poll cycles"
+          description: "Last poll age exceeds 120s or zero polls have completed over the last 5 minutes."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconpollerstalled"
+
+      # -----------------------------------------------------------------------
+      # Immediate Operational Failure Signals
+      # -----------------------------------------------------------------------
+      - alert: SoroBeaconPanicDetected
+        expr: sum by (network) (increase(sorobeacon_poll_panics_total[5m])) > 0
+        for: 0m
+        labels:
+          severity: page
+          component: poller
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "SoroBeacon recovered from a goroutine panic in the poll loop"
+          description: "At least one panic was recovered in the last 5 minutes. Inspect structured error logs and stack traces immediately."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconpanicdetected"
+
+      - alert: SoroBeaconDeadLetterQueueNonZero
+        expr: sorobeacon_dead_letters_total > 0
+        for: 5m
+        labels:
+          severity: ticket
+          component: delivery
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "Unacknowledged dead-letter alerts are waiting for replay"
+          description: "One or more alerts exhausted all delivery retries and landed in the dead-letter queue."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeacondeadletterqueuenonzero"
+
+      - alert: SoroBeaconChannelCircuitBreakerOpen
+        expr: max by (channel_id, channel_type) (sorobeacon_channel_breaker_state) == 2
+        for: 5m
+        labels:
+          severity: ticket
+          component: delivery
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "A notification channel circuit breaker has remained open for >5m"
+          description: "Channel circuit breaker state is 2 (open), indicating repeated downstream webhook or provider failures."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconchannelcircuitbreakeropen"
+
+      - alert: SoroBeaconChannelNeverAcknowledged
+        expr: max by (channel_id, channel_type) (sorobeacon_channel_unacknowledged_flagged) == 1
+        for: 15m
+        labels:
+          severity: ticket
+          component: delivery
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "A notification channel accepts deliveries but alerts are never acknowledged"
+          description: "Channel has accepted deliveries but 0 alerts have been acknowledged within the evaluation window."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconchannelneveracknowledged"
+
+      - alert: SoroBeaconAlertPartitionRunwayLow
+        expr: sorobeacon_alert_partition_runway_months < 2
+        for: 15m
+        labels:
+          severity: ticket
+          component: store
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "PostgreSQL alert partition runway is below 2 future months"
+          description: "Fewer than 2 future monthly alert partitions exist beyond the current UTC month. Investigate automated partition creation before the next month boundary."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconalertpartitionrunwaylow"
+
+      - alert: SoroBeaconAlertPartitionMaintenanceFailed
+        expr: sum(increase(sorobeacon_alert_partition_errors_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: ticket
+          component: store
+          owner: sorobeacon-oncall
+        annotations:
+          summary: "Automated PostgreSQL alert partition maintenance encountered an error"
+          description: "One or more alert partition creation, inspection, or drop operations failed in the last 15 minutes."
+          runbook_url: "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/slos-and-alerts.md#sorobeaconalertpartitionmaintenancefailed"

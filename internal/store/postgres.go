@@ -5,29 +5,108 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/sorotrail/sorobeacon/internal/auth"
+	"github.com/sorotrail/sorobeacon/internal/metrics"
+	"github.com/sorotrail/sorobeacon/internal/telemetry"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
-// PoolSettings tunes the pgx connection pool. A zero value in any field
-// leaves the corresponding pgx default in place so deployments that do
-// not set the env vars keep the same behaviour as before.
+// PoolSettings tunes the pgx connection pool, and the read routing the
+// Postgres backend layers on top of it. A zero value in any field leaves the
+// corresponding pgx default in place so deployments that do not set the env
+// vars keep the same behaviour as before.
+//
+// The SQLite backend ignores this struct entirely: it has no pool, and it
+// serves reads and writes from the same file handle, so there is no replica to
+// route to.
 type PoolSettings struct {
+	// Tracer, when set, records one span per statement (telemetry's pgx
+	// tracer): the statement's verb and a hash identifying it, never the
+	// SQL's parameter values.
+	Tracer          pgx.QueryTracer
 	MaxConns        int32
 	MinConns        int32
 	MaxConnLifetime time.Duration
 	MaxConnIdleTime time.Duration
+	// ReplicaURL is a second Postgres connection string used for the
+	// read-only queries replica.go routes (REPLICA_DATABASE_URL). Empty — the
+	// default, and every deployment that does not set it — keeps all reads on
+	// the primary.
+	//
+	// It rides in this struct rather than a constructor argument because
+	// store.New already threads PoolSettings from config to the Postgres
+	// backend, and a replica URL is pool selection in exactly the same sense
+	// the primary's own URL is.
+	ReplicaURL string
+	// Metrics receives the per-pool read counters that make routing visible.
+	// Nil records nothing, which is what tests pass and what an embedder with
+	// no instrumentation wants; every method is nil-safe, see internal/metrics.
+	Metrics *metrics.Metrics
+	// Log receives the degraded-state transitions. Nil uses the default
+	// logger.
+	Log *slog.Logger
+	// ConnectAttempts is how many times the store tries to reach the
+	// database at startup, the first attempt included. Zero means
+	// DefaultConnectAttempts. A managed database that is being restarted
+	// refuses connections for tens of seconds, and a process that gives up
+	// on the first refusal turns that pause into an outage.
+	ConnectAttempts int
+	// ConnectDelay is the base delay between those attempts; it doubles
+	// after every failure, with jitter. Zero means DefaultConnectDelay.
+	ConnectDelay time.Duration
+	// MaxReplicaLag bounds how far behind the primary the read replica may
+	// drift (sampled via pg_last_xact_replay_timestamp) before routed reads
+	// fall back to the primary. Zero defaults to DefaultMaxReplicaLag (30s).
+	MaxReplicaLag time.Duration
 }
 
 // Postgres implements Store on top of a pgx connection pool.
 type Postgres struct {
 	pool *pgxpool.Pool
+	// replica serves the read-only queries listed in replica.go. Nil (the
+	// default) means REPLICA_DATABASE_URL was unset and every query — read or
+	// write — runs on pool, which is the behaviour of every deployment that
+	// predates replica routing.
+	replica *pgxpool.Pool
+	// maxReplicaLag is the replica lag threshold beyond which routed reads
+	// fall back to the primary pool.
+	maxReplicaLag time.Duration
+	// replicaLagNanos stores the most recently sampled replica lag in nanoseconds.
+	replicaLagNanos atomic.Int64
 	// cipher encrypts and decrypts channels.config at rest. Nil (the
 	// default) keeps the pre-encryption plaintext behaviour.
 	cipher ConfigCipher
+	// telemetry is optional tracing; nil (the default) writes no spans.
+	telemetry *telemetry.Provider
+	// metrics is optional instrumentation for routed reads; nil-safe.
+	metrics *metrics.Metrics
+	// health tracks whether the database is reachable and logs the
+	// transition into and out of that state once.
+	health *DatabaseHealth
+	// retry is the policy used for reads that failed transiently.
+	retry RetryPolicy
+	// breaker protects against database stampedes when unavailable.
+	breaker *StoreBreaker
+	// alertRetention holds the instance-wide fallback ALERT_RETENTION in nanoseconds.
+	alertRetention atomic.Int64
+}
+
+// WithTelemetry attaches tracing to the store's write paths. Only ids go
+// into span attributes; the alert payload and channel config never do.
+func (p *Postgres) WithTelemetry(t *telemetry.Provider) *Postgres {
+	p.telemetry = t
+	return p
 }
 
 var _ Store = (*Postgres)(nil)
@@ -44,11 +123,55 @@ func (p *Postgres) WithConfigCipher(c ConfigCipher) *Postgres {
 // NewPostgres connects to databaseURL and verifies the connection.
 // Call Migrate before using the store on a fresh database. Pass a zero
 // PoolSettings to keep pgx's own pool defaults.
+//
+// With settings.ReplicaURL set it also opens the replica pool and routes the
+// reads replica.go lists to it; a replica that cannot be opened or pinged is a
+// startup error, see connectReplica.
 func NewPostgres(ctx context.Context, databaseURL string, settings PoolSettings) (*Postgres, error) {
 	cfg, err := buildPoolConfig(databaseURL, settings)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect postgres: %w", err)
+	}
+	health := NewDatabaseHealth(settings.Log)
+	// The first ping is retried: the pool is lazy, so this is the first
+	// real connection, and a database that is still starting up is exactly
+	// the case the retry exists for. A refusal that is not transient (a
+	// wrong password, a missing database) is reported at once, because
+	// repeating it cannot help.
+	connectPolicy := ConnectPolicy(settings.ConnectAttempts, settings.ConnectDelay)
+	if err := connectPolicy.Do(ctx, func(ctx context.Context) error {
+		return pool.Ping(ctx)
+	}); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping postgres: %w", err)
+	}
+	p := &Postgres{
+		pool:    pool,
+		metrics: settings.Metrics,
+		health:  health,
+		retry:   ReadPolicy(),
+		breaker: NewStoreBreaker(3, 5*time.Second),
+	}
+	if err := p.connectReplica(ctx, settings); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return p, nil
+}
+
+// NewPostgresReadOnly opens a primary pool whose transactions default to
+// read-only. It intentionally does not open the optional replica pool because
+// preflight inspection uses only the primary database.
+func NewPostgresReadOnly(ctx context.Context, databaseURL string, settings PoolSettings) (*Postgres, error) {
+	cfg, err := buildPoolConfig(databaseURL, settings)
+	if err != nil {
+		return nil, fmt.Errorf("connect postgres: %w", err)
+	}
+	cfg.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
@@ -68,6 +191,9 @@ func buildPoolConfig(databaseURL string, settings PoolSettings) (*pgxpool.Config
 	if err != nil {
 		return nil, err
 	}
+	if settings.Tracer != nil {
+		cfg.ConnConfig.Tracer = settings.Tracer
+	}
 	if settings.MaxConns > 0 {
 		cfg.MaxConns = settings.MaxConns
 	}
@@ -83,8 +209,97 @@ func buildPoolConfig(databaseURL string, settings PoolSettings) (*pgxpool.Config
 	return cfg, nil
 }
 
-func (p *Postgres) Ping(ctx context.Context) error { return p.pool.Ping(ctx) }
-func (p *Postgres) Close()                         { p.pool.Close() }
+// Ping checks the primary only. It is the readiness probe's dependency, and
+// the question readiness asks is "can this process serve traffic?" — which it
+// can while the primary is up, because a replica that is down is covered by
+// the fallback in replica.go. Pinging the replica here would take the instance
+// out of rotation over a read replica, turning a degradable condition into an
+// outage. A replica that is failing shows up as
+// sorobeacon_store_replica_fallbacks_total instead.
+func (p *Postgres) Ping(ctx context.Context) error {
+	err := p.pool.Ping(ctx)
+	// The ping is the store's own view of the database, so it is where the
+	// degraded state is observed: an operator learns that the database is
+	// gone from the readiness probe's own dependency check.
+	p.observe(err)
+	return err
+}
+
+// Degraded reports whether the database was unreachable the last time the
+// store talked to it.
+//
+// It is deliberately not part of the Store interface: a backend that cannot
+// lose its database (the SQLite file) has nothing to report, and adding the
+// method to the interface would force every fake store in the tests to
+// answer for a condition that does not apply to them.
+func (p *Postgres) Degraded() bool {
+	if p.health != nil && p.health.Degraded() {
+		return true
+	}
+	if p.breaker != nil && p.breaker.Degraded() {
+		return true
+	}
+	return false
+}
+
+// Breaker returns the underlying circuit breaker protecting Postgres operations.
+func (p *Postgres) Breaker() *StoreBreaker {
+	return p.breaker
+}
+
+// DegradedSince reports when the database became unreachable, and whether it
+// is unreachable now.
+func (p *Postgres) DegradedSince() (time.Time, bool) {
+	if p.health == nil {
+		return time.Time{}, false
+	}
+	return p.health.DegradedSince()
+}
+
+// read runs a read-only operation, repeating it when the failure was
+// transient.
+//
+// Only reads are repeated. A write that failed may have been applied
+// before the connection broke, so repeating it can duplicate what it did —
+// the alert write carries its own dedup guard, but the general rule is that
+// the caller decides what a repeated write means.
+func (p *Postgres) read(ctx context.Context, fn func(context.Context) error) error {
+	if p.breaker != nil && !p.breaker.Allow() {
+		return ErrUnavailable
+	}
+	return p.retry.Do(ctx, func(ctx context.Context) error {
+		err := fn(ctx)
+		// Every attempt is observed, so a database that goes away mid-read
+		// is reported even when the retry then succeeds.
+		p.observe(err)
+		return err
+	})
+}
+
+// observe hands the outcome of a database operation to the health tracker.
+// A store built without one — the tests that exercise routing — has no
+// database state to report.
+func (p *Postgres) observe(err error) {
+	if p.health != nil {
+		p.health.Observe(err)
+	}
+	if p.breaker != nil {
+		if err == nil {
+			p.breaker.RecordSuccess()
+		} else {
+			p.breaker.RecordFailure(err)
+		}
+	}
+}
+
+// Close releases both pools. The replica goes first so a query cannot be
+// issued against a pool that is being torn down mid-shutdown.
+func (p *Postgres) Close() {
+	if p.replica != nil {
+		p.replica.Close()
+	}
+	p.pool.Close()
+}
 
 // pageLimit matches ListAlerts: a missing or out-of-range limit becomes
 // 50 rather than being rejected, so omitting pagination params still
@@ -96,64 +311,166 @@ func pageLimit(limit int) int {
 	return limit
 }
 
+// --- workspaces ---
+
+// EnsureWorkspace implements the Workspaces half of Store. See the interface
+// for why this is the only write to the table.
+func (p *Postgres) EnsureWorkspace(ctx context.Context, id workspace.ID) error {
+	_, err := p.pool.Exec(ctx,
+		`INSERT INTO workspaces (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
+		string(id), string(id))
+	return err
+}
+
+func (p *Postgres) SetWorkspaceGuidance(ctx context.Context, id workspace.ID, runbookURL, responseGuidance string) error {
+	u, err := ValidateRunbookURL(runbookURL)
+	if err != nil {
+		return err
+	}
+	g, err := ValidateResponseGuidance(responseGuidance)
+	if err != nil {
+		return err
+	}
+	_, err = p.pool.Exec(ctx,
+		`INSERT INTO workspaces (id, name, default_runbook_url, default_response_guidance)
+		 VALUES ($1, $1, $2, $3)
+		 ON CONFLICT (id) DO UPDATE
+		 SET default_runbook_url = EXCLUDED.default_runbook_url,
+		     default_response_guidance = EXCLUDED.default_response_guidance`,
+		string(id), u, g)
+	return mapErr(err)
+}
+
+func (p *Postgres) GetWorkspaceGuidance(ctx context.Context, id workspace.ID) (runbookURL, responseGuidance string, err error) {
+	err = p.pool.QueryRow(ctx,
+		`SELECT default_runbook_url, default_response_guidance FROM workspaces WHERE id = $1`,
+		string(id)).Scan(&runbookURL, &responseGuidance)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", nil
+	}
+	return runbookURL, responseGuidance, mapErr(err)
+}
+
 // --- monitors ---
 
+// pgCreatedAt is nil when t is zero, so the inserted row gets the column's
+// now() default. Restore passes the backup's timestamp to keep a row's
+// original created_at.
+func pgCreatedAt(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
+
 func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
+	if err := normalizeMonitorGuidance(m); err != nil {
+		return err
+	}
 	ids, err := json.Marshal(m.ContractIDs)
 	if err != nil {
 		return err
 	}
-	return p.pool.QueryRow(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled, priority) VALUES ($1, $2, $3, $4)
+	// Normalised here rather than at each caller so every write path —
+	// API, dashboard, import — stores one canonical tag set.
+	m.Tags = NormalizeTags(m.Tags)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	ws := workspaceID(ctx)
+	if err := p.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO monitors (name, contract_ids, tags, enabled, priority, workspace_id, network, created_at, runbook_url, response_guidance)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, now()), $9, $10)
 		 RETURNING id, created_at`,
-		m.Name, ids, m.Enabled, m.Priority.Normalized(),
-	).Scan(&m.ID, &m.CreatedAt)
+		m.Name, ids, m.Tags, m.Enabled, m.Priority.Normalized(), ws, m.Network, pgCreatedAt(m.CreatedAt), m.RunbookURL, m.ResponseGuidance,
+	).Scan(&m.ID, &m.CreatedAt); err != nil {
+		// A name already taken in this workspace violates the unique index, and
+		// that is the request's fault rather than the server's: mapErr turns
+		// it into the typed constraint error the API answers 422 with.
+		return mapErr(err)
+	}
+	m.WorkspaceID = string(ws)
+	return tx.Commit(ctx)
 }
 
 func (p *Postgres) GetMonitor(ctx context.Context, id int64) (*Monitor, error) {
+	ws := workspaceID(ctx)
 	m, err := scanMonitor(p.pool.QueryRow(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority FROM monitors WHERE id = $1`, id))
+		`SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
 	if err != nil {
 		return nil, err
 	}
-	rows, err := p.pool.Query(ctx,
-		`SELECT channel_id FROM monitor_channels WHERE monitor_id = $1 ORDER BY channel_id`, id)
-	if err != nil {
-		return nil, err
-	}
-	m.ChannelIDs, err = pgx.CollectRows(rows, pgx.RowTo[int64])
+	m.ChannelIDs, err = p.monitorChannelIDs(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	return m, nil
 }
 
-func (p *Postgres) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority FROM monitors`
-	if enabledOnly {
-		q += ` WHERE enabled`
-	}
-	q += ` ORDER BY id`
-	rows, err := p.pool.Query(ctx, q)
+func (p *Postgres) monitorChannelIDs(ctx context.Context, monitorID int64) ([]int64, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT channel_id FROM monitor_channels WHERE monitor_id = $1 ORDER BY channel_id`, monitorID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	return pgx.CollectRows(rows, pgx.RowTo[int64])
+}
+
+// ListMonitors is the poller's watch list as well as the dashboard's, so it
+// honours the cross-tenant system scope: an ingest loop must see every
+// workspace's enabled monitors or monitors in a second tenant would silently
+// stop being polled.
+func (p *Postgres) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monitor, error) {
 	var out []Monitor
-	for rows.Next() {
-		m, err := scanMonitor(rows)
-		if err != nil {
-			return nil, err
+	err := p.read(ctx, func(ctx context.Context) error {
+		q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE deleted_at IS NULL`
+		args := []any{}
+		ws, scoped := tenantWorkspace(ctx)
+		if scoped {
+			args = append(args, ws)
+			q += ` AND workspace_id = $1`
 		}
-		out = append(out, *m)
+		if enabledOnly {
+			q += ` AND enabled`
+		}
+		q += ` ORDER BY id`
+		rows, err := p.pool.Query(ctx, q, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		var page []Monitor
+		for rows.Next() {
+			m, err := scanMonitor(rows)
+			if err != nil {
+				return err
+			}
+			page = append(page, *m)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		out = page
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority FROM monitors WHERE TRUE`
-	args := []any{}
-	n := 0
+	q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE workspace_id = $1 AND deleted_at IS NULL`
+	args := []any{workspaceID(ctx)}
+	n := 1
 	arg := func(v any) string {
 		n++
 		args = append(args, v)
@@ -163,6 +480,16 @@ func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monito
 		// strpos + lower is a parameterized substring match without LIKE
 		// metacharacters, so a search for "100%" cannot become a wildcard.
 		q += ` AND strpos(lower(name), lower(` + arg(f.Query) + `)) > 0`
+	}
+	if f.Network != "" {
+		q += ` AND network = ` + arg(f.Network)
+	}
+	for _, t := range NormalizeTags(f.Tags) {
+		// @> containment with a single-element array is exactly what the
+		// GIN index added in migration 0032 is built for, so tag filters
+		// stay indexed. Repeated tags AND together: every tag must be
+		// carried.
+		q += ` AND tags @> ` + arg([]string{t})
 	}
 	switch {
 	case f.Enabled != nil && *f.Enabled:
@@ -174,11 +501,15 @@ func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monito
 	}
 	sort := monitorSort(f.Sort)
 	if f.AfterID != 0 {
+		// The cursor row is read under the same workspace predicate as the page,
+		// so an id belonging to another tenant cannot even be used to probe that
+		// tenant's ordering.
+		ws := workspaceID(ctx)
 		switch sort {
 		case "name":
-			q += ` AND (lower(name), id) > (SELECT lower(name), id FROM monitors WHERE id = ` + arg(f.AfterID) + `)`
+			q += ` AND (lower(name), id) > (SELECT lower(name), id FROM monitors WHERE id = ` + arg(f.AfterID) + ` AND workspace_id = ` + arg(ws) + ` AND deleted_at IS NULL)`
 		case "created_at":
-			q += ` AND (created_at, id) < (SELECT created_at, id FROM monitors WHERE id = ` + arg(f.AfterID) + `)`
+			q += ` AND (created_at, id) < (SELECT created_at, id FROM monitors WHERE id = ` + arg(f.AfterID) + ` AND workspace_id = ` + arg(ws) + ` AND deleted_at IS NULL)`
 		default:
 			q += ` AND id < ` + arg(f.AfterID)
 		}
@@ -192,7 +523,7 @@ func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monito
 		q += ` ORDER BY id DESC`
 	}
 	q += ` LIMIT ` + arg(pageLimit(f.Limit))
-	rows, err := p.pool.Query(ctx, q, args...)
+	rows, err := p.queryRows(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -220,20 +551,41 @@ func monitorSort(s string) string {
 }
 
 func (p *Postgres) UpdateMonitor(ctx context.Context, m *Monitor) error {
+	if err := normalizeMonitorGuidance(m); err != nil {
+		return err
+	}
 	ids, err := json.Marshal(m.ContractIDs)
 	if err != nil {
 		return err
 	}
-	tag, err := p.pool.Exec(ctx,
-		`UPDATE monitors SET name = $2, contract_ids = $3, enabled = $4, priority = $5 WHERE id = $1`,
-		m.ID, m.Name, ids, m.Enabled, m.Priority.Normalized())
+	m.Tags = NormalizeTags(m.Tags)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	var network string
+	if err := tx.QueryRow(ctx,
+		`SELECT network FROM monitors WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+		m.ID, workspaceID(ctx)).Scan(&network); err != nil {
+		return mapErr(err)
+	}
+	tag, err := tx.Exec(ctx,
+		`UPDATE monitors SET name = $3, contract_ids = $4, tags = $5, enabled = $6, priority = $7, runbook_url = $8, response_guidance = $9 WHERE id = $1 AND workspace_id = $2`,
+		m.ID, workspaceID(ctx), m.Name, ids, m.Tags, m.Enabled, m.Priority.Normalized(), m.RunbookURL, m.ResponseGuidance)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}
-	return nil
+	if err := cleanupUnusedContractCursors(ctx, tx, network); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func uniqueIDs(ids []int64) []int64 {
@@ -255,8 +607,8 @@ func (p *Postgres) SetMonitorsEnabled(ctx context.Context, ids []int64, enabled 
 		return 0, []int64{}, nil
 	}
 	rows, err := p.pool.Query(ctx,
-		`UPDATE monitors SET enabled = $1 WHERE id = ANY($2) RETURNING id`,
-		enabled, uniq)
+		`UPDATE monitors SET enabled = $1 WHERE id = ANY($2) AND workspace_id = $3 RETURNING id`,
+		enabled, uniq, workspaceID(ctx))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -284,23 +636,193 @@ func (p *Postgres) SetMonitorsEnabled(ctx context.Context, ids []int64, enabled 
 }
 
 func (p *Postgres) DeleteMonitor(ctx context.Context, id int64) error {
-	return p.deleteByID(ctx, "monitors", id)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	var network string
+	if err := tx.QueryRow(ctx,
+		`SELECT network FROM monitors WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+		id, workspaceID(ctx)).Scan(&network); err != nil {
+		return mapErr(err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM monitors WHERE id = $1 AND workspace_id = $2`, id, workspaceID(ctx)); err != nil {
+		return err
+	}
+	if err := cleanupUnusedContractCursors(ctx, tx, network); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// SoftDeleteMonitor marks a monitor as deleted without removing it.
+// The monitor stops alerting immediately but can be restored within
+// the restore window.
+func (p *Postgres) SoftDeleteMonitor(ctx context.Context, id int64) error {
+	tag, err := p.pool.Exec(ctx,
+		`UPDATE monitors SET deleted_at = now() WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL`,
+		id, workspaceID(ctx))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// RestoreMonitor restores a soft-deleted monitor. Returns ErrNotFound
+// if the monitor doesn't exist or isn't deleted.
+func (p *Postgres) RestoreMonitor(ctx context.Context, id int64) error {
+	ws := workspaceID(ctx)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return mapErr(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	var exists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM monitors WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NOT NULL)`,
+		id, ws).Scan(&exists); err != nil {
+		return mapErr(err)
+	}
+	if !exists {
+		return ErrNotFound
+	}
+	if err := p.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx,
+		`UPDATE monitors SET deleted_at = NULL WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NOT NULL`,
+		id, ws)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return mapErr(tx.Commit(ctx))
+}
+
+// ListDeletedMonitors returns soft-deleted monitors (the "trash").
+func (p *Postgres) ListDeletedMonitors(ctx context.Context, f ListFilter) ([]Monitor, error) {
+	q := `SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE workspace_id = $1 AND deleted_at IS NOT NULL`
+	args := []any{workspaceID(ctx)}
+	n := 1
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	if f.Query != "" {
+		q += ` AND strpos(lower(name), lower(` + arg(f.Query) + `)) > 0`
+	}
+	if f.Network != "" {
+		q += ` AND network = ` + arg(f.Network)
+	}
+	switch {
+	case f.Enabled != nil && *f.Enabled:
+		q += ` AND enabled`
+	case f.Enabled != nil && !*f.Enabled:
+		q += ` AND NOT enabled`
+	case f.EnabledOnly:
+		q += ` AND enabled`
+	}
+	sort := monitorSort(f.Sort)
+	if f.AfterID != 0 {
+		ws := workspaceID(ctx)
+		switch sort {
+		case "name":
+			q += ` AND (lower(name), id) > (SELECT lower(name), id FROM monitors WHERE id = ` + arg(f.AfterID) + ` AND workspace_id = ` + arg(ws) + ` AND deleted_at IS NOT NULL)`
+		case "created_at":
+			q += ` AND (created_at, id) < (SELECT created_at, id FROM monitors WHERE id = ` + arg(f.AfterID) + ` AND workspace_id = ` + arg(ws) + ` AND deleted_at IS NOT NULL)`
+		default:
+			q += ` AND id < ` + arg(f.AfterID)
+		}
+	}
+	switch sort {
+	case "name":
+		q += ` ORDER BY lower(name) ASC, id ASC`
+	case "created_at":
+		q += ` ORDER BY created_at DESC, id DESC`
+	default:
+		q += ` ORDER BY id DESC`
+	}
+	q += ` LIMIT ` + arg(pageLimit(f.Limit))
+	rows, err := p.queryRows(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Monitor
+	for rows.Next() {
+		m, err := scanMonitor(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *m)
+	}
+	return out, rows.Err()
+}
+
+// HardDeleteMonitor permanently removes a monitor and its rules/attachments.
+func (p *Postgres) HardDeleteMonitor(ctx context.Context, id int64) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	var network string
+	if err := tx.QueryRow(ctx,
+		`SELECT network FROM monitors WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+		id, workspaceID(ctx)).Scan(&network); err != nil {
+		return mapErr(err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM monitors WHERE id = $1 AND workspace_id = $2`, id, workspaceID(ctx)); err != nil {
+		return err
+	}
+	if err := cleanupUnusedContractCursors(ctx, tx, network); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, error) {
+	ws := workspaceID(ctx)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return nil, err
+	}
 
 	src, err := scanMonitor(tx.QueryRow(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority FROM monitors WHERE id = $1`, id))
+		`SELECT id, name, contract_ids, tags, enabled, created_at, last_matched_at, priority, network, deleted_at, runbook_url, response_guidance, workspace_id FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
 	if err != nil {
 		return nil, err
 	}
+	// Both sides of the attachment are checked, not just the monitor. A row
+	// attached before tenancy existed (or by a path that has since been scoped)
+	// must not be carried into the copy: that would move a channel this tenant
+	// cannot see — and whose webhook target it therefore should not start
+	// firing — onto a monitor it can. The list read here is the list copied, so
+	// the returned snapshot cannot promise an attachment the copy lacks.
 	chRows, err := tx.Query(ctx,
-		`SELECT channel_id FROM monitor_channels WHERE monitor_id = $1 ORDER BY channel_id`, id)
+		`SELECT mc.channel_id FROM monitor_channels mc
+		   JOIN monitors m ON m.id = mc.monitor_id
+		   JOIN channels c ON c.id = mc.channel_id
+		  WHERE mc.monitor_id = $1 AND m.workspace_id = $2 AND c.workspace_id = $2
+		  ORDER BY mc.channel_id`, id, ws)
 	if err != nil {
 		return nil, err
 	}
@@ -309,19 +831,30 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 		return nil, err
 	}
 	ruleRows, err := tx.Query(ctx,
-		`SELECT type, params, enabled FROM rules WHERE monitor_id = $1 ORDER BY id`, id)
+		`SELECT r.type, r.params, r.enabled, r.runbook_url, r.response_guidance FROM rules r
+		   JOIN monitors m ON m.id = r.monitor_id
+		  WHERE r.monitor_id = $1 AND m.workspace_id = $2 ORDER BY r.id`, id, ws)
 	if err != nil {
 		return nil, err
 	}
 	rules, err := pgx.CollectRows(ruleRows, func(row pgx.CollectableRow) (Rule, error) {
 		var r Rule
-		err := row.Scan(&r.Type, &r.Params, &r.Enabled)
+		err := row.Scan(&r.Type, &r.Params, &r.Enabled, &r.RunbookURL, &r.ResponseGuidance)
 		return r, err
 	})
 	if err != nil {
 		return nil, err
 	}
-	nameRows, err := tx.Query(ctx, `SELECT name FROM monitors`)
+	if err := p.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return nil, err
+	}
+	if err := p.checkRuleQuota(ctx, tx, ws, int64(len(rules))); err != nil {
+		return nil, err
+	}
+	// Name uniqueness is a workspace question, not a global one: two teams may
+	// each have a monitor called "Vault minter", and a copy must not be forced
+	// to "(copy 2)" because another tenant used the plain name first.
+	nameRows, err := tx.Query(ctx, `SELECT name FROM monitors WHERE workspace_id = $1`, ws)
 	if err != nil {
 		return nil, err
 	}
@@ -339,18 +872,26 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 		ContractIDs: src.ContractIDs,
 		Enabled:     false,                     // never inherit enabled: a duplicate must be reviewed first
 		Priority:    src.Priority.Normalized(), // priority is queue position, not a safety switch, so the copy keeps it
+		// The network is not a reviewable setting: the copy watches the same
+		// contract ids, which only exist on the source's chain.
+		Network: src.Network,
+		// Tags group related monitors, so a duplicate belongs in the same
+		// groups until an operator says otherwise.
+		Tags:             NormalizeTags(src.Tags),
+		RunbookURL:       src.RunbookURL,
+		ResponseGuidance: src.ResponseGuidance,
 	}
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled, priority) VALUES ($1, $2, $3, $4)
+		`INSERT INTO monitors (name, contract_ids, tags, enabled, priority, workspace_id, network, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING id, created_at`,
-		copy.Name, ids, copy.Enabled, copy.Priority,
+		copy.Name, ids, copy.Tags, copy.Enabled, copy.Priority, ws, copy.Network, copy.RunbookURL, copy.ResponseGuidance,
 	).Scan(&copy.ID, &copy.CreatedAt); err != nil {
 		return nil, err
 	}
 	for _, r := range rules {
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES ($1, $2, $3, $4)`,
-			copy.ID, r.Type, jsonOrEmpty(r.Params), r.Enabled); err != nil {
+			`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6)`,
+			copy.ID, r.Type, jsonOrEmpty(r.Params), r.Enabled, r.RunbookURL, r.ResponseGuidance); err != nil {
 			return nil, err
 		}
 	}
@@ -365,17 +906,108 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 		return nil, err
 	}
 	copy.ChannelIDs = src.ChannelIDs
+	copy.WorkspaceID = string(ws)
 	return &copy, nil
 }
 
+// CreateMonitorWithRules creates a monitor, its rules and its channel
+// attachments in one transaction. The three land together or not at all: a
+// monitor whose rules went missing is a monitor that watches a contract and
+// never says anything, and nothing outside this call would report the gap.
+func (p *Postgres) CreateMonitorWithRules(ctx context.Context, m *Monitor, rules []*Rule, channelIDs []int64) error {
+	if err := normalizeMonitorGuidance(m); err != nil {
+		return err
+	}
+	for _, r := range rules {
+		if err := normalizeRuleGuidance(r); err != nil {
+			return err
+		}
+	}
+	ws := workspaceID(ctx)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	if err := p.checkMonitorQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	if err := p.checkRuleQuota(ctx, tx, ws, int64(len(rules))); err != nil {
+		return err
+	}
+	ids, err := json.Marshal(m.ContractIDs)
+	if err != nil {
+		return err
+	}
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network, created_at, runbook_url, response_guidance)
+		 VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9)
+		 RETURNING id, created_at`,
+		m.Name, ids, m.Enabled, m.Priority.Normalized(), ws, m.Network, pgCreatedAt(m.CreatedAt), m.RunbookURL, m.ResponseGuidance,
+	).Scan(&m.ID, &m.CreatedAt); err != nil {
+		return err
+	}
+	m.WorkspaceID = string(ws)
+	for _, r := range rules {
+		r.MonitorID = m.ID
+		if err := tx.QueryRow(ctx,
+			`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, version`,
+			r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled, r.RunbookURL, r.ResponseGuidance,
+		).Scan(&r.ID, &r.Version); err != nil {
+			return mapErr(err)
+		}
+	}
+	if err := p.setMonitorChannels(ctx, tx, m.ID, channelIDs, ws); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (p *Postgres) SetMonitorChannels(ctx context.Context, monitorID int64, channelIDs []int64) error {
+	ws := workspaceID(ctx)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
-	if _, err := tx.Exec(ctx, `DELETE FROM monitor_channels WHERE monitor_id = $1`, monitorID); err != nil {
+	if err := p.setMonitorChannels(ctx, tx, monitorID, channelIDs, ws); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// setMonitorChannels replaces one monitor's notification targets inside an
+// open transaction, so a caller that is already writing a monitor does not
+// have to open a second one.
+//
+// Both sides must belong to the caller's workspace: the monitor check is
+// what stops one tenant re-pointing another's monitor, and the channel check
+// is what stops a tenant attaching a channel it cannot see, which would
+// route this workspace's alerts to a webhook owned by someone else.
+func (p *Postgres) setMonitorChannels(ctx context.Context, tx pgx.Tx, monitorID int64, channelIDs []int64, ws workspace.ID) error {
+	if err := p.requireMonitorWorkspace(ctx, tx, monitorID, ws); err != nil {
+		return err
+	}
+	if uniq := uniqueIDs(channelIDs); len(uniq) > 0 {
+		var count int
+		if err := tx.QueryRow(ctx,
+			`SELECT count(*) FROM channels WHERE id = ANY($1) AND workspace_id = $2`,
+			uniq, ws).Scan(&count); err != nil {
+			return err
+		}
+		if count != len(uniq) {
+			return ErrNotFound
+		}
+	}
+
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM monitor_channels
+		  WHERE monitor_id IN (SELECT id FROM monitors WHERE id = $1 AND workspace_id = $2)`,
+		monitorID, ws); err != nil {
 		return err
 	}
 	for _, cid := range channelIDs {
@@ -385,7 +1017,7 @@ func (p *Postgres) SetMonitorChannels(ctx context.Context, monitorID int64, chan
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 type rowScanner interface{ Scan(dest ...any) error }
@@ -393,11 +1025,20 @@ type rowScanner interface{ Scan(dest ...any) error }
 func scanMonitor(r rowScanner) (*Monitor, error) {
 	var m Monitor
 	var ids []byte
+	var tags []string
 	var priority string
-	if err := r.Scan(&m.ID, &m.Name, &ids, &m.Enabled, &m.CreatedAt, &m.LastMatchedAt, &priority); err != nil {
+	var deletedAt *time.Time
+	if err := r.Scan(&m.ID, &m.Name, &ids, &tags, &m.Enabled, &m.CreatedAt, &m.LastMatchedAt, &priority, &m.Network, &deletedAt, &m.RunbookURL, &m.ResponseGuidance, &m.WorkspaceID); err != nil {
 		return nil, mapErr(err)
 	}
 	m.Priority = Priority(priority).Normalized()
+	m.DeletedAt = deletedAt
+	m.Tags = tags
+	if m.Tags == nil {
+		// A monitor without tags reads back as an empty list, not nil, so
+		// JSON output is always an array.
+		m.Tags = []string{}
+	}
 	if err := json.Unmarshal(ids, &m.ContractIDs); err != nil {
 		return nil, fmt.Errorf("monitor %d: bad contract_ids: %w", m.ID, err)
 	}
@@ -405,17 +1046,69 @@ func scanMonitor(r rowScanner) (*Monitor, error) {
 }
 
 // --- rules ---
+//
+// Rules carry no workspace column of their own: their monitor_id foreign key
+// is the tenant link, so every rule query here reaches monitors. Denormalising
+// the workspace onto rules would give a row two ways to say who owns it, and
+// they can disagree.
+
+// requireMonitorWorkspace fails with ErrNotFound unless monitorID is a monitor
+// in ws. It accepts either the pool or an open transaction so CreateRule,
+// CreateRules and SetMonitorChannels share one check. A monitor the caller
+// cannot see fails exactly as a monitor that does not exist does, so the two
+// are indistinguishable to the caller.
+func (p *Postgres) requireMonitorWorkspace(ctx context.Context, q rowQueryer, monitorID int64, ws workspace.ID) error {
+	var ok bool
+	if err := q.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM monitors WHERE id = $1 AND workspace_id = $2)`,
+		monitorID, ws).Scan(&ok); err != nil {
+		return err
+	}
+	if !ok {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// rowQueryer is the one method both *pgxpool.Pool and pgx.Tx provide for a
+// single-row read, so a helper can run inside or outside a transaction.
+type rowQueryer interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
 
 func (p *Postgres) CreateRule(ctx context.Context, r *Rule) error {
-	return mapErr(p.pool.QueryRow(ctx,
-		`INSERT INTO rules (monitor_id, type, params, enabled) VALUES ($1, $2, $3, $4) RETURNING id`,
-		r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled,
-	).Scan(&r.ID))
+	if err := normalizeRuleGuidance(r); err != nil {
+		return err
+	}
+	ws := workspaceID(ctx)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return mapErr(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := p.requireMonitorWorkspace(ctx, tx, r.MonitorID, ws); err != nil {
+		return err
+	}
+	if err := p.checkRuleQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, version`,
+		r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled, r.RunbookURL, r.ResponseGuidance,
+	).Scan(&r.ID, &r.Version); err != nil {
+		return mapErr(err)
+	}
+	return mapErr(tx.Commit(ctx))
 }
 
 func (p *Postgres) CreateRules(ctx context.Context, rules []*Rule) error {
 	if len(rules) == 0 {
 		return nil
+	}
+	for _, r := range rules {
+		if err := normalizeRuleGuidance(r); err != nil {
+			return err
+		}
 	}
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
@@ -423,11 +1116,20 @@ func (p *Postgres) CreateRules(ctx context.Context, rules []*Rule) error {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
+	ws := workspaceID(ctx)
+	for _, r := range rules {
+		if err := p.requireMonitorWorkspace(ctx, tx, r.MonitorID, ws); err != nil {
+			return err
+		}
+	}
+	if err := p.checkRuleQuota(ctx, tx, ws, int64(len(rules))); err != nil {
+		return err
+	}
 	for _, r := range rules {
 		if err := tx.QueryRow(ctx,
-			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES ($1, $2, $3, $4) RETURNING id`,
-			r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled,
-		).Scan(&r.ID); err != nil {
+			`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, version`,
+			r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled, r.RunbookURL, r.ResponseGuidance,
+		).Scan(&r.ID, &r.Version); err != nil {
 			return mapErr(err)
 		}
 	}
@@ -437,8 +1139,10 @@ func (p *Postgres) CreateRules(ctx context.Context, rules []*Rule) error {
 func (p *Postgres) GetRule(ctx context.Context, id int64) (*Rule, error) {
 	var r Rule
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, monitor_id, type, params, enabled FROM rules WHERE id = $1`, id,
-	).Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled)
+		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version, r.runbook_url, r.response_guidance FROM rules r
+		   JOIN monitors m ON m.id = r.monitor_id
+		  WHERE r.id = $1 AND m.workspace_id = $2`, id, workspaceID(ctx),
+	).Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled, &r.Version, &r.RunbookURL, &r.ResponseGuidance)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -446,26 +1150,117 @@ func (p *Postgres) GetRule(ctx context.Context, id int64) (*Rule, error) {
 }
 
 func (p *Postgres) ListRules(ctx context.Context, monitorID int64, enabledOnly bool) ([]Rule, error) {
-	q := `SELECT id, monitor_id, type, params, enabled FROM rules WHERE monitor_id = $1`
-	if enabledOnly {
-		q += ` AND enabled`
-	}
-	q += ` ORDER BY id`
-	rows, err := p.pool.Query(ctx, q, monitorID)
+	var out []Rule
+	err := p.read(ctx, func(ctx context.Context) error {
+		// The predicate is conditional because ListRules serves two callers with
+		// different scopes: the API (one workspace) and the poller's per-monitor
+		// rule loading, which runs under the cross-tenant system scope and would
+		// otherwise find no rules for a monitor outside the default workspace.
+		q := `SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version, r.runbook_url, r.response_guidance FROM rules r
+		         JOIN monitors m ON m.id = r.monitor_id
+		        WHERE r.monitor_id = $1`
+		args := []any{monitorID}
+		if ws, scoped := tenantWorkspace(ctx); scoped {
+			q += ` AND m.workspace_id = $2`
+			args = append(args, ws)
+		}
+		if enabledOnly {
+			q += ` AND r.enabled`
+		}
+		q += ` ORDER BY r.id`
+		rows, err := p.pool.Query(ctx, q, args...)
+		if err != nil {
+			return err
+		}
+		page, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Rule, error) {
+			var r Rule
+			err := row.Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled, &r.Version, &r.RunbookURL, &r.ResponseGuidance)
+			return r, err
+		})
+		if err != nil {
+			return err
+		}
+		out = page
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Rule, error) {
-		var r Rule
-		err := row.Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled)
-		return r, err
-	})
+	return out, nil
 }
 
 func (p *Postgres) UpdateRule(ctx context.Context, r *Rule) error {
+	if err := normalizeRuleGuidance(r); err != nil {
+		return err
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	ws := workspaceID(ctx)
+	var oldType string
+	var oldParams []byte
+	if err := tx.QueryRow(ctx,
+		`SELECT r.type, r.params FROM rules r
+		   JOIN monitors m ON m.id = r.monitor_id
+		  WHERE r.id = $1 AND m.workspace_id = $2
+		  FOR UPDATE OF r`,
+		r.ID, ws,
+	).Scan(&oldType, &oldParams); err != nil {
+		return mapErr(err)
+	}
+
+	newParams := jsonOrEmpty(r.Params)
+	conditionChanged := oldType != r.Type || !canonicalJSONEqual(oldParams, newParams)
+	disabled := !r.Enabled
+
+	if conditionChanged {
+		if err := tx.QueryRow(ctx,
+			`UPDATE rules
+			    SET type = $2, params = $3, enabled = $4, runbook_url = $5, response_guidance = $6, version = version + 1,
+			        last_alert_at = NULL, suppressed_since_last = 0
+			  WHERE id = $1
+			  RETURNING version`,
+			r.ID, r.Type, newParams, r.Enabled, r.RunbookURL, r.ResponseGuidance,
+		).Scan(&r.Version); err != nil {
+			return mapErr(err)
+		}
+	} else {
+		if err := tx.QueryRow(ctx,
+			`UPDATE rules
+			    SET type = $2, params = $3, enabled = $4, runbook_url = $5, response_guidance = $6, version = version + 1
+			  WHERE id = $1
+			  RETURNING version`,
+			r.ID, r.Type, newParams, r.Enabled, r.RunbookURL, r.ResponseGuidance,
+		).Scan(&r.Version); err != nil {
+			return mapErr(err)
+		}
+	}
+
+	if conditionChanged || disabled {
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM rule_absence_state WHERE rule_id = $1`, r.ID); err != nil {
+			return mapErr(err)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE alert_escalations
+			    SET completed_at = now(), updated_at = now()
+			  WHERE completed_at IS NULL
+			    AND alert_id IN (SELECT id FROM alerts WHERE rule_id = $1 AND workspace_id = $2)`,
+			r.ID, ws); err != nil {
+			return mapErr(err)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) DeleteRule(ctx context.Context, id int64) error {
 	tag, err := p.pool.Exec(ctx,
-		`UPDATE rules SET type = $2, params = $3, enabled = $4 WHERE id = $1`,
-		r.ID, r.Type, jsonOrEmpty(r.Params), r.Enabled)
+		`DELETE FROM rules r USING monitors m
+		  WHERE r.id = $1 AND m.id = r.monitor_id AND m.workspace_id = $2`,
+		id, workspaceID(ctx))
 	if err != nil {
 		return err
 	}
@@ -475,8 +1270,50 @@ func (p *Postgres) UpdateRule(ctx context.Context, r *Rule) error {
 	return nil
 }
 
-func (p *Postgres) DeleteRule(ctx context.Context, id int64) error {
-	return p.deleteByID(ctx, "rules", id)
+// --- absence-of-event state ---
+
+func (p *Postgres) ListAbsenceState(ctx context.Context) ([]AbsenceState, error) {
+	var out []AbsenceState
+	err := p.read(ctx, func(ctx context.Context) error {
+		rows, err := p.pool.Query(ctx,
+			`SELECT rule_id, event_name, last_seen_at FROM rule_absence_state`)
+		if err != nil {
+			return err
+		}
+		page, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (AbsenceState, error) {
+			var s AbsenceState
+			err := row.Scan(&s.RuleID, &s.EventName, &s.LastSeen)
+			return s, err
+		})
+		if err != nil {
+			return err
+		}
+		out = page
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (p *Postgres) RecordAbsenceSeen(ctx context.Context, ruleID int64, eventName string, at time.Time) error {
+	// GREATEST is what makes the clock monotonic in one statement: the sweep
+	// and the rearm path both write here, and neither may move a clock that a
+	// newer event already advanced.
+	_, err := p.pool.Exec(ctx,
+		`INSERT INTO rule_absence_state (rule_id, event_name, last_seen_at, updated_at)
+		 VALUES ($1, $2, $3, now())
+		 ON CONFLICT (rule_id, event_name) DO UPDATE
+		 SET last_seen_at = GREATEST(rule_absence_state.last_seen_at, EXCLUDED.last_seen_at),
+		     updated_at   = now()`,
+		ruleID, eventName, at.UTC())
+	return err
+}
+
+func (p *Postgres) DeleteAbsenceStateForRule(ctx context.Context, ruleID int64) error {
+	_, err := p.pool.Exec(ctx, `DELETE FROM rule_absence_state WHERE rule_id = $1`, ruleID)
+	return err
 }
 
 // --- channels ---
@@ -486,34 +1323,64 @@ func (p *Postgres) CreateChannel(ctx context.Context, c *Channel) error {
 	if err != nil {
 		return err
 	}
-	return p.pool.QueryRow(ctx,
-		`INSERT INTO channels (name, type, config, enabled) VALUES ($1, $2, $3, $4)
+	ws := workspaceID(ctx)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return mapErr(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := p.checkChannelQuota(ctx, tx, ws, 1); err != nil {
+		return err
+	}
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO channels (name, type, config, enabled, digest_mode, digest_window_seconds, timeout, workspace_id, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, now()))
 		 RETURNING id, created_at`,
-		c.Name, c.Type, config, c.Enabled,
-	).Scan(&c.ID, &c.CreatedAt)
+		c.Name, c.Type, config, c.Enabled, c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(), ws, pgCreatedAt(c.CreatedAt),
+	).Scan(&c.ID, &c.CreatedAt); err != nil {
+		return mapErr(err)
+	}
+	c.WorkspaceID = string(ws)
+	return mapErr(tx.Commit(ctx))
 }
 
 func (p *Postgres) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 	var c Channel
+	var timeoutSec int
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, name, type, config, enabled, created_at FROM channels WHERE id = $1`, id,
-	).Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.Enabled, &c.CreatedAt)
+		`SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout,
+		        consecutive_failures, consecutive_permanent_failures, last_error,
+		        last_error_at, last_success_at, disabled_at, workspace_id
+		 FROM channels WHERE id = $1 AND workspace_id = $2`, id, workspaceID(ctx),
+	).Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.Enabled, &c.CreatedAt, &c.DigestMode, &c.DigestWindowSeconds, &timeoutSec,
+		&c.ConsecutiveFailures, &c.ConsecutivePermanentFailures, &c.LastError,
+		&c.LastErrorAt, &c.LastSuccessAt, &c.DisabledAt, &c.WorkspaceID)
 	if err != nil {
 		return nil, mapErr(err)
 	}
+	c.Timeout = time.Duration(timeoutSec) * time.Second
 	if err := decryptChannel(p.cipher, &c); err != nil {
 		return nil, err
 	}
 	return &c, nil
 }
 
+// ListChannels serves the dashboard listing and the notifier's startup
+// validation, so it honours the cross-tenant system scope like ListMonitors.
 func (p *Postgres) ListChannels(ctx context.Context, enabledOnly bool) ([]Channel, error) {
-	q := `SELECT id, name, type, config, enabled, created_at FROM channels`
+	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout,
+		        consecutive_failures, consecutive_permanent_failures, last_error,
+		        last_error_at, last_success_at, disabled_at, workspace_id FROM channels WHERE TRUE`
+	args := []any{}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		args = append(args, ws)
+		q += ` AND workspace_id = $1`
+	}
 	if enabledOnly {
-		q += ` WHERE enabled`
+		q += ` AND enabled`
 	}
 	q += ` ORDER BY id`
-	rows, err := p.pool.Query(ctx, q)
+	rows, err := p.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -521,7 +1388,9 @@ func (p *Postgres) ListChannels(ctx context.Context, enabledOnly bool) ([]Channe
 }
 
 func (p *Postgres) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel, error) {
-	q := `SELECT id, name, type, config, enabled, created_at FROM channels WHERE TRUE`
+	q := `SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout,
+		        consecutive_failures, consecutive_permanent_failures, last_error,
+		        last_error_at, last_success_at, disabled_at, workspace_id FROM channels WHERE TRUE`
 	args := []any{}
 	n := 0
 	arg := func(v any) string {
@@ -529,6 +1398,7 @@ func (p *Postgres) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channe
 		args = append(args, v)
 		return fmt.Sprintf("$%d", n)
 	}
+	q += ` AND workspace_id = ` + arg(workspaceID(ctx))
 	if f.EnabledOnly {
 		q += ` AND enabled`
 	}
@@ -546,14 +1416,75 @@ func (p *Postgres) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channe
 	return pgx.CollectRows(rows, p.scanChannel)
 }
 
+func (p *Postgres) SetChannelsEnabled(ctx context.Context, ids []int64, enabled bool) (int, []int64, error) {
+	uniq := uniqueIDs(ids)
+	if len(uniq) == 0 {
+		return 0, []int64{}, nil
+	}
+	// The CASE arms mirror UpdateChannel: an off-to-on transition clears the
+	// health state, so a bulk re-enable is as explicit a recovery as a single one.
+	rows, err := p.pool.Query(ctx,
+		`UPDATE channels SET
+		   enabled = $1,
+		   consecutive_failures = CASE WHEN $1 AND NOT enabled THEN 0 ELSE consecutive_failures END,
+		   consecutive_permanent_failures = CASE WHEN $1 AND NOT enabled THEN 0 ELSE consecutive_permanent_failures END,
+		   last_error = CASE WHEN $1 AND NOT enabled THEN '' ELSE last_error END,
+		   last_error_at = CASE WHEN $1 AND NOT enabled THEN NULL ELSE last_error_at END,
+		   disabled_at = CASE WHEN $1 AND NOT enabled THEN NULL ELSE disabled_at END
+		 WHERE id = ANY($2) AND workspace_id = $3 RETURNING id`,
+		enabled, uniq, workspaceID(ctx))
+	if err != nil {
+		return 0, nil, err
+	}
+	defer rows.Close()
+	found := make(map[int64]struct{}, len(uniq))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return 0, nil, err
+		}
+		found[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, nil, err
+	}
+	return len(found), unknownIDs(uniq, found), nil
+}
+
+// unknownIDs returns the ids in want that are absent from found, never nil.
+func unknownIDs(want []int64, found map[int64]struct{}) []int64 {
+	unknown := make([]int64, 0)
+	for _, id := range want {
+		if _, ok := found[id]; !ok {
+			unknown = append(unknown, id)
+		}
+	}
+	return unknown
+}
+
 func (p *Postgres) UpdateChannel(ctx context.Context, c *Channel) error {
 	config, err := configForWrite(p.cipher, c.ID, c.Name, c.Config)
 	if err != nil {
 		return err
 	}
+	// Turning a channel back on clears the health state that auto-disable
+	// set, in the same statement, so the channel cannot re-disable on the
+	// next failure because of counters accumulated before it was fixed. The
+	// `NOT enabled` test reads the pre-update value, so this fires on a
+	// genuine off-to-on transition only: renaming a channel that is still
+	// failing must not quietly wipe the evidence. This write is the one way
+	// back from auto-disable, which is what makes re-enabling explicit.
 	tag, err := p.pool.Exec(ctx,
-		`UPDATE channels SET name = $2, type = $3, config = $4, enabled = $5 WHERE id = $1`,
-		c.ID, c.Name, c.Type, config, c.Enabled)
+		`UPDATE channels SET
+		   name = $2, type = $3, config = $4, enabled = $5,
+		   digest_mode = $6, digest_window_seconds = $7, timeout = $8,
+		   consecutive_failures = CASE WHEN $5 AND NOT enabled THEN 0 ELSE consecutive_failures END,
+		   consecutive_permanent_failures = CASE WHEN $5 AND NOT enabled THEN 0 ELSE consecutive_permanent_failures END,
+		   last_error = CASE WHEN $5 AND NOT enabled THEN '' ELSE last_error END,
+		   last_error_at = CASE WHEN $5 AND NOT enabled THEN NULL ELSE last_error_at END,
+		   disabled_at = CASE WHEN $5 AND NOT enabled THEN NULL ELSE disabled_at END
+		 WHERE id = $1 AND workspace_id = $9`,
+		c.ID, c.Name, c.Type, config, c.Enabled, c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(), workspaceID(ctx))
 	if err != nil {
 		return err
 	}
@@ -563,17 +1494,134 @@ func (p *Postgres) UpdateChannel(ctx context.Context, c *Channel) error {
 	return nil
 }
 
+// RecordChannelHealth applies one delivery outcome to a channel's health
+// counters. Everything happens in a single statement so concurrent
+// dispatches cannot lose an increment, and the auto-disable decision is made
+// against the value the row actually has rather than one read earlier.
+func (p *Postgres) RecordChannelHealth(ctx context.Context, channelID int64, u ChannelHealthUpdate) error {
+	if u.At.IsZero() {
+		u.At = time.Now()
+	}
+	permanent := u.Permanent && !u.Success
+	if _, err := p.pool.Exec(ctx,
+		`UPDATE channels SET
+		   consecutive_failures = CASE WHEN $2 THEN 0 ELSE consecutive_failures + 1 END,
+		   consecutive_permanent_failures = CASE
+		     WHEN $2 THEN 0
+		     WHEN $3 THEN consecutive_permanent_failures + 1
+		     ELSE consecutive_permanent_failures
+		   END,
+		   -- The casts are load-bearing: without them the parameter is offered a
+		   -- NULL branch to resolve against and Postgres reads $5 as text.
+		   last_error = CASE WHEN $2 THEN '' ELSE $4::text END,
+		   last_error_at = CASE WHEN $2 THEN NULL ELSE $5::timestamptz END,
+		   last_success_at = CASE WHEN $2 THEN $5::timestamptz ELSE last_success_at END,
+		   -- A success clears the auto-disable marker only once the channel is
+		   -- actually back on, so a test send through a still-disabled channel
+		   -- cannot make the dashboard claim an operator turned it off.
+		   disabled_at = CASE
+		     WHEN $2 THEN CASE WHEN enabled THEN NULL ELSE disabled_at END
+		     WHEN $3 AND $6::int > 0 AND consecutive_permanent_failures + 1 >= $6::int THEN COALESCE(disabled_at, $5::timestamptz)
+		     ELSE disabled_at
+		   END,
+		   enabled = CASE
+		     WHEN $2 THEN enabled
+		     WHEN $3 AND $6::int > 0 AND consecutive_permanent_failures + 1 >= $6::int THEN false
+		     ELSE enabled
+		   END
+		 WHERE id = $1`,
+		channelID, u.Success, permanent, u.Error, u.At, u.DisableAfter); err != nil {
+		return err
+	}
+	return nil
+}
+
+// DeleteChannel removes a channel, refusing when an escalation policy step
+// still references it. The reference is checked explicitly so the caller gets
+// ErrChannelInUse (mapped to a 409) rather than a raw foreign-key error; the
+// migration's ON DELETE RESTRICT is the backstop for a concurrent policy write.
 func (p *Postgres) DeleteChannel(ctx context.Context, id int64) error {
+	var inUse bool
+	if err := p.pool.QueryRow(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM escalation_step_channels esc
+			JOIN channels c ON c.id = esc.channel_id
+			WHERE esc.channel_id = $1 AND c.workspace_id = $2
+		)`, id, workspaceID(ctx),
+	).Scan(&inUse); err != nil {
+		return err
+	}
+	if inUse {
+		return ErrChannelInUse
+	}
 	return p.deleteByID(ctx, "channels", id)
 }
 
-func (p *Postgres) ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]Channel, error) {
+func (p *Postgres) ListMonitorsForChannel(ctx context.Context, channelID int64) ([]Monitor, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at
+		`SELECT m.id, m.name, m.contract_ids, m.tags, m.enabled, m.created_at, m.last_matched_at, m.priority, m.network, m.deleted_at, m.runbook_url, m.response_guidance, m.workspace_id
+		 FROM monitors m
+		 JOIN monitor_channels mc ON mc.monitor_id = m.id
+		 WHERE mc.channel_id = $1 AND m.workspace_id = $2
+		 ORDER BY m.id`, channelID, workspaceID(ctx))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Monitor
+	for rows.Next() {
+		m, err := scanMonitor(rows)
+		if err != nil {
+			return nil, err
+		}
+		m.ChannelIDs, err = p.monitorChannelIDs(ctx, m.ID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *m)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) ListChannelsForMonitor(ctx context.Context, monitorID int64) ([]Channel, error) {
+	// Scoped when the caller names a tenant, open when it does not: the
+	// dispatcher delivers in the poller's cross-tenant context for a monitor
+	// it already resolved, while the dashboard and the API must not see another
+	// workspace's attachments.
+	scopeClause := ""
+	args := []any{monitorID}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		scopeClause = ` AND m.workspace_id = $2`
+		args = append(args, ws)
+	}
+	rows, err := p.pool.Query(ctx,
+		`SELECT c.id, c.name, c.type, c.config, c.enabled, c.created_at, c.digest_mode, c.digest_window_seconds, c.timeout,
+		        c.consecutive_failures, c.consecutive_permanent_failures, c.last_error,
+		        c.last_error_at, c.last_success_at, c.disabled_at, c.workspace_id
 		 FROM channels c
 		 JOIN monitor_channels mc ON mc.channel_id = c.id
-		 WHERE mc.monitor_id = $1 AND c.enabled
-		 ORDER BY c.id`, monitorID)
+		 JOIN monitors m ON m.id = mc.monitor_id
+		 WHERE mc.monitor_id = $1 AND c.enabled`+scopeClause+`
+		 ORDER BY c.id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, p.scanChannel)
+}
+
+// ListChannelsByIDs returns the enabled channels among ids, ordered by id, so
+// an escalation step can resolve its channel set in one query. Disabled
+// channels are omitted rather than erroring, matching ListChannelsForMonitor:
+// a paused destination simply stops receiving alerts.
+func (p *Postgres) ListChannelsByIDs(ctx context.Context, ids []int64) ([]Channel, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := p.pool.Query(ctx,
+		`SELECT id, name, type, config, enabled, created_at, digest_mode, digest_window_seconds, timeout,
+		        consecutive_failures, consecutive_permanent_failures, last_error,
+		        last_error_at, last_success_at, disabled_at, workspace_id FROM channels
+		  WHERE id = ANY($1) AND enabled ORDER BY id`, uniqueIDs(ids))
 	if err != nil {
 		return nil, err
 	}
@@ -584,23 +1632,531 @@ func (p *Postgres) ListChannelsForMonitor(ctx context.Context, monitorID int64) 
 // caller up the stack (API, dashboard, dispatcher) sees plaintext.
 func (p *Postgres) scanChannel(row pgx.CollectableRow) (Channel, error) {
 	var c Channel
-	if err := row.Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.Enabled, &c.CreatedAt); err != nil {
+	var timeoutSec int
+	if err := row.Scan(&c.ID, &c.Name, &c.Type, &c.Config, &c.Enabled, &c.CreatedAt, &c.DigestMode, &c.DigestWindowSeconds, &timeoutSec,
+		&c.ConsecutiveFailures, &c.ConsecutivePermanentFailures, &c.LastError,
+		&c.LastErrorAt, &c.LastSuccessAt, &c.DisabledAt, &c.WorkspaceID); err != nil {
 		return c, err
 	}
+	c.Timeout = time.Duration(timeoutSec) * time.Second
 	if err := decryptChannel(p.cipher, &c); err != nil {
 		return c, err
 	}
 	return c, nil
 }
 
+// GetChannelDeliveryStats aggregates one channel's delivery attempts over a
+// window entirely in SQL — one statement, whatever the window holds — rather
+// than loading attempts into Go and counting them there. Routable read, for
+// the same reason as GetStats: every number is a count over append-only
+// history, and nothing is written back from it.
+//
+// The shape mirrors GetMonitorStats. The channel-existence probe rides along
+// as the first column so a channel deleted a moment ago reports ErrNotFound
+// instead of a body of zeroes that reads as "quiet but healthy"; the probe is
+// workspace-scoped because channels are a tenant table, while the aggregate
+// itself needs no join for tenancy: delivery_attempts rows are keyed by their
+// channel, and the probe has already proven this caller may see that channel.
+//
+// Both maxes are filtered aggregates, so a window with no successful (or no
+// failed) attempts scans fine and yields NULL, which the *time.Time targets
+// read as a nil pointer — never a zero time. count(*) FILTER over an empty
+// set is 0, and the success rate is derived once in Go by deriveSuccessRate,
+// which keeps division by zero and the nil-when-empty rule out of SQL entirely.
+func (p *Postgres) GetChannelDeliveryStats(ctx context.Context, channelID int64, since time.Time) (ChannelDeliveryStats, error) {
+	cs := ChannelDeliveryStats{ChannelID: channelID}
+	var exists bool
+	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&exists, &cs.Total, &cs.Succeeded, &cs.Failed,
+			&cs.LastSuccessAt, &cs.LastFailureAt)
+	}, `
+		SELECT
+			(SELECT count(*) FROM channels WHERE id = $1 AND workspace_id = $5) > 0,
+			count(*),
+			count(*) FILTER (WHERE da.status = $2),
+			count(*) FILTER (WHERE da.status = $3),
+			max(da.attempted_at) FILTER (WHERE da.status = $2),
+			max(da.attempted_at) FILTER (WHERE da.status = $3)
+		FROM delivery_attempts da
+		WHERE da.channel_id = $1 AND da.attempted_at >= $4`,
+		channelID, DeliveryStatusSuccess, DeliveryStatusFailed, since.UTC(), workspaceID(ctx))
+	if err != nil {
+		return cs, err
+	}
+	if !exists {
+		return cs, ErrNotFound
+	}
+	cs.deriveSuccessRate()
+	return cs, nil
+}
+
+// ChannelDeliveryChangeKey returns the max delivery attempt ID and count for channelID in the caller's workspace.
+func (p *Postgres) ChannelDeliveryChangeKey(ctx context.Context, channelID int64) (maxID int64, count int64, err error) {
+	ws := workspaceID(ctx)
+	var exists bool
+	err = p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&exists, &maxID, &count)
+	}, `
+		SELECT
+			(SELECT count(*) FROM channels WHERE id = $1 AND workspace_id = $2) > 0,
+			COALESCE(max(da.id), 0),
+			count(*)
+		FROM delivery_attempts da
+		WHERE da.channel_id = $1`, channelID, ws)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !exists {
+		return 0, 0, ErrNotFound
+	}
+	return maxID, count, nil
+}
+
+func (p *Postgres) encryptSigningSecret(secret string) (string, error) {
+	return sealSigningSecret(p.cipher, secret)
+}
+
+func (p *Postgres) decryptSigningSecret(stored string) (string, error) {
+	return openSigningSecret(p.cipher, stored)
+}
+
+func (p *Postgres) CreateChannelSigningKey(ctx context.Context, k *ChannelSigningKey) error {
+	if k.ChannelID <= 0 {
+		return errors.New("channel_id is required")
+	}
+	if k.KeyID == "" {
+		return errors.New("key_id is required")
+	}
+	if k.Secret == "" {
+		return errors.New("secret is required")
+	}
+	if k.Status == "" {
+		k.Status = SigningKeyStatusActive
+	}
+	secret, err := p.encryptSigningSecret(k.Secret)
+	if err != nil {
+		return err
+	}
+	ws := workspaceID(ctx)
+	if k.WorkspaceID != "" {
+		ws = workspace.ID(k.WorkspaceID)
+	}
+	return p.pool.QueryRow(ctx,
+		`INSERT INTO channel_signing_keys (channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9, $10)
+		 RETURNING id, created_at`,
+		k.ChannelID, ws, k.KeyID, secret, k.IsCurrent, k.Status, pgCreatedAt(k.CreatedAt), k.ExpiresAt, k.LastUsedAt, k.RevokedAt,
+	).Scan(&k.ID, &k.CreatedAt)
+}
+
+func (p *Postgres) GetChannelSigningKey(ctx context.Context, channelID int64, keyID string) (*ChannelSigningKey, error) {
+	var k ChannelSigningKey
+	var storedSecret string
+	err := p.pool.QueryRow(ctx,
+		`SELECT id, channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at
+		 FROM channel_signing_keys
+		 WHERE channel_id = $1 AND key_id = $2 AND workspace_id = $3`,
+		channelID, keyID, workspaceID(ctx),
+	).Scan(&k.ID, &k.ChannelID, &k.WorkspaceID, &k.KeyID, &storedSecret, &k.IsCurrent, &k.Status, &k.CreatedAt, &k.ExpiresAt, &k.LastUsedAt, &k.RevokedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	dec, err := p.decryptSigningSecret(storedSecret)
+	if err != nil {
+		return nil, err
+	}
+	k.Secret = dec
+	return &k, nil
+}
+
+func (p *Postgres) ListChannelSigningKeys(ctx context.Context, channelID int64) ([]ChannelSigningKey, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT id, channel_id, workspace_id, key_id, is_current, status, created_at, expires_at, last_used_at, revoked_at
+		 FROM channel_signing_keys
+		 WHERE channel_id = $1 AND workspace_id = $2
+		 ORDER BY created_at DESC, id DESC`,
+		channelID, workspaceID(ctx),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChannelSigningKey
+	for rows.Next() {
+		var k ChannelSigningKey
+		if err := rows.Scan(&k.ID, &k.ChannelID, &k.WorkspaceID, &k.KeyID, &k.IsCurrent, &k.Status, &k.CreatedAt, &k.ExpiresAt, &k.LastUsedAt, &k.RevokedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) GetCurrentChannelSigningKey(ctx context.Context, channelID int64) (*ChannelSigningKey, error) {
+	var k ChannelSigningKey
+	var storedSecret string
+	err := p.pool.QueryRow(ctx,
+		`SELECT id, channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at
+		 FROM channel_signing_keys
+		 WHERE channel_id = $1 AND workspace_id = $2 AND is_current = TRUE AND status = 'active'
+		 ORDER BY created_at DESC, id DESC LIMIT 1`,
+		channelID, workspaceID(ctx),
+	).Scan(&k.ID, &k.ChannelID, &k.WorkspaceID, &k.KeyID, &storedSecret, &k.IsCurrent, &k.Status, &k.CreatedAt, &k.ExpiresAt, &k.LastUsedAt, &k.RevokedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	dec, err := p.decryptSigningSecret(storedSecret)
+	if err != nil {
+		return nil, err
+	}
+	k.Secret = dec
+	return &k, nil
+}
+
+func (p *Postgres) RotateChannelSigningKey(ctx context.Context, channelID int64, newKey *ChannelSigningKey) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM channels WHERE id = $1 AND workspace_id = $2)`, channelID, workspaceID(ctx)).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNotFound
+	}
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE channel_signing_keys SET is_current = FALSE WHERE channel_id = $1 AND workspace_id = $2`,
+		channelID, workspaceID(ctx),
+	); err != nil {
+		return err
+	}
+
+	secret, err := p.encryptSigningSecret(newKey.Secret)
+	if err != nil {
+		return err
+	}
+	newKey.ChannelID = channelID
+	newKey.WorkspaceID = string(workspaceID(ctx))
+	newKey.IsCurrent = true
+	newKey.Status = SigningKeyStatusActive
+
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO channel_signing_keys (channel_id, workspace_id, key_id, secret, is_current, status, created_at, expires_at, last_used_at, revoked_at)
+		 VALUES ($1, $2, $3, $4, TRUE, 'active', COALESCE($5, now()), $6, $7, $8)
+		 RETURNING id, created_at`,
+		newKey.ChannelID, newKey.WorkspaceID, newKey.KeyID, secret, pgCreatedAt(newKey.CreatedAt), newKey.ExpiresAt, newKey.LastUsedAt, newKey.RevokedAt,
+	).Scan(&newKey.ID, &newKey.CreatedAt); err != nil {
+		return mapErr(err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) RetireChannelSigningKey(ctx context.Context, channelID int64, keyID string) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var isCurrent bool
+	var status string
+	err = tx.QueryRow(ctx,
+		`SELECT is_current, status FROM channel_signing_keys WHERE channel_id = $1 AND key_id = $2 AND workspace_id = $3`,
+		channelID, keyID, workspaceID(ctx),
+	).Scan(&isCurrent, &status)
+	if err != nil {
+		return mapErr(err)
+	}
+	if isCurrent {
+		return fmt.Errorf("cannot retire active current signing key %q; rotate first", keyID)
+	}
+	if status == SigningKeyStatusRevoked {
+		return fmt.Errorf("key %q is already revoked", keyID)
+	}
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE channel_signing_keys SET status = 'retired' WHERE channel_id = $1 AND key_id = $2 AND workspace_id = $3`,
+		channelID, keyID, workspaceID(ctx),
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) RevokeChannelSigningKey(ctx context.Context, channelID int64, keyID string) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE channel_signing_keys SET status = 'revoked', is_current = FALSE, revoked_at = now()
+		 WHERE channel_id = $1 AND key_id = $2 AND workspace_id = $3`,
+		channelID, keyID, workspaceID(ctx),
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) RecordChannelSigningKeyUsage(ctx context.Context, channelID int64, keyID string, usedAt time.Time) error {
+	if usedAt.IsZero() {
+		usedAt = time.Now()
+	}
+	_, err := p.pool.Exec(ctx,
+		`UPDATE channel_signing_keys SET last_used_at = $1 WHERE channel_id = $2 AND key_id = $3`,
+		usedAt, channelID, keyID,
+	)
+	return err
+}
+
+// ReconcileChannelAcknowledgements evaluates delivery vs human acknowledgement for all channels
+// in the context's workspace (or instance-wide under a system context).
+func (p *Postgres) ReconcileChannelAcknowledgements(ctx context.Context, cfg AckReconciliationConfig) ([]ChannelAckReconciliation, error) {
+	if cfg.LookbackWindow <= 0 {
+		cfg.LookbackWindow = 7 * 24 * time.Hour
+	}
+	if cfg.CriticalAckWindow <= 0 {
+		cfg.CriticalAckWindow = 1 * time.Hour
+	}
+	if cfg.WarningAckWindow <= 0 {
+		cfg.WarningAckWindow = 4 * time.Hour
+	}
+	if cfg.MinDeliveries <= 0 {
+		cfg.MinDeliveries = 3
+	}
+	if cfg.FlagThresholdRate <= 0 {
+		cfg.FlagThresholdRate = 1.0
+	}
+
+	now := time.Now().UTC()
+	lookbackCutoff := now.Add(-cfg.LookbackWindow)
+	critCutoff := now.Add(-cfg.CriticalAckWindow)
+	warnCutoff := now.Add(-cfg.WarningAckWindow)
+
+	ws, isTenant := tenantWorkspace(ctx)
+	targetWS := ""
+	if isTenant {
+		targetWS = string(ws)
+	}
+
+	query := `
+		SELECT
+			c.id,
+			c.workspace_id,
+			COUNT(q.alert_id),
+			COUNT(CASE WHEN q.alert_id IS NOT NULL AND q.acknowledged_at IS NOT NULL THEN 1 END),
+			COUNT(CASE WHEN q.alert_id IS NOT NULL AND q.acknowledged_at IS NULL THEN 1 END)
+		FROM channels c
+		LEFT JOIN (
+			SELECT DISTINCT
+				da.channel_id,
+				da.alert_id,
+				a.acknowledged_at
+			FROM delivery_attempts da
+			JOIN alerts a ON a.id = da.alert_id
+			WHERE da.status = 'success'
+			  AND a.suppressed = FALSE
+			  AND a.inhibited_by_rule_id IS NULL
+			  AND a.retracted_at IS NULL
+			  AND a.severity IN ('warning', 'critical')
+			  AND a.created_at >= $1
+			  AND (
+				  a.acknowledged_at IS NOT NULL
+				  OR (a.severity = 'critical' AND a.created_at <= $2)
+				  OR (a.severity = 'warning' AND a.created_at <= $3)
+			  )
+		) q ON q.channel_id = c.id
+		WHERE ($4 = '' OR c.workspace_id = $4)
+		GROUP BY c.id, c.workspace_id
+		ORDER BY c.id`
+
+	rows, err := p.pool.Query(ctx, query, lookbackCutoff, critCutoff, warnCutoff, targetWS)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	var reconciliations []ChannelAckReconciliation
+	for rows.Next() {
+		var r ChannelAckReconciliation
+		if err := rows.Scan(&r.ChannelID, &r.WorkspaceID, &r.DeliveredTotal, &r.AcknowledgedTotal, &r.UnacknowledgedTotal); err != nil {
+			return nil, mapErr(err)
+		}
+		r.ComputedAt = now
+		if r.DeliveredTotal > 0 {
+			rate := float64(r.UnacknowledgedTotal) / float64(r.DeliveredTotal)
+			r.UnackRate = &rate
+			if r.DeliveredTotal >= cfg.MinDeliveries && rate >= cfg.FlagThresholdRate {
+				r.Flagged = true
+			}
+		}
+		reconciliations = append(reconciliations, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapErr(err)
+	}
+
+	for _, r := range reconciliations {
+		_, err := p.pool.Exec(ctx, `
+			INSERT INTO channel_ack_reconciliations (
+				channel_id, workspace_id, delivered_total, acknowledged_total, unacknowledged_total, unack_rate, flagged, computed_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (channel_id) DO UPDATE SET
+				workspace_id = EXCLUDED.workspace_id,
+				delivered_total = EXCLUDED.delivered_total,
+				acknowledged_total = EXCLUDED.acknowledged_total,
+				unacknowledged_total = EXCLUDED.unacknowledged_total,
+				unack_rate = EXCLUDED.unack_rate,
+				flagged = EXCLUDED.flagged,
+				computed_at = EXCLUDED.computed_at`,
+			r.ChannelID, r.WorkspaceID, r.DeliveredTotal, r.AcknowledgedTotal, r.UnacknowledgedTotal, r.UnackRate, r.Flagged, r.ComputedAt,
+		)
+		if err != nil {
+			return nil, mapErr(err)
+		}
+	}
+
+	return reconciliations, nil
+}
+
+// GetChannelAckReconciliation returns the current acknowledgement reconciliation for one channel.
+func (p *Postgres) GetChannelAckReconciliation(ctx context.Context, channelID int64) (ChannelAckReconciliation, error) {
+	ws := workspaceID(ctx)
+	var r ChannelAckReconciliation
+	var exists bool
+	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&exists, &r.ChannelID, &r.WorkspaceID, &r.DeliveredTotal, &r.AcknowledgedTotal, &r.UnacknowledgedTotal, &r.UnackRate, &r.Flagged, &r.ComputedAt)
+	}, `
+		SELECT
+			(SELECT count(*) FROM channels WHERE id = $1 AND workspace_id = $2) > 0,
+			COALESCE(car.channel_id, $1),
+			COALESCE(car.workspace_id, $2),
+			COALESCE(car.delivered_total, 0),
+			COALESCE(car.acknowledged_total, 0),
+			COALESCE(car.unacknowledged_total, 0),
+			car.unack_rate,
+			COALESCE(car.flagged, FALSE),
+			COALESCE(car.computed_at, now())
+		FROM channels c
+		LEFT JOIN channel_ack_reconciliations car ON car.channel_id = c.id
+		WHERE c.id = $1 AND c.workspace_id = $2`,
+		channelID, ws)
+	if err != nil {
+		return r, mapErr(err)
+	}
+	if !exists {
+		return r, ErrNotFound
+	}
+	return r, nil
+}
+
+// ListChannelAckReconciliations returns the latest acknowledgement reconciliations for all channels.
+func (p *Postgres) ListChannelAckReconciliations(ctx context.Context) (map[int64]ChannelAckReconciliation, error) {
+	ws, isTenant := tenantWorkspace(ctx)
+	targetWS := ""
+	if isTenant {
+		targetWS = string(ws)
+	}
+
+	out := make(map[int64]ChannelAckReconciliation)
+	rows, err := p.pool.Query(ctx, `
+		SELECT channel_id, workspace_id, delivered_total, acknowledged_total, unacknowledged_total, unack_rate, flagged, computed_at
+		FROM channel_ack_reconciliations
+		WHERE ($1 = '' OR workspace_id = $1)
+		ORDER BY channel_id`, targetWS)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var r ChannelAckReconciliation
+		if err := rows.Scan(&r.ChannelID, &r.WorkspaceID, &r.DeliveredTotal, &r.AcknowledgedTotal, &r.UnacknowledgedTotal, &r.UnackRate, &r.Flagged, &r.ComputedAt); err != nil {
+			return nil, mapErr(err)
+		}
+		out[r.ChannelID] = r
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapErr(err)
+	}
+	return out, nil
+}
+
 // --- alerts ---
 
-func (p *Postgres) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error) {
+// CreateAlert wraps the transaction with the store.create_alert span, so
+// the "was it the database write?" half of the slow-alert question has a
+// timeline. The outcome (created | duplicate | suppressed) is an attribute,
+// turning the dedup and cooldown gates into something visible per trace.
+// Only row ids land in attributes; the payload can embed operator data and
+// stays out.
+func (p *Postgres) CreateAlert(ctx context.Context, a *Alert) (outcome AlertOutcome, err error) {
+	if p.telemetry == nil {
+		return p.createAlert(ctx, a)
+	}
+	ctx, span := p.telemetry.WithRequestID(ctx, "store.create_alert",
+		trace.WithAttributes(
+			attribute.Int64(telemetry.AttrMonitorID, a.MonitorID),
+			attribute.Int64(telemetry.AttrRuleID, a.RuleID),
+			attribute.String(telemetry.AttrEventID, a.EventID),
+		),
+	)
+	defer func() {
+		if err != nil {
+			telemetry.RecordError(span, err)
+		} else {
+			telemetry.SetAttrs(span, telemetry.AttrOutcome, string(outcome))
+		}
+		span.End()
+	}()
+	return p.createAlert(ctx, a)
+}
+
+func (p *Postgres) createAlert(ctx context.Context, a *Alert) (AlertOutcome, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return "", err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	if a.Federated {
+		return p.createFederatedAlert(ctx, tx, a)
+	}
+
+	// The rule and the monitor are separate foreign keys, so the database
+	// alone cannot stop an alert that names this tenant's monitor and another
+	// tenant's rule. The join is the check, and it runs inside the same
+	// transaction as the insert. A system context skips it: the poller
+	// resolved both from one monitor it already read.
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		var ok bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (
+			   SELECT 1 FROM rules r
+			     JOIN monitors m ON m.id = r.monitor_id
+			    WHERE r.id = $1 AND r.monitor_id = $2 AND m.workspace_id = $3)`,
+			a.RuleID, a.MonitorID, ws).Scan(&ok); err != nil {
+			return "", mapErr(err)
+		}
+		if !ok {
+			return "", ErrNotFound
+		}
+	}
 
 	// The cooldown decision is taken under a lock on the rule row, so two
 	// poller instances cannot both fire inside one window. A zero cooldown
@@ -658,23 +2214,56 @@ func (p *Postgres) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 	var reserved int
 	err = tx.QueryRow(ctx,
 		`INSERT INTO alert_dedup (rule_id, event_id, alert_created_at) VALUES ($1, $2, now())
-		 ON CONFLICT (rule_id, event_id) DO NOTHING
+		 ON CONFLICT DO NOTHING
 		 RETURNING 1`,
 		a.RuleID, a.EventID).Scan(&reserved)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AlertDuplicate, nil // duplicate (rule_id, event_id): deduped
 	}
 	if err != nil {
-		return "", err
+		// mapErr, not the raw driver error: this insert references the rule,
+		// so a rule that does not exist is a foreign-key violation and has to
+		// reach the caller as one. A raw *pgconn.PgError here is what turned a
+		// bad payload into an unexplained 500.
+		return "", mapErr(err)
 	}
 
+	ws := workspaceID(ctx)
+	if err := tx.QueryRow(ctx,
+		`SELECT
+			COALESCE(
+				NULLIF($1, ''),
+				NULLIF((SELECT runbook_url FROM rules WHERE id = $2), ''),
+				NULLIF((SELECT runbook_url FROM monitors WHERE id = $3), ''),
+				NULLIF((SELECT default_runbook_url FROM workspaces WHERE id = COALESCE((SELECT workspace_id FROM monitors WHERE id = $3), $4)), ''),
+				''
+			),
+			COALESCE(
+				NULLIF($5, ''),
+				NULLIF((SELECT response_guidance FROM rules WHERE id = $2), ''),
+				NULLIF((SELECT response_guidance FROM monitors WHERE id = $3), ''),
+				NULLIF((SELECT default_response_guidance FROM workspaces WHERE id = COALESCE((SELECT workspace_id FROM monitors WHERE id = $3), $4)), ''),
+				''
+			)`,
+		a.RunbookURL, a.RuleID, a.MonitorID, ws, a.ResponseGuidance,
+	).Scan(&a.RunbookURL, &a.ResponseGuidance); err != nil {
+		return "", mapErr(err)
+	}
+	a.Payload = WithGuidance(a.Payload, a.RunbookURL, a.ResponseGuidance)
+
 	err = tx.QueryRow(ctx,
-		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, backfilled, ledger) VALUES ($1, $2, $3, $4, $5, $6)
-		 RETURNING id, created_at`,
-		a.MonitorID, a.RuleID, a.EventID, jsonOrEmpty(a.Payload), a.Backfilled, int64(a.Ledger),
-	).Scan(&a.ID, &a.CreatedAt)
+		// The network is read from the monitor rather than taken from the
+		// caller: a contract id only means anything on the chain it was
+		// deployed to, so the monitor owns the answer and an alert cannot be
+		// filed against a chain its monitor does not watch.
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, backfilled, ledger, network, workspace_id, rule_version, runbook_url, response_guidance)
+			 VALUES ($1, $2, $3, $4, $5, COALESCE(NULLIF($9, ''), (SELECT severity FROM rules WHERE id = $2), 'warning'), $6, $7, (SELECT network FROM monitors WHERE id = $1), COALESCE((SELECT workspace_id FROM monitors WHERE id = $1), $8), COALESCE(NULLIF($10, 0), (SELECT version FROM rules WHERE id = $2), 1), $11, $12)
+			 RETURNING id, created_at, network, severity, rule_version, runbook_url, response_guidance`,
+		a.MonitorID, a.RuleID, a.EventID, jsonOrEmpty(a.Payload), nullableJSON(a.Enrichment), a.Backfilled, int64(a.Ledger),
+		ws, string(a.Severity), a.RuleVersion, a.RunbookURL, a.ResponseGuidance,
+	).Scan(&a.ID, &a.CreatedAt, &a.Network, &a.Severity, &a.RuleVersion, &a.RunbookURL, &a.ResponseGuidance)
 	if err != nil {
-		return "", err
+		return "", mapErr(err)
 	}
 
 	// Link the reserved key to the row it produced, and carry the alert's
@@ -710,17 +2299,137 @@ func (p *Postgres) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 	return AlertCreated, nil
 }
 
+// createFederatedAlert stores an alert another SoroBeacon instance
+// forwarded.
+//
+// None of the local machinery applies to it: there is no local monitor and
+// no local rule behind it, so the tenant join would look for a rule that
+// cannot exist, the cooldown belongs to a rule that is not ours, and the
+// dedup key cannot be the rule id. The key is the origin plus the event id
+// instead — the same event forwarded twice by the same peer is one alert,
+// and the same event id from two peers is two.
+//
+// The alert lands in the workspace of the credential that delivered it, which
+// is the caller's context and never anything the payload says.
+func (p *Postgres) createFederatedAlert(ctx context.Context, tx pgx.Tx, a *Alert) (AlertOutcome, error) {
+	var reserved int
+	err := tx.QueryRow(ctx,
+		`INSERT INTO alert_dedup (rule_id, event_id, federation_origin, alert_created_at)
+		 VALUES (NULL, $1, $2, now())
+		 ON CONFLICT DO NOTHING
+		 RETURNING 1`,
+		a.EventID, a.FederationOrigin).Scan(&reserved)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AlertDuplicate, nil
+	}
+	if err != nil {
+		return "", mapErr(err)
+	}
+
+	ws := workspaceID(ctx)
+	pURL, hasURL, pGuidance, hasGuidance := extractParamsGuidance(a.Payload)
+	if a.RunbookURL == "" && hasURL {
+		a.RunbookURL = pURL
+	}
+	if a.ResponseGuidance == "" && hasGuidance {
+		a.ResponseGuidance = pGuidance
+	}
+	if err := tx.QueryRow(ctx,
+		`SELECT
+			COALESCE(NULLIF($1, ''), NULLIF((SELECT default_runbook_url FROM workspaces WHERE id = $2), ''), ''),
+			COALESCE(NULLIF($3, ''), NULLIF((SELECT default_response_guidance FROM workspaces WHERE id = $2), ''), '')`,
+		a.RunbookURL, ws, a.ResponseGuidance,
+	).Scan(&a.RunbookURL, &a.ResponseGuidance); err != nil {
+		return "", mapErr(err)
+	}
+	a.Payload = WithGuidance(a.Payload, a.RunbookURL, a.ResponseGuidance)
+
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, ledger, network, workspace_id, federated, federation_origin, source_monitor_id, source_rule_id, rule_version, runbook_url, response_guidance)
+		 VALUES (NULL, NULL, $1, $2, $3, $4, $5, '', $6, TRUE, $7, $8, $9, COALESCE(NULLIF($10, 0), 1), $11, $12)
+		 RETURNING id, created_at, rule_version, runbook_url, response_guidance`,
+		a.EventID, jsonOrEmpty(a.Payload), nullableJSON(a.Enrichment), NormalizedSeverity(a.Severity), int64(a.Ledger),
+		ws, a.FederationOrigin, a.SourceMonitorID, a.SourceRuleID, a.RuleVersion, a.RunbookURL, a.ResponseGuidance,
+	).Scan(&a.ID, &a.CreatedAt, &a.RuleVersion, &a.RunbookURL, &a.ResponseGuidance); err != nil {
+		return "", mapErr(err)
+	}
+
+	// Link the reserved key to the row it produced, and carry the alert's
+	// created_at so retention can drop dedup rows by time.
+	if _, err := tx.Exec(ctx,
+		`UPDATE alert_dedup SET alert_id = $1, alert_created_at = $2 WHERE federation_origin = $3 AND event_id = $4`,
+		a.ID, a.CreatedAt, a.FederationOrigin, a.EventID); err != nil {
+		return "", mapErr(err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return "", mapErr(err)
+	}
+	return AlertCreated, nil
+}
+
+// CreateAlertGroup creates or increments the alert group identified
+// by key and windowStart. On conflict it increments the count; on
+// first insertion it initializes count to 1. Returns the new count.
+func (p *Postgres) CreateAlertGroup(ctx context.Context, key string, windowStart time.Time) (int64, error) {
+	var count int64
+	err := p.pool.QueryRow(ctx,
+		`INSERT INTO alert_groups (group_key, window_start, count, first_alert_id)
+		 VALUES ($1, $2, 1, NULL)
+		 ON CONFLICT (group_key, window_start) DO UPDATE
+		 SET count = alert_groups.count + 1
+		 RETURNING count`,
+		key, windowStart,
+	).Scan(&count)
+	if err != nil {
+		return 0, mapErr(err)
+	}
+	return count, nil
+}
+
+// GroupAlerts creates or increments the alert group for key with
+// windowStart and returns whether the alert should be delivered
+// immediately (first alert in the window) and the current count.
+func (p *Postgres) GroupAlerts(ctx context.Context, key string, windowStart time.Time) (shouldDeliver bool, currentCount int64, err error) {
+	count, err := p.CreateAlertGroup(ctx, key, windowStart)
+	if err != nil {
+		return false, 0, err
+	}
+	return count == 1, count, nil
+}
+
 func (p *Postgres) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	var a Alert
 	var ledger int64
+	var monitorID, ruleID *int64
+	var origin *string
+	var sourceMonitorID, sourceRuleID *int64
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at, backfilled
-		   FROM alerts WHERE id = $1`, id,
-	).Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled)
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version, runbook_url, response_guidance
+		   FROM alerts WHERE id = $1 AND workspace_id = $2`, id, workspaceID(ctx),
+	).Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.AcknowledgedBy, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID, &a.RuleVersion, &a.RunbookURL, &a.ResponseGuidance)
 	if err != nil {
 		return nil, mapErr(err)
 	}
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok && a.CreatedAt.Before(cutoff) {
+		return nil, ErrNotFound
+	}
 	a.Ledger = uint32(ledger)
+	if monitorID != nil {
+		a.MonitorID = *monitorID
+	}
+	if ruleID != nil {
+		a.RuleID = *ruleID
+	}
+	if origin != nil {
+		a.FederationOrigin = *origin
+	}
+	if sourceMonitorID != nil {
+		a.SourceMonitorID = *sourceMonitorID
+	}
+	if sourceRuleID != nil {
+		a.SourceRuleID = *sourceRuleID
+	}
 	return &a, nil
 }
 
@@ -733,8 +2442,274 @@ func alertSort(s string) string {
 	return "created_at_desc"
 }
 
+// ListAlerts searches alerts. It is a routable read: the alert list is a
+// search over history, so a replica a few milliseconds behind shows the caller
+// the same page minus rows written in that window, which is the trade the
+// replica exists to make. A caller that cannot tolerate it — the rules engine
+// rebuilding a match log — uses ListAlertsPrimary.
 func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at, backfilled
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok && (f.From.IsZero() || f.From.Before(cutoff)) {
+		f.From = cutoff
+	}
+	q, args := buildAlertQuery(ctx, f)
+	rows, err := p.queryRows(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	alerts, err := pgx.CollectRows(rows, scanAlert)
+	if err != nil {
+		return nil, err
+	}
+	// If a cursor minted against the primary has not yet replicated to the
+	// replica, the subquery `(SELECT created_at, id FROM alerts WHERE id = $N)`
+	// returns NULL on the replica and produces an empty page. Detect when the
+	// cursor anchor is absent on the replica and replay the page on the primary
+	// so pagination never skips or truncates rows (#572).
+	if f.AfterID > 0 && len(alerts) == 0 && p.replica != nil && !p.replicaLagExceeded() {
+		if !p.cursorAnchorExistsOnReplica(ctx, f.AfterID) {
+			p.metrics.RecordStoreRead(poolPrimary)
+			p.metrics.RecordReplicaFallback()
+			return p.ListAlertsPrimary(ctx, f)
+		}
+	}
+	return alerts, nil
+}
+
+// ListAlertsPrimary is ListAlerts served by the primary, whatever
+// REPLICA_DATABASE_URL says. It exists for readers that must see this
+// process's own writes — see PrimaryReader.
+func (p *Postgres) ListAlertsPrimary(ctx context.Context, f AlertFilter) ([]Alert, error) {
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok && (f.From.IsZero() || f.From.Before(cutoff)) {
+		f.From = cutoff
+	}
+	q, args := buildAlertQuery(ctx, f)
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, scanAlert)
+}
+
+// AlertChangeKey returns the max alert ID and count for the caller's workspace.
+func (p *Postgres) AlertChangeKey(ctx context.Context) (maxID int64, count int64, err error) {
+	ws := workspaceID(ctx)
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok {
+		err = p.queryRowFallback(ctx, func(row pgx.Row) error {
+			return row.Scan(&maxID, &count)
+		}, `SELECT COALESCE(max(id), 0), count(*) FROM alerts WHERE workspace_id = $1 AND created_at >= $2`, ws, cutoff)
+		return maxID, count, err
+	}
+	err = p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&maxID, &count)
+	}, `SELECT COALESCE(max(id), 0), count(*) FROM alerts WHERE workspace_id = $1`, ws)
+	return maxID, count, err
+}
+
+// CreateDeadLetter records a delivery that exhausted its retry budget.
+func (p *Postgres) CreateDeadLetter(ctx context.Context, d *DeadLetter) error {
+	// alert_created_at is read from the alert rather than passed in: the
+	// composite foreign key needs it, and taking it from the row means a
+	// caller cannot supply one that does not match. A missing alert selects
+	// no rows and comes back as ErrNotFound.
+	return mapErr(p.pool.QueryRow(ctx,
+		`INSERT INTO dead_letters (alert_id, alert_created_at, channel_id, last_error, attempt_count, last_status)
+		 SELECT a.id, a.created_at, $2, $3, $4, $5 FROM alerts a WHERE a.id = $1
+		 RETURNING id, created_at`,
+		d.AlertID, d.ChannelID, d.LastError, d.AttemptCount, d.LastStatus,
+	).Scan(&d.ID, &d.CreatedAt))
+}
+
+// GetDeadLetter returns one dead-letter record by id. dead_letters carries no
+// workspace_id of its own, so the tenant predicate reaches it through the
+// alert it belongs to; a caller without a tenant reads by id alone.
+func (p *Postgres) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, error) {
+	var d DeadLetter
+	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
+		FROM dead_letters WHERE id = $1`
+	args := []any{id}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = $2)`
+		args = append(args, ws)
+	}
+	err := p.pool.QueryRow(ctx, q, args...).
+		Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &d.CreatedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	d.Cause = ClassifyCause(d.LastStatus, d.LastError)
+	return &d, nil
+}
+
+// ListDeadLetters returns dead-letter records in id order, applying the
+// optional channel, alert, age, cause and pagination filters. A tenant sees only records
+// whose alert belongs to it; the dispatcher's system context sees every row.
+func (p *Postgres) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error) {
+	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
+		FROM dead_letters WHERE TRUE`
+	args := []any{}
+	n := 0
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = ` + arg(ws) + `)`
+	}
+	if f.ChannelID != 0 {
+		q += ` AND channel_id = ` + arg(f.ChannelID)
+	}
+	if f.AlertID != 0 {
+		q += ` AND alert_id = ` + arg(f.AlertID)
+	}
+	if f.AfterID != 0 {
+		q += ` AND id > ` + arg(f.AfterID)
+	}
+	if !f.CreatedBefore.IsZero() {
+		q += ` AND created_at < ` + arg(f.CreatedBefore)
+	}
+	if f.OlderThan > 0 {
+		cutoff := time.Now().UTC().Add(-f.OlderThan)
+		q += ` AND created_at < ` + arg(cutoff)
+	}
+	if !f.CreatedAfter.IsZero() {
+		q += ` AND created_at >= ` + arg(f.CreatedAfter)
+	}
+	if len(f.IDs) > 0 {
+		q += ` AND id = ANY(` + arg(f.IDs) + `)`
+	}
+	q += ` ORDER BY id ASC LIMIT ` + arg(pageLimit(f.Limit))
+
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	letters, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (DeadLetter, error) {
+		var d DeadLetter
+		err := row.Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &d.CreatedAt)
+		if err == nil {
+			d.Cause = ClassifyCause(d.LastStatus, d.LastError)
+		}
+		return d, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if f.Cause != "" {
+		filtered := make([]DeadLetter, 0, len(letters))
+		for _, dl := range letters {
+			if dl.Cause == f.Cause {
+				filtered = append(filtered, dl)
+			}
+		}
+		return filtered, nil
+	}
+	return letters, nil
+}
+
+// ListDeadLetterGroups aggregates dead letters by channel and cause.
+func (p *Postgres) ListDeadLetterGroups(ctx context.Context, f DeadLetterFilter) ([]DeadLetterGroup, error) {
+	gf := f
+	gf.Limit = 10000
+	gf.AfterID = 0
+	letters, err := p.ListDeadLetters(ctx, gf)
+	if err != nil {
+		return nil, err
+	}
+	channels, err := p.ListChannels(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	chMap := make(map[int64]Channel, len(channels))
+	for _, ch := range channels {
+		chMap[ch.ID] = ch
+	}
+	return GroupDeadLetters(letters, chMap, f.Cause), nil
+}
+
+// DeleteDeadLetter removes one record, which is what a successful redrive does.
+// It does not go through deleteByID: dead_letters carries no workspace_id of
+// its own, so the tenant predicate reaches it through the alert it belongs to.
+// A caller without a tenant (the dispatcher's own context) deletes by id alone.
+func (p *Postgres) DeleteDeadLetter(ctx context.Context, id int64) error {
+	q := `DELETE FROM dead_letters WHERE id = $1`
+	args := []any{id}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = $2)`
+		args = append(args, ws)
+	}
+	tag, err := p.pool.Exec(ctx, q, args...)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// BulkDeleteDeadLetters removes dead letters matching the filter within the context's workspace.
+func (p *Postgres) BulkDeleteDeadLetters(ctx context.Context, f DeadLetterFilter) (int64, error) {
+	gf := f
+	if gf.Limit <= 0 || gf.Limit > 10000 {
+		gf.Limit = 10000
+	}
+	letters, err := p.ListDeadLetters(ctx, gf)
+	if err != nil {
+		return 0, err
+	}
+	if len(letters) == 0 {
+		return 0, nil
+	}
+	ids := make([]int64, len(letters))
+	for i, dl := range letters {
+		ids[i] = dl.ID
+	}
+
+	q := `DELETE FROM dead_letters WHERE id = ANY($1)`
+	args := []any{ids}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = $2)`
+		args = append(args, ws)
+	}
+	tag, err := p.pool.Exec(ctx, q, args...)
+	if err != nil {
+		return 0, mapErr(err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// DeleteExpiredDeadLetters removes up to limit dead letters created strictly before cutoff.
+func (p *Postgres) DeleteExpiredDeadLetters(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = DefaultPruneBatch
+	}
+	var deleted int64
+	err := p.pool.QueryRow(ctx, `
+		WITH expired AS (
+			SELECT id FROM dead_letters
+			WHERE created_at < $1
+			ORDER BY created_at ASC, id ASC
+			LIMIT $2
+		),
+		deleted_rows AS (
+			DELETE FROM dead_letters dl
+			USING expired e
+			WHERE dl.id = e.id
+			RETURNING dl.id
+		)
+		SELECT count(*) FROM deleted_rows`, cutoff, limit).Scan(&deleted)
+	if err != nil {
+		return 0, mapErr(err)
+	}
+	return deleted, nil
+}
+
+// buildAlertQuery builds the ListAlerts statement and its arguments. Both
+// readers call it so the routed and primary-bound forms cannot drift into
+// returning different pages.
+func buildAlertQuery(ctx context.Context, f AlertFilter) (string, []any) {
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version, runbook_url, response_guidance
 		 FROM alerts WHERE TRUE`
 	args := []any{}
 	n := 0
@@ -742,6 +2717,12 @@ func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, erro
 		n++
 		args = append(args, v)
 		return fmt.Sprintf("$%d", n)
+	}
+	// Conditional because ListAlerts serves two callers with different scopes:
+	// the API listing (one tenant) and the frequency rule's match-log rebuild
+	// (which runs inside the poller's cross-tenant context, keyed to one rule).
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND workspace_id = ` + arg(ws)
 	}
 	if f.MonitorID != 0 {
 		q += ` AND monitor_id = ` + arg(f.MonitorID)
@@ -751,6 +2732,25 @@ func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, erro
 	}
 	if f.ContractID != "" {
 		q += ` AND payload->>'contract_id' = ` + arg(f.ContractID)
+	}
+	if f.Network != "" {
+		q += ` AND network = ` + arg(f.Network)
+	}
+	switch f.Acknowledged {
+	case "acknowledged":
+		q += ` AND acknowledged_at IS NOT NULL`
+	case "unacknowledged":
+		q += ` AND acknowledged_at IS NULL`
+	}
+	if pattern := AlertSearchPattern(f.Query); pattern != "" {
+		// One bound pattern, both columns. The payload is cast to text so the
+		// search reaches contract_id, event_name and every other field a rule
+		// type stores without the store knowing each type's shape — the cost
+		// of that generality is that it cannot use an index, which is why the
+		// term is capped (MaxAlertSearchLen) rather than long by default.
+		// ESCAPE makes the pattern's own wildcards literal.
+		p := arg(pattern)
+		q += ` AND (event_id ILIKE ` + p + ` ESCAPE '\' OR payload::text ILIKE ` + p + ` ESCAPE '\')`
 	}
 	if !f.From.IsZero() {
 		q += ` AND created_at >= ` + arg(f.From)
@@ -777,24 +2777,47 @@ func (p *Postgres) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, erro
 		q += ` ORDER BY created_at DESC, id DESC`
 	}
 	q += ` LIMIT ` + arg(pageLimit(f.Limit))
-
-	rows, err := p.pool.Query(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, scanAlert)
+	return q, args
 }
 
+// ListAlertsStream streams alerts matching the filter, calling the callback
+// for each one. This is a simple implementation that loads all alerts and
+// iterates; a true streaming implementation would use a cursor.
 // scanAlert reads one alerts row. It is shared by ListAlerts and ExpiredAlerts
 // so the column order and the ledger/retracted_at mapping cannot drift.
+//
+// The monitor and rule ids are nullable: a federated alert belongs to no
+// local monitor and no local rule, and a NULL is how that is spelled. Zero is
+// not a valid id, so a NULL reads back as zero and the row is not attached to
+// anything local.
 func scanAlert(row pgx.CollectableRow) (Alert, error) {
 	var a Alert
 	var ledger int64
-	err := row.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled)
+	var monitorID, ruleID *int64
+	var origin *string
+	var sourceMonitorID, sourceRuleID *int64
+	err := row.Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.AcknowledgedBy, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID, &a.RuleVersion, &a.RunbookURL, &a.ResponseGuidance)
 	a.Ledger = uint32(ledger)
+	if monitorID != nil {
+		a.MonitorID = *monitorID
+	}
+	if ruleID != nil {
+		a.RuleID = *ruleID
+	}
+	if origin != nil {
+		a.FederationOrigin = *origin
+	}
+	if sourceMonitorID != nil {
+		a.SourceMonitorID = *sourceMonitorID
+	}
+	if sourceRuleID != nil {
+		a.SourceRuleID = *sourceRuleID
+	}
 	return a, err
 }
 
+// ListAlertsStream streams alerts matching the filter to the callback.
+// It is used for large exports where loading all rows into memory is not feasible.
 // ExpiredAlerts returns up to limit alerts older than cutoff, oldest first,
 // with the same ordering DeleteExpiredAlerts uses so the row an archiver reads
 // is the row the delete removes.
@@ -803,7 +2826,7 @@ func (p *Postgres) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit in
 		limit = DefaultPruneBatch
 	}
 	rows, err := p.pool.Query(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at, backfilled
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, acknowledged_by, network, federated, federation_origin, source_monitor_id, source_rule_id, rule_version, runbook_url, response_guidance
 		   FROM alerts WHERE created_at < $1 ORDER BY created_at ASC, id ASC LIMIT $2`,
 		cutoff, limit)
 	if err != nil {
@@ -814,16 +2837,37 @@ func (p *Postgres) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit in
 
 // --- ledger hashes and reorg retraction ---
 
-func (p *Postgres) RecordLedgerHashes(ctx context.Context, hashes []LedgerHash) error {
+// The empty network is the pre-multi-network case and keeps its original
+// single-column ledger_hashes table; every named network shares
+// network_ledger_hashes, whose primary key is (network, ledger). Two chains
+// number their ledgers independently, so one window would report a divergence
+// on almost every cycle — mainnet ledger 100 overwriting testnet ledger 100 is
+// not a reorg — and a false positive here retracts real alerts.
+//
+// A named network therefore starts with an empty window. That is safe rather
+// than lossy: reorg detection compares a hash it has stored, so a ledger with
+// no stored row is recorded and skipped, never read as a divergence.
+
+func (p *Postgres) RecordLedgerHashes(ctx context.Context, network string, hashes []LedgerHash) error {
 	if len(hashes) == 0 {
 		return nil
 	}
+	const legacyInsert = `
+		INSERT INTO ledger_hashes (ledger, hash) VALUES ($1, $2)
+		ON CONFLICT (ledger) DO UPDATE SET hash = EXCLUDED.hash, observed_at = now()
+		WHERE ledger_hashes.hash IS DISTINCT FROM EXCLUDED.hash`
+	const scopedInsert = `
+		INSERT INTO network_ledger_hashes (network, ledger, hash) VALUES ($1, $2, $3)
+		ON CONFLICT (network, ledger) DO UPDATE SET hash = EXCLUDED.hash, observed_at = now()
+		WHERE network_ledger_hashes.hash IS DISTINCT FROM EXCLUDED.hash`
+
 	batch := &pgx.Batch{}
 	for _, h := range hashes {
-		batch.Queue(`
-			INSERT INTO ledger_hashes (ledger, hash) VALUES ($1, $2)
-			ON CONFLICT (ledger) DO UPDATE SET hash = EXCLUDED.hash, observed_at = now()
-			WHERE ledger_hashes.hash IS DISTINCT FROM EXCLUDED.hash`, int64(h.Ledger), h.Hash)
+		if network == "" {
+			batch.Queue(legacyInsert, int64(h.Ledger), h.Hash)
+			continue
+		}
+		batch.Queue(scopedInsert, network, int64(h.Ledger), h.Hash)
 	}
 	br := p.pool.SendBatch(ctx, batch)
 	defer br.Close() //nolint:errcheck // errors surface on the per-command Exec below
@@ -835,31 +2879,56 @@ func (p *Postgres) RecordLedgerHashes(ctx context.Context, hashes []LedgerHash) 
 	return nil
 }
 
-func (p *Postgres) LedgerHashes(ctx context.Context, from, to uint32) ([]LedgerHash, error) {
-	rows, err := p.pool.Query(ctx,
-		`SELECT ledger, hash FROM ledger_hashes WHERE ledger >= $1 AND ledger <= $2 ORDER BY ledger`,
-		int64(from), int64(to))
+func (p *Postgres) LedgerHashes(ctx context.Context, network string, from, to uint32) ([]LedgerHash, error) {
+	var out []LedgerHash
+	err := p.read(ctx, func(ctx context.Context) error {
+		query := `SELECT ledger, hash FROM network_ledger_hashes WHERE network = $1 AND ledger >= $2 AND ledger <= $3 ORDER BY ledger`
+		args := []any{network, int64(from), int64(to)}
+		if network == "" {
+			query = `SELECT ledger, hash FROM ledger_hashes WHERE ledger >= $1 AND ledger <= $2 ORDER BY ledger`
+			args = args[1:]
+		}
+		rows, err := p.pool.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		page, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (LedgerHash, error) {
+			var h LedgerHash
+			var ledger int64
+			err := row.Scan(&ledger, &h.Hash)
+			h.Ledger = uint32(ledger)
+			return h, err
+		})
+		if err != nil {
+			return err
+		}
+		out = page
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (LedgerHash, error) {
-		var h LedgerHash
-		var ledger int64
-		err := row.Scan(&ledger, &h.Hash)
-		h.Ledger = uint32(ledger)
-		return h, err
-	})
+	return out, nil
 }
 
-func (p *Postgres) PruneLedgerHashes(ctx context.Context, before uint32) error {
-	_, err := p.pool.Exec(ctx, `DELETE FROM ledger_hashes WHERE ledger < $1`, int64(before))
+func (p *Postgres) PruneLedgerHashes(ctx context.Context, network string, before uint32) error {
+	if network == "" {
+		_, err := p.pool.Exec(ctx, `DELETE FROM ledger_hashes WHERE ledger < $1`, int64(before))
+		return err
+	}
+	_, err := p.pool.Exec(ctx,
+		`DELETE FROM network_ledger_hashes WHERE network = $1 AND ledger < $2`,
+		network, int64(before))
 	return err
 }
 
-func (p *Postgres) RetractAlertsFromLedger(ctx context.Context, ledger uint32, at time.Time) (int64, error) {
+// RetractAlertsFromLedger retracts one network's alerts from `ledger` up. The
+// network predicate is what stops a testnet reorg from retracting mainnet
+// alerts that happen to sit at the same height.
+func (p *Postgres) RetractAlertsFromLedger(ctx context.Context, network string, ledger uint32, at time.Time) (int64, error) {
 	tag, err := p.pool.Exec(ctx,
-		`UPDATE alerts SET retracted_at = $1 WHERE ledger >= $2 AND retracted_at IS NULL`,
-		at.UTC(), int64(ledger))
+		`UPDATE alerts SET retracted_at = $1 WHERE network = $3 AND ledger >= $2 AND retracted_at IS NULL`,
+		at.UTC(), int64(ledger), network)
 	if err != nil {
 		return 0, err
 	}
@@ -871,25 +2940,26 @@ func (p *Postgres) RecordDeliveryAttempt(ctx context.Context, d *DeliveryAttempt
 	// so the parent's created_at is read in the same statement. A missing
 	// alert yields no row, which mapErr turns into ErrNotFound just as the
 	// old single-column FK violation did.
-	return mapErr(p.pool.QueryRow(ctx,
-		`INSERT INTO delivery_attempts (alert_id, alert_created_at, channel_id, status, response_snippet)
-		 SELECT a.id, a.created_at, $2, $3, $4 FROM alerts a WHERE a.id = $1
-		 RETURNING id, attempted_at`,
-		d.AlertID, d.ChannelID, d.Status, d.ResponseSnippet,
-	).Scan(&d.ID, &d.AttemptedAt))
+	// The dispatcher records attempts from the poller's cross-tenant context,
+	// so the workspace predicate is conditional; the alert id is already the
+	// caller's own, having come from a scoped read.
+	q := `INSERT INTO delivery_attempts (alert_id, alert_created_at, channel_id, status, response_snippet)
+		 SELECT a.id, a.created_at, $2, $3, $4 FROM alerts a WHERE a.id = $1`
+	args := []any{d.AlertID, d.ChannelID, d.Status, d.ResponseSnippet}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND a.workspace_id = $5`
+		args = append(args, ws)
+	}
+	return mapErr(p.pool.QueryRow(ctx, q+`
+		 RETURNING id, attempted_at`, args...).Scan(&d.ID, &d.AttemptedAt))
 }
 
+// ListDeliveryAttempts scopes through its alert: delivery_attempts carries no
+// workspace column, and an alert id only means anything inside the tenant that
+// can see the alert behind it. The join includes created_at because that pair
+// is the alerts primary key once the table is partitioned.
 func (p *Postgres) ListDeliveryAttempts(ctx context.Context, alertID int64, status string) ([]DeliveryAttempt, error) {
-	q := `SELECT id, alert_id, channel_id, status, response_snippet, attempted_at
-		 FROM delivery_attempts WHERE alert_id = $1`
-	args := []any{alertID}
-	if status != "" {
-		// Applied in SQL so a busy alert does not ship every attempt just
-		// so the client can throw most of them away.
-		q += ` AND status = $2`
-		args = append(args, status)
-	}
-	q += ` ORDER BY id`
+	q, args := buildDeliveryAttemptsQuery(alertID, status, workspaceID(ctx))
 	rows, err := p.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -901,14 +2971,295 @@ func (p *Postgres) ListDeliveryAttempts(ctx context.Context, alertID int64, stat
 	})
 }
 
+// buildDeliveryAttemptsQuery builds the ListDeliveryAttempts statement and
+// its arguments. The listing and the EXPLAIN regression test over it
+// (alert_indexes_test.go) both call this, so the plan the test pins is the
+// plan the dashboard actually runs.
+func buildDeliveryAttemptsQuery(alertID int64, status string, ws workspace.ID) (string, []any) {
+	q := `SELECT da.id, da.alert_id, da.channel_id, da.status, da.response_snippet, da.attempted_at
+		 FROM delivery_attempts da
+		 JOIN alerts a ON a.id = da.alert_id AND a.created_at = da.alert_created_at
+		 WHERE da.alert_id = $1 AND a.workspace_id = $2`
+	args := []any{alertID, ws}
+	if status != "" {
+		// Applied in SQL so a busy alert does not ship every attempt just
+		// so the client can throw most of them away.
+		q += ` AND da.status = $3`
+		args = append(args, status)
+	}
+	q += ` ORDER BY da.id`
+	return q, args
+}
+
+// --- maintenance windows ---
+
+func (p *Postgres) CreateMaintenanceWindow(ctx context.Context, w *MaintenanceWindow) error {
+	return mapErr(p.pool.QueryRow(ctx,
+		`INSERT INTO maintenance_windows (reason, scope, monitor_id, contract_id, start_at, end_at)
+		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at`,
+		w.Reason, w.Scope, w.MonitorID, w.ContractID, w.StartAt.UTC(), w.EndAt.UTC(),
+	).Scan(&w.ID, &w.CreatedAt))
+}
+
+func (p *Postgres) GetMaintenanceWindow(ctx context.Context, id int64) (*MaintenanceWindow, error) {
+	return scanMaintenanceWindow(p.pool.QueryRow(ctx,
+		`SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		 FROM maintenance_windows WHERE id = $1`, id))
+}
+
+func (p *Postgres) ListMaintenanceWindows(ctx context.Context, f MaintenanceWindowFilter) ([]MaintenanceWindow, error) {
+	q := `SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		 FROM maintenance_windows WHERE TRUE`
+	args := []any{}
+	n := 0
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	if f.Active || f.Upcoming {
+		at := f.At
+		if at.IsZero() {
+			at = time.Now()
+		}
+		if f.Active {
+			q += ` AND start_at <= ` + arg(at.UTC()) + ` AND end_at > ` + arg(at.UTC())
+		} else {
+			q += ` AND start_at > ` + arg(at.UTC())
+		}
+	}
+	q += ` ORDER BY start_at DESC, id DESC LIMIT ` + arg(pageLimit(f.Limit))
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (MaintenanceWindow, error) {
+		w, err := scanMaintenanceWindow(row)
+		if err != nil {
+			return MaintenanceWindow{}, err
+		}
+		return *w, nil
+	})
+}
+
+func (p *Postgres) UpdateMaintenanceWindow(ctx context.Context, w *MaintenanceWindow) error {
+	tag, err := p.pool.Exec(ctx,
+		`UPDATE maintenance_windows
+		 SET reason = $2, scope = $3, monitor_id = $4, contract_id = $5, start_at = $6, end_at = $7
+		 WHERE id = $1`,
+		w.ID, w.Reason, w.Scope, w.MonitorID, w.ContractID, w.StartAt.UTC(), w.EndAt.UTC())
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DeleteMaintenanceWindow removes one window. It does not go through
+// deleteByID: that helper scopes its delete to the caller's workspace, and
+// maintenance_windows carries no workspace_id. A window's scope is global,
+// monitor or contract — it is instance-level under this model, the same way
+// its listing and its creation are, so the delete matches them rather than
+// inventing a tenancy the rest of the feature does not have.
+func (p *Postgres) DeleteMaintenanceWindow(ctx context.Context, id int64) error {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM maintenance_windows WHERE id = $1`, id)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ActiveMaintenanceWindow is the delivery path's single indexed lookup: a
+// window is active when [start_at, end_at) covers at and its scope covers
+// the alert. The most specific scope wins (contract, then monitor, then
+// global) so a contract's reason is preferred over a broader one's.
+func (p *Postgres) ActiveMaintenanceWindow(ctx context.Context, monitorID int64, contractID string, at time.Time) (*MaintenanceWindow, error) {
+	w, err := scanMaintenanceWindow(p.pool.QueryRow(ctx,
+		`SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		 FROM maintenance_windows
+		 WHERE start_at <= $1 AND end_at > $1
+		   AND (scope = 'global'
+		        OR (scope = 'monitor' AND monitor_id = $2)
+		        OR (scope = 'contract' AND contract_id = $3))
+		 ORDER BY CASE scope WHEN 'contract' THEN 0 WHEN 'monitor' THEN 1 ELSE 2 END, start_at DESC
+		 LIMIT 1`, at.UTC(), monitorID, contractID))
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+func (p *Postgres) SetAlertSuppressed(ctx context.Context, alertID int64, reason string) error {
+	tag, err := p.pool.Exec(ctx,
+		`UPDATE alerts SET suppressed = TRUE, suppression_reason = $2 WHERE id = $1`,
+		alertID, reason)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// --- inhibitions ---
+
+func (p *Postgres) CreateInhibition(ctx context.Context, in *Inhibition) error {
+	if in.FiringWindowSeconds <= 0 {
+		in.FiringWindowSeconds = DefaultInhibitionWindowSeconds
+	}
+	// mapErr, not the raw driver error: the pair names two rules, and a rule
+	// that does not exist is a foreign-key violation the caller has to be
+	// told about, not an unexplained server fault.
+	return mapErr(p.pool.QueryRow(ctx,
+		`INSERT INTO alert_inhibitions (source_rule_id, target_rule_id, firing_window_seconds)
+		 VALUES ($1, $2, $3) RETURNING created_at`,
+		in.SourceRuleID, in.TargetRuleID, in.FiringWindowSeconds,
+	).Scan(&in.CreatedAt))
+}
+
+func (p *Postgres) scanInhibition(row pgx.CollectableRow) (Inhibition, error) {
+	var in Inhibition
+	err := row.Scan(&in.SourceRuleID, &in.TargetRuleID, &in.FiringWindowSeconds, &in.CreatedAt)
+	return in, err
+}
+
+func (p *Postgres) ListInhibitions(ctx context.Context) ([]Inhibition, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT source_rule_id, target_rule_id, firing_window_seconds, created_at
+		 FROM alert_inhibitions ORDER BY source_rule_id, target_rule_id`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, p.scanInhibition)
+}
+
+func (p *Postgres) ListInhibitionsForTarget(ctx context.Context, targetRuleID int64) ([]Inhibition, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT source_rule_id, target_rule_id, firing_window_seconds, created_at
+		 FROM alert_inhibitions WHERE target_rule_id = $1 ORDER BY source_rule_id`, targetRuleID)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, p.scanInhibition)
+}
+
+func (p *Postgres) DeleteInhibition(ctx context.Context, sourceRuleID, targetRuleID int64) error {
+	tag, err := p.pool.Exec(ctx,
+		`DELETE FROM alert_inhibitions WHERE source_rule_id = $1 AND target_rule_id = $2`,
+		sourceRuleID, targetRuleID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func scanMaintenanceWindow(r rowScanner) (*MaintenanceWindow, error) {
+	var w MaintenanceWindow
+	err := r.Scan(&w.ID, &w.Reason, &w.Scope, &w.MonitorID, &w.ContractID, &w.StartAt, &w.EndAt, &w.CreatedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return &w, nil
+}
+
+func (p *Postgres) RuleFiredWithin(ctx context.Context, ruleID int64, window time.Duration) (bool, error) {
+	// The cutoff is computed in Go so both backends share the decision;
+	// Postgres compares timestamptz, SQLite compares the fixed-format TEXT.
+	cutoff := time.Now().UTC().Truncate(time.Millisecond).Add(-window)
+	var fired bool
+	err := p.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM alerts WHERE rule_id = $1 AND created_at >= $2)`,
+		ruleID, cutoff).Scan(&fired)
+	return fired, err
+}
+
+func (p *Postgres) ListRuleAlertTimes(ctx context.Context, ruleID int64, since time.Time) ([]time.Time, error) {
+	query := `SELECT created_at FROM alerts WHERE rule_id = $1 AND created_at >= $2`
+	args := []any{ruleID, since.UTC()}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		query += ` AND workspace_id = $3`
+		args = append(args, ws)
+	}
+	query += ` ORDER BY created_at`
+	rows, err := p.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var times []time.Time
+	for rows.Next() {
+		var at time.Time
+		if err := rows.Scan(&at); err != nil {
+			return nil, err
+		}
+		times = append(times, at)
+	}
+	return times, rows.Err()
+}
+
+func (p *Postgres) MarkAlertInhibited(ctx context.Context, alertID, sourceRuleID int64) error {
+	// No row check: the alert may have been pruned between dispatch and
+	// this write, and that must not fail the dispatch path.
+	_, err := p.pool.Exec(ctx,
+		`UPDATE alerts SET inhibited_by_rule_id = $1 WHERE id = $2`, sourceRuleID, alertID)
+	return err
+}
+
 // --- ingest state ---
 
-func (p *Postgres) GetIngestState(ctx context.Context) (IngestState, error) {
+// GetIngestState reads one network's checkpoint. The empty network is the
+// pre-multi-network row and behaves exactly as it always did; a named network
+// reads network_ingest_state, which is seeded from that legacy row the first
+// time any network asks. Seeding is what makes the upgrade transparent: an
+// instance that moves from NETWORK=testnet to a network list resumes at the
+// ledger it stopped on instead of cold-starting at the tip and silently missing
+// everything in between.
+func (p *Postgres) GetIngestState(ctx context.Context, network string) (IngestState, error) {
 	var s IngestState
+	if network == "" {
+		var lastLedger int64
+		err := p.pool.QueryRow(ctx,
+			`SELECT last_ledger, last_cursor, updated_at FROM ingest_state WHERE id = 1`,
+		).Scan(&lastLedger, &s.LastCursor, &s.UpdatedAt)
+		s.LastLedger = uint32(lastLedger)
+		return s, mapErr(err)
+	}
+
+	// Only while the per-network table is empty does the legacy checkpoint get
+	// claimed, so a second network added later cold-starts on its own chain
+	// rather than inheriting a cursor from a chain that has nothing to do with
+	// it. Both statements are DO NOTHING, so two pollers starting at the same
+	// moment cannot race into an error.
+	if _, err := p.pool.Exec(ctx, `
+		INSERT INTO network_ingest_state (network, last_ledger, last_cursor)
+		SELECT $1, last_ledger, last_cursor FROM ingest_state
+		 WHERE id = 1 AND NOT EXISTS (SELECT 1 FROM network_ingest_state)
+		ON CONFLICT (network) DO NOTHING`, network); err != nil {
+		return s, err
+	}
+	if _, err := p.pool.Exec(ctx,
+		`INSERT INTO network_ingest_state (network) VALUES ($1) ON CONFLICT (network) DO NOTHING`,
+		network); err != nil {
+		return s, err
+	}
+
 	var lastLedger int64
 	err := p.pool.QueryRow(ctx,
-		`SELECT last_ledger, last_cursor, updated_at FROM ingest_state WHERE id = 1`,
-	).Scan(&lastLedger, &s.LastCursor, &s.UpdatedAt)
+		`SELECT last_ledger, last_cursor, updated_at FROM network_ingest_state WHERE network = $1`,
+		network).Scan(&lastLedger, &s.LastCursor, &s.UpdatedAt)
 	if err != nil {
 		return s, mapErr(err)
 	}
@@ -916,11 +3267,472 @@ func (p *Postgres) GetIngestState(ctx context.Context) (IngestState, error) {
 	return s, nil
 }
 
-func (p *Postgres) SetIngestState(ctx context.Context, s IngestState) error {
+// SetIngestState advances one network's checkpoint. Writing a named network is
+// an upsert because the row may not exist yet: the first cycle of a newly
+// configured network has nothing to update.
+func (p *Postgres) SetIngestState(ctx context.Context, network string, s IngestState) error {
+	if network == "" {
+		_, err := p.pool.Exec(ctx,
+			`UPDATE ingest_state SET last_ledger = $1, last_cursor = $2, updated_at = now() WHERE id = 1`,
+			int64(s.LastLedger), s.LastCursor)
+		return err
+	}
 	_, err := p.pool.Exec(ctx,
-		`UPDATE ingest_state SET last_ledger = $1, last_cursor = $2, updated_at = now() WHERE id = 1`,
-		int64(s.LastLedger), s.LastCursor)
+		`INSERT INTO network_ingest_state (network, last_ledger, last_cursor, updated_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (network) DO UPDATE
+		    SET last_ledger = EXCLUDED.last_ledger,
+		        last_cursor = EXCLUDED.last_cursor,
+		    updated_at  = EXCLUDED.updated_at`,
+		network, int64(s.LastLedger), s.LastCursor)
 	return err
+}
+
+// --- retention gaps ---
+
+// RecordRetentionGap persists one detected hole in ingest history. There is
+// no dedup: each detection is a real observation, and the poller only
+// detects once per resume.
+func (p *Postgres) RecordRetentionGap(ctx context.Context, network string, fromLedger, toLedger uint32, detectedAt time.Time) error {
+	_, err := p.pool.Exec(ctx,
+		`INSERT INTO retention_gaps (network, from_ledger, to_ledger, detected_at)
+		 VALUES ($1, $2, $3, $4)`,
+		network, int64(fromLedger), int64(toLedger), detectedAt)
+	return err
+}
+
+// LatestRetentionGap returns the most recently detected gap for network, or
+// across every network when network is empty. ErrNotFound when none was ever
+// recorded — the healthy case, which callers treat as "no gap to report"
+// rather than an error.
+func (p *Postgres) LatestRetentionGap(ctx context.Context, network string) (RetentionGap, error) {
+	var g RetentionGap
+	var from, to int64
+	scan := func(row pgx.Row) error {
+		return row.Scan(&g.ID, &g.Network, &from, &to, &g.DetectedAt)
+	}
+	var err error
+	if network == "" {
+		err = p.queryRowFallback(ctx, scan,
+			`SELECT id, network, from_ledger, to_ledger, detected_at
+		     FROM retention_gaps ORDER BY detected_at DESC, id DESC LIMIT 1`)
+	} else {
+		err = p.queryRowFallback(ctx, scan,
+			`SELECT id, network, from_ledger, to_ledger, detected_at
+		     FROM retention_gaps WHERE network = $1
+		     ORDER BY detected_at DESC, id DESC LIMIT 1`, network)
+	}
+	if err != nil {
+		return RetentionGap{}, mapErr(err)
+	}
+	g.FromLedger, g.ToLedger = uint32(from), uint32(to)
+	return g, nil
+}
+
+// --- event archive ---
+
+// RecordEvents upserts one page of decoded events into the replay archive.
+// One batched round-trip regardless of page size: a poll cycle would
+// otherwise pay one network hop per event. ON CONFLICT (network, event_id)
+// DO NOTHING makes the write idempotent under the re-reads a crash or a
+// confirmation-depth hold causes — the same event arriving twice keeps one
+// row.
+func (p *Postgres) RecordEvents(ctx context.Context, network string, events []ArchivedEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for i := range events {
+		ev := &events[i]
+		batch.Queue(
+			`INSERT INTO event_archive (network, event_id, contract_id, ledger, ledger_closed_at, tx_hash, event_name, topics, value, fields)
+		     VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, '[]'::jsonb), $9, $10)
+		     ON CONFLICT (network, event_id) DO NOTHING`,
+			network, ev.EventID, ev.ContractID, int64(ev.Ledger), ev.LedgerClosedAt, ev.TxHash, ev.EventName,
+			ev.Topics, ev.Value, ev.Fields,
+		)
+	}
+	results := p.pool.SendBatch(ctx, batch)
+	defer results.Close() //nolint:errcheck // Close after a prior failure is a no-op
+	for range events {
+		if _, err := results.Exec(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// archiveFilterClause builds the WHERE clauses shared by the archive read
+// paths, so List and Count can never disagree about what matches. arg binds
+// each value and returns its placeholder.
+func archiveFilterClause(f EventArchiveFilter, arg func(any) string) string {
+	q := ` WHERE 1 = 1`
+	if f.Network != "" {
+		q += ` AND network = ` + arg(f.Network)
+	}
+	if len(f.ContractIDs) > 0 {
+		q += ` AND contract_id = ANY(` + arg(f.ContractIDs) + `)`
+	}
+	if f.FromLedger > 0 {
+		q += ` AND ledger >= ` + arg(int64(f.FromLedger))
+	}
+	if f.ToLedger > 0 {
+		q += ` AND ledger <= ` + arg(int64(f.ToLedger))
+	}
+	if f.AfterID > 0 {
+		q += ` AND id > ` + arg(f.AfterID)
+	}
+	return q
+}
+
+// ListArchivedEvents returns matching archived events oldest-first by id, so
+// a replay walks forward through history and pages with the id keyset.
+func (p *Postgres) ListArchivedEvents(ctx context.Context, f EventArchiveFilter) ([]ArchivedEvent, error) {
+	args := []any{}
+	n := 0
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	q := `SELECT id, network, event_id, contract_id, ledger, ledger_closed_at, tx_hash, event_name, topics, value, fields, ingested_at
+	     FROM event_archive` + archiveFilterClause(f, arg) +
+		` ORDER BY id ASC LIMIT ` + arg(pageLimit(f.Limit))
+	rows, err := p.queryRows(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ArchivedEvent
+	for rows.Next() {
+		ev, err := scanArchivedEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
+// CountArchivedEvents returns how many events match f. Replay calls it first
+// so a range too expensive to evaluate is rejected before any evaluation
+// runs rather than hanging mid-request.
+func (p *Postgres) CountArchivedEvents(ctx context.Context, f EventArchiveFilter) (int64, error) {
+	args := []any{}
+	n := 0
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	var count int64
+	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&count)
+	}, `SELECT count(*) FROM event_archive`+archiveFilterClause(f, arg), args...)
+	return count, err
+}
+
+// scanArchivedEvent reads one event_archive row. Topics/value/fields are
+// JSONB columns scanned as raw JSON; value and fields are NULL for events
+// whose decode produced nothing, which stays a nil RawMessage.
+func scanArchivedEvent(r rowScanner) (ArchivedEvent, error) {
+	var ev ArchivedEvent
+	var ledger int64
+	if err := r.Scan(&ev.ID, &ev.Network, &ev.EventID, &ev.ContractID, &ledger, &ev.LedgerClosedAt,
+		&ev.TxHash, &ev.EventName, &ev.Topics, &ev.Value, &ev.Fields, &ev.IngestedAt); err != nil {
+		return ArchivedEvent{}, mapErr(err)
+	}
+	ev.Ledger = uint32(ledger)
+	return ev, nil
+}
+
+const contractCursorRefsLock int64 = 0x534f524f435552
+
+func lockContractCursorRefs(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, contractCursorRefsLock)
+	return err
+}
+
+func cleanupUnusedContractCursors(ctx context.Context, tx pgx.Tx, network string) error {
+	_, err := tx.Exec(ctx, `
+		DELETE FROM contract_ingest_cursors c
+		 WHERE c.network = $1
+		   AND NOT EXISTS (
+			SELECT 1 FROM monitors m, jsonb_array_elements_text(m.contract_ids) AS ids(contract_id)
+			 WHERE m.network = c.network AND ids.contract_id = c.contract_id
+		   )`, network)
+	return err
+}
+
+func (p *Postgres) ListContractCursors(ctx context.Context, network string) ([]ContractCursor, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT network, contract_id, last_ledger, updated_at
+		   FROM contract_ingest_cursors WHERE network = $1 ORDER BY contract_id`, network)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]ContractCursor, 0)
+	for rows.Next() {
+		var cursor ContractCursor
+		var lastLedger int64
+		if err := rows.Scan(&cursor.Network, &cursor.ContractID, &lastLedger, &cursor.UpdatedAt); err != nil {
+			return nil, err
+		}
+		cursor.LastLedger = uint32(lastLedger)
+		out = append(out, cursor)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) InitializeContractCursor(ctx context.Context, network, contractID string, lastLedger uint32) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO contract_ingest_cursors (network, contract_id, last_ledger)
+		SELECT $1, $2, $3
+		 WHERE EXISTS (
+			SELECT 1 FROM monitors m, jsonb_array_elements_text(m.contract_ids) AS ids(contract_id)
+			 WHERE m.network = $1 AND ids.contract_id = $2
+		 )
+		ON CONFLICT (network, contract_id) DO NOTHING`, network, contractID, int64(lastLedger))
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) AdvanceContractCursor(ctx context.Context, network, contractID string, lastLedger uint32) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO contract_ingest_cursors (network, contract_id, last_ledger)
+		SELECT $1, $2, $3
+		 WHERE EXISTS (
+			SELECT 1 FROM monitors m, jsonb_array_elements_text(m.contract_ids) AS ids(contract_id)
+			 WHERE m.network = $1 AND ids.contract_id = $2
+		 )
+		ON CONFLICT (network, contract_id) DO UPDATE
+		   SET last_ledger = EXCLUDED.last_ledger, updated_at = now()
+		 WHERE contract_ingest_cursors.last_ledger < EXCLUDED.last_ledger`, network, contractID, int64(lastLedger))
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) RewindContractCursors(ctx context.Context, network string, lastLedger uint32) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx,
+		`UPDATE contract_ingest_cursors SET last_ledger = $2, updated_at = now()
+		  WHERE network = $1 AND last_ledger > $2`, network, int64(lastLedger))
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// --- digest queue ---
+
+func (p *Postgres) PushDigestAlert(ctx context.Context, channelID int64, payload json.RawMessage) error {
+	_, err := p.pool.Exec(ctx,
+		`INSERT INTO pending_digests (channel_id, payload) VALUES ($1, $2)`, channelID, payload)
+	return err
+}
+
+func (p *Postgres) ListDigestAlerts(ctx context.Context, channelID int64) ([]DigestAlert, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT id, channel_id, payload, created_at FROM pending_digests WHERE channel_id = $1 ORDER BY id`, channelID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DigestAlert
+	for rows.Next() {
+		var d DigestAlert
+		var payload []byte
+		if err := rows.Scan(&d.ID, &d.ChannelID, &payload, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		d.Payload = json.RawMessage(payload)
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) DeleteDigestAlerts(ctx context.Context, channelID int64, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := p.pool.Exec(ctx,
+		`DELETE FROM pending_digests WHERE channel_id = $1 AND id = ANY($2)`, channelID, ids)
+	return err
+}
+
+// --- audit log ---
+
+func (p *Postgres) CreateAuditEntry(ctx context.Context, e *AuditEntry) error {
+	NormalizeAuditEntry(ctx, e)
+	if e.CreatedAt.IsZero() {
+		e.CreatedAt = time.Now().UTC().Truncate(time.Millisecond)
+	} else {
+		e.CreatedAt = e.CreatedAt.UTC().Truncate(time.Millisecond)
+	}
+
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('audit_log:' || $1))`, e.WorkspaceID); err != nil {
+		return err
+	}
+	var prevHash string
+	if err := tx.QueryRow(ctx,
+		`SELECT COALESCE((SELECT record_hash FROM audit_log WHERE workspace_id = $1 ORDER BY id DESC LIMIT 1), '')`,
+		e.WorkspaceID).Scan(&prevHash); err != nil {
+		return err
+	}
+	e.PrevHash = prevHash
+	e.RecordHash = ComputeAuditRecordHash(*e)
+
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO audit_log (
+			workspace_id, actor, actor_type, action, target_type, target_id,
+			resource_id, surface, source_ip, outcome, status_code, reason,
+			diff, prev_hash, record_hash, created_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6,
+			$7, $8, $9, $10, $11, $12,
+			$13, $14, $15, $16
+		) RETURNING id, created_at`,
+		e.WorkspaceID, e.Actor, e.ActorType, e.Action, e.TargetType, e.TargetID,
+		e.ResourceID, e.Surface, e.SourceIP, e.Outcome, e.StatusCode, e.Reason,
+		e.Diff, e.PrevHash, e.RecordHash, e.CreatedAt,
+	).Scan(&e.ID, &e.CreatedAt); err != nil {
+		return err
+	}
+	e.CreatedAt = e.CreatedAt.UTC()
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) ListAuditEntries(ctx context.Context, f AuditFilter) ([]AuditEntry, error) {
+	where := []string{"TRUE"}
+	args := []any{}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		if f.WorkspaceID != "" && f.WorkspaceID != string(ws) {
+			return []AuditEntry{}, nil
+		}
+		args = append(args, string(ws))
+		where = append(where, fmt.Sprintf("workspace_id = $%d", len(args)))
+	} else if f.WorkspaceID != "" {
+		args = append(args, f.WorkspaceID)
+		where = append(where, fmt.Sprintf("workspace_id = $%d", len(args)))
+	}
+	if f.TargetType != "" {
+		args = append(args, f.TargetType)
+		where = append(where, fmt.Sprintf("target_type = $%d", len(args)))
+	}
+	if f.TargetID != 0 {
+		args = append(args, f.TargetID)
+		where = append(where, fmt.Sprintf("target_id = $%d", len(args)))
+	}
+	if f.ResourceID != "" {
+		args = append(args, f.ResourceID)
+		where = append(where, fmt.Sprintf("resource_id = $%d", len(args)))
+	}
+	if f.Action != "" {
+		args = append(args, f.Action)
+		where = append(where, fmt.Sprintf("action = $%d", len(args)))
+	}
+	if !f.From.IsZero() {
+		args = append(args, f.From)
+		where = append(where, fmt.Sprintf("created_at >= $%d", len(args)))
+	}
+	if !f.To.IsZero() {
+		args = append(args, f.To)
+		where = append(where, fmt.Sprintf("created_at <= $%d", len(args)))
+	}
+	if f.Actor != "" {
+		args = append(args, f.Actor)
+		where = append(where, fmt.Sprintf("actor = $%d", len(args)))
+	}
+	if f.ActorType != "" {
+		args = append(args, f.ActorType)
+		where = append(where, fmt.Sprintf("actor_type = $%d", len(args)))
+	}
+	if f.Surface != "" {
+		args = append(args, f.Surface)
+		where = append(where, fmt.Sprintf("surface = $%d", len(args)))
+	}
+	if f.Outcome != "" {
+		args = append(args, f.Outcome)
+		where = append(where, fmt.Sprintf("outcome = $%d", len(args)))
+	}
+	if f.AfterID != 0 {
+		// The listing is id DESC, so the next page holds strictly smaller ids.
+		args = append(args, f.AfterID)
+		where = append(where, fmt.Sprintf("id < $%d", len(args)))
+	}
+	limit := clampAuditLimit(f.Limit)
+	args = append(args, limit)
+	q := `SELECT id, workspace_id, actor, actor_type, action, target_type, target_id,
+	             resource_id, surface, source_ip, outcome, status_code, reason,
+	             diff, prev_hash, record_hash, created_at
+	        FROM audit_log WHERE ` +
+		strings.Join(where, " AND ") + fmt.Sprintf(" ORDER BY id DESC LIMIT $%d", len(args))
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AuditEntry
+	for rows.Next() {
+		var e AuditEntry
+		var diff []byte
+		if err := rows.Scan(
+			&e.ID, &e.WorkspaceID, &e.Actor, &e.ActorType, &e.Action, &e.TargetType, &e.TargetID,
+			&e.ResourceID, &e.Surface, &e.SourceIP, &e.Outcome, &e.StatusCode, &e.Reason,
+			&diff, &e.PrevHash, &e.RecordHash, &e.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		e.Diff = json.RawMessage(diff)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// clampAuditLimit bounds a caller-supplied page size, defaulting to 50 and
+// capping at 500 so a typo cannot scan the whole log in one request.
+func clampAuditLimit(limit int) int {
+	if limit <= 0 {
+		return 50
+	}
+	if limit > 500 {
+		return 500
+	}
+	return limit
 }
 
 // --- backfills ---
@@ -964,28 +3776,70 @@ func (p *Postgres) UpsertBackfill(ctx context.Context, b *Backfill) error {
 
 // --- stats ---
 
+// GetStats returns the dashboard's headline counters. It is a routable read:
+// the numbers are aggregate counts over a table that only ever grows, so a
+// replica a moment behind reports a total that is a moment stale rather than
+// wrong. Nothing is written back from these values, so a stale read cannot
+// turn into a stale write.
 func (p *Postgres) GetStats(ctx context.Context) (Stats, error) {
 	var s Stats
-	err := p.pool.QueryRow(ctx, `
+	cutoff, policy, hasCutoff := p.workspaceAlertCutoff(ctx)
+	var cutoffArg *time.Time
+	if hasCutoff {
+		c := cutoff.UTC()
+		cutoffArg = &c
+		s.PrunedBefore = &c
+		s.RetentionPolicySource = policy.PolicySource
+	}
+	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&s.Monitors, &s.Rules, &s.Channels, &s.Alerts, &s.AlertsLast24, &s.LastLedger, &s.LastPollAt)
+	}, `
 		SELECT
-			(SELECT count(*) FROM monitors),
-			(SELECT count(*) FROM rules),
-			(SELECT count(*) FROM channels),
-			(SELECT count(*) FROM alerts),
-			(SELECT count(*) FROM alerts WHERE created_at > now() - interval '24 hours'),
+			(SELECT count(*) FROM monitors WHERE workspace_id = $1),
+			(SELECT count(*) FROM rules r JOIN monitors m ON m.id = r.monitor_id WHERE m.workspace_id = $1),
+			(SELECT count(*) FROM channels WHERE workspace_id = $1),
+			CASE WHEN $2::timestamptz IS NULL THEN
+				COALESCE((SELECT sum(total_count) FROM alert_stat_rollups WHERE workspace_id = $1), 0)
+			ELSE
+				(SELECT count(*) FROM alerts WHERE workspace_id = $1 AND created_at >= $2)
+			END,
+			(SELECT count(*) FROM alerts WHERE workspace_id = $1 AND created_at > now() - interval '24 hours' AND ($2::timestamptz IS NULL OR created_at >= $2)),
 			(SELECT last_ledger FROM ingest_state WHERE id = 1),
-			(SELECT updated_at FROM ingest_state WHERE id = 1)`,
-	).Scan(&s.Monitors, &s.Rules, &s.Channels, &s.Alerts, &s.AlertsLast24, &s.LastLedger, &s.LastPollAt)
-	return s, err
+			(SELECT updated_at FROM ingest_state WHERE id = 1)`, workspaceID(ctx), cutoffArg)
+	if err != nil {
+		return s, err
+	}
+	// The most recent retention gap is an instance fact like last_ledger,
+	// not tenant data: if the service lost history, every operator of this
+	// instance needs to know. No recorded gap is the healthy case and leaves
+	// the field nil, which JSON omits.
+	gap, err := p.LatestRetentionGap(ctx, "")
+	switch {
+	case err == nil:
+		s.RetentionGap = &gap
+	case errors.Is(err, ErrNotFound):
+		// No gap ever recorded; report the shape GET /stats always had.
+	default:
+		return s, err
+	}
+	return s, nil
 }
 
+// AlertCountsByDay returns the daily alert totals behind the dashboard chart.
+// Routable for the same reason as GetStats: a day's bar can lag a moment
+// behind real time, and no decision is taken from the value.
 func (p *Postgres) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCount, error) {
 	days = ClampAlertSeriesDays(days)
+	var cutoffArg *time.Time
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok {
+		c := cutoff.UTC()
+		cutoffArg = &c
+	}
 	// generate_series fills every UTC calendar day in the window, including
 	// zeroes, so a quiet day is an explicit 0 rather than a missing bar.
 	// date_trunc / ::date run on (timestamptz AT TIME ZONE 'UTC') so the
 	// session TimeZone cannot shift a late-UTC event into the next local day.
-	rows, err := p.pool.Query(ctx, `
+	rows, err := p.queryRows(ctx, `
 		WITH days AS (
 			SELECT generate_series(
 				((now() AT TIME ZONE 'UTC')::date - ($1::int - 1)),
@@ -996,8 +3850,10 @@ func (p *Postgres) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCo
 		SELECT days.day, COUNT(a.id)::bigint
 		FROM days
 		LEFT JOIN alerts a ON (a.created_at AT TIME ZONE 'UTC')::date = days.day
+			AND a.workspace_id = $2
+			AND ($3::timestamptz IS NULL OR a.created_at >= $3)
 		GROUP BY days.day
-		ORDER BY days.day`, days)
+		ORDER BY days.day`, days, workspaceID(ctx), cutoffArg)
 	if err != nil {
 		return nil, err
 	}
@@ -1014,23 +3870,92 @@ func (p *Postgres) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCo
 	return out, rows.Err()
 }
 
+// GetMonitorStats reports one monitor's alert, delivery and per-rule counts.
+// Two statements, whatever the monitor's rule count: the aggregate row and one
+// grouped per-rule count. Routable reads for the same reason as GetStats —
+// every number here is a count over history that only ever grows, and nothing
+// is written back from them.
+//
+// The existence probe rides along in the aggregate rather than being a third
+// query, so a monitor deleted a moment ago reports ErrNotFound instead of a
+// page of zeroes that looks like a healthy but quiet monitor.
+func (p *Postgres) GetMonitorStats(ctx context.Context, monitorID int64) (MonitorStats, error) {
+	var (
+		ms        MonitorStats
+		exists    bool
+		cutoffArg *time.Time
+	)
+	if cutoff, _, ok := p.workspaceAlertCutoff(ctx); ok {
+		c := cutoff.UTC()
+		cutoffArg = &c
+	}
+	ms.MonitorID = monitorID
+	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&exists, &ms.Alerts, &ms.AlertsLast24h, &ms.AlertsLast7d,
+			&ms.LastAlertAt, &ms.DeliveriesOK, &ms.DeliveriesFail)
+	}, `
+		SELECT
+			(SELECT count(*) FROM monitors WHERE id = $1 AND workspace_id = $4) > 0,
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4 AND ($5::timestamptz IS NULL OR created_at >= $5)),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4 AND created_at > now() - interval '24 hours' AND ($5::timestamptz IS NULL OR created_at >= $5)),
+			(SELECT count(*) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4 AND created_at > now() - interval '7 days' AND ($5::timestamptz IS NULL OR created_at >= $5)),
+			(SELECT max(created_at) FROM alerts WHERE monitor_id = $1 AND workspace_id = $4 AND ($5::timestamptz IS NULL OR created_at >= $5)),
+			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
+			   WHERE a.monitor_id = $1 AND a.workspace_id = $4 AND da.status = $2 AND ($5::timestamptz IS NULL OR a.created_at >= $5)),
+			(SELECT count(*) FROM delivery_attempts da JOIN alerts a ON a.id = da.alert_id
+			   WHERE a.monitor_id = $1 AND a.workspace_id = $4 AND da.status = $3 AND ($5::timestamptz IS NULL OR a.created_at >= $5))`,
+		monitorID, DeliveryStatusSuccess, DeliveryStatusFailed, workspaceID(ctx), cutoffArg)
+	if err != nil {
+		return ms, err
+	}
+	if !exists {
+		return ms, ErrNotFound
+	}
+
+	rows, err := p.queryRows(ctx, `
+		SELECT r.id, r.type, count(a.id)
+		FROM rules r
+		LEFT JOIN alerts a ON a.rule_id = r.id AND a.workspace_id = $2 AND ($3::timestamptz IS NULL OR a.created_at >= $3)
+		WHERE r.monitor_id = $1
+		GROUP BY r.id, r.type
+		ORDER BY r.id`, monitorID, workspaceID(ctx), cutoffArg)
+	if err != nil {
+		return ms, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rc RuleMatchCount
+		if err := rows.Scan(&rc.RuleID, &rc.Type, &rc.Alerts); err != nil {
+			return ms, err
+		}
+		ms.Rules = append(ms.Rules, rc)
+	}
+	return ms, rows.Err()
+}
+
 // --- helpers ---
 
 // --- saved searches ---
 
 func (p *Postgres) CreateSavedSearch(ctx context.Context, s *SavedSearch) error {
 	filter, _ := json.Marshal(s.Filter)
+	ws := workspaceID(ctx)
 	if s.IsDefault {
-		_, _ = p.pool.Exec(ctx, `UPDATE saved_searches SET is_default = FALSE WHERE is_default = TRUE`)
+		// Scoped, or making one workspace's search the default would clear
+		// every other workspace's. The same reasoning applies to the two
+		// default-search methods below.
+		_, _ = p.pool.Exec(ctx, `UPDATE saved_searches SET is_default = FALSE WHERE is_default = TRUE AND workspace_id = $1`, ws)
 	}
 	return p.pool.QueryRow(ctx,
-		`INSERT INTO saved_searches (name, filter, is_default) VALUES ($1, $2, $3) RETURNING id, created_at`,
-		s.Name, filter, s.IsDefault).Scan(&s.ID, &s.CreatedAt)
+		`INSERT INTO saved_searches (name, filter, is_default, workspace_id, created_at)
+		 VALUES ($1, $2, $3, $4, COALESCE($5, now())) RETURNING id, created_at`,
+		s.Name, filter, s.IsDefault, ws, pgCreatedAt(s.CreatedAt)).Scan(&s.ID, &s.CreatedAt)
 }
 
 func (p *Postgres) ListSavedSearches(ctx context.Context) ([]SavedSearch, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT id, name, filter, is_default, created_at FROM saved_searches ORDER BY name`)
+		`SELECT id, name, filter, is_default, created_at FROM saved_searches WHERE workspace_id = $1 ORDER BY name`,
+		workspaceID(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -1052,7 +3977,8 @@ func (p *Postgres) GetSavedSearch(ctx context.Context, id int64) (*SavedSearch, 
 	var s SavedSearch
 	var filter []byte
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, name, filter, is_default, created_at FROM saved_searches WHERE id = $1`, id).
+		`SELECT id, name, filter, is_default, created_at FROM saved_searches WHERE id = $1 AND workspace_id = $2`,
+		id, workspaceID(ctx)).
 		Scan(&s.ID, &s.Name, &filter, &s.IsDefault, &s.CreatedAt)
 	if err != nil {
 		return nil, mapErr(err)
@@ -1071,10 +3997,13 @@ func (p *Postgres) SetDefaultSearch(ctx context.Context, id int64) error {
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
-	_, _ = tx.Exec(ctx, `UPDATE saved_searches SET is_default = FALSE WHERE is_default = TRUE`)
-	tag, err := tx.Exec(ctx, `UPDATE saved_searches SET is_default = TRUE WHERE id = $1`, id)
+	ws := workspaceID(ctx)
+	_, _ = tx.Exec(ctx, `UPDATE saved_searches SET is_default = FALSE WHERE is_default = TRUE AND workspace_id = $1`, ws)
+	tag, err := tx.Exec(ctx, `UPDATE saved_searches SET is_default = TRUE WHERE id = $1 AND workspace_id = $2`, id, ws)
 	if err != nil {
-		return err
+		// The partial unique index allows one default per workspace, and a
+		// second one is the request's fault rather than the server's.
+		return mapErr(err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
@@ -1083,7 +4012,9 @@ func (p *Postgres) SetDefaultSearch(ctx context.Context, id int64) error {
 }
 
 func (p *Postgres) ClearDefaultSearch(ctx context.Context, id int64) error {
-	tag, err := p.pool.Exec(ctx, `UPDATE saved_searches SET is_default = FALSE WHERE id = $1`, id)
+	tag, err := p.pool.Exec(ctx,
+		`UPDATE saved_searches SET is_default = FALSE WHERE id = $1 AND workspace_id = $2`,
+		id, workspaceID(ctx))
 	if err != nil {
 		return err
 	}
@@ -1099,15 +4030,17 @@ func (p *Postgres) CreateMonitorTemplate(ctx context.Context, t *MonitorTemplate
 	rulesJSON, _ := json.Marshal(t.Rules)
 	paramsJSON, _ := json.Marshal(t.Parameters)
 	return p.pool.QueryRow(ctx,
-		`INSERT INTO monitor_templates (name, description, rules, channel_ids, parameters) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
-		t.Name, t.Description, rulesJSON, t.ChannelIDs, paramsJSON).Scan(&t.ID, &t.CreatedAt)
+		`INSERT INTO monitor_templates (name, description, rules, channel_ids, parameters, workspace_id, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now())) RETURNING id, created_at`,
+		t.Name, t.Description, rulesJSON, templateChannelIDs(t.ChannelIDs), paramsJSON, workspaceID(ctx), pgCreatedAt(t.CreatedAt)).Scan(&t.ID, &t.CreatedAt)
 }
 
 func (p *Postgres) GetMonitorTemplate(ctx context.Context, id int64) (*MonitorTemplate, error) {
 	var t MonitorTemplate
 	var rulesJSON, paramsJSON []byte
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, name, description, rules, channel_ids, parameters, created_at FROM monitor_templates WHERE id = $1`, id).
+		`SELECT id, name, description, rules, channel_ids, parameters, created_at FROM monitor_templates WHERE id = $1 AND workspace_id = $2`,
+		id, workspaceID(ctx)).
 		Scan(&t.ID, &t.Name, &t.Description, &rulesJSON, &t.ChannelIDs, &paramsJSON, &t.CreatedAt)
 	if err != nil {
 		return nil, mapErr(err)
@@ -1122,7 +4055,8 @@ func (p *Postgres) GetMonitorTemplate(ctx context.Context, id int64) (*MonitorTe
 
 func (p *Postgres) ListMonitorTemplates(ctx context.Context) ([]MonitorTemplate, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT id, name, description, rules, channel_ids, parameters, created_at FROM monitor_templates ORDER BY name`)
+		`SELECT id, name, description, rules, channel_ids, parameters, created_at FROM monitor_templates WHERE workspace_id = $1 ORDER BY name`,
+		workspaceID(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -1148,8 +4082,8 @@ func (p *Postgres) UpdateMonitorTemplate(ctx context.Context, t *MonitorTemplate
 	rulesJSON, _ := json.Marshal(t.Rules)
 	paramsJSON, _ := json.Marshal(t.Parameters)
 	tag, err := p.pool.Exec(ctx,
-		`UPDATE monitor_templates SET name=$1, description=$2, rules=$3, channel_ids=$4, parameters=$5 WHERE id=$6`,
-		t.Name, t.Description, rulesJSON, t.ChannelIDs, paramsJSON, t.ID)
+		`UPDATE monitor_templates SET name=$1, description=$2, rules=$3, channel_ids=$4, parameters=$5 WHERE id=$6 AND workspace_id=$7`,
+		t.Name, t.Description, rulesJSON, templateChannelIDs(t.ChannelIDs), paramsJSON, t.ID, workspaceID(ctx))
 	if err != nil {
 		return err
 	}
@@ -1163,8 +4097,307 @@ func (p *Postgres) DeleteMonitorTemplate(ctx context.Context, id int64) error {
 	return p.deleteByID(ctx, "monitor_templates", id)
 }
 
+// AssignLegacyNetwork labels the rows written before the network column
+// existed, once, at startup, in the instance's own cross-tenant scope: an
+// operator upgrading a single-network deployment must not watch every monitor
+// vanish from the network-filtered listing. Idempotent because the predicate
+// only matches the empty value.
+func (p *Postgres) AssignLegacyNetwork(ctx context.Context, network string) (int64, error) {
+	if network == "" {
+		return 0, nil // nothing to label: no network configured
+	}
+	var total int64
+	for _, q := range []string{
+		`UPDATE monitors SET network = $1 WHERE network = ''`,
+		`UPDATE alerts SET network = $1 WHERE network = ''`,
+	} {
+		tag, err := p.pool.Exec(ctx, q, network)
+		if err != nil {
+			return total, mapErr(err)
+		}
+		total += tag.RowsAffected()
+	}
+	return total, nil
+}
+
+// --- api tokens ---
+
+// CreateAPIToken inserts one token row. The caller passes a digest, never a
+// secret: auth.Manager hashes before this point and drops the plaintext, so the
+// string that reaches SQL (or a log, or an error) is already one-way.
+func (p *Postgres) CreateAPIToken(ctx context.Context, t *auth.Token) error {
+	var expiresAt any
+	if !t.ExpiresAt.IsZero() {
+		expiresAt = t.ExpiresAt
+	}
+	ws := workspaceID(ctx)
+	err := p.pool.QueryRow(ctx,
+		`INSERT INTO api_tokens (workspace_id, name, token_hash, prefix, scopes, expires_at)
+		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at`,
+		ws, t.Name, t.Hash, t.Prefix, auth.JoinScopes(t.Scopes), expiresAt).
+		Scan(&t.ID, &t.CreatedAt)
+	if err != nil {
+		return mapErr(err)
+	}
+	t.Workspace = ws
+	return nil
+}
+
+// TokenByHash is the authentication read. It is the one token method that does
+// not scope itself to ctx's workspace: a request carrying a token has no tenant
+// until this row answers, and the row's own workspace_id is what the request
+// then gets — never anything the caller supplied.
+func (p *Postgres) TokenByHash(ctx context.Context, hash string) (*auth.Token, bool, error) {
+	t, err := scanAPIToken(p.pool.QueryRow(ctx,
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
+		        rotated_from_id, successor_id, rotated_at, pre_rotation_expires_at
+		   FROM api_tokens WHERE token_hash = $1`, hash))
+	if errors.Is(err, ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return &t, true, nil
+}
+
+func (p *Postgres) ListAPITokens(ctx context.Context) ([]auth.Token, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
+		        rotated_from_id, successor_id, rotated_at, pre_rotation_expires_at
+		   FROM api_tokens WHERE workspace_id = $1 ORDER BY id DESC`,
+		workspaceID(ctx))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []auth.Token
+	for rows.Next() {
+		t, err := scanAPIToken(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// GetAPIToken returns one token by id in the caller's workspace.
+func (p *Postgres) GetAPIToken(ctx context.Context, id int64) (*auth.Token, error) {
+	t, err := scanAPIToken(p.pool.QueryRow(ctx,
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
+		        rotated_from_id, successor_id, rotated_at, pre_rotation_expires_at
+		   FROM api_tokens WHERE id = $1 AND workspace_id = $2`,
+		id, workspaceID(ctx)))
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// RotateAPIToken atomically creates a successor token and updates the predecessor
+// with the successor's id, rotation timestamp, and new expiry.
+func (p *Postgres) RotateAPIToken(ctx context.Context, predecessorID int64, successor *auth.Token, predecessorExpiry time.Time) error {
+	ws := workspaceID(ctx)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	pred, err := scanAPIToken(tx.QueryRow(ctx,
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
+		        rotated_from_id, successor_id, rotated_at, pre_rotation_expires_at
+		   FROM api_tokens WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+		predecessorID, ws))
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	if !pred.RevokedAt.IsZero() {
+		return fmt.Errorf("cannot rotate a revoked token")
+	}
+	if !pred.ExpiresAt.IsZero() && now.After(pred.ExpiresAt) {
+		return fmt.Errorf("cannot rotate an expired token")
+	}
+
+	var succExpires any
+	if !successor.ExpiresAt.IsZero() {
+		succExpires = successor.ExpiresAt
+	}
+
+	var succCreated, succRotated time.Time
+	err = tx.QueryRow(ctx,
+		`INSERT INTO api_tokens (workspace_id, name, token_hash, prefix, scopes, expires_at, rotated_from_id, rotated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, created_at, rotated_at`,
+		ws, successor.Name, successor.Hash, successor.Prefix, auth.JoinScopes(successor.Scopes),
+		succExpires, predecessorID, now).Scan(&successor.ID, &succCreated, &succRotated)
+	if err != nil {
+		return mapErr(err)
+	}
+	successor.Workspace = ws
+	successor.CreatedAt = succCreated
+	successor.RotatedAt = succRotated
+	successor.RotatedFromID = &predecessorID
+
+	var predExpiry any
+	if !predecessorExpiry.IsZero() {
+		predExpiry = predecessorExpiry
+	}
+	var origPredExpires any
+	if !pred.ExpiresAt.IsZero() {
+		origPredExpires = pred.ExpiresAt
+	}
+
+	_, err = tx.Exec(ctx,
+		`UPDATE api_tokens
+		    SET successor_id = $1, rotated_at = $2, pre_rotation_expires_at = $3, expires_at = $4
+		  WHERE id = $5 AND workspace_id = $6`,
+		successor.ID, now, origPredExpires, predExpiry, predecessorID, ws)
+	if err != nil {
+		return mapErr(err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+// AbandonAPITokenRotation revokes the successor and restores predecessor's pre-rotation expiry.
+func (p *Postgres) AbandonAPITokenRotation(ctx context.Context, id int64) error {
+	ws := workspaceID(ctx)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tok, err := scanAPIToken(tx.QueryRow(ctx,
+		`SELECT id, workspace_id, name, token_hash, prefix, scopes, expires_at, last_used_at, revoked_at, created_at,
+		        rotated_from_id, successor_id, rotated_at, pre_rotation_expires_at
+		   FROM api_tokens WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+		id, ws))
+	if err != nil {
+		return err
+	}
+
+	var predID, succID int64
+	switch {
+	case tok.SuccessorID != nil:
+		predID = tok.ID
+		succID = *tok.SuccessorID
+	case tok.RotatedFromID != nil:
+		succID = tok.ID
+		predID = *tok.RotatedFromID
+	default:
+		return fmt.Errorf("no rotation in progress for token %d", id)
+	}
+
+	var preRotExpires *time.Time
+	err = tx.QueryRow(ctx,
+		`SELECT pre_rotation_expires_at FROM api_tokens WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+		predID, ws).Scan(&preRotExpires)
+	if err != nil {
+		return mapErr(err)
+	}
+
+	_, err = tx.Exec(ctx,
+		`UPDATE api_tokens SET revoked_at = COALESCE(revoked_at, now()) WHERE id = $1 AND workspace_id = $2`,
+		succID, ws)
+	if err != nil {
+		return mapErr(err)
+	}
+
+	var restoredExpiry any
+	if preRotExpires != nil {
+		restoredExpiry = *preRotExpires
+	}
+	_, err = tx.Exec(ctx,
+		`UPDATE api_tokens
+		    SET successor_id = NULL, rotated_at = NULL, pre_rotation_expires_at = NULL, expires_at = $1
+		  WHERE id = $2 AND workspace_id = $3`,
+		restoredExpiry, predID, ws)
+	if err != nil {
+		return mapErr(err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+// RevokeAPIToken retires one of the caller's tokens. COALESCE keeps the first
+// revocation timestamp, so revoking twice is a no-op that still reports success
+// rather than a 404 for a token the caller can already see is revoked; a row in
+// another workspace is ErrNotFound, the same answer a missing id gives.
+func (p *Postgres) RevokeAPIToken(ctx context.Context, id int64) error {
+	tag, err := p.pool.Exec(ctx,
+		`UPDATE api_tokens SET revoked_at = COALESCE(revoked_at, now()) WHERE id = $1 AND workspace_id = $2`,
+		id, workspaceID(ctx))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// TouchAPIToken records that a token authenticated. The write is unconditional
+// because the caller throttles it (auth.Manager skips a token used within the
+// last minute); a store-side guard would make the throttle's interval a second
+// copy of the same constant.
+func (p *Postgres) TouchAPIToken(ctx context.Context, id int64, at time.Time) error {
+	_, err := p.pool.Exec(
+		ctx,
+		`UPDATE api_tokens SET last_used_at = $3 WHERE id = $1 AND workspace_id = $2`,
+		id, workspaceID(ctx), at)
+	return err
+}
+
+// scanAPIToken reads one api_tokens row through the same rowScanner the other
+// scans use, so the single-row read and the listing share one column order.
+// The three nullable timestamps come back as pointers and become zero times,
+// which is what auth.Token's Live and the dashboard's "never used" both key off.
+func scanAPIToken(row rowScanner) (auth.Token, error) {
+	var t auth.Token
+	var scopes string
+	var expiresAt, lastUsedAt, revokedAt, rotatedAt, preRotExpires *time.Time
+	var rotatedFromID, successorID *int64
+	err := row.Scan(&t.ID, &t.Workspace, &t.Name, &t.Hash, &t.Prefix, &scopes,
+		&expiresAt, &lastUsedAt, &revokedAt, &t.CreatedAt,
+		&rotatedFromID, &successorID, &rotatedAt, &preRotExpires)
+	if err != nil {
+		return t, mapErr(err)
+	}
+	t.Scopes = auth.SplitScopes(scopes)
+	if expiresAt != nil {
+		t.ExpiresAt = *expiresAt
+	}
+	if lastUsedAt != nil {
+		t.LastUsedAt = *lastUsedAt
+	}
+	if revokedAt != nil {
+		t.RevokedAt = *revokedAt
+	}
+	t.RotatedFromID = rotatedFromID
+	t.SuccessorID = successorID
+	if rotatedAt != nil {
+		t.RotatedAt = *rotatedAt
+	}
+	if preRotExpires != nil {
+		t.PreRotationExpiresAt = *preRotExpires
+	}
+	return t, nil
+}
+
+// deleteByID removes one row by id from a workspace-bearing table. The table
+// name is not a parameter, so it is constrained to deletableTables rather than
+// taken from a caller; a row outside the caller's workspace reports RowsAffected
+// 0, which is ErrNotFound — the same answer an id that does not exist gives, so
+// a delete cannot probe other tenants.
 func (p *Postgres) deleteByID(ctx context.Context, table string, id int64) error {
-	tag, err := p.pool.Exec(ctx, `DELETE FROM `+table+` WHERE id = $1`, id)
+	if !deletableTables[table] {
+		return errUnallowlistedTable
+	}
+	tag, err := p.pool.Exec(ctx,
+		`DELETE FROM `+table+` WHERE id = $1 AND workspace_id = $2`, id, workspaceID(ctx))
 	if err != nil {
 		return err
 	}
@@ -1177,6 +4410,13 @@ func (p *Postgres) deleteByID(ctx context.Context, table string, id int64) error
 func jsonOrEmpty(raw json.RawMessage) []byte {
 	if len(raw) == 0 {
 		return []byte(`{}`)
+	}
+	return raw
+}
+
+func nullableJSON(raw json.RawMessage) any {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
 	}
 	return raw
 }
@@ -1202,14 +4442,108 @@ func WithSuppressed(payload json.RawMessage, n int64) json.RawMessage {
 	return merged
 }
 
-// mapErr converts pgx sentinel and FK errors into store-level errors.
+// Postgres reports a constraint violation as an SQLSTATE code on the driver's
+// error. The three that matter here are the ones a request can cause: a
+// foreign key naming a row that does not exist, a CHECK the value fails and a
+// unique index the value collides with.
+const (
+	pgForeignKeyViolation = "23503"
+	pgCheckViolation      = "23514"
+	pgUniqueViolation     = "23505"
+)
+
+// mapErr converts pgx sentinel and constraint errors into store-level errors.
 func mapErr(err error) error {
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23503" { // foreign_key_violation
-		return fmt.Errorf("%w: %s", ErrNotFound, pgErr.ConstraintName)
+	if !errors.As(err, &pgErr) {
+		return err
+	}
+	switch pgErr.Code {
+	case pgForeignKeyViolation:
+		// The row the request named does not exist, so this is a missing row
+		// as well as a constraint violation: a caller that only knows
+		// ErrNotFound keeps the answer it has always had, and a caller that
+		// knows ErrConstraint can tell the caller it was the request's fault
+		// rather than the server's.
+		return fmt.Errorf("%w: %w", ErrNotFound, &ConstraintError{
+			Kind:       ConstraintForeignKey,
+			Constraint: pgErr.ConstraintName,
+		})
+	case pgCheckViolation:
+		return &ConstraintError{Kind: ConstraintCheck, Constraint: pgErr.ConstraintName}
+	case pgUniqueViolation:
+		return &ConstraintError{Kind: ConstraintUnique, Constraint: pgErr.ConstraintName}
 	}
 	return err
+}
+
+// ListAlertsStream implements Store by paging ListAlerts with the keyset
+// cursor, so peak memory is one page rather than the whole result set.
+func (p *Postgres) ListAlertsStream(ctx context.Context, f AlertFilter, fn func(Alert) error) error {
+	return streamAlerts(ctx, f, p.ListAlerts, fn)
+}
+
+func (p *Postgres) RegisterPersistedOperation(ctx context.Context, op PersistedOperation) error {
+	now := time.Now().UTC()
+	if op.CreatedAt.IsZero() {
+		op.CreatedAt = now
+	}
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO persisted_operations (id, name, document, created_at)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (id) DO UPDATE SET
+			name = EXCLUDED.name,
+			document = EXCLUDED.document`,
+		op.ID, op.Name, op.Document, op.CreatedAt)
+	return mapErr(err)
+}
+
+func (p *Postgres) GetPersistedOperation(ctx context.Context, id string) (*PersistedOperation, error) {
+	var op PersistedOperation
+	err := p.pool.QueryRow(ctx, `
+		SELECT id, name, document, created_at
+		FROM persisted_operations
+		WHERE id = $1`, id).Scan(&op.ID, &op.Name, &op.Document, &op.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, mapErr(err)
+	}
+	return &op, nil
+}
+
+func (p *Postgres) ListPersistedOperations(ctx context.Context) ([]PersistedOperation, error) {
+	rows, err := p.pool.Query(ctx, `
+		SELECT id, name, document, created_at
+		FROM persisted_operations
+		ORDER BY created_at DESC, id ASC`)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	var ops []PersistedOperation
+	for rows.Next() {
+		var op PersistedOperation
+		if err := rows.Scan(&op.ID, &op.Name, &op.Document, &op.CreatedAt); err != nil {
+			return nil, mapErr(err)
+		}
+		ops = append(ops, op)
+	}
+	return ops, rows.Err()
+}
+
+func (p *Postgres) DeletePersistedOperation(ctx context.Context, id string) error {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM persisted_operations WHERE id = $1`, id)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

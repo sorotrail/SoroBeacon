@@ -42,7 +42,7 @@ func decodedEvent(raw json.RawMessage) template.HTML {
 		b.WriteString("</td></tr>")
 	}
 	b.WriteString("</table>")
-	return template.HTML(b.String())
+	return template.HTML(b.String()) // #nosec G203 -- every label and value is escaped with html.EscapeString above
 }
 
 // decodedFields turns a stored alert payload into display rows.

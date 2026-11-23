@@ -1,10 +1,13 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
 
 	"github.com/golang-migrate/migrate/v4"
 	pgxmigrate "github.com/golang-migrate/migrate/v4/database/pgx/v5"
@@ -19,6 +22,67 @@ import (
 //
 //go:embed migrations/*.sql migrations/sqlite/*.sql
 var migrationsFS embed.FS
+
+// MigrationState reports the current and latest embedded migration versions
+// without applying migrations or creating a database. It is intended for
+// deployment preflight checks, where inspecting the target must be read-only.
+func MigrationState(ctx context.Context, databaseURL string) (current, latest uint, dirty bool, err error) {
+	scheme, err := Scheme(databaseURL)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	sourcePath := "migrations"
+	driverName := "pgx"
+	if scheme == "sqlite" {
+		sourcePath = "migrations/sqlite"
+		driverName = sqliteDriver
+	} else if scheme != "postgres" && scheme != "postgresql" {
+		return 0, 0, false, fmt.Errorf("unsupported DATABASE_URL scheme %q", scheme)
+	}
+	src, err := iofs.New(migrationsFS, sourcePath)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("load migrations: %w", err)
+	}
+	latest, err = src.First()
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("find first migration: %w", err)
+	}
+	for {
+		next, nextErr := src.Next(latest)
+		if errors.Is(nextErr, os.ErrNotExist) {
+			break
+		}
+		if nextErr != nil {
+			return 0, 0, false, fmt.Errorf("find latest migration: %w", nextErr)
+		}
+		latest = next
+	}
+
+	dsn := databaseURL
+	if scheme == "sqlite" {
+		path, pathErr := sqliteFilePath(databaseURL)
+		if pathErr != nil {
+			return 0, latest, false, pathErr
+		}
+		query := url.Values{}
+		query.Set("mode", "ro")
+		query.Add("_pragma", "busy_timeout(5000)")
+		query.Add("_pragma", "query_only(1)")
+		dsn = "file:" + path + "?" + query.Encode()
+	}
+	db, err := sql.Open(driverName, dsn)
+	if err != nil {
+		return 0, latest, false, fmt.Errorf("open database: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.PingContext(ctx); err != nil {
+		return 0, latest, false, fmt.Errorf("ping database: %w", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT version, dirty FROM schema_migrations LIMIT 1`).Scan(&current, &dirty); err != nil {
+		return 0, latest, false, fmt.Errorf("read migration state: %w", err)
+	}
+	return current, latest, dirty, nil
+}
 
 // Migrate applies all pending migrations for the backend selected by the
 // DATABASE_URL scheme. It is embedded in the binary and safe to call on every

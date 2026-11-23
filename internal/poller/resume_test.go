@@ -71,9 +71,12 @@ func (f *crashRPC) GetNetwork(context.Context) (*stellar.Network, error) {
 
 // errorRPC fails every GetEvents call and still records the requests it was
 // asked to make, so a test can assert the cursor did not move by watching
-// what the next cycle asks for.
+// what the next cycle asks for. oldest is what getHealth reports as the
+// oldest retained ledger, exactly like fakeRPC, so a retention test can
+// drive the clamp against a source that is down.
 type errorRPC struct {
 	latest   uint32
+	oldest   uint32
 	requests []stellar.GetEventsRequest
 }
 
@@ -85,7 +88,9 @@ func (f *errorRPC) GetEvents(_ context.Context, req stellar.GetEventsRequest) (*
 func (f *errorRPC) GetLatestLedger(context.Context) (*stellar.LatestLedger, error) {
 	return latestLedgerAt(f.latest), nil
 }
-func (f *errorRPC) GetHealth(context.Context) (*stellar.Health, error) { return healthyHealth(), nil }
+func (f *errorRPC) GetHealth(context.Context) (*stellar.Health, error) {
+	return &stellar.Health{Status: "healthy", OldestLedger: f.oldest}, nil
+}
 func (f *errorRPC) GetNetwork(context.Context) (*stellar.Network, error) {
 	return anyNetwork(), nil
 }
@@ -105,6 +110,33 @@ func (f *emptyRPC) GetLatestLedger(context.Context) (*stellar.LatestLedger, erro
 func (f *emptyRPC) GetHealth(context.Context) (*stellar.Health, error) { return healthyHealth(), nil }
 func (f *emptyRPC) GetNetwork(context.Context) (*stellar.Network, error) {
 	return anyNetwork(), nil
+}
+
+type contractCursorSource struct {
+	latest uint32
+	events map[string][]*stellar.DecodedEvent
+	starts []uint32
+	watch  [][]string
+}
+
+func (s *contractCursorSource) LatestLedger(context.Context) (uint32, error) {
+	return s.latest, nil
+}
+
+func (s *contractCursorSource) FetchEvents(_ context.Context, start uint32, watch []Watch, _ string, _ int) (FetchPage, error) {
+	s.starts = append(s.starts, start)
+	page := FetchPage{LatestLedger: s.latest}
+	var contracts []string
+	for _, w := range watch {
+		contracts = append(contracts, w.ContractID)
+		for _, event := range s.events[w.ContractID] {
+			if event.Ledger >= start {
+				page.Events = append(page.Events, event)
+			}
+		}
+	}
+	s.watch = append(s.watch, contracts)
+	return page, nil
 }
 
 // fullCrashPage builds one max-size page of distinct matching events, so the
@@ -273,4 +305,74 @@ func TestResumeSourceErrorLeavesCursorAtPersistedPosition(t *testing.T) {
 		"recovery resumes after the checkpoint the errors left untouched")
 	assert.Equal(t, uint32(6000), st.state.LastLedger,
 		"the recovered cycle closes at the source's tip")
+}
+
+func TestColdStartInitializesNewContractAtTipBeforeFetch(t *testing.T) {
+	rpc := &errorRPC{latest: 5000}
+	st := newFakeStore()
+	seedMonitor(st, `{"event_name":"transfer"}`)
+	p := newResumePoller(rpc, st, &fakeDispatcher{})
+
+	require.ErrorIs(t, p.Poll(context.Background()), errSourceDown)
+	require.Len(t, rpc.requests, 1)
+	assert.Equal(t, uint32(5000), rpc.requests[0].StartLedger)
+	cursors, err := st.ListContractCursors(context.Background(), "")
+	require.NoError(t, err)
+	require.Len(t, cursors, 1)
+	assert.Equal(t, uint32(4999), cursors[0].LastLedger,
+		"a failed first fetch leaves the cursor immediately before the cold-start tip")
+}
+
+func TestContractCursorsAdvanceIndependentlyAndReplayFailedLedger(t *testing.T) {
+	ctx := context.Background()
+	contractA := contractID(0xA1)
+	contractB := contractID(0xB2)
+	st := newFakeStore()
+	st.state.LastLedger = 100
+	seedMonitor(st, `{"event_name":"transfer"}`)
+	st.mu.Lock()
+	st.monitors[0].ContractIDs = []string{contractA, contractB}
+	st.mu.Unlock()
+	require.NoError(t, st.InitializeContractCursor(ctx, "", contractA, 100))
+	require.NoError(t, st.InitializeContractCursor(ctx, "", contractB, 90))
+	st.alertErrors["event-a"] = errSourceDown
+
+	source := &contractCursorSource{
+		latest: 120,
+		events: map[string][]*stellar.DecodedEvent{
+			contractA: {
+				{ID: "event-a-before-failure", ContractID: contractA, Ledger: 105, Topics: []any{"transfer"}},
+				{ID: "event-a", ContractID: contractA, Ledger: 105, Topics: []any{"transfer"}},
+			},
+			contractB: {{ID: "event-b", ContractID: contractB, Ledger: 95, Topics: []any{"transfer"}}},
+		},
+	}
+	p := New(source, st, rules.NewRegistry(), &fakeDispatcher{}, 0, slog.New(slog.DiscardHandler))
+	require.NoError(t, p.Poll(ctx))
+
+	cursors, err := st.ListContractCursors(ctx, "")
+	require.NoError(t, err)
+	require.Len(t, cursors, 2)
+	positions := map[string]uint32{}
+	for _, cursor := range cursors {
+		positions[cursor.ContractID] = cursor.LastLedger
+	}
+	assert.Equal(t, uint32(104), positions[contractA], "failed event holds A before its ledger")
+	assert.Equal(t, uint32(120), positions[contractB], "B advances independently")
+
+	st.mu.Lock()
+	delete(st.alertErrors, "event-a")
+	st.mu.Unlock()
+	require.NoError(t, p.Poll(ctx))
+	assert.Equal(t, []uint32{91, 101, 105, 121}, source.starts,
+		"the retry starts A at the failed ledger while B resumes after its own cursor")
+	assert.ElementsMatch(t, []string{"event-a-before-failure", "event-a", "event-b"}, func() []string {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		ids := make([]string, 0, len(st.alerts))
+		for _, alert := range st.alerts {
+			ids = append(ids, alert.EventID)
+		}
+		return ids
+	}(), "replay creates the missing alert without duplicating B")
 }

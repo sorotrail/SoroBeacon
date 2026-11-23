@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 func TestVerifyAcceptsConfiguredTokens(t *testing.T) {
@@ -61,8 +63,8 @@ func TestNilAuthenticatorIsDisabledAndSafe(t *testing.T) {
 		t.Fatal("nil authenticator must not report a session")
 	}
 	a.DropSession("x") // must not panic
-	if !a.Authenticated(httptest.NewRequest(http.MethodGet, "/", nil)) {
-		t.Fatal("nil authenticator must leave requests open")
+	if ws, ok := a.Workspace(httptest.NewRequest(http.MethodGet, "/", nil)); !ok || ws != workspace.Default {
+		t.Fatal("nil authenticator must leave requests open on the default workspace")
 	}
 }
 
@@ -116,7 +118,7 @@ func TestSessionIDsAreOpaqueAndUnique(t *testing.T) {
 	a := New([]string{"s3cret"}, 0)
 	seen := map[string]bool{}
 	for i := 0; i < 64; i++ {
-		id := a.NewSession()
+		id := a.NewSession(workspace.Default)
 		if len(id) < 32 {
 			t.Fatalf("session id %q is shorter than 32 chars; it must not be guessable", id)
 		}
@@ -132,7 +134,7 @@ func TestHasSessionExpiresAndDrops(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	a.now = func() time.Time { return now }
 
-	id := a.NewSession()
+	id := a.NewSession(workspace.Default)
 	if !a.HasSession(id) {
 		t.Fatal("session must be live before its TTL elapses")
 	}
@@ -150,8 +152,8 @@ func TestHasSessionExpiresAndDrops(t *testing.T) {
 		t.Fatal("an expired session must stay gone")
 	}
 
-	first := a.NewSession()
-	second := a.NewSession()
+	first := a.NewSession(workspace.Default)
+	second := a.NewSession(workspace.Default)
 	a.DropSession(first)
 	if a.HasSession(first) {
 		t.Fatal("DropSession must end that session")
@@ -165,10 +167,47 @@ func TestHasSessionExpiresAndDrops(t *testing.T) {
 	}
 }
 
+// NewSession turns a workspace id into a tenancy decision, so the edges of
+// that input matter: an empty id is the single-tenant fallback, and an id that
+// sits at or past the workspace grammar's length boundary must reach the
+// session unchanged rather than being trimmed into a different tenant's name.
+func TestNewSessionWorkspaceEdgeCases(t *testing.T) {
+	maxLen := workspace.ID(strings.Repeat("w", 40))
+	overMaxLen := workspace.ID(strings.Repeat("w", 41))
+	tests := map[string]struct {
+		in   workspace.ID
+		want workspace.ID
+	}{
+		"empty falls back to the default workspace": {in: "", want: workspace.Default},
+		"single character is the minimum":           {in: "a", want: "a"},
+		"maximum length is kept as given":           {in: maxLen, want: maxLen},
+		"over the maximum is not truncated":         {in: overMaxLen, want: overMaxLen},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			a := New([]string{"s3cret"}, 0)
+			id := a.NewSession(tc.in)
+			if id == "" {
+				t.Fatal("NewSession returned no session id")
+			}
+			got, ok := a.SessionWorkspace(id)
+			if !ok {
+				t.Fatal("a freshly minted session must resolve to a workspace")
+			}
+			if got != tc.want {
+				t.Fatalf("session workspace = %q, want %q", got, tc.want)
+			}
+			if role, ok := a.SessionRole(id); !ok || role != RoleAdmin {
+				t.Fatalf("session role = %v, %v; want an admin", role, ok)
+			}
+		})
+	}
+}
+
 func TestZeroTTLFallsBackToDefault(t *testing.T) {
 	a := New([]string{"s3cret"}, 0)
-	if a.ttl != DefaultSessionTTL {
-		t.Fatalf("ttl = %v, want %v", a.ttl, DefaultSessionTTL)
+	if a.SessionTTL() != DefaultSessionTTL {
+		t.Fatalf("SessionTTL() = %v, want %v", a.SessionTTL(), DefaultSessionTTL)
 	}
 }
 
@@ -180,36 +219,182 @@ func requestWithHeader(name, value string) *http.Request {
 	return r
 }
 
-func TestAuthenticatedAcceptsBearerOrSessionCookie(t *testing.T) {
-	a := New([]string{"s3cret"}, 0)
-	sessionID, ok := a.Login("s3cret")
+func requestWithCookie(value string) *http.Request {
+	r := requestWithHeader("", "")
+	r.AddCookie(&http.Cookie{Name: SessionCookie, Value: value})
+	return r
+}
+
+func TestWorkspaceResolvesTheCredential(t *testing.T) {
+	a := NewBound([]Binding{
+		{Workspace: "acme", Token: "tok-acme"},
+		{Workspace: "beta", Token: "tok-beta"},
+	}, 0)
+	session, ok := a.Login("tok-acme")
 	if !ok {
 		t.Fatal("Login failed")
 	}
 
 	tests := map[string]struct {
-		req  *http.Request
-		want bool
+		req           *http.Request
+		want          workspace.ID
+		authenticated bool
 	}{
-		"valid bearer": {requestWithHeader("Authorization", "Bearer s3cret"), true},
-		"wrong bearer": {requestWithHeader("Authorization", "Bearer nope"), false},
-		"basic":        {requestWithHeader("Authorization", "Basic czNjcmV0"), false},
-		"no header":    {requestWithHeader("", ""), false},
-		"live cookie": {func() *http.Request {
-			r := requestWithHeader("", "")
-			r.AddCookie(&http.Cookie{Name: SessionCookie, Value: sessionID})
-			return r
-		}(), true},
-		"made-up cookie": {func() *http.Request {
-			r := requestWithHeader("", "")
-			r.AddCookie(&http.Cookie{Name: SessionCookie, Value: strings.Repeat("a", 43)})
-			return r
-		}(), false},
+		"bearer of one workspace": {requestWithHeader("Authorization", "Bearer tok-acme"), "acme", true},
+		"bearer of another":       {requestWithHeader("Authorization", "Bearer tok-beta"), "beta", true},
+		"wrong bearer":            {requestWithHeader("Authorization", "Bearer nope"), "", false},
+		"basic scheme":            {requestWithHeader("Authorization", "Basic dG9rLWFjbWU="), "", false},
+		"no credential":           {requestWithHeader("", ""), "", false},
+		// The session keeps the workspace of the token that minted it, which
+		// is what stops a signed-in browser from wandering into another
+		// tenant's rows.
+		"live cookie":    {requestWithCookie(session), "acme", true},
+		"made-up cookie": {requestWithCookie(strings.Repeat("a", 43)), "", false},
 	}
 	for name, tc := range tests {
-		if got := a.Authenticated(tc.req); got != tc.want {
-			t.Errorf("Authenticated(%s) = %v, want %v", name, got, tc.want)
+		got, ok := a.Workspace(tc.req)
+		if ok != tc.authenticated || got != tc.want {
+			t.Errorf("Workspace(%s) = %q, %v; want %q, %v", name, got, ok, tc.want, tc.authenticated)
 		}
+	}
+}
+
+// Tenancy has to come from the credential and nowhere else. If a request
+// could name its own workspace, every query scoped below would be scoped to
+// whatever the caller asked for, so this pins that the obvious injections do
+// nothing.
+func TestWorkspaceIgnoresClientSuppliedWorkspace(t *testing.T) {
+	a := NewBound([]Binding{
+		{Workspace: "acme", Token: "tok-acme"},
+		{Workspace: "beta", Token: "tok-beta"},
+	}, 0)
+
+	bearer := requestWithHeader("Authorization", "Bearer tok-acme")
+	bearer.Header.Set("X-Workspace", "beta")
+	bearer.URL.RawQuery = "workspace=beta"
+	if got, ok := a.Workspace(bearer); !ok || got != "acme" {
+		t.Fatalf("Workspace with X-Workspace and ?workspace = %q, %v; want acme, true", got, ok)
+	}
+
+	session, _ := a.Login("tok-acme")
+	cookie := requestWithCookie(session)
+	cookie.Header.Set("X-Workspace", "beta")
+	if got, ok := a.Workspace(cookie); !ok || got != "acme" {
+		t.Fatalf("Workspace with a session and X-Workspace = %q, %v; want acme, true", got, ok)
+	}
+}
+
+func TestWorkspaceWithoutTokensIsOpenOnDefault(t *testing.T) {
+	a := New(nil, 0)
+	got, ok := a.Workspace(requestWithHeader("", ""))
+	if !ok || got != workspace.Default {
+		t.Fatalf("Workspace with no tokens = %q, %v; want %q, true", got, ok, workspace.Default)
+	}
+	// An unscoped token list (API_TOKEN) is the single-tenant case: every
+	// credential resolves to the default workspace.
+	scoped := New([]string{"s3cret"}, 0)
+	if got, ok := scoped.Workspace(requestWithHeader("Authorization", "Bearer s3cret")); !ok || got != workspace.Default {
+		t.Fatalf("Workspace for an unscoped token = %q, %v; want %q, true", got, ok, workspace.Default)
+	}
+}
+
+// A token configured for two workspaces would make resolution depend on which
+// entry the comparison happened to hit. NewBound cannot be built that way from
+// configuration (internal/config rejects it), so the guard is that duplicate
+// entries for the *same* workspace still work and no binding is dropped.
+func TestNewBoundDropsUnusableBindings(t *testing.T) {
+	a := NewBound([]Binding{
+		{Workspace: "acme", Token: "tok-acme"},
+		{Workspace: "acme", Token: "tok-acme"},
+		{Workspace: "NOT VALID", Token: "tok-bad"},
+		{Workspace: "beta", Token: "   "},
+		{Workspace: "", Token: "tok-nobody"},
+	}, 0)
+	if len(a.tokens) != 2 {
+		t.Fatalf("%d bindings accepted, want the two acme ones only", len(a.tokens))
+	}
+	if _, ok := a.Workspace(requestWithHeader("Authorization", "Bearer tok-bad")); ok {
+		t.Fatal("a token for an invalid workspace id must not authenticate")
+	}
+	if ws, ok := a.Workspace(requestWithHeader("Authorization", "Bearer tok-acme")); !ok || ws != "acme" {
+		t.Fatalf("Workspace(tok-acme) = %q, %v; want acme, true", ws, ok)
+	}
+}
+
+// NewBound turns workspace-bound tokens into an Authenticator. Pin the edge cases:
+// empty input (nil/empty bindings with zero TTL yields an unconfigured authenticator
+// with default TTL), boundary values (maximum 40-character workspace ID, token
+// whitespace trimming, and explicit positive TTL), and invalid input (workspace ID
+// exceeding the 40-character maximum is dropped rather than accepted).
+func TestNewBoundEdgeCases(t *testing.T) {
+	tests := []struct {
+		name       string
+		bindings   []Binding
+		ttl        time.Duration
+		wantTokens int
+		wantTTL    time.Duration
+		probeToken string
+		wantVerify bool
+		wantWS     workspace.ID
+		wantAuth   bool
+	}{
+		{
+			name:       "empty input: nil bindings with zero ttl produces unconfigured authenticator with default ttl",
+			bindings:   nil,
+			ttl:        0,
+			wantTokens: 0,
+			wantTTL:    DefaultSessionTTL,
+			probeToken: "any-token",
+			wantVerify: false,
+			wantWS:     workspace.Default,
+			wantAuth:   true, // unconfigured authenticator is open on default workspace
+		},
+		{
+			name: "boundary values: maximum 40-character workspace id with whitespace-trimmed token and custom ttl",
+			bindings: []Binding{
+				{Workspace: workspace.ID(strings.Repeat("w", 40)), Token: "  tok-boundary  "},
+			},
+			ttl:        5 * time.Minute,
+			wantTokens: 1,
+			wantTTL:    5 * time.Minute,
+			probeToken: "tok-boundary",
+			wantVerify: true,
+			wantWS:     workspace.ID(strings.Repeat("w", 40)),
+			wantAuth:   true,
+		},
+		{
+			name: "invalid input: workspace id exceeding maximum 40-character length is dropped",
+			bindings: []Binding{
+				{Workspace: "acme", Token: "tok-acme"},
+				{Workspace: workspace.ID(strings.Repeat("w", 41)), Token: "tok-overmax"},
+			},
+			ttl:        0,
+			wantTokens: 1,
+			wantTTL:    DefaultSessionTTL,
+			probeToken: "tok-overmax",
+			wantVerify: false,
+			wantWS:     "",
+			wantAuth:   false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := NewBound(tc.bindings, tc.ttl)
+			if len(a.tokens) != tc.wantTokens {
+				t.Fatalf("len(tokens) = %d, want %d", len(a.tokens), tc.wantTokens)
+			}
+			if a.SessionTTL() != tc.wantTTL {
+				t.Fatalf("SessionTTL() = %v, want %v", a.SessionTTL(), tc.wantTTL)
+			}
+			if got := a.Verify(tc.probeToken); got != tc.wantVerify {
+				t.Fatalf("Verify(%q) = %v, want %v", tc.probeToken, got, tc.wantVerify)
+			}
+			ws, ok := a.Workspace(requestWithHeader("Authorization", "Bearer "+tc.probeToken))
+			if ok != tc.wantAuth || ws != tc.wantWS {
+				t.Fatalf("Workspace(%q) = %q, %v; want %q, %v", tc.probeToken, ws, ok, tc.wantWS, tc.wantAuth)
+			}
+		})
 	}
 }
 

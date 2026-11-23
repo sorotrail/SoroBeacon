@@ -1,0 +1,18 @@
+{{define "content"}}
+<h1>Edit channel</h1>
+{{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+{{if .CanAdmin}}<p><a href="/audit?target_type=channel&target_id={{.Channel.ID}}">Change history for this channel &rarr;</a></p>{{end}}
+<fieldset>
+  <legend>{{.Channel.Name}}</legend>
+  <form method="post" action="/channels/{{.Channel.ID}}">
+    <label for="name">Name</label>
+    <input type="text" id="name" name="name" value="{{.Name}}" required>
+    <label for="type">Type</label>
+    <input type="text" id="type" value="{{.Channel.Type}}" disabled>
+    <label for="config">Config (JSON)</label>
+    <textarea id="config" name="config" rows="4"></textarea>
+    <p class="muted">Config is never displayed. Leave this blank to keep the current config, or enter new JSON to replace it.</p>
+    <p><button>Save changes</button> <a href="/channels">Cancel</a></p>
+  </form>
+</fieldset>
+{{end}}

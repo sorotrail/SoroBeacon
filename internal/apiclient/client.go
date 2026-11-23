@@ -24,6 +24,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/sorotrail/sorobeacon/internal/apierr"
 )
 
 // DefaultBaseURL is where the CLI looks for an instance when SOROBEACON_URL
@@ -111,6 +113,7 @@ type Channel struct {
 	Type      string    `json:"type"`
 	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
+	Timeout   int       `json:"timeout,omitempty"`
 }
 
 // MonitorCreate is the body of POST /monitors.
@@ -145,6 +148,7 @@ type ChannelCreate struct {
 	Type    string          `json:"type"`
 	Config  json.RawMessage `json:"config,omitempty"`
 	Enabled *bool           `json:"enabled,omitempty"`
+	Timeout *int            `json:"timeout,omitempty"`
 }
 
 // ListOptions filters a listing request. The zero value lists everything the
@@ -181,11 +185,30 @@ type APIError struct {
 // Error returns the human-readable reason, which is what callers print.
 func (e *APIError) Error() string { return e.Message }
 
-// IsNotFound reports whether err is a 404 from the API, so callers can give a
-// friendlier message without string matching.
+// IsNotFound reports whether err indicates a resource was not found,
+// checking the stable machine-readable code first before the HTTP status.
 func IsNotFound(err error) bool {
 	var apiErr *APIError
-	return errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound
+	return errors.As(err, &apiErr) && (apiErr.Code == apierr.CodeNotFound || apiErr.Status == http.StatusNotFound)
+}
+
+// IsAlreadyExists reports whether err indicates a resource already exists
+// or a duplicate was rejected by the server.
+func IsAlreadyExists(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && (apiErr.Code == apierr.CodeAlreadyExists || apiErr.Code == "DUPLICATE" || apiErr.Status == http.StatusConflict)
+}
+
+// IsInvalidArgument reports whether err represents a bad argument or validation failure.
+func IsInvalidArgument(err error) bool {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.Code == apierr.CodeAlreadyExists || apiErr.Code == "DUPLICATE" {
+			return false
+		}
+		return apiErr.Code == apierr.CodeInvalidArgument || apiErr.Status == http.StatusBadRequest
+	}
+	return false
 }
 
 // ListMonitors returns the monitors matching opts.

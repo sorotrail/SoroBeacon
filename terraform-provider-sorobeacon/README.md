@@ -2,6 +2,15 @@
 
 Manage SoroBeacon monitors, rules and channels as infrastructure-as-code.
 
+**Not published to the Terraform Registry yet.** `terraform init` cannot find
+`sorotrail/sorobeacon`, so the install needs a local copy of the binary: a
+[filesystem mirror](https://developer.hashicorp.com/terraform/cli/config/config-file#filesystem_mirror)
+for shared use, or a
+[development override](https://developer.hashicorp.com/terraform/cli/config/config-file#development-overrides)
+while working on the provider. Both are written out step by step, and verified
+against a running instance, in
+[docs/reference/terraform.md](../docs/reference/terraform.md).
+
 ## ⚠️ Channel secrets and Terraform state
 
 Channel config contains credentials: webhook URLs, bot tokens, SMTP passwords.
@@ -11,7 +20,8 @@ the state file on disk contains the raw value.
 
 **You must encrypt your state backend.** Use S3 with KMS, GCS with CMEK,
 `terraform_remote_state` with encryption, or equivalent. If you use local
-state, encrypt the disk.
+state, encrypt the disk. See `docs/channels/secrets.md` for the server-side
+half of the same problem.
 
 ## Usage
 
@@ -29,23 +39,23 @@ provider "sorobeacon" {
   token    = var.sorobeacon_token
 }
 
+resource "sorobeacon_channel" "slack" {
+  name   = "ops-alerts"
+  type   = "slack"
+  config = jsonencode({ webhook_url = var.slack_webhook_url })
+}
+
 resource "sorobeacon_monitor" "payments" {
   name         = "Payment events"
-  contract_ids = ["CDLZFC..."]
-  enabled      = true
+  contract_ids = ["CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"]
   channel_ids  = [sorobeacon_channel.slack.id]
 }
 
 resource "sorobeacon_rule" "transfer" {
   monitor_id = sorobeacon_monitor.payments.id
   type       = "event_emitted"
-  params     = jsonencode({ topic = "transfer" })
-}
-
-resource "sorobeacon_channel" "slack" {
-  name    = "ops-alerts"
-  type    = "slack"
-  config  = jsonencode({ webhook_url = var.slack_webhook_url })
+  # `params` is a JSON string, validated by the server against the rule type.
+  params = jsonencode({ event_name = "transfer" })
 }
 ```
 
@@ -61,11 +71,14 @@ terraform import sorobeacon_rule.transfer 42/15   # monitor_id/rule_id
 
 ## Resources
 
-| Resource                | Description                  |
-|-------------------------|------------------------------|
-| `sorobeacon_monitor`    | A contract event monitor     |
-| `sorobeacon_rule`       | A rule on a monitor          |
-| `sorobeacon_channel`    | A notification channel       |
+| Resource                        | Description                              |
+|---------------------------------|------------------------------------------|
+| `sorobeacon_monitor`            | A contract event monitor                 |
+| `sorobeacon_rule`               | A rule on a monitor                      |
+| `sorobeacon_channel`            | A notification channel                   |
+| `sorobeacon_escalation_policy`  | A tiered escalation policy on a monitor  |
+| `sorobeacon_maintenance_window` | A scheduled maintenance silence window   |
+| `sorobeacon_inhibition`         | An alert inhibition pair between rules   |
 
 ## Data Sources
 
@@ -76,12 +89,29 @@ terraform import sorobeacon_rule.transfer 42/15   # monitor_id/rule_id
 ## Building
 
 ```sh
-cd terraform-provider-sorobeacon
+make build-tf              # from the repository root
+```
+
+or, from this directory:
+
+```sh
 go build -o terraform-provider-sorobeacon
 ```
 
 The provider has its own `go.mod` to keep its dependencies (terraform-plugin-framework)
 out of the server build.
+
+## Documentation
+
+- [`docs/reference/terraform.md`](../docs/reference/terraform.md) — install,
+  provider configuration, credential handling, worked example, per-resource
+  attribute tables, import and update behaviour.
+- [`docs/`](docs/) — the same schema as generated Registry-format reference
+  pages, regenerated with:
+
+  ```sh
+  go run github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs generate --provider-name sorobeacon
+  ```
 
 ## What is not covered
 

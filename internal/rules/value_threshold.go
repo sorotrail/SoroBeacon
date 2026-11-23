@@ -100,6 +100,84 @@ func (ValueThreshold) Evaluate(_ context.Context, ev *stellar.DecodedEvent, para
 	return match(value.Cmp(threshold)), nil
 }
 
+// Explain returns a detailed explanation of why the event matched or didn't match.
+func (ValueThreshold) Explain(ctx context.Context, ev *stellar.DecodedEvent, params json.RawMessage) (*RuleExplanation, error) {
+	p, threshold, err := parseValueThreshold(params)
+	if err != nil {
+		return &RuleExplanation{Error: err.Error()}, err
+	}
+
+	var conditions []ConditionExplanation
+	matched := true
+
+	// Check event name
+	if p.EventName != "" {
+		actual := ev.EventName()
+		passed := actual == p.EventName
+		if !passed {
+			matched = false
+		}
+		conditions = append(conditions, ConditionExplanation{
+			Name:     "event_name",
+			Expected: p.EventName,
+			Actual:   actual,
+			Passed:   passed,
+			Reason:   fmt.Sprintf("event name %q %s expected %q", actual, ternary(passed, "matches", "does not match"), p.EventName),
+		})
+	}
+
+	// Check value path
+	var raw any
+	var found bool
+	if ev.Fields != nil && p.ValuePath != "" {
+		raw, found = stellar.Lookup(ev.Fields, p.ValuePath)
+	}
+	if !found {
+		raw, found = stellar.Lookup(ev.Value, p.ValuePath)
+	}
+	if !found {
+		conditions = append(conditions, ConditionExplanation{
+			Name:     "value_path",
+			Expected: "a numeric value",
+			Actual:   nil,
+			Passed:   false,
+			Reason:   fmt.Sprintf("value path %q not found in event", p.ValuePath),
+		})
+		matched = false
+	} else {
+		value, ok := stellar.ToBigFloat(raw)
+		if !ok {
+			conditions = append(conditions, ConditionExplanation{
+				Name:     "value_path",
+				Expected: "a numeric value",
+				Actual:   raw,
+				Passed:   false,
+				Reason:   fmt.Sprintf("value at path %q is not numeric: %v", p.ValuePath, raw),
+			})
+			matched = false
+		} else if threshold != nil {
+			cmp := value.Cmp(threshold)
+			match, ok := comparisons[p.Comparison]
+			passed := ok && match(cmp)
+			if !passed {
+				matched = false
+			}
+			conditions = append(conditions, ConditionExplanation{
+				Name:     "value_threshold",
+				Expected: fmt.Sprintf("%s %s", p.Comparison, threshold.String()),
+				Actual:   value.String(),
+				Passed:   passed,
+				Reason:   fmt.Sprintf("value %s %s threshold %s", value.String(), ternary(passed, "satisfies", "does not satisfy"), threshold.String()),
+			})
+		}
+	}
+
+	return &RuleExplanation{
+		Matched:    matched,
+		Conditions: conditions,
+	}, nil
+}
+
 // EventNames reports the event name this rule is scoped to. value_threshold
 // may omit event_name, in which case it judges every event's value and cannot
 // be narrowed server-side.

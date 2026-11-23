@@ -1,17 +1,21 @@
-// Package config loads SoroBeacon configuration from environment variables.
+// Package config loads SoroBeacon configuration from the environment and an
+// optional config file.
 package config
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"math"
 	"net"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/sorotrail/sorobeacon/internal/auth"
+	"github.com/sorotrail/sorobeacon/internal/secrets"
 )
 
 // Defaults used when the corresponding environment variable is unset.
@@ -19,6 +23,10 @@ const (
 	DefaultRPCURL       = "https://soroban-testnet.stellar.org"
 	DefaultPollInterval = 5 * time.Second
 	DefaultHTTPAddr     = ":8080"
+	// DefaultOTLPSampleRate keeps every trace when tracing is enabled.
+	// Sampling is an operator lever for busy deployments, not a way to hide
+	// spans by default: the whole feature is off unless OTLP_ENDPOINT is set.
+	DefaultOTLPSampleRate = 1.0
 	// DefaultHTTPMaxBodyBytes is 1 MiB. Rule params are nested JSON and
 	// channel configs are small; 1 MiB is well above any legitimate write
 	// payload while bounding unauthenticated POSTs on a small instance.
@@ -26,11 +34,28 @@ const (
 	// DefaultMonitorSilentAfter is how long since last_matched_at before
 	// the monitors list treats a monitor as silent.
 	DefaultMonitorSilentAfter = 24 * time.Hour
+	// DefaultShutdownGracePeriod is how long to wait for in-flight deliveries
+	// before persisting them as retries and exiting.
+	DefaultShutdownGracePeriod = 30 * time.Second
+
+	DefaultFlappingEpisodes   = 3
+	DefaultFlappingWindow     = 15 * time.Minute
+	DefaultFlappingQuietAfter = 2 * time.Minute
 	// DefaultReorgTrackingWindow is how many recent ledger hashes the poller
 	// keeps for reorg detection. 128 ledgers is roughly ten minutes on
 	// Stellar and a few getLedgers pages per cycle — cheap, and deep enough
 	// to cover the practical reorg depth.
 	DefaultReorgTrackingWindow uint32 = 128
+	// DefaultHeartbeatInterval is how often a healthy instance pings
+	// HEARTBEAT_URL when HEARTBEAT_INTERVAL is unset. It must stay
+	// comfortably longer than the poll interval: the ping is sent only
+	// when a new successful poll appeared since the last check, so an
+	// interval at or below the poll cycle would read as no progress.
+	DefaultHeartbeatInterval = time.Minute
+	// DefaultGraphQLMaxDepth is the maximum query depth for GraphQL.
+	// DefaultGraphQLMaxComplexity is the maximum query complexity for GraphQL.
+	DefaultGraphQLMaxDepth      = 10
+	DefaultGraphQLMaxComplexity = 1000
 )
 
 // Config holds all runtime configuration. Every field maps to one
@@ -39,7 +64,17 @@ type Config struct {
 	// Network is the Stellar network to monitor — its name, passphrase
 	// and RPC endpoint, resolved from NETWORK / RPC_URL /
 	// NETWORK_PASSPHRASE by ParseNetwork.
+	//
+	// It is the *primary* network: with NETWORKS set it is that list's first
+	// entry, and it is the network the startup upgrade labels pre-multi-network
+	// monitors and alerts with. Networks holds the full list to poll.
 	Network Network
+	// Networks is every Stellar network this instance polls, primary first,
+	// from NETWORKS (falling back to NETWORK alone). It is never empty, so
+	// single-network deployments are one-element lists rather than a special
+	// case — which is what keeps the poller supervisor free of any "if there
+	// is only one" branch.
+	Networks []Network
 	// RPCURL is the first Stellar RPC endpoint (JSON-RPC 2.0 over HTTP).
 	// This is Network.RPCURL; kept as a direct field since most call sites
 	// only need the URL.
@@ -63,6 +98,23 @@ type Config struct {
 	// DatabaseMaxConnIdleTime is the pgx pool MaxConnIdleTime. Zero
 	// means use the driver default (DATABASE_MAX_CONN_IDLE_TIME).
 	DatabaseMaxConnIdleTime time.Duration
+	// DatabaseConnectAttempts is how many times the store tries to reach
+	// Postgres at startup, the first attempt included
+	// (DATABASE_CONNECT_ATTEMPTS). A managed database that is being
+	// restarted refuses connections for tens of seconds, and a process
+	// that gives up on the first refusal turns that pause into an
+	// outage. Zero means the store's default.
+	DatabaseConnectAttempts int
+	// DatabaseConnectDelay is the base delay between those attempts; it
+	// doubles after every failure, with jitter, so a fleet of instances
+	// does not retry in lockstep (DATABASE_CONNECT_DELAY). Zero means the
+	// store's default.
+	DatabaseConnectDelay time.Duration
+	// ReplicaDatabaseURL is a second Postgres connection string serving the
+	// read-only queries the store routes (REPLICA_DATABASE_URL). Empty means
+	// no replica: every read stays on DatabaseURL, which is how every
+	// deployment behaved before replica routing existed.
+	ReplicaDatabaseURL string
 	// ConfigEncryptionKey is the decoded AES-GCM key used to encrypt
 	// channels.config at rest (CONFIG_ENCRYPTION_KEY, base64). Nil means
 	// encryption is disabled and configs stay plaintext, preserving the
@@ -75,19 +127,43 @@ type Config struct {
 	// authentication existed, and the process logs one startup warning.
 	// Hold the tokens here, not the raw string: the values are secrets and
 	// must never be logged or echoed.
+	//
+	// These tokens are unscoped: each one selects the default workspace.
+	// WORKSPACE_TOKENS (WorkspaceTokens below) is how a shared instance
+	// hands out one token per team.
 	APITokens []string
+	// WorkspaceTokens is the parsed WORKSPACE_TOKENS list, one
+	// workspace=token binding per comma-separated entry. It is what makes an
+	// instance multi-tenant over static credentials: the credential decides
+	// which workspace a request acts on, so no client can ask for another
+	// team's data. Load rejects an entry whose id is not a valid workspace id
+	// and a token that appears twice for two different workspaces.
+	WorkspaceTokens []WorkspaceToken
+	// OIDC is the parsed OIDC_* block. Enabled() is false with OIDC_ISSUER
+	// unset, which leaves single sign-on off and the dashboard on its static
+	// token exactly as before.
+	OIDC OIDC
 	// PollInterval is how often the poller asks the RPC for new events.
 	PollInterval time.Duration
 	// SourceMode selects where events come from: "rpc" (standalone,
-	// default) or "sorotrail" (upstream, reads a SoroTrail indexer).
+	// default), "sorotrail" (upstream, reads a SoroTrail indexer), or
+	// "horizon" (reads contract events from a Horizon server).
 	SourceMode string
 	// SoroTrailURL is the base URL of a SoroTrail indexer; required when
 	// SourceMode is "sorotrail", ignored otherwise.
 	SoroTrailURL string
+	// HorizonURL is the base URL of a Horizon server; required when
+	// SourceMode is "horizon", ignored otherwise.
+	HorizonURL string
 	// CORSAllowedOrigins is the allow-list of browser Origins permitted to
 	// call the API cross-origin (CORS_ALLOWED_ORIGINS, comma-separated).
 	// Empty disables CORS; the dashboard is same-origin and never needs it.
 	CORSAllowedOrigins []string
+	// InstanceName is this deployment's stable identity (INSTANCE_NAME). It is
+	// stamped as the origin on federated alerts and must be unique across the
+	// sending instances. Empty is fine unless a federation channel is created;
+	// the channel factory then fails closed with an actionable error.
+	InstanceName string
 	// HTTPAddr is the listen address for the API and dashboard.
 	HTTPAddr string
 	// HTTPMaxBodyBytes is the maximum request body size accepted by API
@@ -100,6 +176,23 @@ type Config struct {
 	// ReadyzLagThreshold is the ledger lag at which /readyz fails.
 	// Zero (the default) disables the check so existing probes stay green.
 	ReadyzLagThreshold uint32
+	// HeartbeatURL enables the external dead-man's switch: when set, the
+	// leader pings this URL while ingest is demonstrably healthy
+	// (HEARTBEAT_URL). The URL is a credential — its path identifies the
+	// monitor to the external service — so it is never logged, never
+	// printed in LogAttrs, and never included in an error message.
+	HeartbeatURL string
+	// HeartbeatInterval is how often the health of ingest is re-evaluated
+	// (HEARTBEAT_INTERVAL); DefaultHeartbeatInterval when unset, and Load
+	// rejects a value at or below PollInterval because a heartbeat faster
+	// than the poll cycle could never observe new progress.
+	HeartbeatInterval time.Duration
+	// HeartbeatFailureSuffix, when set, enables one failure ping per
+	// outage to HeartbeatURL+suffix (HEARTBEAT_FAILURE_SUFFIX, e.g.
+	// "/fail" — the convention Healthchecks.io and most other
+	// dead-man's-switch services use). Unset means success pings only:
+	// the external service notices the silence itself.
+	HeartbeatFailureSuffix string
 	// RateLimitRPS is the per-client API token-bucket refill rate.
 	// Zero (default) disables the limiter.
 	RateLimitRPS float64
@@ -114,13 +207,44 @@ type Config struct {
 	// are kept. Zero (the default, when ALERT_RETENTION is unset) keeps
 	// everything forever so upgrades never start deleting history.
 	AlertRetention time.Duration
+	// AuditRetention is how long administrative audit_log records are kept
+	// (AUDIT_RETENTION). It is configured separately from ALERT_RETENTION
+	// because audit records and alerts age under different operational and
+	// compliance policies. Zero (the default) keeps audit records forever.
+	AuditRetention time.Duration
+	// AlertEnrichmentURL is an optional operator-supplied HTTP JSON source.
+	AlertEnrichmentURL      string
+	AlertEnrichmentTimeout  time.Duration
+	AlertEnrichmentCacheTTL time.Duration
 	// MonitorSilentAfter is how long since last_matched_at before the
 	// dashboard marks a monitor silent. Default 24h.
 	MonitorSilentAfter time.Duration
+	// ShutdownGracePeriod is how long to wait for in-flight deliveries
+	// before persisting them as retries and exiting.
+	ShutdownGracePeriod time.Duration
+	// FlappingEpisodes is the number of alert episodes in FlappingWindow
+	// that trigger notification damping.
+	FlappingEpisodes int
+	// FlappingWindow is the alert-history window used to count episodes.
+	FlappingWindow time.Duration
+	// FlappingQuietAfter is the minimum gap between episodes.
+	FlappingQuietAfter time.Duration
+	// OTLP is the OpenTelemetry tracing configuration. Endpoint empty (the
+	// default, OTLP_ENDPOINT unset) disables tracing entirely: no exporter,
+	// no exporter goroutines, no measurable overhead — spans collapse to
+	// no-ops. When set it is the OTLP/HTTP base URL spans are shipped to.
+	OTLP OTLPConfig
 	// GRPCAddr is the listen address for the optional gRPC server
 	// (GRPC_ADDR). Empty (the default) disables gRPC entirely so existing
 	// deployments do not open a new port without opting in.
 	GRPCAddr string
+	// ChannelDisableAfterFailures is how many consecutive permanent channel
+	// failures (401/403/404 — a revoked bot token, a deleted webhook) take a
+	// channel out of rotation. Zero, the default when the variable is unset,
+	// never auto-disables: silently switching off someone's alerting is a
+	// worse outcome than the failure it would fix, so opting in is the
+	// operator's call.
+	ChannelDisableAfterFailures int
 	// ReorgTrackingWindow is how many recent ledgers' hashes the poller keeps
 	// and re-checks each cycle for reorg detection
 	// (REORG_TRACKING_WINDOW, default 128). Zero disables detection, which is
@@ -130,40 +254,248 @@ type Config struct {
 	// be before it may alert (REORG_CONFIRMATION_DEPTH, default 0). Zero
 	// alerts immediately, the historical default.
 	ReorgConfirmationDepth uint32
+	// SecretsProvider selects the external secret provider used to resolve
+	// ${secret:...} references in channel configs (SECRETS_PROVIDER).
+	// Empty (the default) disables external secrets: references are then
+	// treated as literals, so an upgrade changes nothing.
+	SecretsProvider string
+	// SecretsCacheTTL is how long a resolved secret is reused
+	// (SECRETS_CACHE_TTL, default secrets.DefaultTTL). Zero disables
+	// caching so every construction re-fetches.
+	SecretsCacheTTL time.Duration
+	// VaultAddr is the HashiCorp Vault address (VAULT_ADDR); required when
+	// SecretsProvider is "vault".
+	VaultAddr string
+	// VaultToken is the Vault token (VAULT_TOKEN). It is a credential and
+	// is never logged.
+	VaultToken string
+	// VaultNamespace is the optional Vault Enterprise namespace
+	// (VAULT_NAMESPACE).
+	VaultNamespace string
 	// ArchiveURL is where retention copies alerts before deleting them
 	// (ARCHIVE_URL). Empty (the default) leaves archiving off, so retention
 	// behaves exactly as it did before the feature. A local directory path,
 	// file://, dir:// or s3://bucket/prefix are accepted; the archive package
 	// validates it when the pruner is built.
 	ArchiveURL string
+
+	// GraphQL is the GraphQL endpoint configuration.
+	GraphQL GraphQLConfig
+
+	// NotifyRateLimitSlackRPS overrides the Slack delivery rate
+	// (NOTIFY_RATE_LIMIT_SLACK_RPS). Zero keeps the built-in notifier default;
+	// see notify.RateLimits.
+	NotifyRateLimitSlackRPS float64
+	// NotifyRateLimitTelegramRPS overrides the Telegram delivery rate
+	// (NOTIFY_RATE_LIMIT_TELEGRAM_RPS). Zero keeps the built-in notifier
+	// default; see notify.RateLimits.
+	NotifyRateLimitTelegramRPS float64
+	// NotifyRateLimitPagerDutyRPS overrides the PagerDuty delivery rate
+	// (NOTIFY_RATE_LIMIT_PAGERDUTY_RPS). Zero keeps the built-in notifier
+	// default; see notify.RateLimits.
+	NotifyRateLimitPagerDutyRPS float64
+	// NotifyRateLimitDefaultRPS overrides the fallback delivery rate for
+	// channel types without a specific limit (NOTIFY_RATE_LIMIT_DEFAULT_RPS).
+	// Zero keeps the built-in notifier default; see notify.RateLimits.
+	NotifyRateLimitDefaultRPS float64
+
+	// Server TLS / mTLS (HTTP API + dashboard + gRPC server).
+	TLSCertFile     string
+	TLSKeyFile      string
+	TLSClientCAFile string
+	TLSClientAuth   string
+	MTLSBindings    []auth.MTLSBinding
+
+	// Upstream SoroTrail client TLS / mTLS.
+	SoroTrailTLSCertFile   string
+	SoroTrailTLSKeyFile    string
+	SoroTrailTLSCAFile     string
+	SoroTrailTLSServerName string
+
+	// Database client TLS / mTLS (PostgreSQL).
+	DatabaseSSLMode         string
+	DatabaseSSLCertFile     string
+	DatabaseSSLKeyFile      string
+	DatabaseSSLRootCertFile string
 }
 
-// Load reads configuration from the environment. DATABASE_URL is the only
-// required variable; everything else has a sensible default.
-func Load() (Config, error) {
-	net, err := ParseNetwork(os.Getenv)
-	if err != nil {
-		return Config{}, err
+// OTLPConfig is the tracing slice of the configuration. It is a struct so a
+// stage that needs the endpoint does not pull the whole Config in.
+type OTLPConfig struct {
+	// Endpoint is the OTLP/HTTP base URL (OTLP_ENDPOINT, e.g.
+	// http://localhost:4318). Empty disables tracing.
+	Endpoint string
+	// ServiceName is the service.name resource attribute
+	// (OTLP_SERVICE_NAME). Empty falls back to "sorobeacon".
+	ServiceName string
+	// SampleRate is the fraction of traces kept, in [0,1]
+	// (OTLP_SAMPLE_RATE). Defaults to 1 (keep everything).
+	SampleRate float64
+}
+
+// Enabled reports whether tracing is switched on. The single place the
+// "off unless OTLP_ENDPOINT is set" rule lives, so the wiring in main and
+// the tests cannot drift apart.
+func (o OTLPConfig) Enabled() bool { return o.Endpoint != "" }
+
+// GraphQLConfig is the GraphQL endpoint configuration.
+type GraphQLConfig struct {
+	// EnablePlayground serves the GraphQL playground at /graphql/playground.
+	// Default false for security.
+	EnablePlayground bool
+	// MaxDepth limits the maximum query depth. Default 10.
+	MaxDepth int
+	// MaxComplexity limits the maximum query complexity. Default 1000.
+	MaxComplexity int
+	// AllowlistOnly requires all executed queries to match registered persisted operations. Default false.
+	AllowlistOnly bool
+}
+
+// PlaygroundEnabled reports whether the interactive playground is served.
+// The endpoint itself is always available; this controls the playground only.
+func (g GraphQLConfig) PlaygroundEnabled() bool { return g.EnablePlayground }
+
+// Problem is one configuration problem: the setting it was found in and what
+// is wrong with it. The field is the environment variable (or the block of
+// settings) an operator has to look at, so a report can be acted on without
+// reading the message.
+type Problem struct {
+	Field  string `json:"field"`
+	Reason string `json:"reason"`
+}
+
+// Error makes a Problem usable as an error, so the first one can be returned
+// where an error is expected.
+func (p Problem) Error() string { return p.Reason }
+
+// problemList collects the problems found while loading configuration. The
+// order is the order the checks ran in, so the first problem is the one a
+// single-error caller has always seen.
+type problemList struct {
+	list []Problem
+}
+
+// add records one problem. A nil error is ignored, so a caller can pass the
+// result of a check straight through.
+func (p *problemList) add(field string, err error) {
+	if err == nil {
+		return
 	}
+	p.list = append(p.list, Problem{Field: field, Reason: err.Error()})
+}
+
+func (p *problemList) has(field string) bool {
+	for _, pr := range p.list {
+		if pr.Field == field {
+			return true
+		}
+	}
+	return false
+}
+
+// Load reads configuration from the environment and, optionally, a YAML file
+// pointed to by CONFIG_FILE. Environment values win over the file, and the file
+// wins over defaults so a checked-in config stays sane while emergency
+// overrides still work.
+//
+// Load reports the first problem it finds and stops there, which is what a
+// process that is about to exit wants. LoadProblems is the same code path
+// with the other half of the story: it collects every problem, so an
+// operator fixing a broken configuration sees all of it at once.
+func Load() (Config, error) {
+	cfg, problems := LoadProblems()
+	if len(problems) > 0 {
+		return cfg, problems[0]
+	}
+	return cfg, nil
+}
+
+// LoadProblems loads the configuration and reports every problem it finds.
+// It is the same checks, in the same order, as Load — a validator that
+// disagreed with startup would be worse than no validator at all — but it
+// does not stop at the first one: four typos in four variables cost four
+// runs to find otherwise.
+//
+// A configuration that cannot be read at all (an unreadable config file, a
+// network list that does not parse) has no usable configuration to report
+// against, so those are returned as the only problem.
+func LoadProblems() (Config, []Problem) {
+	var ps problemList
+	fileValues, err := loadFileValues()
+	if err != nil {
+		return Config{}, []Problem{{Field: "CONFIG_FILE", Reason: err.Error()}}
+	}
+
+	var secretsCfg Config
+	if err := loadSecrets(&secretsCfg, fileValues); err != nil {
+		ps.add("SECRETS_PROVIDER", err)
+	}
+	secretResolver := BuildResolver(secretsCfg)
+
+	lookupSecret := func(key string) string {
+		raw := lookupConfigValue(key, fileValues)
+		if !secrets.IsReference(raw) {
+			return raw
+		}
+		if secretResolver == nil {
+			ps.add(key, fmt.Errorf("cannot resolve secret reference %s for %s: SECRETS_PROVIDER is not configured", raw, key))
+			return ""
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		val, err := secretResolver.ResolveString(ctx, raw)
+		if err != nil {
+			ps.add(key, fmt.Errorf("resolve %s secret reference %s: %w", key, raw, err))
+			return ""
+		}
+		return val
+	}
+
+	nets, err := ParseNetworks(func(key string) string {
+		return lookupConfigValue(key, fileValues)
+	})
+	if err != nil {
+		return Config{}, []Problem{{Field: "NETWORK", Reason: err.Error()}}
+	}
+	// The primary network is the list's first entry. With NETWORKS unset that
+	// entry is exactly what ParseNetwork resolves from NETWORK, so every
+	// consumer of the single-network fields below behaves as it always did.
+	net := nets[0]
 
 	cfg := Config{
 		Network:            net,
+		Networks:           nets,
 		RPCURL:             net.RPCURL,
 		RPCURLs:            net.RPCURLs,
-		DatabaseURL:        os.Getenv("DATABASE_URL"),
+		DatabaseURL:        lookupSecret("DATABASE_URL"),
+		InstanceName:       strings.TrimSpace(lookupConfigValue("INSTANCE_NAME", fileValues)),
 		PollInterval:       DefaultPollInterval,
-		HTTPAddr:           getenv("HTTP_ADDR", DefaultHTTPAddr),
+		HeartbeatInterval:  DefaultHeartbeatInterval,
+		HTTPAddr:           valueOrFallback("HTTP_ADDR", fileValues, DefaultHTTPAddr),
 		HTTPMaxBodyBytes:   DefaultHTTPMaxBodyBytes,
 		LogLevel:           slog.LevelInfo,
 		MonitorSilentAfter: DefaultMonitorSilentAfter,
+		// Without this the zero value would make the shutdown drain give up
+		// immediately, which is the opposite of what the grace period is for.
+		ShutdownGracePeriod: DefaultShutdownGracePeriod,
+		FlappingEpisodes:    DefaultFlappingEpisodes,
+		FlappingWindow:      DefaultFlappingWindow,
+		FlappingQuietAfter:  DefaultFlappingQuietAfter,
 		// Detection is on by default; confirmation depth off, so a monitor
 		// alerts exactly as soon as it did before this feature.
 		ReorgTrackingWindow:    DefaultReorgTrackingWindow,
 		ReorgConfirmationDepth: 0,
+		SecretsProvider:        secretsCfg.SecretsProvider,
+		SecretsCacheTTL:        secretsCfg.SecretsCacheTTL,
+		VaultAddr:              secretsCfg.VaultAddr,
+		VaultToken:             secretsCfg.VaultToken,
+		VaultNamespace:         secretsCfg.VaultNamespace,
 	}
 
-	if err := validateDatabaseURL(cfg.DatabaseURL); err != nil {
-		return cfg, err
+	if !ps.has("DATABASE_URL") {
+		if err := validateDatabaseURL(cfg.DatabaseURL); err != nil {
+			ps.add("DATABASE_URL", err)
+		}
 	}
 	// The pool knobs below are Postgres-only. Knowing the backend here lets
 	// Load fail loudly when a SQLite deployment carries them instead of
@@ -171,7 +503,7 @@ func Load() (Config, error) {
 	sqliteBackend := isSQLiteURL(cfg.DatabaseURL)
 
 	if err := validateHTTPAddr(cfg.HTTPAddr); err != nil {
-		return cfg, err
+		ps.add("HTTP_ADDR", err)
 	}
 
 	// An absolute http(s) RPC URL is required whenever one is in play —
@@ -180,33 +512,46 @@ func Load() (Config, error) {
 	// set, so this covers both spellings; ParseRPCURLs validates the rest of
 	// the list (and each entry's own message names it).
 	if cfg.RPCURL != "" && !validRPCURL(cfg.RPCURL) {
-		return cfg, fmt.Errorf(
+		ps.add("RPC_URL", fmt.Errorf(
 			"invalid RPC_URL %q: must be an absolute http or https URL",
 			cfg.RPCURL,
-		)
+		))
 	}
 
-	cfg.SourceMode = getenv("SOURCE_MODE", "rpc")
-	if cfg.SourceMode != "rpc" && cfg.SourceMode != "sorotrail" {
-		return cfg, fmt.Errorf("invalid SOURCE_MODE %q (want rpc|sorotrail)", cfg.SourceMode)
+	cfg.SourceMode = valueOrFallback("SOURCE_MODE", fileValues, "rpc")
+	if cfg.SourceMode != "rpc" && cfg.SourceMode != "sorotrail" && cfg.SourceMode != "horizon" {
+		ps.add("SOURCE_MODE", fmt.Errorf("invalid SOURCE_MODE %q (want rpc|sorotrail|horizon)", cfg.SourceMode))
 	}
-	cfg.SoroTrailURL = os.Getenv("SOROTRAIL_URL")
+	cfg.SoroTrailURL = lookupConfigValue("SOROTRAIL_URL", fileValues)
 	if cfg.SourceMode == "sorotrail" && cfg.SoroTrailURL == "" {
-		return cfg, fmt.Errorf("SOROTRAIL_URL is required when SOURCE_MODE=sorotrail")
+		ps.add("SOROTRAIL_URL", fmt.Errorf("SOROTRAIL_URL is required when SOURCE_MODE=sorotrail"))
+	}
+	cfg.HorizonURL = lookupConfigValue("HORIZON_URL", fileValues)
+	if cfg.SourceMode == "horizon" && cfg.HorizonURL == "" {
+		ps.add("HORIZON_URL", fmt.Errorf("HORIZON_URL is required when SOURCE_MODE=horizon"))
+	}
+	// The upstream source is one SoroTrail deployment reading one chain: it has
+	// no per-network request to make, so a second entry in NETWORKS would be
+	// polled by nobody. Fail here instead of starting a supervisor whose
+	// testnet unit never advances.
+	if cfg.SourceMode == "sorotrail" && len(cfg.Networks) > 1 {
+		ps.add("NETWORKS", fmt.Errorf("NETWORKS=%s lists %d chains but SOURCE_MODE=sorotrail reads events from a single upstream deployment; use SOURCE_MODE=rpc to poll several networks",
+			strings.Join(NetworkNames(cfg.Networks), ","), len(cfg.Networks)))
 	}
 
-	if v := os.Getenv("POLL_INTERVAL"); v != "" {
+	if v := lookupConfigValue("POLL_INTERVAL", fileValues); v != "" {
 		d, err := time.ParseDuration(v)
-		if err != nil {
-			return cfg, fmt.Errorf("invalid POLL_INTERVAL %q: %w", v, err)
+		switch {
+		case err != nil:
+			ps.add("POLL_INTERVAL", fmt.Errorf("invalid POLL_INTERVAL %q: %w", v, err))
+		case d < time.Second:
+			ps.add("POLL_INTERVAL", fmt.Errorf("POLL_INTERVAL %q is below the 1s minimum", v))
+		default:
+			cfg.PollInterval = d
 		}
-		if d < time.Second {
-			return cfg, fmt.Errorf("POLL_INTERVAL %q is below the 1s minimum", v)
-		}
-		cfg.PollInterval = d
 	}
 
-	if v := os.Getenv("CORS_ALLOWED_ORIGINS"); v != "" {
+	if v := lookupConfigValue("CORS_ALLOWED_ORIGINS", fileValues); v != "" {
 		for _, o := range strings.Split(v, ",") {
 			if o = strings.TrimSpace(o); o != "" {
 				cfg.CORSAllowedOrigins = append(cfg.CORSAllowedOrigins, o)
@@ -214,48 +559,115 @@ func Load() (Config, error) {
 		}
 	}
 
-	tokens, err := parseAPITokens(os.Getenv("API_TOKEN"))
-	if err != nil {
-		return cfg, err
+	rawAPITokens := lookupSecret("API_TOKEN")
+	if !ps.has("API_TOKEN") {
+		tokens, err := parseAPITokens(rawAPITokens)
+		if err != nil {
+			ps.add("API_TOKEN", err)
+		}
+		cfg.APITokens = tokens
 	}
-	cfg.APITokens = tokens
 
-	if v := os.Getenv("HTTP_MAX_BODY_BYTES"); v != "" {
+	rawWSTokens := lookupSecret("WORKSPACE_TOKENS")
+	if !ps.has("WORKSPACE_TOKENS") {
+		bound, err := parseWorkspaceTokens(rawWSTokens)
+		if err != nil {
+			ps.add("WORKSPACE_TOKENS", err)
+		}
+		cfg.WorkspaceTokens = bound
+	}
+	// A token that names two workspaces is rejected at startup, not at the
+	// first request: resolution would otherwise depend on which configured
+	// entry the comparison happened to hit, which is the one failure mode
+	// tenancy cannot have.
+	if err := checkTokenWorkspaces(cfg.APITokens, cfg.WorkspaceTokens); err != nil {
+		ps.add("WORKSPACE_TOKENS", err)
+	}
+
+	oidc, err := parseOIDC(func(key string) string {
+		return lookupSecret(key)
+	})
+	if err != nil {
+		ps.add("OIDC_ISSUER", err)
+	}
+	cfg.OIDC = oidc
+
+	if v := lookupConfigValue("HTTP_MAX_BODY_BYTES", fileValues); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || n <= 0 {
-			return cfg, fmt.Errorf("invalid HTTP_MAX_BODY_BYTES %q: must be a positive integer (bytes)", v)
+			ps.add("HTTP_MAX_BODY_BYTES", fmt.Errorf("invalid HTTP_MAX_BODY_BYTES %q: must be a positive integer (bytes)", v))
+		} else {
+			cfg.HTTPMaxBodyBytes = n
 		}
-		cfg.HTTPMaxBodyBytes = n
 	}
 
-	if v := os.Getenv("LOG_LEVEL"); v != "" {
+	if v := lookupConfigValue("LOG_LEVEL", fileValues); v != "" {
 		lvl, err := parseLevel(v)
 		if err != nil {
-			return cfg, err
+			ps.add("LOG_LEVEL", err)
+		} else {
+			cfg.LogLevel = lvl
 		}
-		cfg.LogLevel = lvl
 	}
 
-	if v := os.Getenv("READYZ_LAG_THRESHOLD"); v != "" {
+	if v := lookupConfigValue("READYZ_LAG_THRESHOLD", fileValues); v != "" {
 		n, err := strconv.ParseUint(v, 10, 32)
 		if err != nil {
-			return cfg, fmt.Errorf("invalid READYZ_LAG_THRESHOLD %q: %w", v, err)
+			ps.add("READYZ_LAG_THRESHOLD", fmt.Errorf("invalid READYZ_LAG_THRESHOLD %q: %w", v, err))
+		} else {
+			cfg.ReadyzLagThreshold = uint32(n)
 		}
-		cfg.ReadyzLagThreshold = uint32(n)
 	}
-	if v := os.Getenv("RATE_LIMIT_RPS"); v != "" {
+	// Heartbeat. The URL is parsed only to validate its shape: it is a
+	// credential, so neither it nor anything derived from it is ever
+	// echoed back in an error. It is validated after POLL_INTERVAL (which
+	// is parsed above) because the interval comparison depends on it.
+	if v := lookupSecret("HEARTBEAT_URL"); v != "" {
+		if !ps.has("HEARTBEAT_URL") {
+			u, err := url.Parse(v)
+			if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+				ps.add("HEARTBEAT_URL", fmt.Errorf("invalid HEARTBEAT_URL: want an http(s) URL with a host (the URL itself is not printed because its path is a credential)"))
+			} else {
+				cfg.HeartbeatURL = v
+			}
+		}
+	}
+	if v := lookupConfigValue("HEARTBEAT_INTERVAL", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			ps.add("HEARTBEAT_INTERVAL", fmt.Errorf("invalid HEARTBEAT_INTERVAL %q (want a positive duration like 30s or 5m)", v))
+		} else {
+			cfg.HeartbeatInterval = d
+		}
+	}
+	if v := lookupConfigValue("HEARTBEAT_FAILURE_SUFFIX", fileValues); v != "" {
+		if !strings.HasPrefix(v, "/") {
+			ps.add("HEARTBEAT_FAILURE_SUFFIX", fmt.Errorf("invalid HEARTBEAT_FAILURE_SUFFIX %q (want a path suffix starting with /, like /fail)", v))
+		} else {
+			cfg.HeartbeatFailureSuffix = v
+		}
+	}
+	if cfg.HeartbeatFailureSuffix != "" && cfg.HeartbeatURL == "" {
+		ps.add("HEARTBEAT_FAILURE_SUFFIX", fmt.Errorf("HEARTBEAT_FAILURE_SUFFIX %q is set but HEARTBEAT_URL is not: there is no endpoint to fail", cfg.HeartbeatFailureSuffix))
+	}
+	if cfg.HeartbeatURL != "" && cfg.HeartbeatInterval <= cfg.PollInterval {
+		ps.add("HEARTBEAT_INTERVAL", fmt.Errorf("HEARTBEAT_INTERVAL %s must be longer than POLL_INTERVAL %s: a ping is sent only when a new successful poll appeared since the last check, so a heartbeat at or below the poll interval would read as no progress", cfg.HeartbeatInterval, cfg.PollInterval))
+	}
+	if v := lookupConfigValue("RATE_LIMIT_RPS", fileValues); v != "" {
 		rps, err := strconv.ParseFloat(v, 64)
 		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
-			return cfg, fmt.Errorf("invalid RATE_LIMIT_RPS %q (want a non-negative number)", v)
+			ps.add("RATE_LIMIT_RPS", fmt.Errorf("invalid RATE_LIMIT_RPS %q (want a non-negative number)", v))
+		} else {
+			cfg.RateLimitRPS = rps
 		}
-		cfg.RateLimitRPS = rps
 	}
-	if v := os.Getenv("RATE_LIMIT_BURST"); v != "" {
+	if v := lookupConfigValue("RATE_LIMIT_BURST", fileValues); v != "" {
 		burst, err := strconv.Atoi(v)
 		if err != nil || burst < 0 {
-			return cfg, fmt.Errorf("invalid RATE_LIMIT_BURST %q (want a non-negative integer)", v)
+			ps.add("RATE_LIMIT_BURST", fmt.Errorf("invalid RATE_LIMIT_BURST %q (want a non-negative integer)", v))
+		} else {
+			cfg.RateLimitBurst = burst
 		}
-		cfg.RateLimitBurst = burst
 	}
 	if cfg.RateLimitRPS > 0 && cfg.RateLimitBurst == 0 {
 		cfg.RateLimitBurst = int(math.Ceil(cfg.RateLimitRPS))
@@ -263,89 +675,435 @@ func Load() (Config, error) {
 			cfg.RateLimitBurst = 1
 		}
 	}
-	if v := os.Getenv("MONITOR_SILENT_AFTER"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return cfg, fmt.Errorf("invalid MONITOR_SILENT_AFTER %q: %w", v, err)
+	if v := lookupConfigValue("CHANNEL_DISABLE_AFTER_FAILURES", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			ps.add("CHANNEL_DISABLE_AFTER_FAILURES", fmt.Errorf("invalid CHANNEL_DISABLE_AFTER_FAILURES %q (want a non-negative integer)", v))
+		} else {
+			cfg.ChannelDisableAfterFailures = n
 		}
-		if d <= 0 {
-			return cfg, fmt.Errorf("MONITOR_SILENT_AFTER %q must be greater than 0", v)
-		}
-		cfg.MonitorSilentAfter = d
 	}
 
-	if v := os.Getenv("RATE_LIMIT_TRUST_FORWARDED"); v != "" {
+	if v := lookupConfigValue("MONITOR_SILENT_AFTER", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		switch {
+		case err != nil:
+			ps.add("MONITOR_SILENT_AFTER", fmt.Errorf("invalid MONITOR_SILENT_AFTER %q: %w", v, err))
+		case d <= 0:
+			ps.add("MONITOR_SILENT_AFTER", fmt.Errorf("MONITOR_SILENT_AFTER %q must be greater than 0", v))
+		default:
+			cfg.MonitorSilentAfter = d
+		}
+	}
+
+	if v := lookupConfigValue("SHUTDOWN_GRACE_PERIOD", fileValues); v != "" {
+		switch d, err := time.ParseDuration(v); {
+		case err != nil:
+			ps.add("SHUTDOWN_GRACE_PERIOD", fmt.Errorf("invalid SHUTDOWN_GRACE_PERIOD %q: %w", v, err))
+		case d <= 0:
+			ps.add("SHUTDOWN_GRACE_PERIOD", fmt.Errorf("SHUTDOWN_GRACE_PERIOD %q must be greater than 0", v))
+		default:
+			cfg.ShutdownGracePeriod = d
+		}
+	}
+
+	if v := lookupConfigValue("RATE_LIMIT_TRUST_FORWARDED", fileValues); v != "" {
 		switch strings.ToLower(strings.TrimSpace(v)) {
 		case "1", "true", "yes", "on":
 			cfg.RateLimitTrustForwarded = true
 		case "0", "false", "no", "off":
 			cfg.RateLimitTrustForwarded = false
 		default:
-			return cfg, fmt.Errorf("invalid RATE_LIMIT_TRUST_FORWARDED %q (want true|false)", v)
+			ps.add("RATE_LIMIT_TRUST_FORWARDED", fmt.Errorf("invalid RATE_LIMIT_TRUST_FORWARDED %q (want true|false)", v))
 		}
 	}
-	maxConns, err := parseInt32Env("DATABASE_MAX_CONNS")
+	maxConns, err := parseInt32EnvWithFile("DATABASE_MAX_CONNS", fileValues)
 	if err != nil {
-		return cfg, err
+		ps.add("DATABASE_MAX_CONNS", err)
 	}
-	minConns, err := parseInt32Env("DATABASE_MIN_CONNS")
+	minConns, err := parseInt32EnvWithFile("DATABASE_MIN_CONNS", fileValues)
 	if err != nil {
-		return cfg, err
+		ps.add("DATABASE_MIN_CONNS", err)
 	}
-	maxLifetime, err := parseDurationEnv("DATABASE_MAX_CONN_LIFETIME")
+	maxLifetime, err := parseDurationEnvWithFile("DATABASE_MAX_CONN_LIFETIME", fileValues)
 	if err != nil {
-		return cfg, err
+		ps.add("DATABASE_MAX_CONN_LIFETIME", err)
 	}
-	maxIdle, err := parseDurationEnv("DATABASE_MAX_CONN_IDLE_TIME")
+	maxIdle, err := parseDurationEnvWithFile("DATABASE_MAX_CONN_IDLE_TIME", fileValues)
 	if err != nil {
-		return cfg, err
+		ps.add("DATABASE_MAX_CONN_IDLE_TIME", err)
 	}
 	if maxConns > 0 && minConns > 0 && maxConns < minConns {
-		return cfg, fmt.Errorf("DATABASE_MAX_CONNS %d is below DATABASE_MIN_CONNS %d", maxConns, minConns)
+		ps.add("DATABASE_MAX_CONNS", fmt.Errorf("DATABASE_MAX_CONNS %d is below DATABASE_MIN_CONNS %d", maxConns, minConns))
 	}
 	if sqliteBackend && (maxConns > 0 || minConns > 0 || maxLifetime > 0 || maxIdle > 0) {
-		return cfg, fmt.Errorf("DATABASE_MAX_CONNS, DATABASE_MIN_CONNS, DATABASE_MAX_CONN_LIFETIME and DATABASE_MAX_CONN_IDLE_TIME tune the Postgres pool and have no effect on a sqlite DATABASE_URL; unset them or use Postgres")
+		ps.add("DATABASE_MAX_CONNS", fmt.Errorf("DATABASE_MAX_CONNS, DATABASE_MIN_CONNS, DATABASE_MAX_CONN_LIFETIME and DATABASE_MAX_CONN_IDLE_TIME tune the Postgres pool and have no effect on a sqlite DATABASE_URL; unset them or use Postgres"))
 	}
 	cfg.DatabaseMaxConns = maxConns
 	cfg.DatabaseMinConns = minConns
 	cfg.DatabaseMaxConnLifetime = maxLifetime
 	cfg.DatabaseMaxConnIdleTime = maxIdle
-	key, err := parseEncryptionKey(os.Getenv("CONFIG_ENCRYPTION_KEY"))
-	if err != nil {
-		return cfg, err
+
+	// The startup connection retry. It exists because a database that is
+	// mid-failover refuses connections for a while, and the pause is not
+	// the process's fault.
+	if v := lookupConfigValue("DATABASE_CONNECT_ATTEMPTS", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		switch {
+		case err != nil:
+			ps.add("DATABASE_CONNECT_ATTEMPTS", fmt.Errorf("invalid DATABASE_CONNECT_ATTEMPTS %q (want a positive integer)", v))
+		case n < 1:
+			ps.add("DATABASE_CONNECT_ATTEMPTS", fmt.Errorf("DATABASE_CONNECT_ATTEMPTS %d must be at least 1", n))
+		case n > 100:
+			ps.add("DATABASE_CONNECT_ATTEMPTS", fmt.Errorf("DATABASE_CONNECT_ATTEMPTS %d is above the 100 maximum", n))
+		default:
+			cfg.DatabaseConnectAttempts = n
+		}
 	}
-	cfg.ConfigEncryptionKey = key
-	cfg.GRPCAddr = os.Getenv("GRPC_ADDR")
-	if cfg.GRPCAddr != "" {
-		if err := validateHTTPAddr(cfg.GRPCAddr); err != nil {
-			return cfg, fmt.Errorf("invalid GRPC_ADDR: %w", err)
+	if v := lookupConfigValue("DATABASE_CONNECT_DELAY", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		switch {
+		case err != nil:
+			ps.add("DATABASE_CONNECT_DELAY", fmt.Errorf("invalid DATABASE_CONNECT_DELAY %q: %w", v, err))
+		case d <= 0:
+			ps.add("DATABASE_CONNECT_DELAY", fmt.Errorf("DATABASE_CONNECT_DELAY %q must be greater than 0", v))
+		default:
+			cfg.DatabaseConnectDelay = d
 		}
 	}
 
-	if v := os.Getenv("ALERT_RETENTION"); v != "" {
+	// Read-replica routing is Postgres-only and off unless asked for. Both
+	// failures below are startup errors rather than warnings: an operator who
+	// sets REPLICA_DATABASE_URL believes reads are being routed, and a
+	// deployment that silently serves everything from the primary while
+	// claiming otherwise is worse than one that refuses to boot.
+	replicaURL := strings.TrimSpace(lookupSecret("REPLICA_DATABASE_URL"))
+	switch {
+	case sqliteBackend && replicaURL != "":
+		ps.add("REPLICA_DATABASE_URL", fmt.Errorf("REPLICA_DATABASE_URL has no effect on a sqlite DATABASE_URL: SQLite serves reads and writes from one file; unset it or use Postgres"))
+	case replicaURL != "":
+		if !ps.has("REPLICA_DATABASE_URL") {
+			if err := validateReplicaDatabaseURL(replicaURL, cfg.DatabaseURL); err != nil {
+				ps.add("REPLICA_DATABASE_URL", err)
+			} else {
+				cfg.ReplicaDatabaseURL = replicaURL
+			}
+		}
+	default:
+		cfg.ReplicaDatabaseURL = replicaURL
+	}
+	rawEncKey := lookupSecret("CONFIG_ENCRYPTION_KEY")
+	if !ps.has("CONFIG_ENCRYPTION_KEY") {
+		key, err := parseEncryptionKey(rawEncKey)
+		if err != nil {
+			ps.add("CONFIG_ENCRYPTION_KEY", err)
+		}
+		cfg.ConfigEncryptionKey = key
+	}
+	grpcAddr := lookupConfigValue("GRPC_ADDR", fileValues)
+	if grpcAddr != "" {
+		if err := validateHTTPAddr(grpcAddr); err != nil {
+			ps.add("GRPC_ADDR", fmt.Errorf("invalid GRPC_ADDR: %w", err))
+		} else {
+			cfg.GRPCAddr = grpcAddr
+		}
+	}
+
+	if v := lookupConfigValue("ALERT_RETENTION", fileValues); v != "" {
 		d, err := ParseRetention(v)
 		if err != nil {
-			return cfg, fmt.Errorf("invalid ALERT_RETENTION %q: %w", v, err)
+			ps.add("ALERT_RETENTION", fmt.Errorf("invalid ALERT_RETENTION %q: %w", v, err))
+		} else {
+			cfg.AlertRetention = d
 		}
-		cfg.AlertRetention = d
 	}
-	if v := os.Getenv("REORG_TRACKING_WINDOW"); v != "" {
+	if v := lookupConfigValue("AUDIT_RETENTION", fileValues); v != "" {
+		d, err := ParseRetention(v)
+		if err != nil {
+			ps.add("AUDIT_RETENTION", fmt.Errorf("invalid AUDIT_RETENTION %q: %w", v, err))
+		} else {
+			cfg.AuditRetention = d
+		}
+	}
+	if v := lookupConfigValue("FLAPPING_EPISODES", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			ps.add("FLAPPING_EPISODES", fmt.Errorf("invalid FLAPPING_EPISODES %q: must be a positive integer", v))
+		} else {
+			cfg.FlappingEpisodes = n
+		}
+	}
+	if v := lookupConfigValue("FLAPPING_WINDOW", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			ps.add("FLAPPING_WINDOW", fmt.Errorf("invalid FLAPPING_WINDOW %q: must be a positive duration", v))
+		} else {
+			cfg.FlappingWindow = d
+		}
+	}
+	if v := lookupConfigValue("FLAPPING_QUIET_AFTER", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			ps.add("FLAPPING_QUIET_AFTER", fmt.Errorf("invalid FLAPPING_QUIET_AFTER %q: must be a positive duration", v))
+		} else {
+			cfg.FlappingQuietAfter = d
+		}
+	}
+	cfg.AlertEnrichmentURL = strings.TrimSpace(lookupSecret("ALERT_ENRICHMENT_URL"))
+	cfg.AlertEnrichmentTimeout = 2 * time.Second
+	cfg.AlertEnrichmentCacheTTL = 5 * time.Minute
+	if v := lookupConfigValue("ALERT_ENRICHMENT_TIMEOUT", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			ps.add("ALERT_ENRICHMENT_TIMEOUT", fmt.Errorf("invalid ALERT_ENRICHMENT_TIMEOUT %q", v))
+		} else {
+			cfg.AlertEnrichmentTimeout = d
+		}
+	}
+	if v := lookupConfigValue("ALERT_ENRICHMENT_CACHE_TTL", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			ps.add("ALERT_ENRICHMENT_CACHE_TTL", fmt.Errorf("invalid ALERT_ENRICHMENT_CACHE_TTL %q", v))
+		} else {
+			cfg.AlertEnrichmentCacheTTL = d
+		}
+	}
+	if v := lookupConfigValue("REORG_TRACKING_WINDOW", fileValues); v != "" {
 		n, err := strconv.ParseUint(v, 10, 32)
 		if err != nil {
-			return cfg, fmt.Errorf("invalid REORG_TRACKING_WINDOW %q: must be a non-negative integer", v)
+			ps.add("REORG_TRACKING_WINDOW", fmt.Errorf("invalid REORG_TRACKING_WINDOW %q: must be a non-negative integer", v))
+		} else {
+			cfg.ReorgTrackingWindow = uint32(n)
 		}
-		cfg.ReorgTrackingWindow = uint32(n)
 	}
-	if v := os.Getenv("REORG_CONFIRMATION_DEPTH"); v != "" {
+	if v := lookupConfigValue("REORG_CONFIRMATION_DEPTH", fileValues); v != "" {
 		n, err := strconv.ParseUint(v, 10, 32)
 		if err != nil {
-			return cfg, fmt.Errorf("invalid REORG_CONFIRMATION_DEPTH %q: must be a non-negative integer", v)
+			ps.add("REORG_CONFIRMATION_DEPTH", fmt.Errorf("invalid REORG_CONFIRMATION_DEPTH %q: must be a non-negative integer", v))
+		} else {
+			cfg.ReorgConfirmationDepth = uint32(n)
 		}
-		cfg.ReorgConfirmationDepth = uint32(n)
 	}
-	cfg.ArchiveURL = strings.TrimSpace(os.Getenv("ARCHIVE_URL"))
+	cfg.ArchiveURL = strings.TrimSpace(lookupConfigValue("ARCHIVE_URL", fileValues))
 
-	return cfg, nil
+	// Tracing is off unless OTLP_ENDPOINT is set; see telemetry.Config.
+	cfg.OTLP.Endpoint = lookupConfigValue("OTLP_ENDPOINT", fileValues)
+	if cfg.OTLP.Endpoint != "" {
+		u, err := url.Parse(cfg.OTLP.Endpoint)
+		if err != nil || !u.IsAbs() || u.Host == "" ||
+			(u.Scheme != "http" && u.Scheme != "https") {
+			ps.add("OTLP_ENDPOINT", fmt.Errorf(
+				"invalid OTLP_ENDPOINT %q: must be an absolute http or https URL",
+				cfg.OTLP.Endpoint,
+			))
+			// Leave the endpoint unset: a half-valid value would make
+			// the tracing setup try to export to it.
+			cfg.OTLP.Endpoint = ""
+		}
+	}
+	cfg.OTLP.ServiceName = lookupConfigValue("OTLP_SERVICE_NAME", fileValues)
+	cfg.OTLP.SampleRate = DefaultOTLPSampleRate
+	if v := lookupConfigValue("OTLP_SAMPLE_RATE", fileValues); v != "" {
+		r, err := strconv.ParseFloat(v, 64)
+		if err != nil || r < 0 || r > 1 || math.IsNaN(r) || math.IsInf(r, 0) {
+			ps.add("OTLP_SAMPLE_RATE", fmt.Errorf("invalid OTLP_SAMPLE_RATE %q (want a number in [0, 1])", v))
+		} else {
+			cfg.OTLP.SampleRate = r
+		}
+	}
+	// GraphQL configuration. Read through lookupConfigValue like every other
+	// setting, so CONFIG_FILE can supply these too.
+	cfg.GraphQL.EnablePlayground = false
+	if v := lookupConfigValue("GRAPHQL_PLAYGROUND", fileValues); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			cfg.GraphQL.EnablePlayground = true
+		case "0", "false", "no", "off":
+			cfg.GraphQL.EnablePlayground = false
+		default:
+			ps.add("GRAPHQL_PLAYGROUND", fmt.Errorf("invalid GRAPHQL_PLAYGROUND %q (want true|false)", v))
+		}
+	}
+	cfg.GraphQL.MaxDepth = DefaultGraphQLMaxDepth
+	if v := lookupConfigValue("GRAPHQL_MAX_DEPTH", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 50 {
+			ps.add("GRAPHQL_MAX_DEPTH", fmt.Errorf("invalid GRAPHQL_MAX_DEPTH %q (want an integer between 1 and 50)", v))
+		} else {
+			cfg.GraphQL.MaxDepth = n
+		}
+	}
+	cfg.GraphQL.MaxComplexity = DefaultGraphQLMaxComplexity
+	if v := lookupConfigValue("GRAPHQL_MAX_COMPLEXITY", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 10000 {
+			ps.add("GRAPHQL_MAX_COMPLEXITY", fmt.Errorf("invalid GRAPHQL_MAX_COMPLEXITY %q (want an integer between 1 and 10000)", v))
+		} else {
+			cfg.GraphQL.MaxComplexity = n
+		}
+	}
+	cfg.GraphQL.AllowlistOnly = false
+	if v := lookupConfigValue("GRAPHQL_ALLOWLIST_ONLY", fileValues); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			cfg.GraphQL.AllowlistOnly = true
+		case "0", "false", "no", "off":
+			cfg.GraphQL.AllowlistOnly = false
+		default:
+			ps.add("GRAPHQL_ALLOWLIST_ONLY", fmt.Errorf("invalid GRAPHQL_ALLOWLIST_ONLY %q (want true|false)", v))
+		}
+	}
+
+	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_SLACK_RPS", fileValues); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			ps.add("NOTIFY_RATE_LIMIT_SLACK_RPS", fmt.Errorf("invalid NOTIFY_RATE_LIMIT_SLACK_RPS %q (want a non-negative number)", v))
+		} else {
+			cfg.NotifyRateLimitSlackRPS = rps
+		}
+	}
+	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_TELEGRAM_RPS", fileValues); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			ps.add("NOTIFY_RATE_LIMIT_TELEGRAM_RPS", fmt.Errorf("invalid NOTIFY_RATE_LIMIT_TELEGRAM_RPS %q (want a non-negative number)", v))
+		} else {
+			cfg.NotifyRateLimitTelegramRPS = rps
+		}
+	}
+	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_PAGERDUTY_RPS", fileValues); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			ps.add("NOTIFY_RATE_LIMIT_PAGERDUTY_RPS", fmt.Errorf("invalid NOTIFY_RATE_LIMIT_PAGERDUTY_RPS %q (want a non-negative number)", v))
+		} else {
+			cfg.NotifyRateLimitPagerDutyRPS = rps
+		}
+	}
+	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_DEFAULT_RPS", fileValues); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			ps.add("NOTIFY_RATE_LIMIT_DEFAULT_RPS", fmt.Errorf("invalid NOTIFY_RATE_LIMIT_DEFAULT_RPS %q (want a non-negative number)", v))
+		} else {
+			cfg.NotifyRateLimitDefaultRPS = rps
+		}
+	}
+
+	loadMTLS(&cfg, fileValues, sqliteBackend, &ps)
+
+	return cfg, ps.list
+}
+
+// loadSecrets reads the external-secret provider configuration. The active
+// provider is validated here so a typo or a missing Vault address fails
+// startup rather than the first alert that references a secret.
+//
+// It takes fileValues so these settings resolve the same way as every other
+// one: environment first, config file as the fallback.
+func loadSecrets(cfg *Config, fileValues map[string]string) error {
+	cfg.SecretsProvider = strings.ToLower(strings.TrimSpace(lookupConfigValue("SECRETS_PROVIDER", fileValues)))
+	hasVault := false
+	if cfg.SecretsProvider != "" {
+		for _, rawP := range strings.Split(cfg.SecretsProvider, ",") {
+			p := strings.TrimSpace(rawP)
+			switch p {
+			case "env", "file":
+			case "vault", "all":
+				hasVault = true
+			default:
+				return fmt.Errorf("invalid SECRETS_PROVIDER %q (want env|vault|file, or unset to disable external secrets)", cfg.SecretsProvider)
+			}
+		}
+	}
+
+	cfg.SecretsCacheTTL = secrets.DefaultTTL
+	if v := lookupConfigValue("SECRETS_CACHE_TTL", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SECRETS_CACHE_TTL %q: %w", v, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("SECRETS_CACHE_TTL %q is negative", v)
+		}
+		cfg.SecretsCacheTTL = d
+	}
+
+	cfg.VaultAddr = strings.TrimRight(strings.TrimSpace(lookupConfigValue("VAULT_ADDR", fileValues)), "/")
+	cfg.VaultToken = lookupConfigValue("VAULT_TOKEN", fileValues)
+	cfg.VaultNamespace = strings.TrimSpace(lookupConfigValue("VAULT_NAMESPACE", fileValues))
+	if hasVault && cfg.VaultAddr == "" {
+		return fmt.Errorf("VAULT_ADDR is required when SECRETS_PROVIDER includes vault")
+	}
+	return nil
+}
+
+// BuildResolver returns a secrets.Resolver built from cfg.SecretsProvider.
+// It returns nil when external secrets are disabled.
+func BuildResolver(cfg Config) *secrets.Resolver {
+	if cfg.SecretsProvider == "" {
+		return nil
+	}
+	r := secrets.NewResolver()
+	registered := 0
+	for _, rawP := range strings.Split(cfg.SecretsProvider, ",") {
+		switch strings.TrimSpace(rawP) {
+		case "env":
+			r.Register(secrets.NewEnvProvider())
+			registered++
+		case "file":
+			r.Register(secrets.NewFileProvider())
+			registered++
+		case "vault":
+			r.Register(secrets.NewVaultProvider(cfg.VaultAddr, cfg.VaultToken, cfg.VaultNamespace))
+			registered++
+		case "all":
+			r.Register(secrets.NewEnvProvider())
+			r.Register(secrets.NewFileProvider())
+			if cfg.VaultAddr != "" {
+				r.Register(secrets.NewVaultProvider(cfg.VaultAddr, cfg.VaultToken, cfg.VaultNamespace))
+			}
+			registered++
+		}
+	}
+	if registered == 0 {
+		return nil
+	}
+	return r.WithTTL(cfg.SecretsCacheTTL)
+}
+
+func valueOrFallback(key string, fileValues map[string]string, fallback string) string {
+	if v := lookupConfigValue(key, fileValues); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func parseInt32EnvWithFile(key string, fileValues map[string]string) (int32, error) {
+	v := lookupConfigValue(key, fileValues)
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("%s %d is negative", key, n)
+	}
+	return int32(n), nil
+}
+
+func parseDurationEnvWithFile(key string, fileValues map[string]string) (time.Duration, error) {
+	v := lookupConfigValue(key, fileValues)
+	if v == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s %q is negative", key, v)
+	}
+	return d, nil
 }
 
 // validateHTTPAddr checks HTTP_ADDR is a host:port pair with a numeric
@@ -375,24 +1133,52 @@ const redacted = "[redacted]"
 func (c Config) LogAttrs() []slog.Attr {
 	return []slog.Attr{
 		slog.String("database_url", redactDatabaseURL(c.DatabaseURL)),
+		// Redacted the same way: the replica URL carries its own credentials,
+		// and the redaction keeps only scheme, host and database name.
+		slog.String("replica_database_url", redactDatabaseURL(c.ReplicaDatabaseURL)),
 		slog.String("http_addr", c.HTTPAddr),
 		slog.String("source_mode", c.SourceMode),
 		slog.String("poll_interval", c.PollInterval.String()),
+		// On/off, the interval and whether failure pings are configured —
+		// never the URL: its path is the credential the external service
+		// keys on, and LogAttrs is the one place configuration is printed.
+		slog.Bool("heartbeat_enabled", c.HeartbeatURL != ""),
+		slog.String("heartbeat_interval", c.HeartbeatInterval.String()),
+		slog.Bool("heartbeat_failure_pings", c.HeartbeatFailureSuffix != ""),
 		slog.String("log_level", strings.ToLower(c.LogLevel.String())),
 		slog.String("network", c.Network.Name),
-		slog.String("rpc_url", c.RPCURL),
+		slog.String("rpc_url", redactURLCredentials(c.RPCURL)),
 		// The count, not the list: it is how an operator confirms at a
 		// glance that the failover set was read, and the URLs themselves
 		// already appear (first one above) in the poller's own lines.
 		slog.Int("rpc_endpoint_count", len(c.RPCURLs)),
-		slog.String("sorotrail_url", c.SoroTrailURL),
+		slog.String("sorotrail_url", redactURLCredentials(c.SoroTrailURL)),
+		// Redacted for the same reason as the others: a Horizon endpoint
+		// behind basic auth carries the credential in the URL.
+		slog.String("horizon_url", redactURLCredentials(c.HorizonURL)),
 		slog.String("cors_allowed_origins", strings.Join(c.CORSAllowedOrigins, ",")),
 		slog.Bool("config_encryption_enabled", len(c.ConfigEncryptionKey) > 0),
+		// The provider name, never the token or any resolved value.
+		slog.String("secrets_provider", c.SecretsProvider),
+		slog.String("secrets_cache_ttl", c.SecretsCacheTTL.String()),
+		slog.Bool("vault_token_configured", c.VaultToken != ""),
 		slog.Uint64("reorg_tracking_window", uint64(c.ReorgTrackingWindow)),
 		slog.Uint64("reorg_confirmation_depth", uint64(c.ReorgConfirmationDepth)),
 		// The count, never the tokens themselves: LogAttrs is the one place
 		// configuration is printed, and an API token is a credential.
 		slog.Int("api_token_count", len(c.APITokens)),
+		// The workspace ids are safe to print and useful on a startup line; the
+		// tokens that select them are not, so only the ids appear.
+		slog.Any("workspaces", c.Workspaces()),
+		slog.Bool("sso_enabled", c.OIDC.Enabled()),
+		slog.Bool("otlp_tracing_enabled", c.OTLP.Endpoint != ""),
+		slog.String("otlp_service_name", c.OTLP.ServiceName),
+		slog.Float64("otlp_sample_rate", c.OTLP.SampleRate),
+		slog.Bool("graphql_playground_enabled", c.GraphQL.EnablePlayground),
+		slog.Int("graphql_max_depth", c.GraphQL.MaxDepth),
+		slog.Int("graphql_max_complexity", c.GraphQL.MaxComplexity),
+		slog.Bool("graphql_allowlist_only", c.GraphQL.AllowlistOnly),
+		slog.Int("channel_disable_after_failures", c.ChannelDisableAfterFailures),
 	}
 }
 
@@ -405,7 +1191,17 @@ func redactDatabaseURL(raw string) string {
 		return ""
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" {
+	if err != nil {
+		// A sqlite URL can carry a Windows drive path ("sqlite://C:\srv\x.db"),
+		// which url.Parse rejects because it reads "C:" as a host with a bad
+		// port. It holds no credentials, so the operator can still be shown
+		// which file the process opened.
+		if strings.HasPrefix(strings.ToLower(raw), "sqlite:") {
+			return raw
+		}
+		return redacted
+	}
+	if u.Scheme == "" {
 		return redacted
 	}
 	if strings.EqualFold(u.Scheme, "sqlite") {
@@ -415,6 +1211,23 @@ func redactDatabaseURL(raw string) string {
 		return redacted
 	}
 	return u.Scheme + "://" + u.Host + u.Path
+}
+
+// redactURLCredentials drops userinfo from a URL so an API key supplied as
+// basic auth cannot reach a log line, while keeping the rest readable. Like
+// redactDatabaseURL it fails closed, because a valid password is enough to
+// defeat url.Parse — a "%", a space or a "[" in the userinfo each do it — and
+// that is precisely the input worth protecting.
+func redactURLCredentials(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" {
+		return redacted
+	}
+	u.User = nil
+	return u.String()
 }
 
 // ParseRetention accepts Go durations (24h, 90m) plus a day suffix
@@ -508,6 +1321,30 @@ func validateDatabaseURL(raw string) error {
 	}
 }
 
+// validateReplicaDatabaseURL checks REPLICA_DATABASE_URL. The replica must be
+// a Postgres URL — there is no replica concept for SQLite, which
+// Load rejects before calling this — and it must not be the primary itself.
+// Pointing both at the same string is almost always a half-finished edit, and
+// it is worth failing on: it looks like routing is on in every log line and
+// every metric label, while every "replica" read lands on the primary. An
+// operator who genuinely wants one database behind two pools should say so
+// with two URLs.
+func validateReplicaDatabaseURL(replicaURL, primaryURL string) error {
+	u, err := url.Parse(replicaURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("REPLICA_DATABASE_URL is not a parseable URL (want a postgres connection string, e.g. postgres://user:pass@replica-host:5432/sorobeacon)")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "postgres", "postgresql":
+	default:
+		return fmt.Errorf("REPLICA_DATABASE_URL scheme %q is not supported: reads can only be routed to a Postgres replica", u.Scheme)
+	}
+	if replicaURL == primaryURL {
+		return fmt.Errorf("REPLICA_DATABASE_URL is identical to DATABASE_URL; unset it to read from the primary, or point it at the replica")
+	}
+	return nil
+}
+
 // isSQLiteURL reports whether raw selects the SQLite backend. It is a
 // best-effort parse: an unparseable value has already been rejected by
 // validateDatabaseURL, so a false here simply means "not sqlite".
@@ -537,48 +1374,6 @@ func parseAPITokens(raw string) ([]string, error) {
 		return nil, fmt.Errorf("invalid API_TOKEN: set but contains no tokens (use comma-separated values, or unset it to leave authentication off)")
 	}
 	return tokens, nil
-}
-
-func getenv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-// parseInt32Env reads an optional int32. Unset or empty is 0 (driver
-// default). Negative values are rejected so a typo cannot shrink the
-// pool below pgx's floor.
-func parseInt32Env(key string) (int32, error) {
-	v := os.Getenv(key)
-	if v == "" {
-		return 0, nil
-	}
-	n, err := strconv.ParseInt(v, 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
-	}
-	if n < 0 {
-		return 0, fmt.Errorf("%s %d is negative", key, n)
-	}
-	return int32(n), nil
-}
-
-// parseDurationEnv reads an optional duration. Unset or empty is 0
-// (driver default). Negative durations are rejected.
-func parseDurationEnv(key string) (time.Duration, error) {
-	v := os.Getenv(key)
-	if v == "" {
-		return 0, nil
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
-	}
-	if d < 0 {
-		return 0, fmt.Errorf("%s %q is negative", key, v)
-	}
-	return d, nil
 }
 
 func parseLevel(s string) (slog.Level, error) {

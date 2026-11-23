@@ -22,7 +22,7 @@ import (
 //	HMAC-SHA256(key="s3cret", msg="1700000000." + `{"event_id":"e1"}`)
 func TestSignGoldenVector(t *testing.T) {
 	const want = "b7ae34b78dfdf65e437098c4dc42d89f96f5dd9152180c66b3c5aec58df53b7a"
-	got := Sign("s3cret", "1700000000", []byte(`{"event_id":"e1"}`))
+	got := Sign([]byte("s3cret"), "1700000000", []byte(`{"event_id":"e1"}`))
 	assert.Equal(t, want, got)
 }
 
@@ -49,7 +49,7 @@ func TestWebhookSignsTimestampAndBody(t *testing.T) {
 	ts, err := strconv.ParseInt(gotTS, 10, 64)
 	require.NoError(t, err, "timestamp header must be decimal Unix seconds")
 	assert.WithinDuration(t, time.Unix(ts, 0), time.Now(), time.Minute)
-	assert.Equal(t, Sign("s3cret", gotTS, gotBody), gotSig)
+	assert.Equal(t, Sign([]byte("s3cret"), gotTS, gotBody), gotSig)
 
 	var sent Alert
 	require.NoError(t, json.Unmarshal(gotBody, &sent))
@@ -74,8 +74,8 @@ func TestWebhookRotationSendsBothSignatures(t *testing.T) {
 
 	// A receiver still on the old key verifies the previous header; one on
 	// the new key verifies the primary header. Both cover the same bytes.
-	assert.Equal(t, Sign("new-secret", gotTS, gotBody), gotSig)
-	assert.Equal(t, Sign("old-secret", gotTS, gotBody), gotPrevSig)
+	assert.Equal(t, Sign([]byte("new-secret"), gotTS, gotBody), gotSig)
+	assert.Equal(t, Sign([]byte("old-secret"), gotTS, gotBody), gotPrevSig)
 	assert.NotEqual(t, gotSig, gotPrevSig)
 }
 

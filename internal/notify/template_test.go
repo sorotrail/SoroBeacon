@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -179,4 +181,115 @@ func TestTemplateCanAddressEveryAlertField(t *testing.T) {
 	require.NoError(t, err)
 	_, err = tpl.render(Alert{})
 	require.NoError(t, err, "every exported Alert field must be addressable from a template")
+}
+
+// NewPerMonitorTemplate is not referenced by any channel constructor or by
+// the Factory — per-monitor overrides are not wired into delivery at all. The
+// tests below therefore pin the standalone behaviour the function does have,
+// and the PR records the missing wiring as a finding rather than pretending
+// the feature exists.
+func TestPerMonitorTemplateRendersAlert(t *testing.T) {
+	tpl := NewPerMonitorTemplate("MON {{.MonitorName}} {{.EventName}} @{{.Ledger}}")
+	require.NotNil(t, tpl)
+
+	var b strings.Builder
+	require.NoError(t, tpl.tmpl.Execute(&b, Alert{MonitorName: "Treasury", EventName: "transfer", Ledger: 42}))
+	assert.Equal(t, "MON Treasury transfer @42", b.String())
+}
+
+// TestPerMonitorTemplatePanicsOnMalformedPattern pins a contrast with
+// parseChannelTemplate: malformed input panics here (template.Must) instead of
+// returning an error the API can turn into a 400. Today nothing calls this
+// function, so no request can trigger the panic; the finding is that wiring
+// it up as-is would turn an operator typo into a crash.
+func TestPerMonitorTemplatePanicsOnMalformedPattern(t *testing.T) {
+	assert.Panics(t, func() {
+		NewPerMonitorTemplate("{{.MonitorName")
+	})
+}
+
+// TestPerMonitorTemplateExecutionErrorHasNoFallback is the other half of the
+// contrast. channelTemplate.render logs and falls back to the default message
+// when execution fails; PerMonitorTemplate exposes no such path, so a template
+// that parses but references a missing field simply cannot produce a message.
+func TestPerMonitorTemplateExecutionErrorHasNoFallback(t *testing.T) {
+	tpl := NewPerMonitorTemplate("{{.NoSuchField}}")
+
+	var b strings.Builder
+	err := tpl.tmpl.Execute(&b, Alert{MonitorName: "Treasury"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "NoSuchField")
+}
+
+// TestTemplateDataCannotAddressChannelConfig checks the credential-disclosure
+// path the other way around: templates execute against Alert, which carries
+// no channel config, and neither template implementation can address one.
+// Alert.Payload and Alert.Enrichment are operator data, not config.
+func TestTemplateDataCannotAddressChannelConfig(t *testing.T) {
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	rt := reflect.TypeOf(Alert{})
+	for i := 0; i < rt.NumField(); i++ {
+		name := strings.ToLower(rt.Field(i).Name)
+		for _, forbidden := range []string{"config", "secret", "token", "password", "webhook", "credential"} {
+			assert.NotContains(t, name, forbidden,
+				"template data must not expose anything config-like: Alert.%s", rt.Field(i).Name)
+		}
+	}
+
+	channelTpl, err := parseChannelTemplate("{{.Config}}")
+	require.NoError(t, err)
+	full, err := channelTpl.render(Alert{})
+	require.NoError(t, err, "render falls back rather than failing the alert")
+	defaultMessage, err := RenderText(Alert{})
+	require.NoError(t, err)
+	assert.Equal(t, defaultMessage, full, "a template cannot reach channel config and falls back")
+
+	perMonitor := NewPerMonitorTemplate("{{.Config}}")
+	var b strings.Builder
+	require.Error(t, perMonitor.tmpl.Execute(&b, Alert{}),
+		"Alert has no Config field, so a config-interpolating template cannot resolve")
+}
+
+// TestTemplateOutputCannotBreakChatPayload covers the realistic failure mode
+// for a plain-text template: an event name containing quotes, backslashes and
+// newlines must still produce a valid JSON request body for every chat
+// channel. text/template inserts values verbatim; the channels' JSON encoder
+// is what keeps the payload intact.
+func TestTemplateOutputCannotBreakChatPayload(t *testing.T) {
+	const hostile = "quote \" backslash \\ newline\nclosing }"
+
+	for _, name := range []string{TypeDiscord, TypeSlack, TypeTelegram} {
+		t.Run(name, func(t *testing.T) {
+			bodies := make(chan []byte, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				bodies <- body
+			}))
+			t.Cleanup(srv.Close)
+
+			n, err := buildTextChannel(t, name, "{{.EventName}}", srv.URL)
+			require.NoError(t, err)
+			require.NoError(t, n.Send(context.Background(), Alert{EventName: hostile}))
+
+			var raw []byte
+			select {
+			case raw = <-bodies:
+			case <-time.After(2 * time.Second):
+				t.Fatal("channel made no request")
+			}
+			require.True(t, json.Valid(raw), "template output broke the JSON payload: %s", raw)
+
+			var payload map[string]string
+			require.NoError(t, json.Unmarshal(raw, &payload))
+			field := "text"
+			if name == TypeDiscord {
+				field = "content"
+			}
+			assert.Equal(t, hostile, payload[field],
+				"template values must round-trip unchanged through the channel payload")
+		})
+	}
 }

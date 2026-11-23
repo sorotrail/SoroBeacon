@@ -117,6 +117,9 @@ func TestExportAlertsCSV_EscapesAndGuardsInjection(t *testing.T) {
 			EventID:   "@evt",
 			Payload:   json.RawMessage(`{"contract_id":"=SUM(A1)","event_name":"+cmd","ledger":17}`),
 			CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+			// A stored network still goes through the same guard: the column is
+			// operator-supplied config on a custom chain, not a fixed enum.
+			Network: "=HYPERLINK(\"http://evil\")",
 		}},
 	}
 	_, body := exportCSV(t, st, "")
@@ -128,12 +131,14 @@ func TestExportAlertsCSV_EscapesAndGuardsInjection(t *testing.T) {
 		"7",
 		`'-ops, "prod"`,
 		"3",
+		"warning",
 		"'=SUM(A1)",
 		"'+cmd",
 		"'@evt",
 		"17",
 		"2026-01-02T03:04:05Z",
 		`{"contract_id":"=SUM(A1)","event_name":"+cmd","ledger":17}`,
+		`'=HYPERLINK("http://evil")`,
 	}
 	if !reflect.DeepEqual(rows[1], want) {
 		t.Fatalf("row = %v\nwant %v", rows[1], want)

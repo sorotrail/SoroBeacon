@@ -10,11 +10,26 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log/slog"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
+
+	"github.com/sorotrail/sorobeacon/internal/secrets"
+	"github.com/sorotrail/sorobeacon/internal/store"
 )
+
+// DefaultTimeout is the fallback timeout applied to channel deliveries
+// when no explicit channel timeout is configured.
+const DefaultTimeout = store.DefaultChannelTimeout
+
+// MinTimeout is the lower bound on channel delivery timeouts.
+const MinTimeout = store.MinChannelTimeout
+
+// MaxTimeout is the upper bound on channel delivery timeouts.
+const MaxTimeout = store.MaxChannelTimeout
 
 // Alert is the rendered-alert payload handed to a Notifier. It is a
 // flattened, channel-agnostic view of a stored alert plus its context.
@@ -30,7 +45,44 @@ type Alert struct {
 	Ledger      uint32          `json:"ledger"`
 	TxHash      string          `json:"tx_hash"`
 	Payload     json.RawMessage `json:"payload,omitempty"`
+	Enrichment  json.RawMessage `json:"enrichment,omitempty"`
 	CreatedAt   time.Time       `json:"created_at"`
+	// Severity is the alert severity (info, warning, critical). Empty means
+	// warning for backwards compatibility.
+	Severity string `json:"severity,omitempty"`
+	// Digest carries a pre-rendered summary when this Alert represents a
+	// channel digest rather than a single event. RenderText returns it
+	// verbatim, so every text channel sends the same summary without
+	// needing a digest-specific method.
+	Digest string `json:"digest,omitempty"`
+	// GroupCount is the number of alerts in the current digest window.
+	// Used by the default digest template.
+	GroupCount int `json:"group_count,omitempty"`
+	// WindowStart is the start of the digest window.
+	WindowStart time.Time `json:"window_start,omitempty"`
+	// WindowEnd is the end of the digest window.
+	WindowEnd time.Time `json:"window_end,omitempty"`
+	// Silence is set by absence-of-event rules: how long the event they wait
+	// for had been missing when the alert fired. Zero for event-driven alerts.
+	// The message template switches on it, because an absence alert has no
+	// ledger, no transaction and no matching event — reporting those as empty
+	// fields reads like a broken alert rather than a contract gone quiet.
+	Silence time.Duration `json:"silence,omitempty"`
+	// FederationOrigin names the instance an alert was forwarded from. It is
+	// empty for a local alert, and it is what tells a forwarded alert apart
+	// from a local one in the channels that key on the alert's identity: a
+	// forwarded alert has no local rule id to key on.
+	FederationOrigin string `json:"federation_origin,omitempty"`
+	// RunbookURL is the resolved http/https runbook link for this alert
+	// (rule -> monitor -> workspace default).
+	RunbookURL string `json:"runbook_url,omitempty"`
+	// ResponseGuidance is the resolved triage instruction note for this alert
+	// (rule -> monitor -> workspace default).
+	ResponseGuidance string `json:"response_guidance,omitempty"`
+
+	// esc escapes enrichment text for the channel rendering this alert. It is
+	// set by the channel just before rendering and is never serialised.
+	esc func(string) string
 }
 
 // Notifier sends one alert to one destination. Implementations should
@@ -40,24 +92,54 @@ type Notifier interface {
 	Send(ctx context.Context, a Alert) error
 }
 
+// PreflightChecker verifies a notifier's remote configuration without sending
+// an alert. A channel that cannot offer a non-delivering probe should not
+// implement this interface.
+type PreflightChecker interface {
+	Check(ctx context.Context) error
+}
+
 // Constructor builds a Notifier from a channel's JSON config.
 type Constructor func(config json.RawMessage) (Notifier, error)
 
-// Factory builds Notifiers by channel type name.
+// Factory builds Notifiers by channel type name. When a secrets resolver is
+// attached, every constructor resolves ${secret:...} references in the
+// config before it runs, so all channel types support external secrets
+// without individual changes.
 type Factory struct {
-	constructors map[string]Constructor
+	constructors     map[string]Constructor
+	secrets          *secrets.Resolver
+	federationOrigin string
+	pushOnce         sync.Once
+	push             *pushShared
 }
 
 // Channel type names understood by DefaultFactory.
 const (
-	TypeDiscord   = "discord"
-	TypeSlack     = "slack"
-	TypeTelegram  = "telegram"
-	TypeEmail     = "email"
-	TypeWebhook   = "webhook"
-	TypeMatrix    = "matrix"
-	TypePagerDuty = "pagerduty"
-	TypeTwilio    = "twilio"
+	TypeDiscord      = "discord"
+	TypeSlack        = "slack"
+	TypeTelegram     = "telegram"
+	TypeEmail        = "email"
+	TypeWebhook      = "webhook"
+	TypeNtfy         = "ntfy"
+	TypeMatrix       = "matrix"
+	TypePagerDuty    = "pagerduty"
+	TypeTwilio       = "twilio"
+	TypeSignal       = "signal"
+	TypeWebex        = "webex"
+	TypeLark         = "lark"
+	TypeDingTalk     = "dingtalk"
+	TypeMattermost   = "mattermost"
+	TypeRocketChat   = "rocketchat"
+	TypeZulip        = "zulip"
+	TypePushover     = "pushover"
+	TypeGoogleChat   = "googlechat"
+	TypeOpsgenie     = "opsgenie"
+	TypeGotify       = "gotify"
+	TypeTeams        = "teams"
+	TypeSNS          = "sns"
+	TypeJSONTemplate = "jsontemplate"
+	// TypePush is declared in push.go.
 )
 
 // DefaultFactory returns a Factory with the built-in channel types.
@@ -68,10 +150,26 @@ func DefaultFactory() *Factory {
 	f.Register(TypeTelegram, NewTelegram)
 	f.Register(TypeEmail, NewEmail)
 	f.Register(TypeWebhook, NewWebhook)
+	f.Register(TypeNtfy, NewNtfy)
 	f.Register(TypeMatrix, NewMatrix)
 	f.Register(TypePagerDuty, NewPagerDuty)
-	f.Register(TypeFederation, NewFederation)
+	f.Register(TypeFederation, f.newFederation)
 	f.Register(TypeTwilio, NewTwilio)
+	f.Register(TypeSignal, NewSignal)
+	f.Register(TypeWebex, NewWebex)
+	f.Register(TypeLark, NewLark)
+	f.Register(TypeDingTalk, NewDingTalk)
+	f.Register(TypeMattermost, NewMattermost)
+	f.Register(TypeRocketChat, NewRocketChat)
+	f.Register(TypeZulip, NewZulip)
+	f.Register(TypePushover, NewPushover)
+	f.Register(TypeGoogleChat, NewGoogleChat)
+	f.Register(TypeOpsgenie, NewOpsgenie)
+	f.Register(TypeGotify, NewGotify)
+	f.Register(TypeTeams, NewTeams)
+	f.Register(TypeSNS, NewSNS)
+	f.Register(TypeJSONTemplate, NewJSONTemplate)
+	f.Register(TypePush, f.newPush)
 	return f
 }
 
@@ -89,13 +187,57 @@ func (f *Factory) Types() []string {
 	return out
 }
 
-// New builds a Notifier for a channel type and config.
+// WithSecrets attaches an external-secret resolver. It is optional: without
+// one, config values (including anything that looks like a reference) are
+// passed through as literals, which is exactly the behaviour before external
+// secrets existed.
+func (f *Factory) WithSecrets(r *secrets.Resolver) *Factory {
+	f.secrets = r
+	return f
+}
+
+// WithFederationOrigin sets the sending instance's identity, stamped as the
+// origin on every federated alert. An empty origin leaves federation
+// fail-closed: creating a federation channel returns an actionable error
+// instead of sending payloads the receiving instance must reject.
+func (f *Factory) WithFederationOrigin(origin string) *Factory {
+	f.federationOrigin = strings.TrimSpace(origin)
+	return f
+}
+
+// InvalidateSecretCache drops cached secret values. The API calls it when a
+// channel is created, updated or deleted so a corrected or rotated secret
+// takes effect on the next delivery instead of waiting for the TTL.
+func (f *Factory) InvalidateSecretCache() {
+	if f.secrets != nil {
+		f.secrets.Invalidate()
+	}
+}
+
+// New builds a Notifier for a channel type and config. References are
+// resolved against the attached resolver, if any; the resolved copy stays in
+// memory with the notifier and is never written back, logged or returned.
 func (f *Factory) New(channelType string, config json.RawMessage) (Notifier, error) {
+	return f.NewContext(context.Background(), channelType, config)
+}
+
+// NewContext builds a notifier while resolving secrets with ctx. It is useful
+// for bounded preflight checks; resolved values remain only in the returned
+// notifier and are never written back to channel config.
+func (f *Factory) NewContext(ctx context.Context, channelType string, config json.RawMessage) (Notifier, error) {
 	c, ok := f.constructors[channelType]
 	if !ok {
 		return nil, fmt.Errorf("unknown channel type %q (registered: %v)", channelType, f.Types())
 	}
-	return c(config)
+	resolved := config
+	if f.secrets != nil && len(config) > 0 {
+		r, err := f.secrets.ResolveConfig(ctx, config)
+		if err != nil {
+			return nil, err
+		}
+		resolved = r
+	}
+	return c(resolved)
 }
 
 // defaultTemplate renders the plain-text alert message shared by the chat
@@ -103,22 +245,118 @@ func (f *Factory) New(channelType string, config json.RawMessage) (Notifier, err
 var defaultTemplate = template.Must(template.New("alert").Parse(strings.TrimSpace(`
 🔔 SoroBeacon alert: {{.MonitorName}}
 Rule: {{.RuleType}} (#{{.RuleID}})
-Contract: {{.ContractID}}
-{{- if .EventName}}
+{{- if .ContractID}}
+Contract: {{.ContractID}}{{end}}
+{{- if .ContractLabel}}
+Label: {{.ContractLabel}} (from {{.EnrichmentSource}}{{if .EnrichmentStale}}, stale{{end}}; unverified){{end}}
+{{- if .PrimaryAmount}}
+Amount: {{.PrimaryAmount}}{{end}}
+{{- if .Silence}}
+No {{.EventName}} for {{.Silence}}
+{{- else if .EventName}}
 Event: {{.EventName}}{{end}}
-Ledger: {{.Ledger}}
-Tx: {{.TxHash}}
+{{- if .Ledger}}
+Ledger: {{.Ledger}}{{end}}
+{{- if .TxHash}}
+Tx: {{.TxHash}}{{end}}
 Event ID: {{.EventID}}
 At: {{.CreatedAt.UTC.Format "2006-01-02 15:04:05"}} UTC
+{{- if .RunbookURL}}
+Runbook: {{.RunbookURL}}{{end}}
+{{- if .ResponseGuidance}}
+Guidance: {{.ResponseGuidance}}{{end}}
+{{- if gt .GroupCount 0}}
+Group: {{.GroupCount}} alert(s) in window {{.WindowStart.UTC.Format "2006-01-02T15:04:05Z"}} to {{.WindowEnd.UTC.Format "2006-01-02T15:04:05Z"}}
+{{- end}}
 `)))
 
-// RenderText renders the default plain-text message for an alert.
+// RenderText renders the default plain-text message for an alert. A digest
+// Alert (one with Digest set) returns the summary unchanged: it is already a
+// finished message.
 func RenderText(a Alert) (string, error) {
+	if a.Digest != "" {
+		return a.Digest, nil
+	}
 	var b strings.Builder
 	if err := defaultTemplate.Execute(&b, a); err != nil {
 		return "", fmt.Errorf("render alert message: %w", err)
 	}
 	return b.String(), nil
+}
+
+// DefaultDigestMaxLen bounds a digest message in bytes. It is documented in
+// docs/channels/digest.md; a longer digest ends with an explicit "and N more"
+// line rather than being cut off mid-line.
+const DefaultDigestMaxLen = 2000
+
+// RenderDigest builds the summary message a digest channel sends after its
+// window elapses. It states how many alerts it covers, groups them by
+// monitor, and truncates to maxLen (DefaultDigestMaxLen when maxLen <= 0)
+// with an explicit "and N more" line. An empty slice renders "" — the caller
+// sends nothing.
+func RenderDigest(alerts []Alert, maxLen int) string {
+	if len(alerts) == 0 {
+		return ""
+	}
+	if maxLen <= 0 {
+		maxLen = DefaultDigestMaxLen
+	}
+	type group struct {
+		name   string
+		alerts []Alert
+	}
+	var groups []group
+	index := map[string]int{}
+	for _, a := range alerts {
+		name := a.MonitorName
+		if name == "" {
+			name = "(unknown monitor)"
+		}
+		i, ok := index[name]
+		if !ok {
+			i = len(groups)
+			index[name] = i
+			groups = append(groups, group{name: name})
+		}
+		groups[i].alerts = append(groups[i].alerts, a)
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "SoroBeacon digest: %d alert(s) across %d monitor(s)\n", len(alerts), len(groups))
+	omitted := 0
+	for _, g := range groups {
+		header := fmt.Sprintf("\n%s (%d)\n", g.name, len(g.alerts))
+		if b.Len()+len(header) > maxLen {
+			omitted += len(g.alerts)
+			continue
+		}
+		b.WriteString(header)
+		for _, a := range g.alerts {
+			line := fmt.Sprintf("- %s\n", digestLine(a))
+			if b.Len()+len(line) > maxLen {
+				omitted++
+				continue
+			}
+			b.WriteString(line)
+		}
+	}
+	if omitted > 0 {
+		fmt.Fprintf(&b, "\n... and %d more\n", omitted)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// digestLine is one alert's one-line summary inside a digest.
+func digestLine(a Alert) string {
+	parts := []string{a.EventName}
+	if a.ContractID != "" {
+		parts = append(parts, a.ContractID)
+	}
+	parts = append(parts, fmt.Sprintf("ledger %d", a.Ledger))
+	if !a.CreatedAt.IsZero() {
+		parts = append(parts, a.CreatedAt.UTC().Format("2006-01-02 15:04:05")+" UTC")
+	}
+	return strings.Join(parts, "  ")
 }
 
 // channelTemplate is an optional per-channel override of the plain-text
@@ -134,6 +372,59 @@ func RenderText(a Alert) (string, error) {
 // The zero value means "no override": render then falls back to RenderText.
 type channelTemplate struct {
 	tpl *template.Template
+	// kind selects how enrichment text is escaped for this channel (see
+	// escapeFor); empty means plain text.
+	kind string
+}
+
+// EscapeSlackMrkdwn escapes &, <, and > per Slack's mrkdwn rules so untrusted
+// or operator-provided text cannot inject <!channel> mentions or link syntax.
+func EscapeSlackMrkdwn(s string) string {
+	r := strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+	)
+	return r.Replace(s)
+}
+
+// EscapeHTML escapes &, <, >, ", and ' for safe embedding in HTML bodies.
+func EscapeHTML(s string) string {
+	return html.EscapeString(s)
+}
+
+// EscapeJSONString returns s escaped as a JSON string body without surrounding
+// double quotes, suitable for interpolation inside a JSON template literal.
+func EscapeJSONString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil || len(b) < 2 {
+		return ""
+	}
+	return string(b[1 : len(b)-1])
+}
+
+// EscapeMarkdown escapes common Markdown formatting and link-control characters.
+func EscapeMarkdown(s string) string {
+	r := strings.NewReplacer(
+		`\`, `\\`,
+		"`", "\\`",
+		"*", `\*`,
+		"_", `\_`,
+		"[", `\[`,
+		"]", `\]`,
+		"(", `\(`,
+		")", `\)`,
+		"<", `&lt;`,
+		">", `&gt;`,
+	)
+	return r.Replace(s)
+}
+
+var channelTemplateFuncs = template.FuncMap{
+	"slackEscape":    EscapeSlackMrkdwn,
+	"htmlEscape":     EscapeHTML,
+	"jsonEscape":     EscapeJSONString,
+	"markdownEscape": EscapeMarkdown,
 }
 
 // parseChannelTemplate compiles a channel's optional template. An empty (or
@@ -143,7 +434,7 @@ func parseChannelTemplate(raw string) (channelTemplate, error) {
 	if strings.TrimSpace(raw) == "" {
 		return channelTemplate{}, nil
 	}
-	tpl, err := template.New("alert").Parse(raw)
+	tpl, err := template.New("alert").Funcs(channelTemplateFuncs).Parse(raw)
 	if err != nil {
 		return channelTemplate{}, fmt.Errorf("invalid template: %w", err)
 	}
@@ -155,6 +446,12 @@ func parseChannelTemplate(raw string) (channelTemplate, error) {
 // into a slice — falls back to the default and logs a warning: an alert must
 // never be dropped over a formatting mistake.
 func (t channelTemplate) render(a Alert) (string, error) {
+	// A digest summary is already rendered; a per-alert template must not
+	// reshape it.
+	if a.Digest != "" {
+		return a.Digest, nil
+	}
+	a.esc = escapeFor(t.kind)
 	if t.tpl == nil {
 		return RenderText(a)
 	}

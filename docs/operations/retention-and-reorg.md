@@ -50,7 +50,9 @@ without detection.
 On Postgres, `alerts` is range-partitioned by `created_at`, one partition per
 UTC month plus a `DEFAULT` partition that stores a row whose month has no
 partition yet (so a missing partition never loses a row). Upcoming months are
-created on startup and on every prune pass.
+created on startup and, when retention is enabled, on every prune pass. See
+[Alert retention and partitioning](retention.md) for the full operator runbook:
+creation schedule, monitoring, backups, and schema constraints.
 
 With `ALERT_RETENTION` set, retention drops whole expired partitions — which is
 effectively free compared to deleting rows — and clears the delivery attempts
@@ -82,8 +84,7 @@ A failed archive blocks that batch's delete, so nothing is dropped
 un-archived — the ordering is the guarantee. Objects are keyed by the batch's
 own id range, so re-running after a crash overwrites rather than duplicates.
 
-Archiving is off by default, and it is skipped in favour of partition drops
-when it is on: a `DROP` cannot archive, so with `ARCHIVE_URL` set the row-by-row
-archive-then-delete path is used instead. Archive objects contain only alert
-rows — contract data, never channel `config`, so a webhook URL or bot token can
-never reach one.
+Archiving is off by default. When an archive is configured, partition drops
+are skipped: a `DROP` cannot archive, so the row-by-row archive-then-delete path
+is used instead. Archive objects contain only alert rows — contract data, never
+channel `config`, so a webhook URL or bot token can never reach one.

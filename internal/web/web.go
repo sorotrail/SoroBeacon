@@ -8,6 +8,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -20,21 +21,39 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/sorotrail/sorobeacon/internal/api"
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/buildinfo"
+	"github.com/sorotrail/sorobeacon/internal/lease"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
 	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 // PositionReader is the poller's race-free snapshot of ingest progress.
 type PositionReader interface {
 	Position() poller.Position
+}
+
+// NetworkStatusReader is the multi-network supervisor's per-chain view, which
+// the overview page renders as one row per network. The supervisor satisfies
+// it; a bare poller does not, and the page then shows the single aggregate it
+// always showed.
+type NetworkStatusReader interface {
+	Statuses(ctx context.Context) []poller.NetworkStatus
+}
+
+// LeaderReader reports this instance's leader-election status, shown on the
+// overview page so an operator can tell which replica is polling.
+type LeaderReader interface {
+	Status() lease.Status
 }
 
 //go:embed templates/*.html
@@ -45,19 +64,33 @@ var faviconSVG []byte
 
 // Server renders the dashboard.
 type Server struct {
+	// paging propagates dashboard acknowledgements to external paging
+	// providers; nil-safe.
+	paging   *notify.PagingSync
 	store    store.Store
 	registry *rules.Registry
 	factory  *notify.Factory
 	log      *slog.Logger
 	pages    map[string]*template.Template
 	poller   PositionReader
+	// networkNames are the chains this instance polls, primary first. With
+	// more than one, every list page grows a network filter and creating a
+	// monitor has to say which chain it means.
+	networkNames []string
+	networkState NetworkStatusReader
+	leader       LeaderReader
 	// silentAfter is how long since last_matched_at before a monitor is
 	// marked silent on the list. Zero means the New default (24h).
 	silentAfter time.Duration
 	// auth gates every page on a dashboard session once a token is
 	// configured. Nil (until WithAuth, or with no API_TOKEN) leaves the
 	// dashboard open.
+	a    *auth.Authenticator
 	auth *auth.Authenticator
+	// tokenMgr mints and lists scoped API tokens for the dashboard's token
+	// page. Nil disables the page rather than showing one that cannot mint.
+	tokenMgr     *auth.Manager
+	maxBodyBytes int64
 }
 
 // monitorListRow is a monitor plus the last-matched cue rendered on the
@@ -70,11 +103,15 @@ type monitorListRow struct {
 
 // templateFuncs are available to every page template.
 var templateFuncs = template.FuncMap{
-	"prettyJSON":   prettyJSON,
-	"formatTime":   formatTime,
-	"decodedEvent": decodedEvent,
-	"truncateID":   truncateID,
-	"relTime":      relTime,
+	"prettyJSON":    prettyJSON,
+	"formatTime":    formatTime,
+	"decodedEvent":  decodedEvent,
+	"truncateID":    truncateID,
+	"relTime":       relTime,
+	"relTimePtr":    relTimePtr,
+	"severityClass": severityClass,
+	"auditFields":   auditFields,
+	"receiptLabel":  notify.ReceiptCapabilityLabel,
 }
 
 const tsLayout = "2006-01-02 15:04:05"
@@ -89,6 +126,7 @@ func formatTime(t time.Time, tz string) template.HTML {
 	}
 	utc := t.UTC()
 	label := utc.Format(tsLayout) + " UTC"
+	// #nosec G203 -- every interpolated value is escaped via template.HTMLEscapeString
 	return template.HTML(fmt.Sprintf(
 		`<time datetime="%s" data-tz="%s">%s</time>`,
 		template.HTMLEscapeString(utc.Format(time.RFC3339)),
@@ -105,6 +143,16 @@ func formatTime(t time.Time, tz string) template.HTML {
 //
 // Rounding: seconds under a minute, minutes under an hour, hours under a
 // day, then whole days.
+// relTimePtr is relTime for the nullable timestamps channel health carries.
+// html/template does not dereference a pointer for you, so a nil-safe wrapper
+// keeps the channels table readable.
+func relTimePtr(t *time.Time, now ...time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return relTime(*t, now...)
+}
+
 func relTime(t time.Time, now ...time.Time) string {
 	ref := time.Now()
 	if len(now) > 0 && !now[0].IsZero() {
@@ -130,6 +178,24 @@ func relTime(t time.Time, now ...time.Time) string {
 	default:
 		n := int(d / (24 * time.Hour))
 		return fmt.Sprintf("%dd ago", n)
+	}
+}
+
+// severityClass returns a CSS class for the given severity level.
+//
+// It takes store.Severity rather than a string because every template call site
+// passes a Severity field, and html/template checks argument types when the
+// action runs: a string parameter made any alert or rule that actually carried
+// a severity fail the page render rather than print a pill. Anything outside
+// the closed set, including the empty value, keeps the default warning colour.
+func severityClass(severity store.Severity) string {
+	switch severity {
+	case store.SeverityCritical:
+		return "critical"
+	case store.SeverityInfo:
+		return "info"
+	default:
+		return "warning"
 	}
 }
 
@@ -170,8 +236,11 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 		pages:       map[string]*template.Template{},
 		silentAfter: 24 * time.Hour,
 	}
-	for _, page := range []string{"index", "monitors", "monitor", "channels", "alerts", "alert", "login", "error", "rulebuilder", "searches"} {
-		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/"+page+".html")
+	// Every page the dashboard can render. A page missing from this list is a
+	// nil template at request time, which is a panic rather than a 500, so the
+	// list and the templates directory have to agree.
+	for _, page := range []string{"index", "monitors", "monitor", "channels", "channel-edit", "channel-delete", "alerts", "alert", "audit", "maintenance", "login", "error", "rulebuilder", "searches", "tokens", "deadletters"} {
+		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/shortcuts.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, fmt.Errorf("parse template %s: %w", page, err)
 		}
@@ -181,8 +250,58 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 }
 
 // WithPoller attaches the ingest-position source shown on the overview page.
+// A source that reports per-network status — the multi-network supervisor —
+// is wired for that in the same call.
 func (s *Server) WithPoller(p PositionReader) *Server {
 	s.poller = p
+	if ns, ok := p.(NetworkStatusReader); ok {
+		s.networkState = ns
+	}
+	return s
+}
+
+// WithNetworks declares the chains this instance polls, primary first, so the
+// dashboard can filter by them and the new-monitor form can say which chain a
+// contract lives on. Passing config.NetworkNames(cfg.Networks) is the wire-up.
+func (s *Server) WithNetworks(names []string) *Server {
+	s.networkNames = names
+	return s
+}
+
+// defaultNetwork is the chain a dashboard-created monitor lands on: the
+// primary, which is the only chain a single-network instance polls. Empty when
+// no list was configured, which leaves a monitor unlabelled as it was before
+// networks existed.
+func (s *Server) defaultNetwork() string {
+	if len(s.networkNames) == 0 {
+		return ""
+	}
+	return s.networkNames[0]
+}
+
+// networkChoice validates a network named by a form or query string against
+// the configured list. Anything unknown or blank becomes the default rather
+// than an error: a filter that arrives with a stale name should show
+// something, and a create form left on its default should not be rejected
+// over a name the instance does not poll.
+func (s *Server) networkChoice(raw string) string {
+	n := strings.ToLower(strings.TrimSpace(raw))
+	if n == "" {
+		return s.defaultNetwork()
+	}
+	for _, cfg := range s.networkNames {
+		if cfg == n {
+			return n
+		}
+	}
+	return s.defaultNetwork()
+}
+
+// WithLeadership attaches the leader-election status shown on the overview
+// page. Not wiring it leaves the page exactly as it was before leader
+// election existed.
+func (s *Server) WithLeadership(r LeaderReader) *Server {
+	s.leader = r
 	return s
 }
 
@@ -193,6 +312,24 @@ func (s *Server) WithSilentAfter(d time.Duration) *Server {
 		s.silentAfter = d
 	}
 	return s
+}
+
+// WithMaxBodyBytes sets the maximum form body size for web dashboard write actions.
+func (s *Server) WithMaxBodyBytes(n int64) *Server {
+	if n > 0 {
+		s.maxBodyBytes = n
+	}
+	return s
+}
+
+// SilentAfter returns the configured silent-after duration. Exposed for tests.
+func (s *Server) SilentAfter() time.Duration {
+	return s.silentAfter
+}
+
+// MaxBodyBytes returns the configured max body bytes limit. Exposed for tests.
+func (s *Server) MaxBodyBytes() int64 {
+	return s.maxBodyBytes
 }
 
 func (s *Server) monitorRow(m store.Monitor, tz string, now time.Time) monitorListRow {
@@ -218,52 +355,100 @@ func (s *Server) monitorRows(monitors []store.Monitor, tz string, now time.Time)
 
 // Routes returns the dashboard router, mounted at / by cmd/sorobeacon.
 func (s *Server) Routes() chi.Router {
-	r := chi.NewRouter()
+	mux := chi.NewRouter()
+	limit := s.maxBodyBytes
+	if limit <= 0 {
+		limit = api.DefaultMaxBodyBytes
+	}
+	mux.Use(api.MaxBodyMiddleware(limit))
 	// Registered before any route, so the gate covers everything below it.
 	// With no token configured it is the identity function.
-	r.Use(s.authMiddleware())
-	r.Get(loginPath, s.loginPage)
-	r.Post(loginPath, s.login)
-	r.Post(logoutPath, s.logout)
+	mux.Use(s.authMiddleware())
+	// The role check comes after the session gate, so the credential is
+	// resolved once and the role it carries is read from there.
+	mux.Use(auth.RoleCheck{
+		Authenticator: s.auth,
+		Table:         routeRoles,
+		RoutePath:     routePath,
+		RouteExists: func(method, path string) bool {
+			// The router is the authority on which routes exist, so a
+			// request for a page that does not exist is left to the 404 page
+			// instead of being answered 403.
+			return mux.Match(chi.NewRouteContext(), method, path)
+		},
+		Deny: s.denyRole,
+	}.Middleware())
+	mux.Get(loginPath, s.loginPage)
+	mux.Post(loginPath, s.login)
+	mux.Post(logoutPath, s.logout)
+	// OIDC sign-in, when a provider is configured. Both are exempt from the
+	// session gate (see authExempt); without one they are 404s.
+	mux.Get(oidcStartPath, s.oidcStart)
+	mux.Get(oidcCallbackPath, s.oidcCallback)
 
-	r.Get("/", s.index)
-	r.Get("/favicon.ico", s.favicon)
-	r.Post("/theme", s.setTheme)
-	r.Post("/timezone", s.setTimezone)
+	mux.Get("/", s.index)
+	mux.Get("/favicon.ico", s.favicon)
+	mux.Post("/theme", s.setTheme)
+	mux.Post("/timezone", s.setTimezone)
 
-	r.Get("/monitors", s.monitors)
-	r.Post("/monitors", s.createMonitor)
-	r.Post("/monitors/bulk", s.bulkMonitors)
-	r.Get("/monitors/{id}", s.monitorDetail)
-	r.Post("/monitors/{id}/toggle", s.toggleMonitor)
-	r.Post("/monitors/{id}/delete", s.deleteMonitor)
-	r.Post("/monitors/{id}/duplicate", s.duplicateMonitor)
-	r.Post("/monitors/{id}/rules", s.createRuleFromBuilder)
-	r.Post("/monitors/{id}/rules/{ruleID}/toggle", s.toggleRule)
-	r.Post("/monitors/{id}/rules/{ruleID}/delete", s.deleteRule)
-	r.Post("/monitors/{id}/channels", s.setMonitorChannels)
+	mux.Get("/monitors", s.monitors)
+	mux.Post("/monitors", s.createMonitor)
+	mux.Post("/monitors/bulk", s.bulkMonitors)
+	mux.Get("/monitors/trash", s.listTrash)
+	mux.Get("/monitors/{id}", s.monitorDetail)
+	mux.Post("/monitors/{id}/toggle", s.toggleMonitor)
+	mux.Post("/monitors/{id}/delete", s.deleteMonitor)
+	mux.Post("/monitors/{id}/soft-delete", s.deleteMonitor) // alias for soft-delete
+	mux.Post("/monitors/{id}/restore", s.restoreMonitor)
+	mux.Post("/monitors/{id}/duplicate", s.duplicateMonitor)
+	mux.Post("/monitors/{id}/rules", s.createRuleFromBuilder)
+	mux.Post("/monitors/{id}/rules/{ruleID}/toggle", s.toggleRule)
+	mux.Post("/monitors/{id}/rules/{ruleID}/delete", s.deleteRule)
+	mux.Post("/monitors/{id}/channels", s.setMonitorChannels)
 
-	r.Get("/channels", s.channels)
-	r.Post("/channels", s.createChannel)
-	r.Post("/channels/{id}/delete", s.deleteChannel)
-	r.Post("/channels/{id}/test", s.testChannel)
+	mux.Get("/channels", s.channels)
+	mux.Post("/channels", s.createChannel)
+	mux.Get("/channels/{id}/edit", s.editChannelPage)
+	mux.Post("/channels/{id}", s.updateChannel)
+	mux.Post("/channels/{id}/delete", s.deleteChannel)
+	mux.Post("/channels/{id}/test", s.testChannel)
+	mux.Post("/channels/{id}/toggle", s.toggleChannel)
+	mux.Post("/channels/bulk", s.bulkChannels)
+	mux.Post("/channels/{id}/duplicate", s.duplicateChannel)
 
-	r.Get("/rulebuilder/{type}", s.ruleBuilderFields)
+	mux.Get("/rulebuilder/{type}", s.ruleBuilderFields)
 
-	r.Get("/searches", s.searches)
-	r.Post("/searches", s.createSearch)
-	r.Post("/searches/{id}/delete", s.deleteSearch)
-	r.Post("/searches/{id}/default", s.setDefaultSearch)
-	r.Post("/searches/{id}/undefault", s.clearDefaultSearch)
+	mux.Get("/tokens", s.tokens)
+	mux.Post("/tokens", s.createToken)
+	mux.Post("/tokens/{id}/revoke", s.revokeToken)
 
-	r.Post("/monitors/import", s.importContractsWeb)
+	mux.Get("/searches", s.searches)
+	mux.Post("/searches", s.createSearch)
+	mux.Post("/searches/{id}/delete", s.deleteSearch)
+	mux.Post("/searches/{id}/default", s.setDefaultSearch)
+	mux.Post("/searches/{id}/undefault", s.clearDefaultSearch)
 
-	r.Get("/alerts", s.alerts)
-	r.Get("/alerts/{id}/deliveries", s.alertDeliveries)
-	r.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)
-	r.Get("/alerts/{id}", s.alertDetail)
-	r.NotFound(s.notFound)
-	return r
+	mux.Post("/monitors/import", s.importContractsWeb)
+
+	mux.Get("/alerts", s.alerts)
+	mux.Get("/alerts/{id}/deliveries", s.alertDeliveries)
+	mux.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)
+	mux.Post("/alerts/{id}/acknowledge", s.acknowledgeAlert)
+	mux.Get("/alerts/{id}", s.alertDetail)
+
+	mux.Get("/audit", s.auditPage)
+
+	mux.Get("/dead-letters", s.listDeadLetters)
+	mux.Post("/dead-letters/{id}/redrive", s.redriveDeadLetter)
+	mux.Post("/dead-letters/{id}/discard", s.discardDeadLetter)
+	mux.Post("/dead-letters/bulk/redrive", s.bulkRedriveDeadLetters)
+	mux.Post("/dead-letters/bulk/discard", s.bulkDiscardDeadLetters)
+
+	mux.Get("/maintenance", s.maintenance)
+	mux.Post("/maintenance", s.createMaintenance)
+	mux.Post("/maintenance/{id}/delete", s.deleteMaintenance)
+	mux.NotFound(s.notFound)
+	return mux
 }
 
 // navSection maps a page name to the header nav entry it highlights.
@@ -272,12 +457,14 @@ func (s *Server) Routes() chi.Router {
 // intentionally maps to "" (Overview has no distinct nav highlight of its
 // own beyond the brand link).
 var navSection = map[string]string{
-	"monitors": "monitors",
-	"monitor":  "monitors",
-	"channels": "channels",
-	"alerts":   "alerts",
-	"alert":    "alerts",
-	"searches": "alerts",
+	"monitors":    "monitors",
+	"monitor":     "monitors",
+	"channels":    "channels",
+	"alerts":      "alerts",
+	"alert":       "alerts",
+	"audit":       "audit",
+	"maintenance": "maintenance",
+	"searches":    "alerts",
 }
 
 func (s *Server) render(w http.ResponseWriter, r *http.Request, page string, data any) {
@@ -294,6 +481,15 @@ func (s *Server) renderStatus(w http.ResponseWriter, r *http.Request, status int
 		// The sign-in page has nothing to sign out of, so it hides the header's
 		// sign-out button even though authentication is on.
 		m["AuthEnabled"] = s.authEnabled() && page != "login"
+		// CanWrite and CanAdmin gate what the page *offers* — an acknowledge
+		// button a viewer cannot use is a broken button, not a protected one.
+		// The role table is what actually refuses a caller without the role;
+		// hiding the control is the courtesy that comes with it. With no
+		// credential configured RoleForRequest reports admin, so the open
+		// dashboard shows every control it has.
+		role, _ := s.auth.RoleForRequest(r)
+		m["CanWrite"] = role.AtLeast(auth.RoleEditor)
+		m["CanAdmin"] = role.AtLeast(auth.RoleAdmin)
 		m["SessionHours"] = int(s.auth.SessionTTL().Hours())
 		m["Version"] = displayVersion(buildinfo.Version)
 		m["Commit"] = displayCommit(buildinfo.Commit)
@@ -368,22 +564,57 @@ func tzFromRequest(r *http.Request) string {
 
 // safeReturn keeps the timezone POST from bouncing to an external Referer.
 func safeReturn(r *http.Request) string {
+	return returnTo(r, "/")
+}
+
+// returnTo is safeReturn with a destination of its own: a mutation posted
+// from a page goes back to that page — filters, cursor and all — and a
+// missing, unparseable or foreign Referer lands on fallback. For the
+// acknowledge action that is the alert's own page, the one place that shows
+// what the acknowledgement did.
+func returnTo(r *http.Request, fallback string) string {
 	ref := r.Header.Get("Referer")
 	if ref == "" {
-		return "/"
+		return fallback
 	}
 	u, err := url.Parse(ref)
 	if err != nil {
-		return "/"
+		return fallback
 	}
 	if u.Host != "" && u.Host != r.Host {
-		return "/"
+		return fallback
 	}
 	p := u.RequestURI()
 	if p == "" || !strings.HasPrefix(p, "/") {
-		return "/"
+		return fallback
 	}
 	return p
+}
+
+// withAckFlag appends the result of an acknowledge POST to the page it
+// redirects back to. Only "already" is ever set: a first acknowledgement
+// changes what the page shows by itself, while a repeat has nothing to show
+// except that it changed nothing — which is exactly what an operator who
+// pressed the button on a stale page needs to read.
+func withAckFlag(loc string, already bool) string {
+	if !already {
+		return loc
+	}
+	sep := "?"
+	if strings.Contains(loc, "?") {
+		sep = "&"
+	}
+	return loc + sep + "ack=already"
+}
+
+// ackNote is the sentence a page shows after an acknowledge POST that found
+// the alert already stamped. Anything else in the query string means nothing
+// to say, so a hand-typed ?ack=... stays silent.
+func ackNote(r *http.Request) string {
+	if r.URL.Query().Get("ack") != "already" {
+		return ""
+	}
+	return "This alert was already acknowledged, so nothing changed — acknowledging again is idempotent and the escalation stays stopped."
 }
 
 // setTheme persists the dashboard theme in a cookie and redirects back so
@@ -562,6 +793,15 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 			data["Poller"] = pos
 		}
 	}
+	// One row per chain on a multi-network instance. The aggregate above is
+	// deliberately the worst network, so an overview that showed only it
+	// would hide which chain an operator needs to look at.
+	if s.networkState != nil && len(s.networkNames) > 1 {
+		data["NetworkStatuses"] = s.networkState.Statuses(r.Context())
+	}
+	if s.leader != nil {
+		data["Leadership"] = s.leader.Status()
+	}
 	s.render(w, r, "index", data)
 }
 
@@ -607,12 +847,19 @@ func alertChartSVG(days []store.AlertDayCount) template.HTML {
 	fmt.Fprintf(&b,
 		`<text x="0" y="%g" font-size="8">%s</text><text x="%g" y="%g" font-size="8" text-anchor="end">%s</text></svg>`,
 		height-4, first, width, height-4, last)
-	return template.HTML(b.String())
+	return template.HTML(b.String()) // #nosec G203 -- SVG attributes are numeric or escaped via html.EscapeString
 }
 
 func (s *Server) monitors(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f := store.ListFilter{Limit: 50, Query: strings.TrimSpace(q.Get("q"))}
+	// Network narrows the list to one chain. It arrives from a select whose
+	// options are this instance's configured networks, so it can only ever be
+	// a name the store has rows for.
+	f.Network = strings.ToLower(strings.TrimSpace(q.Get("network")))
+	// A repeated tag= ANDs, matching the API's ?tag= semantics. Normalisation
+	// drops blanks, so an empty field is no filter.
+	f.Tags = store.NormalizeTags(q["tag"])
 	switch q.Get("enabled") {
 	case "true":
 		t := true
@@ -662,21 +909,35 @@ func (s *Server) monitors(w http.ResponseWriter, r *http.Request) {
 		"Title": "Monitors", "Monitors": s.monitorRows(monitors, tzFromRequest(r), time.Now()), "NextCursor": next,
 		"Empty": empty,
 		"Query": f.Query, "Enabled": enabled, "Sort": sort,
+		"Network": f.Network,
+		// Tags is the tag filter repopulated in the form; the rows carry
+		// their own tag lists.
+		"Tags": strings.Join(f.Tags, " "),
+		// Networks is the filter's option list: one chain needs no control at
+		// all, so the template only renders it when there is a choice to make.
+		"Networks":   s.networkNames,
+		"NewNetwork": s.defaultNetwork(),
 	}
 	if next != "" {
 		// template.URL so q/enabled/sort query separators are not %26-escaped.
-		data["OlderHref"] = template.URL("/monitors?" + monitorFilterQuery(f.Query, enabled, f.Sort) + "cursor=" + next)
+		data["OlderHref"] = template.URL("/monitors?" + monitorFilterQuery(f.Query, enabled, f.Sort, f.Network, f.Tags) + "cursor=" + next) // #nosec G203 -- fixed relative path with url.Values.Encode query string and integer cursor
 	}
 	s.render(w, r, "monitors", data)
 }
 
-// monitorFilterQuery is the q/enabled/sort prefix preserved on the Older
-// paging link so filters survive navigation. Empty when every control is
+// monitorFilterQuery is the q/enabled/sort/network/tag prefix preserved on the
+// Older paging link so filters survive navigation. Empty when every control is
 // at its default, so the existing `?cursor=` link stays stable.
-func monitorFilterQuery(q, enabled, sort string) string {
+func monitorFilterQuery(q, enabled, sort, network string, tags []string) string {
 	v := url.Values{}
 	if q != "" {
 		v.Set("q", q)
+	}
+	if network != "" {
+		v.Set("network", network)
+	}
+	for _, t := range tags {
+		v.Add("tag", t)
 	}
 	if enabled == "true" || enabled == "false" {
 		v.Set("enabled", enabled)
@@ -704,13 +965,40 @@ func (s *Server) createMonitor(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	m := store.Monitor{Name: name, ContractIDs: contracts, Enabled: true}
+	runbookURL, err := store.ValidateRunbookURL(r.FormValue("runbook_url"))
+	if err != nil {
+		http.Error(w, "invalid runbook_url: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	responseGuidance, err := store.ValidateResponseGuidance(r.FormValue("response_guidance"))
+	if err != nil {
+		http.Error(w, "invalid response_guidance: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	// The form's network select is hidden on a single-chain instance, so the
+	// value is usually empty and lands on the primary — which is the only
+	// chain there is. An unlabelled monitor would be polled by nobody.
+	m := store.Monitor{
+		Name:             name,
+		ContractIDs:      contracts,
+		Enabled:          true,
+		Network:          s.networkChoice(r.FormValue("network")),
+		Tags:             splitTags(r.FormValue("tags")),
+		RunbookURL:       runbookURL,
+		ResponseGuidance: responseGuidance,
+	}
 	if err := s.store.CreateMonitor(r.Context(), &m); err != nil {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionCreate, "monitor", m.ID, "name", "contract_ids")
 	http.Redirect(w, r, "/monitors", http.StatusSeeOther)
 }
+
+// recentAlertsPanelSize bounds the monitor page's recent-alerts table. The
+// page is a summary of one monitor, not the alerts list: five rows answers
+// "is this firing?" and anything more belongs on /alerts?monitor_id=.
+const recentAlertsPanelSize = 5
 
 func (s *Server) monitorDetail(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
@@ -718,29 +1006,95 @@ func (s *Server) monitorDetail(w http.ResponseWriter, r *http.Request) {
 		s.notFound(w, r)
 		return
 	}
+	data, err := s.monitorPage(r, id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.notFound(w, r)
+			return
+		}
+		s.fail(w, err)
+		return
+	}
+	s.render(w, r, "monitor", data)
+}
+
+// monitorPage assembles the monitor detail page's data. The rule builder
+// re-renders this same page when it rejects a malformed form, so the two
+// share one assembly: a page that has to show the monitor's rules must not
+// be built in two places that can drift apart.
+func (s *Server) monitorPage(r *http.Request, id int64) (map[string]any, error) {
 	m, err := s.store.GetMonitor(r.Context(), id)
 	if err != nil {
-		s.notFound(w, r)
-		return
+		return nil, err
 	}
 	ruleList, err := s.store.ListRules(r.Context(), id, false)
 	if err != nil {
-		s.fail(w, err)
-		return
+		return nil, err
 	}
 	channels, err := s.store.ListChannels(r.Context(), false)
 	if err != nil {
-		s.fail(w, err)
-		return
+		return nil, err
+	}
+	recent, err := s.store.ListAlerts(r.Context(), store.AlertFilter{
+		MonitorID: id, Limit: recentAlertsPanelSize,
+	})
+	if err != nil {
+		return nil, err
+	}
+	stats, err := s.store.GetMonitorStats(r.Context(), id)
+	if err != nil {
+		return nil, err
+	}
+	// The budget panel is informational, so a failed read hides it rather
+	// than failing the whole page: the monitor's rules and alerts are still
+	// what the person came for.
+	budget, err := s.store.GetDeliveryBudget(r.Context(), id, time.Now())
+	if err != nil {
+		s.log.Warn("load delivery budget for monitor page", "monitor_id", id, "err", err)
+		budget = nil
 	}
 	attached := map[int64]bool{}
 	for _, cid := range m.ChannelIDs {
 		attached[cid] = true
 	}
-	s.render(w, r, "monitor", map[string]any{
-		"Title": m.Name, "Monitor": s.monitorRow(*m, tzFromRequest(r), time.Now()), "Rules": ruleList,
+	tz := tzFromRequest(r)
+	// The panel and the last-matched cue are rendered from one value: the same
+	// monitorRow the list pages use. Two readings of "when did this fire" on
+	// one page would be the disagreement the issue asks not to create.
+	row := s.monitorRow(*m, tz, time.Now())
+	return map[string]any{
+		"Title": m.Name, "Monitor": row, "Rules": ruleList,
 		"Channels": channels, "Attached": attached, "RuleTypes": s.registry.Types(),
-	})
+		"RecentAlerts": recent,
+		// The alerts page already filters by monitor, so the panel is a summary
+		// with a way to see everything rather than a second, shorter list.
+		"AlertsHref": template.URL("/alerts?monitor_id=" + strconv.FormatInt(id, 10)), // #nosec G203 -- fixed relative path with base-10 integer monitor ID
+		"Stats":      stats,
+		"LastAlert":  formatStatTime(stats.LastAlertAt, tz),
+		"Budget":     budget,
+		// The rule builder's own state. The page is also rendered after the
+		// builder rejects a malformed form, which fills these in with what
+		// the user typed; the defaults are the empty form.
+		"BuilderType":             "",
+		"BuilderFields":           "",
+		"BuilderRawParams":        defaultBuilderParams,
+		"BuilderRunbookURL":       "",
+		"BuilderResponseGuidance": "",
+		"BuilderErrors":           []string{},
+	}, nil
+}
+
+// formatStatTime renders the nullable most-recent-alert timestamp from
+// store.MonitorStats. It returns template.HTML rather than a time.Time because
+// formatTime takes a time.Time and html/template will not hand it the
+// *time.Time the field is — the same reason monitorListRow carries MatchedHTML.
+// A nil timestamp (a monitor that has never alerted) renders as the empty
+// string, which is what formatTime already does for a zero time.
+func formatStatTime(t *time.Time, tz string) template.HTML {
+	if t == nil {
+		return ""
+	}
+	return formatTime(*t, tz)
 }
 
 func (s *Server) bulkMonitors(w http.ResponseWriter, r *http.Request) {
@@ -790,6 +1144,7 @@ func (s *Server) toggleMonitor(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionUpdate, "monitor", id, "enabled")
 	http.Redirect(w, r, "/monitors", http.StatusSeeOther)
 }
 
@@ -808,6 +1163,7 @@ func (s *Server) duplicateMonitor(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionCreate, "monitor", m.ID, "name", "contract_ids")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", m.ID), http.StatusSeeOther)
 }
 
@@ -817,11 +1173,94 @@ func (s *Server) deleteMonitor(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if err := s.store.DeleteMonitor(r.Context(), id); err != nil {
+	if err := s.store.SoftDeleteMonitor(r.Context(), id); err != nil {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionDelete, "monitor", id)
 	http.Redirect(w, r, "/monitors", http.StatusSeeOther)
+}
+
+func (s *Server) restoreMonitor(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := s.store.RestoreMonitor(r.Context(), id); err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.audit(r, store.AuditActionUpdate, "monitor", id, "restored")
+	http.Redirect(w, r, "/monitors", http.StatusSeeOther)
+}
+
+func (s *Server) listTrash(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	f := store.ListFilter{Limit: 50, Query: strings.TrimSpace(q.Get("q"))}
+	f.Network = strings.ToLower(strings.TrimSpace(q.Get("network")))
+	switch q.Get("enabled") {
+	case "true":
+		t := true
+		f.Enabled = &t
+		f.EnabledOnly = true
+	case "false":
+		t := false
+		f.Enabled = &t
+	}
+	switch q.Get("sort") {
+	case "id", "created_at", "name":
+		f.Sort = q.Get("sort")
+	}
+	if v := q.Get("cursor"); v != "" {
+		f.AfterID, _ = strconv.ParseInt(v, 10, 64)
+	}
+	monitors, err := s.store.ListDeletedMonitors(r.Context(), f)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	next := ""
+	if len(monitors) == f.Limit {
+		next = strconv.FormatInt(monitors[len(monitors)-1].ID, 10)
+	}
+	enabled := q.Get("enabled")
+	sort := f.Sort
+	if sort == "" {
+		sort = "name"
+	}
+	data := map[string]any{
+		"Title":      "Trash",
+		"Monitors":   s.monitorRows(monitors, tzFromRequest(r), time.Now()),
+		"NextCursor": next,
+		"Query":      f.Query,
+		"Enabled":    enabled,
+		"Sort":       sort,
+		"Network":    f.Network,
+		"Networks":   s.networkNames,
+	}
+	if next != "" {
+		v := url.Values{}
+		if f.Query != "" {
+			v.Set("q", f.Query)
+		}
+		if f.Network != "" {
+			v.Set("network", f.Network)
+		}
+		if enabled == "true" || enabled == "false" {
+			v.Set("enabled", enabled)
+		}
+		if sort != "" && sort != "name" {
+			v.Set("sort", sort)
+		}
+		enc := v.Encode()
+		if enc != "" {
+			data["OlderHref"] = template.URL("/monitors/trash?" + enc + "cursor=" + next) // #nosec G203 -- fixed relative path with url.Values.Encode query string and integer cursor
+		} else {
+			data["OlderHref"] = template.URL("/monitors/trash?cursor=" + next) // #nosec G203 -- fixed relative path with integer cursor
+		}
+	}
+	s.render(w, r, "trash", data)
 }
 
 func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
@@ -844,6 +1283,7 @@ func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionDelete, "rule", ruleID, "monitor_id")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
 
@@ -868,6 +1308,7 @@ func (s *Server) toggleRule(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionUpdate, "rule", ruleID, "enabled")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
 
@@ -894,8 +1335,20 @@ func (s *Server) setMonitorChannels(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionUpdate, "monitor", id, "channel_ids")
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
+
+// The window the channels page's delivery-health column aggregates over, and
+// the label it is shown under. It is deliberately the same default the stats
+// API uses (GET /channels/{id}/stats), so the dashboard and the endpoint
+// answer "how is this channel doing?" over the same span and can never
+// disagree about which window either one meant. The label is a constant
+// because Duration.String() would spell 24h as "24h0m0s".
+const (
+	deliveryHealthWindow      = 24 * time.Hour
+	deliveryHealthWindowLabel = "24h"
+)
 
 func (s *Server) channels(w http.ResponseWriter, r *http.Request) {
 	f := store.ListFilter{Limit: 50}
@@ -912,6 +1365,27 @@ func (s *Server) channels(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	// Delivery health for the listed channels, aggregated in the database per
+	// channel. A store failure fails the page like every other read here:
+	// a half-rendered health column that silently shows nothing would be
+	// mistaken for "no attempts". One query per listed channel is bounded by
+	// the page size, and each is answered by the (channel_id, attempted_at)
+	// index added in migration 0032.
+	since := time.Now().UTC().Add(-deliveryHealthWindow)
+	health := make(map[int64]store.ChannelDeliveryStats, len(channels))
+	for _, ch := range channels {
+		ds, err := s.store.GetChannelDeliveryStats(r.Context(), ch.ID, since)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		health[ch.ID] = ds
+	}
+	ackReconciliations, err := s.store.ListChannelAckReconciliations(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
 	empty := ""
 	if len(channels) == 0 {
 		empty = "no_channels"
@@ -924,6 +1398,10 @@ func (s *Server) channels(w http.ResponseWriter, r *http.Request) {
 		"Title": "Channels", "Channels": channels, "ChannelTypes": s.factory.Types(),
 		"Empty": empty, "HasMonitors": len(monitors) > 0,
 		"NextCursor": next,
+		// DeliveryStats is keyed by channel id; index in the template reads a
+		// missing entry as the zero value, which is exactly "no attempts".
+		"DeliveryStats": health, "DeliveryWindow": deliveryHealthWindowLabel,
+		"AckReconciliations": ackReconciliations,
 	})
 }
 
@@ -947,6 +1425,67 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionCreate, "channel", ch.ID, "name", "type", "config")
+	http.Redirect(w, r, "/channels", http.StatusSeeOther)
+}
+
+func (s *Server) editChannelPage(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	ch, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	s.render(w, r, "channel-edit", map[string]any{
+		"Title": "Edit channel", "Channel": ch, "Name": ch.Name,
+	})
+}
+
+func (s *Server) updateChannel(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	ch, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	if name == "" {
+		s.renderStatus(w, r, http.StatusBadRequest, "channel-edit", map[string]any{
+			"Title": "Edit channel", "Channel": ch, "Name": name, "Error": "name is required",
+		})
+		return
+	}
+	if submittedType := r.FormValue("type"); submittedType != "" && submittedType != ch.Type {
+		s.renderStatus(w, r, http.StatusBadRequest, "channel-edit", map[string]any{
+			"Title": "Edit channel", "Channel": ch, "Name": name, "Error": "channel type cannot be changed",
+		})
+		return
+	}
+	updated := *ch
+	updated.Name = name
+	if config := r.FormValue("config"); strings.TrimSpace(config) != "" {
+		updated.Config = []byte(config)
+	}
+	if _, err := s.factory.New(updated.Type, updated.Config); err != nil {
+		s.renderStatus(w, r, http.StatusBadRequest, "channel-edit", map[string]any{
+			"Title": "Edit channel", "Channel": ch, "Name": name, "Error": err.Error(),
+		})
+		return
+	}
+	if err := s.store.UpdateChannel(r.Context(), &updated); err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.factory.InvalidateSecretCache()
+	s.audit(r, store.AuditActionUpdate, "channel", id, "name", "config")
 	http.Redirect(w, r, "/channels", http.StatusSeeOther)
 }
 
@@ -956,11 +1495,49 @@ func (s *Server) deleteChannel(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	ch, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	monitors, err := s.store.ListMonitorsForChannel(r.Context(), id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	signature := channelDeleteSignature(monitors)
+	if r.FormValue("confirm") != "1" || r.FormValue("confirmed_signature") != signature {
+		shown := monitors
+		if len(shown) > 5 {
+			shown = shown[:5]
+		}
+		s.render(w, r, "channel-delete", map[string]any{
+			"Channel": ch, "Monitors": shown, "AttachedCount": len(monitors),
+			"More":      len(monitors) - len(shown),
+			"Signature": signature, "Stale": r.FormValue("confirm") == "1",
+		})
+		return
+	}
 	if err := s.store.DeleteChannel(r.Context(), id); err != nil {
 		s.fail(w, err)
 		return
 	}
+	s.audit(r, store.AuditActionDelete, "channel", id)
 	http.Redirect(w, r, "/channels", http.StatusSeeOther)
+}
+
+func channelDeleteSignature(monitors []store.Monitor) string {
+	var b strings.Builder
+	for _, monitor := range monitors {
+		b.WriteString(strconv.FormatInt(monitor.ID, 10))
+		b.WriteByte(':')
+		for _, channelID := range monitor.ChannelIDs {
+			b.WriteString(strconv.FormatInt(channelID, 10))
+			b.WriteByte(',')
+		}
+		b.WriteByte(';')
+	}
+	return b.String()
 }
 
 // testChannel is the htmx target for the "Send test" button; it returns a
@@ -978,13 +1555,22 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	notifier, err := s.factory.New(ch.Type, ch.Config)
 	if err == nil {
-		err = notifier.Send(r.Context(), notify.Alert{
+		testCtx, cancel := context.WithTimeout(r.Context(), ch.TimeoutDuration())
+		defer cancel()
+		err = notifier.Send(testCtx, notify.Alert{
 			MonitorName: "Test monitor",
 			RuleType:    "test",
 			EventName:   "sorobeacon_test",
 			EventID:     "test-0000000000000000000",
 			CreatedAt:   time.Now(),
 		})
+	}
+	// Record the outcome like the API's test endpoint does, so a channel that
+	// has just been fixed stops being reported as broken the moment the
+	// operator proves it works. A bookkeeping failure is logged, not shown:
+	// the send is what the operator asked about.
+	if err := s.store.RecordChannelHealth(r.Context(), ch.ID, notify.TestHealthUpdate(err, time.Now())); err != nil {
+		s.log.Error("record channel health", "channel_id", ch.ID, "err", err)
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err != nil {
@@ -994,7 +1580,303 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "✅ sent")
 }
 
+// toggleChannel flips a channel's enabled flag. Turning one back on goes
+// through the same store write the API uses, so a channel that auto-disable
+// parked comes back with its failure count cleared instead of re-disabling on
+// the next failure.
+func (s *Server) toggleChannel(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	ch, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	ch.Enabled = !ch.Enabled
+	if err := s.store.UpdateChannel(r.Context(), ch); err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.audit(r, store.AuditActionUpdate, store.AuditTargetChannel, id, "enabled")
+	http.Redirect(w, r, "/channels", http.StatusSeeOther)
+}
+
+func (s *Server) bulkChannels(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	enabledStr := r.FormValue("enabled")
+	if enabledStr != "true" && enabledStr != "false" {
+		http.Error(w, "enabled is required", http.StatusBadRequest)
+		return
+	}
+	raw := r.Form["ids"]
+	if len(raw) == 0 {
+		http.Error(w, "ids is required", http.StatusBadRequest)
+		return
+	}
+	if len(raw) > 100 {
+		http.Error(w, "at most 100 channels per request", http.StatusBadRequest)
+		return
+	}
+	ids := make([]int64, 0, len(raw))
+	for _, v := range raw {
+		id, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			http.Error(w, "invalid id", http.StatusBadRequest)
+			return
+		}
+		ids = append(ids, id)
+	}
+	if _, _, err := s.store.SetChannelsEnabled(r.Context(), ids, enabledStr == "true"); err != nil {
+		s.fail(w, err)
+		return
+	}
+	http.Redirect(w, r, "/channels", http.StatusSeeOther)
+}
+
+// duplicateChannel copies a channel as a disabled, unattached channel. The
+// config is carried over through the store, never logged.
+func (s *Server) duplicateChannel(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	src, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	all, err := s.store.ListChannels(r.Context(), false)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	names := make([]string, 0, len(all))
+	for _, c := range all {
+		names = append(names, c.Name)
+	}
+	dup := *src
+	dup.ID = 0
+	dup.CreatedAt = time.Time{}
+	dup.Name = store.CopyMonitorName(src.Name, names)
+	dup.Enabled = false
+	dup.ConsecutiveFailures, dup.ConsecutivePermanentFailures = 0, 0
+	dup.LastError, dup.LastErrorAt, dup.LastSuccessAt, dup.DisabledAt = "", nil, nil, nil
+	if err := s.store.CreateChannel(r.Context(), &dup); err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.audit(r, store.AuditActionCreate, store.AuditTargetChannel, dup.ID, "name", "type", "config")
+	http.Redirect(w, r, "/channels", http.StatusSeeOther)
+}
+
+// maintenanceRow is a window plus its computed status for the listing.
+type maintenanceRow struct {
+	store.MaintenanceWindow
+	Active bool
+}
+
+// maintenance lists active and upcoming windows. Past windows are omitted:
+// the page is a control surface for what is silencing alerts now and what
+// is about to, not a history of every window ever created.
+func (s *Server) maintenance(w http.ResponseWriter, r *http.Request) {
+	now := time.Now()
+	active, err := s.store.ListMaintenanceWindows(r.Context(), store.MaintenanceWindowFilter{Active: true, At: now, Limit: 100})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	upcoming, err := s.store.ListMaintenanceWindows(r.Context(), store.MaintenanceWindowFilter{Upcoming: true, At: now, Limit: 100})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	rows := make([]maintenanceRow, 0, len(active)+len(upcoming))
+	for _, w := range active {
+		rows = append(rows, maintenanceRow{MaintenanceWindow: w, Active: true})
+	}
+	for _, w := range upcoming {
+		rows = append(rows, maintenanceRow{MaintenanceWindow: w})
+	}
+	monitors, err := s.store.ListMonitors(r.Context(), false)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.render(w, r, "maintenance", map[string]any{
+		"Title": "Maintenance", "Windows": rows, "Monitors": monitors,
+	})
+}
+
+func (s *Server) createMaintenance(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	reason := strings.TrimSpace(r.FormValue("reason"))
+	if reason == "" {
+		http.Error(w, "reason is required", http.StatusBadRequest)
+		return
+	}
+	scope := r.FormValue("scope")
+	if !store.ValidMaintenanceScope(scope) {
+		http.Error(w, "invalid scope", http.StatusBadRequest)
+		return
+	}
+	start, err := parseUTCInput(r.FormValue("start_at"))
+	if err != nil {
+		http.Error(w, "start_at must be YYYY-MM-DDTHH:MM (UTC)", http.StatusBadRequest)
+		return
+	}
+	end, err := parseUTCInput(r.FormValue("end_at"))
+	if err != nil {
+		http.Error(w, "end_at must be YYYY-MM-DDTHH:MM (UTC)", http.StatusBadRequest)
+		return
+	}
+	if !end.After(start) {
+		http.Error(w, "end_at must be after start_at", http.StatusBadRequest)
+		return
+	}
+	mw := store.MaintenanceWindow{Reason: reason, Scope: scope, StartAt: start, EndAt: end}
+	switch scope {
+	case store.MaintenanceScopeMonitor:
+		id, err := strconv.ParseInt(r.FormValue("monitor_id"), 10, 64)
+		if err != nil || id == 0 {
+			http.Error(w, "monitor_id is required for monitor scope", http.StatusBadRequest)
+			return
+		}
+		mw.MonitorID = &id
+	case store.MaintenanceScopeContract:
+		cid := strings.TrimSpace(r.FormValue("contract_id"))
+		if cid == "" {
+			http.Error(w, "contract_id is required for contract scope", http.StatusBadRequest)
+			return
+		}
+		mw.ContractID = &cid
+	}
+	if err := s.store.CreateMaintenanceWindow(r.Context(), &mw); err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.audit(r, store.AuditActionCreate, store.AuditTargetMaintenanceWindow, mw.ID, "reason", "scope", "start_at", "end_at")
+	http.Redirect(w, r, "/maintenance", http.StatusSeeOther)
+}
+
+func (s *Server) deleteMaintenance(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := s.store.DeleteMaintenanceWindow(r.Context(), id); err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.audit(r, store.AuditActionDelete, store.AuditTargetMaintenanceWindow, id)
+	http.Redirect(w, r, "/maintenance", http.StatusSeeOther)
+}
+
+// parseUTCInput parses the dashboard's datetime-local value as UTC, matching
+// the UTC-only interpretation the API uses for start_at/end_at.
+func parseUTCInput(v string) (time.Time, error) {
+	t, err := time.Parse("2006-01-02T15:04", strings.TrimSpace(v))
+	if err != nil {
+		return time.Time{}, err
+	}
+	return t.UTC(), nil
+}
+
+// alertDateLayout is the value an <input type="date"> submits.
+const alertDateLayout = "2006-01-02"
+
+// parseAlertDate reads one end of the dashboard's date range and returns the
+// instant to filter on, the value to put back in the form, and whether the
+// input was readable at all.
+//
+// It accepts the calendar date the picker sends and the RFC 3339 instant the
+// API documents, because the page's own Older link round-trips the bound
+// through the API form: a link that could not be re-read would silently drop
+// the date range on the second page.
+//
+// A date is a calendar day in UTC, not in the viewer's zone. The dashboard can
+// render timestamps in a preferred zone, but "local" means the browser's zone
+// and the server never learns it, so a filter interpreted in the zone the page
+// happens to be labelled in would be wrong for exactly the readers who changed
+// that setting. The form says UTC beside both fields.
+//
+// end marks the upper bound, which alerts.go compares with < : the day picked
+// is inside the range, so the bound is the following midnight. When that
+// midnight comes back on an Older link the form shows the day it closes rather
+// than the day after it, or every click of paging would move the picker
+// forward a day.
+func parseAlertDate(v string, end bool) (bound time.Time, display string, ok bool) {
+	if v == "" {
+		return time.Time{}, "", true
+	}
+	if d, err := time.Parse(alertDateLayout, v); err == nil {
+		bound = d.UTC()
+		if end {
+			bound = bound.AddDate(0, 0, 1)
+		}
+		return bound, v, true
+	}
+	t, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		return time.Time{}, v, false
+	}
+	bound = t.UTC()
+	display = bound.Format(alertDateLayout)
+	if end {
+		if h, m, s := bound.Clock(); h == 0 && m == 0 && s == 0 {
+			display = bound.AddDate(0, 0, -1).Format(alertDateLayout)
+		}
+	}
+	return bound, display, true
+}
+
 func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
+	// An operator who saved a default search expects the alerts page to open
+	// with it applied. The helper only answers for a bare /alerts request, so
+	// an explicit filter is never overridden.
+	if target := s.defaultSearchRedirect(r); target != "" {
+		http.Redirect(w, r, target, http.StatusSeeOther)
+		return
+	}
+
+	var maxID, count int64
+	var changeKeyErr error
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				changeKeyErr = fmt.Errorf("panic in AlertChangeKey: %v", rec)
+			}
+		}()
+		if s.store != nil {
+			maxID, count, changeKeyErr = s.store.AlertChangeKey(r.Context())
+		} else {
+			changeKeyErr = errors.New("no store")
+		}
+	}()
+	if changeKeyErr == nil {
+		ws := ""
+		if wID, ok := workspace.From(r.Context()); ok {
+			ws = string(wID)
+		}
+		changeKey := fmt.Sprintf("alerts:%d:%d", maxID, count)
+		etag := api.FormatETag(ws, r.URL.Path, r.URL.Query().Encode(), changeKey)
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Cache-Control", "private, no-cache")
+		if api.ETagMatches(r.Header.Get("If-None-Match"), etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
 	q := r.URL.Query()
 	f := store.AlertFilter{Limit: 50}
 	var selected int64
@@ -1008,6 +1890,22 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 		f.RuleID = selectedRule
 	}
 	f.ContractID = strings.TrimSpace(q.Get("contract_id"))
+	severity := strings.TrimSpace(q.Get("severity"))
+	if severity != "" {
+		if parsed, ok := store.ParseSeverity(severity); ok {
+			f.Severity = parsed
+		}
+	}
+	// The acknowledgement filter follows the severity control's rule: an
+	// unknown value is dropped rather than rejected, so a link written before
+	// this build existed still lists alerts instead of failing the page.
+	acknowledged := strings.TrimSpace(q.Get("acknowledged"))
+	switch acknowledged {
+	case "acknowledged", "unacknowledged":
+		f.Acknowledged = acknowledged
+	default:
+		acknowledged = ""
+	}
 	switch q.Get("sort") {
 	case "created_at_asc", "created_at_desc":
 		f.Sort = q.Get("sort")
@@ -1015,11 +1913,37 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("cursor"); v != "" {
 		f.AfterID, _ = strconv.ParseInt(v, 10, 64)
 	}
-	alerts, err := s.store.ListAlerts(r.Context(), f)
-	if err != nil {
-		s.fail(w, err)
-		return
+
+	// The search term and the date range are collected here rather than handed
+	// straight to the store because the page has to say *why* it came back with
+	// nothing. A filter the store never saw is indistinguishable from a filter
+	// that matched no alerts unless the form reports it.
+	search := store.NormalizeAlertSearch(q.Get("q"))
+	note := ""
+	if search != "" {
+		if utf8.RuneCountInString(search) > store.MaxAlertSearchLen {
+			// Nothing is listed, the same way an unreadable date lists nothing:
+			// a full table under a search box the operator just typed into
+			// reads like results for that term whether or not it was applied.
+			// The term stays in the box so it can be trimmed in place.
+			note = fmt.Sprintf("Search is limited to %d characters, so nothing was listed. Trim the term and search again.", store.MaxAlertSearchLen)
+		} else {
+			f.Query = search
+		}
 	}
+	from, fromValue, fromOK := parseAlertDate(q.Get("from"), false)
+	to, toValue, toOK := parseAlertDate(q.Get("to"), true)
+	f.From, f.To = from, to
+	switch {
+	case !fromOK || !toOK:
+		note = "Those dates could not be read. Pick a date, or send them as RFC 3339."
+	case !from.IsZero() && !to.IsZero() && !to.After(from):
+		// An inverted range is an empty result set, and an empty table does not
+		// say so; the operator would conclude there were no alerts rather than
+		// that the range asked for none.
+		note = "That range is empty: the end date is before the start date."
+	}
+
 	monitors, err := s.store.ListMonitors(r.Context(), false)
 	if err != nil {
 		s.fail(w, err)
@@ -1029,14 +1953,6 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 	for _, m := range monitors {
 		names[m.ID] = m.Name
 	}
-	next := ""
-	if len(alerts) == f.Limit {
-		next = strconv.FormatInt(alerts[len(alerts)-1].ID, 10)
-	}
-	sort := f.Sort
-	if sort == "" {
-		sort = "created_at_desc"
-	}
 	// Channels are only needed to tell the empty states apart: "no alerts
 	// yet" reads very differently when nothing is being watched, when every
 	// monitor is off, and when there is nowhere to deliver to.
@@ -1045,48 +1961,119 @@ func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+
+	var alerts []store.Alert
+	next := ""
+	if note == "" {
+		alerts, err = s.store.ListAlerts(r.Context(), f)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		if len(alerts) == f.Limit {
+			next = strconv.FormatInt(alerts[len(alerts)-1].ID, 10)
+		}
+	}
+	sort := f.Sort
+	if sort == "" {
+		sort = "created_at_desc"
+	}
 	data := map[string]any{
 		"Title": "Alerts", "Alerts": alerts, "Monitors": monitors,
 		"MonitorNames": names, "SelectedMonitor": selected,
-		"SelectedRule": selectedRule, "ContractID": f.ContractID, "Sort": sort,
-		"ExportHref": alertExportHref(selected, selectedRule, f.ContractID, f.Sort),
-		"Empty":      emptyKind(monitors, channels, alerts),
+		"SelectedRule": selectedRule, "ContractID": f.ContractID, "Severity": severity, "Sort": sort,
+		"Acknowledged": acknowledged, "AckNote": ackNote(r),
+		"Query": search, "FromDate": fromValue, "ToDate": toValue, "Note": note,
+		// FromRFC/ToRFC are the bounds in the form the live stream compares
+		// against, so a row that arrives for a window the page is not showing
+		// does not talk its way into the table.
+		"FromRFC": rfc3339OrEmpty(f.From), "ToRFC": rfc3339OrEmpty(f.To),
+		// Any one of the controls makes an empty list an answer rather than a
+		// state of the instance, so the page says "no alerts match" instead of
+		// walking the operator through creating a monitor they already have.
+		"HasFilters": selected != 0 || selectedRule != 0 || f.ContractID != "" ||
+			severity != "" || acknowledged != "" || search != "" || !f.From.IsZero() || !f.To.IsZero(),
+		"ExportHref": alertExportHref(f),
+		// The network filter and the per-row network column only appear on a
+		// multi-network instance; with one chain there is nothing to choose
+		// between and the page looks exactly as it did.
+		"Networks": s.networkNames,
+		"Network":  f.Network,
+		"Empty":    emptyKind(monitors, channels, alerts),
 	}
 	if next != "" {
 		// template.URL so filter query separators are not %26-escaped.
-		data["OlderHref"] = template.URL("/alerts?" + alertFilterQuery(selected, selectedRule, f.ContractID, f.Sort) + "cursor=" + next)
+		data["OlderHref"] = template.URL("/alerts?" + alertFilterQuery(f) + "cursor=" + next) // #nosec G203 -- fixed relative path with url.Values.Encode query string and integer cursor
 	}
 	s.render(w, r, "alerts", data)
+}
+
+// rfc3339OrEmpty renders a bound for the page's JavaScript. A zero bound is an
+// empty string, which the script reads as "no bound", the same way the store
+// reads a zero time.
+func rfc3339OrEmpty(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // alertExportHref is the dashboard's CSV export link: the same filters as
 // the list currently on screen, pointed at the JSON API's /alerts.csv. The
 // cursor is deliberately dropped — an export is the whole filtered set, not
 // just the page after the one being viewed.
-func alertExportHref(monitorID, ruleID int64, contractID, sort string) template.URL {
-	q := strings.TrimSuffix(alertFilterQuery(monitorID, ruleID, contractID, sort), "&")
+func alertExportHref(f store.AlertFilter) template.URL {
+	q := strings.TrimSuffix(alertFilterQuery(f), "&")
 	if q == "" {
 		return template.URL("/api/v1/alerts.csv")
 	}
-	return template.URL("/api/v1/alerts.csv?" + q)
+	return template.URL("/api/v1/alerts.csv?" + q) // #nosec G203 -- fixed relative path with url.Values.Encode query string
 }
 
-// alertFilterQuery is the monitor/rule/contract/sort prefix preserved on
-// the Older paging link. Empty when every control is at its default, so
-// the existing `?cursor=` link stays stable.
-func alertFilterQuery(monitorID, ruleID int64, contractID, sort string) string {
+// alertFilterQuery is the filter prefix preserved on the Older paging link and
+// mirrored onto the CSV export link. Empty when every control is at its
+// default, so the existing `?cursor=` link stays stable.
+//
+// It takes the store filter rather than a list of arguments because the page
+// now has seven of them: every control that narrows the list on the first
+// request has to narrow it on the second, and a positional parameter list is
+// how a filter ends up silently missing from the encoding.
+func alertFilterQuery(f store.AlertFilter) string {
 	v := url.Values{}
-	if monitorID != 0 {
-		v.Set("monitor_id", strconv.FormatInt(monitorID, 10))
+	if f.MonitorID != 0 {
+		v.Set("monitor_id", strconv.FormatInt(f.MonitorID, 10))
 	}
-	if ruleID != 0 {
-		v.Set("rule_id", strconv.FormatInt(ruleID, 10))
+	if f.RuleID != 0 {
+		v.Set("rule_id", strconv.FormatInt(f.RuleID, 10))
 	}
-	if contractID != "" {
-		v.Set("contract_id", contractID)
+	if f.ContractID != "" {
+		v.Set("contract_id", f.ContractID)
 	}
-	if sort != "" && sort != "created_at_desc" {
-		v.Set("sort", sort)
+	if f.Query != "" {
+		v.Set("q", f.Query)
+	}
+	if sev := string(f.Severity); sev != "" {
+		v.Set("severity", sev)
+	}
+	if f.Sort != "" && f.Sort != "created_at_desc" {
+		v.Set("sort", f.Sort)
+	}
+	if f.Acknowledged != "" {
+		v.Set("acknowledged", f.Acknowledged)
+	}
+	// The network has to survive paging too: an Older link that dropped it
+	// would widen the page to every chain halfway through a result set.
+	if f.Network != "" {
+		v.Set("network", f.Network)
+	}
+	// The bounds go out as instants, not as the calendar dates the form
+	// collected: re-deriving the exclusive end from a date would add the day
+	// again on every page.
+	if !f.From.IsZero() {
+		v.Set("from", f.From.UTC().Format(time.RFC3339))
+	}
+	if !f.To.IsZero() {
+		v.Set("to", f.To.UTC().Format(time.RFC3339))
 	}
 	enc := v.Encode()
 	if enc == "" {
@@ -1141,18 +2128,38 @@ func (s *Server) retryDelivery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	na := notify.Alert{
-		ID:        alert.ID,
-		MonitorID: alert.MonitorID,
-		RuleID:    alert.RuleID,
-		EventID:   alert.EventID,
-		Payload:   alert.Payload,
-		CreatedAt: alert.CreatedAt,
+		ID:               alert.ID,
+		MonitorID:        alert.MonitorID,
+		RuleID:           alert.RuleID,
+		EventID:          alert.EventID,
+		Payload:          alert.Payload,
+		CreatedAt:        alert.CreatedAt,
+		Severity:         string(alert.Severity),
+		RunbookURL:       alert.RunbookURL,
+		ResponseGuidance: alert.ResponseGuidance,
+		// A federated alert has no local rule, so the channels that key on
+		// the rule need the instance it came from to tell two peers' alerts
+		// apart.
+		FederationOrigin: alert.FederationOrigin,
 	}
-	if m, merr := s.store.GetMonitor(r.Context(), alert.MonitorID); merr == nil && m != nil {
+	var m *store.Monitor
+	if mon, merr := s.store.GetMonitor(r.Context(), alert.MonitorID); merr == nil && mon != nil {
+		m = mon
 		na.MonitorName = m.Name
 	}
-	if rule, rerr := s.store.GetRule(r.Context(), alert.RuleID); rerr == nil && rule != nil {
+	var rule *store.Rule
+	if ru, rerr := s.store.GetRule(r.Context(), alert.RuleID); rerr == nil && ru != nil {
+		rule = ru
 		na.RuleType = rule.Type
+	}
+	if na.RunbookURL == "" || na.ResponseGuidance == "" {
+		url, guidance := store.ResolveAlertGuidance(rule, m, "", "")
+		if na.RunbookURL == "" {
+			na.RunbookURL = url
+		}
+		if na.ResponseGuidance == "" {
+			na.ResponseGuidance = guidance
+		}
 	}
 	notify.NewDispatcher(s.store, s.factory, s.log).Retry(r.Context(), na, *ch)
 	s.writeDeliveriesFragment(w, r, alertID, "")
@@ -1162,6 +2169,25 @@ func (s *Server) writeDeliveriesFragment(w http.ResponseWriter, r *http.Request,
 	attempts, err := s.store.ListDeliveryAttempts(r.Context(), alertID, "")
 	if err != nil {
 		s.fail(w, err)
+		return
+	}
+
+	var maxAttemptID int64
+	for _, a := range attempts {
+		if a.ID > maxAttemptID {
+			maxAttemptID = a.ID
+		}
+	}
+	ws := ""
+	if wID, ok := workspace.From(r.Context()); ok {
+		ws = string(wID)
+	}
+	changeKey := fmt.Sprintf("alert_deliv:%d:%d:%d:%s", alertID, maxAttemptID, len(attempts), note)
+	etag := api.FormatETag(ws, r.URL.Path, r.URL.Query().Encode(), changeKey)
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "private, no-cache")
+	if api.ETagMatches(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	channels, err := s.store.ListChannels(r.Context(), false)
@@ -1259,25 +2285,96 @@ func (s *Server) alertDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fields := payloadFields(a.Payload)
+	runbookURL := a.RunbookURL
+	if runbookURL == "" {
+		runbookURL = fields.runbookURL
+	}
+	responseGuidance := a.ResponseGuidance
+	if responseGuidance == "" {
+		responseGuidance = fields.responseGuidance
+	}
+	if runbookURL == "" || responseGuidance == "" {
+		u, g := store.ResolveAlertGuidance(rule, monitor, "", "")
+		if runbookURL == "" {
+			runbookURL = u
+		}
+		if responseGuidance == "" {
+			responseGuidance = g
+		}
+	}
 	s.render(w, r, "alert", map[string]any{
-		"Title":          fmt.Sprintf("Alert #%d", a.ID),
-		"Alert":          a,
-		"Monitor":        monitor,
-		"Rule":           rule,
-		"Attempts":       attempts,
-		"ChannelNames":   channelNames,
-		"ContractID":     fields.contractID,
-		"EventName":      fields.eventName,
-		"Ledger":         fields.ledger,
-		"LedgerClosedAt": fields.closedAt,
+		"Title":            fmt.Sprintf("Alert #%d", a.ID),
+		"Alert":            a,
+		"Monitor":          monitor,
+		"Rule":             rule,
+		"Attempts":         attempts,
+		"ChannelNames":     channelNames,
+		"AckNote":          ackNote(r),
+		"ContractID":       fields.contractID,
+		"EventName":        fields.eventName,
+		"Ledger":           fields.ledger,
+		"LedgerClosedAt":   fields.closedAt,
+		"RunbookURL":       runbookURL,
+		"ResponseGuidance": responseGuidance,
 	})
 }
 
+// acknowledgeAlert serves POST /alerts/{id}/acknowledge, the dashboard's half
+// of the API's endpoint. The store method it calls is the one the API handler
+// calls: acknowledgement lives in the store, not in either handler, so a
+// dashboard click and a curl cannot disagree about what it means — both stamp
+// the row and stop the escalation through AcknowledgeAlert.
+//
+// The POST redirects back to wherever the button was pressed (the alert page
+// for the detail action, the filtered list for a per-row one) so the rendered
+// state — acknowledged or not, by whom, when — is the answer, and the
+// operator's filters survive the round trip. Acknowledging an alert that is
+// already acknowledged is not an error: the store is idempotent and the
+// escalation stays stopped, so the redirect says that in words instead of
+// leaving the operator to wonder whether the second press did anything. A
+// repeat writes no second audit row — the log records the transition, once.
+func (s *Server) acknowledgeAlert(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	alert, err := s.store.GetAlert(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		s.fail(w, err)
+		return
+	}
+	already := alert.AcknowledgedAt != nil
+	// Straight through to the store even when this alert is already stamped:
+	// the API handler does exactly the same, and sharing that path is what
+	// makes "acknowledge" one operation with one meaning.
+	if err := s.store.AcknowledgeAlert(r.Context(), id, actor(r)); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		s.fail(w, err)
+		return
+	}
+	if !already {
+		s.audit(r, store.AuditActionUpdate, "alert", id)
+	}
+	s.paging.Propagate(r.Context(), id, "acknowledge")
+	loc := withAckFlag(returnTo(r, "/alerts/"+strconv.FormatInt(id, 10)), already)
+	http.Redirect(w, r, loc, http.StatusSeeOther)
+}
+
 type alertPayloadFields struct {
-	contractID string
-	eventName  string
-	ledger     string
-	closedAt   time.Time
+	contractID       string
+	eventName        string
+	ledger           string
+	closedAt         time.Time
+	runbookURL       string
+	responseGuidance string
 }
 
 // payloadFields pulls the permalink columns out of the stored event JSON
@@ -1304,6 +2401,8 @@ func payloadFields(raw json.RawMessage) alertPayloadFields {
 			out.closedAt = t
 		}
 	}
+	out.runbookURL = stringifyPayload(m["runbook_url"])
+	out.responseGuidance = stringifyPayload(m["response_guidance"])
 	return out
 }
 
@@ -1333,4 +2432,19 @@ func splitLines(s string) []string {
 		}
 	}
 	return out
+}
+
+// splitTags parses the dashboard's tags form field: tags separated by
+// commas, spaces or newlines, e.g. "treasury, mainnet". Normalisation
+// (trim, lowercase, dedupe) is the store's, so the dashboard and the API
+// always store one canonical set.
+func splitTags(s string) []string {
+	return store.NormalizeTags(splitLines(s))
+}
+
+// WithPaging enables outbound acknowledgement sync to external paging
+// providers. Optional.
+func (s *Server) WithPaging(p *notify.PagingSync) *Server {
+	s.paging = p
+	return s
 }

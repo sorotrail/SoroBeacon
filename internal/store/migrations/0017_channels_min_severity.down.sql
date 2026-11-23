@@ -1,0 +1,1 @@
+ALTER TABLE channels DROP COLUMN min_severity;

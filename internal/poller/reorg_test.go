@@ -17,36 +17,55 @@ import (
 
 // --- fakeStore: the reorg-detection half of the Store interface ---
 
-func (f *fakeStore) RecordLedgerHashes(_ context.Context, hashes []store.LedgerHash) error {
+func (f *fakeStore) RecordLedgerHashes(_ context.Context, network string, hashes []store.LedgerHash) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	w := f.window(network)
 	for _, h := range hashes {
-		f.ledgerHashes[h.Ledger] = h.Hash
+		w[h.Ledger] = h.Hash
 	}
 	return nil
 }
 
-func (f *fakeStore) LedgerHashes(_ context.Context, from, to uint32) ([]store.LedgerHash, error) {
+func (f *fakeStore) LedgerHashes(_ context.Context, network string, from, to uint32) ([]store.LedgerHash, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	w := f.window(network)
 	var out []store.LedgerHash
 	for l := from; l <= to; l++ {
-		if h, ok := f.ledgerHashes[l]; ok {
+		if h, ok := w[l]; ok {
 			out = append(out, store.LedgerHash{Ledger: l, Hash: h})
 		}
 	}
 	return out, nil
 }
 
-func (f *fakeStore) PruneLedgerHashes(_ context.Context, before uint32) error {
-	for l := range f.ledgerHashes {
+func (f *fakeStore) PruneLedgerHashes(_ context.Context, network string, before uint32) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	w := f.window(network)
+	for l := range w {
 		if l < before {
-			delete(f.ledgerHashes, l)
+			delete(w, l)
 		}
 	}
 	return nil
 }
 
-func (f *fakeStore) RetractAlertsFromLedger(_ context.Context, ledger uint32, at time.Time) (int64, error) {
+func (f *fakeStore) RetractAlertsFromLedger(_ context.Context, network string, ledger uint32, at time.Time) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastRetract = append(f.lastRetract, retraction{network: network, ledger: ledger})
 	var n int64
 	t := at.UTC()
 	for i := range f.alerts {
+		// The network predicate is the whole point of the multi-network split:
+		// two chains number their ledgers independently, so a reorg on one must
+		// leave the other chain's alerts alone. The fake matches the real
+		// store's WHERE network = ? exactly.
+		if f.alerts[i].Network != network {
+			continue
+		}
 		if f.alerts[i].Ledger >= ledger && f.alerts[i].RetractedAt == nil {
 			f.alerts[i].RetractedAt = &t
 			n++

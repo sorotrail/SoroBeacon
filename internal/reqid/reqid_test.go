@@ -1,6 +1,7 @@
 package reqid
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -72,5 +73,27 @@ func TestNewUnique(t *testing.T) {
 			t.Fatalf("duplicate ID %q within 1000 draws", id)
 		}
 		seen[id] = true
+	}
+}
+
+func TestFromContext(t *testing.T) {
+	if got := FromContext(context.Background()); got != "" {
+		t.Fatalf("background context should carry no ID, got %q", got)
+	}
+
+	// The middleware is the only writer; after it runs the ID must be
+	// readable without an *http.Request in hand.
+	var seen string
+	h := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = FromContext(r.Context())
+	}))
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/", nil))
+	if seen == "" {
+		t.Fatal("FromContext lost the middleware-assigned ID")
+	}
+	if seen != From(httptest.NewRequest(http.MethodGet, "/", nil).WithContext(
+		context.WithValue(context.Background(), ctxKey{}, seen))) {
+		t.Fatal("FromContext and From disagree about the same context")
 	}
 }

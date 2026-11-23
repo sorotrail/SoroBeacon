@@ -1,0 +1,14 @@
+apiVersion: v2
+name: sorobeacon
+description: Helm chart for SoroBeacon — monitoring and alerting for Soroban smart contracts
+type: application
+version: 0.1.0
+appVersion: "latest"
+keywords:
+  - stellar
+  - soroban
+  - blockchain
+  - monitoring
+  - alerting
+sources:
+  - https://github.com/sorotrail/sorobeacon

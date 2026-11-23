@@ -65,6 +65,20 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 			c.detail = err.Error()
 			return
 		}
+		// A store that knows its database is unreachable says so even when
+		// the ping itself came back: the instance is degraded, and a load
+		// balancer should stop sending it traffic until the store says
+		// otherwise.
+		if s.isDegraded() {
+			c.detail = "database degraded"
+			if s.metrics != nil {
+				s.metrics.SetDatabaseDegraded(true)
+			}
+			return
+		}
+		if s.metrics != nil {
+			s.metrics.SetDatabaseDegraded(false)
+		}
 		c.healthy = true
 	}()
 	go func() {
@@ -82,6 +96,27 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 		c.detail = "latest ledger " + strconv.FormatInt(int64(h.LatestLedger), 10)
 	}()
 	wg.Wait()
+
+	// Per-network detail, primary first. "rpc" above is only the primary
+	// chain's source, so on a multi-network instance it would read "healthy"
+	// while a second chain's node was unreachable and its alerts missing.
+	// Each network gets its own check, and the aggregate status below already
+	// fails on the first unhealthy one.
+	if s.networkState != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), probeTimeout)
+		defer cancel()
+		for _, ns := range s.networkState.Statuses(ctx) {
+			c := check{name: "rpc_" + ns.Network}
+			if ns.Source != "ok" {
+				c.detail = ns.Source
+			} else {
+				c.healthy = true
+				c.detail = "latest ledger " + strconv.FormatUint(uint64(ns.LatestChainLedger), 10) +
+					", lag " + strconv.FormatInt(ns.LedgerLag, 10)
+			}
+			checks = append(checks, c)
+		}
+	}
 
 	if s.readyzLagThreshold > 0 && s.poller != nil {
 		pos := s.poller.Position()

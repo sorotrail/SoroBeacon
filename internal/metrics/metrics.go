@@ -16,12 +16,29 @@ import (
 
 // Metrics is the process-wide metric set. Construct with New; serve with
 // Handler.
+//
+// Every ingest metric carries the Stellar network it belongs to, because one
+// instance can now poll several at once and "the poller is lagging" is not a
+// question that has an instance-wide answer. The copy returned by WithNetwork
+// shares one registry with its parent, so /metrics exports a single merged
+// view: the aggregate sum over networks still works, and so does a per-network
+// slice.
 type Metrics struct {
 	registry *prometheus.Registry
+	// network is this instance's label value. New leaves it empty, which is
+	// how a single-network deployment that never calls WithNetwork reports —
+	// the same series name it always had, just with the label unbound.
+	network string
 
 	pollsTotal    *prometheus.CounterVec
-	pollDuration  prometheus.Histogram
-	pollLagLedger prometheus.Gauge
+	pollDuration  *prometheus.HistogramVec
+	pollLagLedger *prometheus.GaugeVec
+
+	// Upstream mode (SoroTrail) health gauges: how far the upstream indexer
+	// itself trails the chain head, and how many consecutive upstream HTTP
+	// requests have failed.
+	upstreamLagLedger *prometheus.GaugeVec
+	upstreamFailures  *prometheus.GaugeVec
 
 	// Priority tier gauges: how many contracts each tier carries, and how
 	// far behind the tip the freshest event seen for that tier is. The lag
@@ -31,78 +48,188 @@ type Metrics struct {
 
 	// Reorg detection: how many reorgs have been seen, and the ledger of the
 	// most recent one. Both are expected to sit at zero.
-	reorgsTotal     prometheus.Counter
-	lastReorgLedger prometheus.Gauge
+	reorgsTotal     *prometheus.CounterVec
+	lastReorgLedger *prometheus.GaugeVec
 
-	eventsScanned  prometheus.Counter
-	eventsMatched  prometheus.Counter
-	alertsFired    prometheus.Counter
-	deliveries     *prometheus.CounterVec
-	httpDuration   *prometheus.HistogramVec
-	lastPollAgoSec prometheus.Gauge
+	eventsScanned   *prometheus.CounterVec
+	eventsMatched   *prometheus.CounterVec
+	ruleEvaluations *prometheus.CounterVec
+	// Per-rule-type metrics (cardinality bounded by rule type names)
+	ruleEvalsTotal       *prometheus.CounterVec
+	ruleMatchesTotal     *prometheus.CounterVec
+	ruleErrorsTotal      *prometheus.CounterVec
+	ruleDuration         *prometheus.HistogramVec
+	alertsFired          *prometheus.CounterVec
+	deliveries           *prometheus.CounterVec
+	throttles            *prometheus.CounterVec
+	budgetExhausted      prometheus.Counter
+	httpDuration         *prometheus.HistogramVec
+	httpNotModifiedTotal *prometheus.CounterVec
+	lastPollAgoSec       *prometheus.GaugeVec
+	pollPanics           *prometheus.CounterVec
+	breakerStates        *prometheus.GaugeVec
+	channelUnackFlagged  *prometheus.GaugeVec
+	channelUnackRate     *prometheus.GaugeVec
+
+	storeReads           *prometheus.CounterVec
+	storeFallbacks       prometheus.Counter
+	replicaEnabled       prometheus.Gauge
+	replicaLagSeconds    prometheus.Gauge
+	deadLetters          prometheus.Gauge
+	deadLettersByChannel *prometheus.GaugeVec
+	// heartbeatLastSuccess is the unix time of the last heartbeat ping that
+	// confirmed ingest was healthy. Zero (unset) means none has succeeded
+	// since the process started, which is the signal a dashboard alert can
+	// be built on.
+	heartbeatLastSuccess prometheus.Gauge
+
+	requestBodyRejectionsTotal *prometheus.CounterVec
+
+	databaseDegraded         prometheus.Gauge
+	databaseUnavailableTotal prometheus.Counter
+
+	workspaceTracker         *workspaceLabelTracker
+	workspaceAlertsRaised    *prometheus.CounterVec
+	workspaceRuleEvaluations *prometheus.CounterVec
+	workspaceNotifications   *prometheus.CounterVec
+	workspaceAPIRequests     *prometheus.CounterVec
+	workspaceStoredRows      *prometheus.GaugeVec
+
+	alertPartitionRunwayMonths  prometheus.Gauge
+	alertPartitionErrorsTotal   *prometheus.CounterVec
+	alertPartitionsCreatedTotal prometheus.Counter
+	alertPartitionsDroppedTotal prometheus.Counter
+	alertPrunerDeletedTotal     *prometheus.CounterVec
+	workspaceRetentionSeconds   *prometheus.GaugeVec
 }
+
+// networkLabel is the Prometheus label every ingest metric carries.
+const networkLabel = "network"
 
 // New returns a Metrics with its own registry, so multiple instances (e.g.
 // in tests) never collide on the default registry.
 func New() *Metrics {
+	networks := []string{networkLabel}
+	ruleTypes := []string{networkLabel, "rule_type"}
 	m := &Metrics{
 		registry: prometheus.NewRegistry(),
 
 		pollsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "sorobeacon_polls_total",
-			Help: "RPC polls, by outcome (ok|error).",
-		}, []string{"outcome"}),
+			Help: "RPC polls, by network and outcome (ok|error).",
+		}, []string{networkLabel, "outcome"}),
 
-		pollDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+		pollDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "sorobeacon_poll_duration_seconds",
-			Help:    "Wall-clock duration of a single poll cycle.",
+			Help:    "Wall-clock duration of a single poll cycle, by network.",
 			Buckets: prometheus.DefBuckets,
-		}),
+		}, networks),
 
-		pollLagLedger: prometheus.NewGauge(prometheus.GaugeOpts{
+		pollLagLedger: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "sorobeacon_poll_lag_ledgers",
-			Help: "How far the poller's resume point trails the chain tip, in ledgers.",
-		}),
+			Help: "How far a network's poller resume point trails that chain's tip, in ledgers.",
+		}, networks),
+
+		upstreamLagLedger: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_upstream_lag_ledgers",
+			Help: "How far the upstream SoroTrail indexer trails the chain head, in ledgers, by network.",
+		}, networks),
+
+		upstreamFailures: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_upstream_consecutive_failures",
+			Help: "Consecutive failed requests against the upstream event source, by network.",
+		}, networks),
 
 		pollPriorityContracts: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "sorobeacon_poll_priority_contracts",
-			Help: "Watched contracts per poll-priority tier (low|normal|high).",
-		}, []string{"priority"}),
+			Help: "Watched contracts per poll-priority tier (low|normal|high), by network.",
+		}, []string{networkLabel, "priority"}),
 
 		pollPriorityLag: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "sorobeacon_poll_lag_ledgers_by_priority",
-			Help: "Ledger lag of the freshest event seen for each poll-priority tier this cycle.",
-		}, []string{"priority"}),
+			Help: "Ledger lag of the freshest event seen for each poll-priority tier this cycle, by network.",
+		}, []string{networkLabel, "priority"}),
 
-		reorgsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+		reorgsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "sorobeacon_reorgs_total",
-			Help: "Chain reorganisations detected within the tracking window. Expected to stay at zero.",
-		}),
+			Help: "Chain reorganisations detected within the tracking window, by network. Expected to stay at zero.",
+		}, networks),
 
-		lastReorgLedger: prometheus.NewGauge(prometheus.GaugeOpts{
+		lastReorgLedger: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "sorobeacon_last_reorg_ledger",
-			Help: "Ledger at which the most recent reorganisation diverged from the ingested chain.",
-		}),
+			Help: "Ledger at which a network most recently diverged from the ingested chain.",
+		}, networks),
 
-		eventsScanned: prometheus.NewCounter(prometheus.CounterOpts{
+		eventsScanned: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "sorobeacon_events_scanned_total",
-			Help: "Contract events read from the RPC and evaluated against rules.",
-		}),
+			Help: "Contract events read from the RPC and evaluated against rules, by network.",
+		}, networks),
 
-		eventsMatched: prometheus.NewCounter(prometheus.CounterOpts{
+		eventsMatched: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "sorobeacon_events_matched_total",
-			Help: "Events that matched at least one monitor rule.",
-		}),
+			Help: "Events that matched at least one monitor rule, by network.",
+		}, networks),
 
-		alertsFired: prometheus.NewCounter(prometheus.CounterOpts{
+		ruleEvaluations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_rule_evaluations_total",
+			Help: "Rule evaluations: each event checked against each of its monitor's enabled rules, by network.",
+		}, networks),
+
+		ruleEvalsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_rule_evals_total",
+			Help: "Rule evaluations per rule type, by network.",
+		}, ruleTypes),
+
+		ruleMatchesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_rule_matches_total",
+			Help: "Rule matches per rule type, by network.",
+		}, ruleTypes),
+
+		ruleErrorsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_rule_errors_total",
+			Help: "Rule evaluation errors per rule type, by network.",
+		}, ruleTypes),
+
+		ruleDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "sorobeacon_rule_duration_seconds",
+			Help:    "Rule evaluation duration per rule type, by network.",
+			Buckets: []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
+		}, ruleTypes),
+
+		alertsFired: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "sorobeacon_alerts_fired_total",
-			Help: "Alerts created by rule matches.",
-		}),
+			Help: "Alerts created by rule matches, by network.",
+		}, networks),
+
+		lastPollAgoSec: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_seconds_since_last_poll",
+			Help: "Seconds since a network's poller last completed a cycle. Grows without bound when polling has stopped.",
+		}, networks),
+
+		pollPanics: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_poll_panics_total",
+			Help: "Ingest cycles ended by a recovered panic, by network. A non-zero value means that chain's poll loop restarted.",
+		}, networks),
 
 		deliveries: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "sorobeacon_alert_deliveries_total",
 			Help: "Alert deliveries, by channel type and outcome (ok|error).",
 		}, []string{"channel", "outcome"}),
+
+		throttles: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_alert_throttles_total",
+			Help: "Throttled alert delivery attempts, by channel type.",
+		}, []string{"channel"}),
+
+		budgetExhausted: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_delivery_budget_exhausted_total",
+			Help: "Times a monitor spent its daily delivery budget and stopped delivering.",
+		}),
+
+		breakerStates: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_channel_breaker_state",
+			Help: "Circuit breaker state for each channel (0=closed, 1=half-open, 2=open).",
+		}, []string{"channel_id", "channel_type", "state"}),
 
 		httpDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "sorobeacon_http_request_duration_seconds",
@@ -110,21 +237,185 @@ func New() *Metrics {
 			Buckets: prometheus.DefBuckets,
 		}, []string{"route", "method", "status"}),
 
-		lastPollAgoSec: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "sorobeacon_seconds_since_last_poll",
-			Help: "Seconds since the poller last completed a cycle. Grows without bound when polling has stopped.",
+		httpNotModifiedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_http_not_modified_total",
+			Help: "HTTP 304 Not Modified responses served, by route pattern.",
+		}, []string{"route"}),
+
+		// Where read-only queries actually went. The pool label is the closed
+		// set {primary, replica}, so cardinality is bounded; watching the ratio
+		// is how an operator confirms replica routing is doing anything, and
+		// the fallback counter is how they see it stop.
+		storeReads: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_store_reads_total",
+			Help: "Read-only store queries by the pool that served them.",
+		}, []string{"pool"}),
+
+		storeFallbacks: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_store_replica_fallbacks_total",
+			Help: "Read-only queries that were served by the primary because the replica was unavailable.",
 		}),
+
+		replicaEnabled: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_store_replica_enabled",
+			Help: "1 when a read replica is configured and routing, 0 when every read goes to the primary.",
+		}),
+
+		replicaLagSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_store_replica_lag_seconds",
+			Help: "Observed replication lag in seconds on the Postgres read replica (from pg_last_xact_replay_timestamp); 0 when no replica is configured.",
+		}),
+
+		deadLetters: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_dead_letters_total",
+			Help: "Current number of dead-lettered delivery attempts waiting for review or re-drive.",
+		}),
+
+		deadLettersByChannel: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_dead_letters",
+			Help: "Current number of dead-lettered delivery attempts by workspace and channel.",
+		}, []string{"workspace", "channel"}),
+
+		heartbeatLastSuccess: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_heartbeat_last_success_timestamp_seconds",
+			Help: "Unix time of the last heartbeat ping sent while ingest was healthy; 0 when none has succeeded this run.",
+		}),
+
+		requestBodyRejectionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_request_body_rejections_total",
+			Help: "Requests rejected for exceeding body or field size limits, partitioned by limit type.",
+		}, []string{"limit"}),
+
+		databaseDegraded: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_database_degraded",
+			Help: "1 if the database is unreachable or operating in degraded mode, 0 otherwise.",
+		}),
+
+		databaseUnavailableTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_database_unavailable_total",
+			Help: "Count of database unavailable failures encountered across the service.",
+		}),
+
+		channelUnackFlagged: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_channel_unacknowledged_flagged",
+			Help: "Whether a channel is flagged as accepting deliveries but never acknowledged (1=flagged, 0=healthy).",
+		}, []string{"channel_id", "channel_type"}),
+
+		channelUnackRate: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_channel_unacknowledged_delivery_rate",
+			Help: "Share of delivered alerts that were never acknowledged within the SLA window [0.0 - 1.0].",
+		}, []string{"channel_id", "channel_type"}),
+
+		workspaceTracker: newWorkspaceLabelTracker(MaxTrackedWorkspaces),
+
+		workspaceAlertsRaised: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_workspace_alerts_raised_total",
+			Help: "Alerts raised per workspace (opaque hashed workspace label, bounded with overflow).",
+		}, []string{"workspace"}),
+
+		workspaceRuleEvaluations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_workspace_rule_evaluations_total",
+			Help: "Rule evaluations executed per workspace (opaque hashed workspace label, bounded with overflow).",
+		}, []string{"workspace"}),
+
+		workspaceNotifications: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_workspace_notifications_total",
+			Help: "Notification attempts per workspace by channel_type and outcome (ok|error|throttled).",
+		}, []string{"workspace", "channel_type", "outcome"}),
+
+		workspaceAPIRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_workspace_api_requests_total",
+			Help: "Authenticated HTTP API requests served per workspace.",
+		}, []string{"workspace"}),
+
+		workspaceStoredRows: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_workspace_stored_rows",
+			Help: "Exact stored row count per workspace and resource kind (monitors|rules|channels|alerts|dead_letters).",
+		}, []string{"workspace", "resource"}),
+
+		alertPartitionRunwayMonths: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "sorobeacon_alert_partition_runway_months",
+			Help: "Number of consecutive monthly alert partitions currently created beyond the current UTC month.",
+		}),
+
+		alertPartitionErrorsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_alert_partition_errors_total",
+			Help: "Total errors encountered during alert partition lifecycle operations, by operation (ensure|drop|inspect).",
+		}, []string{"operation"}),
+
+		alertPartitionsCreatedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_alert_partitions_created_total",
+			Help: "Total monthly alert partitions created by the automated partition lifecycle manager.",
+		}),
+
+		alertPartitionsDroppedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "sorobeacon_alert_partitions_dropped_total",
+			Help: "Total expired monthly alert partitions dropped by the automated partition lifecycle manager.",
+		}),
+
+		alertPrunerDeletedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_alert_pruner_deleted_total",
+			Help: "Total expired alerts deleted by the retention pruner, by workspace_id and policy_source (workspace|instance).",
+		}, []string{"workspace_id", "policy_source"}),
+
+		workspaceRetentionSeconds: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "sorobeacon_workspace_retention_seconds",
+			Help: "Effective alert retention duration in seconds per workspace_id and policy_source (workspace|instance|none).",
+		}, []string{"workspace_id", "policy_source"}),
 	}
 	m.registry.MustRegister(m.pollsTotal, m.pollDuration, m.pollLagLedger,
-		m.eventsScanned, m.eventsMatched, m.alertsFired, m.deliveries,
-		m.httpDuration, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
-		m.reorgsTotal, m.lastReorgLedger)
+		m.upstreamLagLedger, m.upstreamFailures,
+		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired, m.deliveries, m.throttles, m.budgetExhausted,
+		m.httpDuration, m.httpNotModifiedTotal, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
+		m.reorgsTotal, m.lastReorgLedger, m.breakerStates, m.pollPanics,
+		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.replicaLagSeconds, m.deadLetters, m.deadLettersByChannel, m.heartbeatLastSuccess,
+		m.ruleEvalsTotal, m.ruleMatchesTotal, m.ruleErrorsTotal, m.ruleDuration, m.requestBodyRejectionsTotal,
+		m.databaseDegraded, m.databaseUnavailableTotal, m.channelUnackFlagged, m.channelUnackRate,
+		m.workspaceAlertsRaised, m.workspaceRuleEvaluations, m.workspaceNotifications, m.workspaceAPIRequests, m.workspaceStoredRows,
+		m.alertPartitionRunwayMonths, m.alertPartitionErrorsTotal, m.alertPartitionsCreatedTotal, m.alertPartitionsDroppedTotal,
+		m.alertPrunerDeletedTotal, m.workspaceRetentionSeconds)
 	return m
+}
+
+// WithNetwork returns a view of the same metric set whose ingest metrics carry
+// `network`. Each poller gets one, so two networks polled by one process
+// report two labelled series instead of overwriting each other's gauges.
+//
+// It is a shallow copy on purpose: the registry and every vector are shared,
+// so /metrics stays a single scrape target.
+func (m *Metrics) WithNetwork(network string) *Metrics {
+	if m == nil {
+		return nil
+	}
+	dup := *m
+	dup.network = network
+	return &dup
+}
+
+// lv prefixes a metric's label values with this view's network.
+func (m *Metrics) lv(values ...string) []string {
+	return append([]string{m.network}, values...)
 }
 
 // Handler serves the metrics registry in Prometheus text format.
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
+}
+
+// RegisterStreamDropped exposes the live-alerts broadcaster's dropped-event
+// counter on /metrics. The callback is read lazily on each scrape, so the
+// broadcaster keeps its own cheap atomic counter and this package does not
+// need to import it. A nil callback (or nil receiver) registers nothing.
+func (m *Metrics) RegisterStreamDropped(dropped func() uint64) {
+	if m == nil || dropped == nil {
+		return
+	}
+	m.registry.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "sorobeacon_alerts_stream_dropped_total",
+		Help: "Alert events dropped from the live SSE stream because a subscriber could not keep up.",
+	}, func() float64 {
+		return float64(dropped())
+	}))
 }
 
 // RecordPoll observes one completed poll cycle.
@@ -136,9 +427,9 @@ func (m *Metrics) RecordPoll(ok bool, took time.Duration) {
 	if !ok {
 		outcome = "error"
 	}
-	m.pollsTotal.WithLabelValues(outcome).Inc()
-	m.pollDuration.Observe(took.Seconds())
-	m.lastPollAgoSec.Set(0)
+	m.pollsTotal.WithLabelValues(m.lv(outcome)...).Inc()
+	m.pollDuration.WithLabelValues(m.lv()...).Observe(took.Seconds())
+	m.lastPollAgoSec.WithLabelValues(m.lv()...).Set(0)
 }
 
 // SetPollLag records the gap between the poller's resume point and the
@@ -147,7 +438,32 @@ func (m *Metrics) SetPollLag(ledgersBehind int64) {
 	if m == nil {
 		return
 	}
-	m.pollLagLedger.Set(float64(ledgersBehind))
+	m.pollLagLedger.WithLabelValues(m.lv()...).Set(float64(ledgersBehind))
+}
+
+// SetUpstreamLag records how far behind the chain head the upstream SoroTrail
+// indexer is. Clamped at zero so clock skew between upstream and chain head
+// never reports negative lag.
+func (m *Metrics) SetUpstreamLag(ledgersBehind int64) {
+	if m == nil || m.upstreamLagLedger == nil {
+		return
+	}
+	if ledgersBehind < 0 {
+		ledgersBehind = 0
+	}
+	m.upstreamLagLedger.WithLabelValues(m.lv()...).Set(float64(ledgersBehind))
+}
+
+// SetUpstreamFailures records consecutive failed requests against the upstream
+// SoroTrail source. Resets to zero on the next successful request.
+func (m *Metrics) SetUpstreamFailures(count int) {
+	if m == nil || m.upstreamFailures == nil {
+		return
+	}
+	if count < 0 {
+		count = 0
+	}
+	m.upstreamFailures.WithLabelValues(m.lv()...).Set(float64(count))
 }
 
 // SetPriorityContracts records how many contracts the cycle scheduled in each
@@ -157,7 +473,7 @@ func (m *Metrics) SetPriorityContracts(priority string, contracts int) {
 	if m == nil {
 		return
 	}
-	m.pollPriorityContracts.WithLabelValues(priority).Set(float64(contracts))
+	m.pollPriorityContracts.WithLabelValues(m.lv(priority)...).Set(float64(contracts))
 }
 
 // RecordReorg counts one detected chain reorganisation and records where it
@@ -166,8 +482,8 @@ func (m *Metrics) RecordReorg(ledger uint32) {
 	if m == nil {
 		return
 	}
-	m.reorgsTotal.Inc()
-	m.lastReorgLedger.Set(float64(ledger))
+	m.reorgsTotal.WithLabelValues(m.lv()...).Inc()
+	m.lastReorgLedger.WithLabelValues(m.lv()...).Set(float64(ledger))
 }
 
 // SetPollLagByPriority records the ledger lag of the freshest event seen for
@@ -182,7 +498,7 @@ func (m *Metrics) SetPollLagByPriority(priority string, ledgersBehind int64) {
 	if ledgersBehind < 0 {
 		ledgersBehind = 0
 	}
-	m.pollPriorityLag.WithLabelValues(priority).Set(float64(ledgersBehind))
+	m.pollPriorityLag.WithLabelValues(m.lv(priority)...).Set(float64(ledgersBehind))
 }
 
 // TickPollAge advances the seconds-since-last-poll gauge; called on a timer
@@ -191,7 +507,7 @@ func (m *Metrics) TickPollAge(secondsSince float64) {
 	if m == nil {
 		return
 	}
-	m.lastPollAgoSec.Set(secondsSince)
+	m.lastPollAgoSec.WithLabelValues(m.lv()...).Set(secondsSince)
 }
 
 // RecordEvents counts events read and how many matched a rule in the cycle
@@ -200,8 +516,34 @@ func (m *Metrics) RecordEvents(scanned, matched int) {
 	if m == nil {
 		return
 	}
-	m.eventsScanned.Add(float64(scanned))
-	m.eventsMatched.Add(float64(matched))
+	m.eventsScanned.WithLabelValues(m.lv()...).Add(float64(scanned))
+	m.eventsMatched.WithLabelValues(m.lv()...).Add(float64(matched))
+}
+
+// RecordRuleEvaluations counts the rule evaluations (one per event x enabled
+// rule) in the cycle that just ran. It is deliberately separate from
+// RecordEvents so a monitor with many rules is distinguishable from a busy
+// contract.
+func (m *Metrics) RecordRuleEvaluations(n int) {
+	if m == nil {
+		return
+	}
+	m.ruleEvaluations.WithLabelValues(m.lv()...).Add(float64(n))
+}
+
+// RecordRuleEval records one rule evaluation for a specific rule type.
+func (m *Metrics) RecordRuleEval(ruleType string, matched bool, err error, duration time.Duration) {
+	if m == nil {
+		return
+	}
+	m.ruleEvalsTotal.WithLabelValues(m.lv(ruleType)...).Inc()
+	if matched {
+		m.ruleMatchesTotal.WithLabelValues(m.lv(ruleType)...).Inc()
+	}
+	if err != nil {
+		m.ruleErrorsTotal.WithLabelValues(m.lv(ruleType)...).Inc()
+	}
+	m.ruleDuration.WithLabelValues(m.lv(ruleType)...).Observe(duration.Seconds())
 }
 
 // RecordAlert counts one alert fired.
@@ -209,7 +551,17 @@ func (m *Metrics) RecordAlert() {
 	if m == nil {
 		return
 	}
-	m.alertsFired.Inc()
+	m.alertsFired.WithLabelValues(m.lv()...).Inc()
+}
+
+// RecordPanic counts one ingest cycle that ended in a recovered panic, so
+// the supervisor's restart is visible in monitoring rather than only in the
+// log.
+func (m *Metrics) RecordPanic() {
+	if m == nil {
+		return
+	}
+	m.pollPanics.WithLabelValues(m.lv()...).Inc()
 }
 
 // RecordDelivery counts one delivery attempt per channel type and outcome.
@@ -225,6 +577,199 @@ func (m *Metrics) RecordDelivery(channelType string, ok bool) {
 		outcome = "error"
 	}
 	m.deliveries.WithLabelValues(channelType, outcome).Inc()
+}
+
+// RecordStoreRead counts one read-only store query and which pool answered it.
+// pool is "primary" or "replica" — a static set chosen by the store, never
+// request-derived, so cardinality stays bounded.
+func (m *Metrics) RecordStoreRead(pool string) {
+	if m == nil {
+		return
+	}
+	m.storeReads.WithLabelValues(pool).Inc()
+}
+
+// RecordReplicaFallback counts one read that was routed to the replica but had
+// to be replayed on the primary. A steady rate here means the replica is
+// unreachable or lagging past its timeout and the routing is buying nothing.
+func (m *Metrics) RecordReplicaFallback() {
+	if m == nil {
+		return
+	}
+	m.storeFallbacks.Inc()
+}
+
+// SetReplicaEnabled records whether a read replica is configured. It is a
+// gauge, not a constant, because routing can be turned off at runtime without
+// a restart by the store itself.
+func (m *Metrics) SetReplicaEnabled(enabled bool) {
+	if m == nil {
+		return
+	}
+	if enabled {
+		m.replicaEnabled.Set(1)
+		return
+	}
+	m.replicaEnabled.Set(0)
+}
+
+// SetReplicaLag records the latest sampled replication lag in seconds on the
+// Postgres read replica. Negative values (from minor clock skew between primary
+// and replica) are clamped to 0.
+func (m *Metrics) SetReplicaLag(seconds float64) {
+	if m == nil {
+		return
+	}
+	if seconds < 0 {
+		seconds = 0
+	}
+	m.replicaLagSeconds.Set(seconds)
+}
+
+// SetDeadLetters sets the current total number of dead letters.
+func (m *Metrics) SetDeadLetters(count int) {
+	if m == nil {
+		return
+	}
+	m.deadLetters.Set(float64(count))
+}
+
+// SetDeadLettersFor sets the dead letter gauge for a specific workspace and channel.
+func (m *Metrics) SetDeadLettersFor(workspace, channel string, count int) {
+	if m == nil {
+		return
+	}
+	if workspace == "" {
+		workspace = "default"
+	}
+	if channel == "" {
+		channel = "unknown"
+	}
+	m.deadLettersByChannel.WithLabelValues(workspace, channel).Set(float64(count))
+}
+
+// RecordDeadLetter increments the number of dead letters awaiting review.
+func (m *Metrics) RecordDeadLetter() {
+	if m == nil {
+		return
+	}
+	m.deadLetters.Inc()
+}
+
+// RecordDeadLetterFor increments the dead letter gauge for a specific workspace and channel.
+func (m *Metrics) RecordDeadLetterFor(workspace, channel string) {
+	if m == nil {
+		return
+	}
+	m.deadLetters.Inc()
+	if workspace == "" {
+		workspace = "default"
+	}
+	if channel == "" {
+		channel = "unknown"
+	}
+	m.deadLettersByChannel.WithLabelValues(workspace, channel).Inc()
+}
+
+// RecordHeartbeatSuccess stamps the last time a heartbeat ping confirmed
+// that ingest was healthy. It is how an operator proves from inside the
+// instance that the external dead-man's switch was being fed, without
+// looking at the external service.
+func (m *Metrics) RecordHeartbeatSuccess() {
+	if m == nil {
+		return
+	}
+	m.heartbeatLastSuccess.SetToCurrentTime()
+}
+
+// ClearDeadLetter decrements the number of dead letters after a successful
+// redrive. Prometheus gauges clamp naturally at the store's authoritative
+// value when the next SetDeadLetters refresh runs.
+func (m *Metrics) ClearDeadLetter() {
+	if m == nil {
+		return
+	}
+	m.deadLetters.Dec()
+}
+
+// ClearDeadLetterFor decrements the dead letter gauge for a specific workspace and channel.
+func (m *Metrics) ClearDeadLetterFor(workspace, channel string) {
+	if m == nil {
+		return
+	}
+	m.deadLetters.Dec()
+	if workspace == "" {
+		workspace = "default"
+	}
+	if channel == "" {
+		channel = "unknown"
+	}
+	m.deadLettersByChannel.WithLabelValues(workspace, channel).Dec()
+}
+
+// RecordThrottle counts one throttled delivery per channel type.
+func (m *Metrics) RecordThrottle(channelType string) {
+	if m == nil {
+		return
+	}
+	m.throttles.WithLabelValues(channelType).Inc()
+}
+
+// RecordDeliveryBudgetExhausted counts one monitor spending its daily delivery
+// budget. It is incremented once per exhaustion, when the notice goes out, so
+// an alert on its rate means "a monitor just stopped delivering".
+func (m *Metrics) RecordDeliveryBudgetExhausted() {
+	if m == nil {
+		return
+	}
+	m.budgetExhausted.Inc()
+}
+
+// SetBreakerState sets the gauge value for a channel's circuit breaker state.
+func (m *Metrics) SetBreakerState(channelID string, channelType string, state string) {
+	if m == nil {
+		return
+	}
+	for _, s := range []string{"closed", "open", "half-open"} {
+		val := float64(0)
+		if s == state {
+			val = 1
+		}
+		m.breakerStates.WithLabelValues(channelID, channelType, s).Set(val)
+	}
+}
+
+// SetChannelUnacknowledged records the reconciliation outcome for one channel.
+func (m *Metrics) SetChannelUnacknowledged(channelID string, channelType string, flagged bool, rate float64) {
+	if m == nil {
+		return
+	}
+	val := 0.0
+	if flagged {
+		val = 1.0
+	}
+	m.channelUnackFlagged.WithLabelValues(channelID, channelType).Set(val)
+	m.channelUnackRate.WithLabelValues(channelID, channelType).Set(rate)
+}
+
+// SetChannelUnacknowledgedFlagged sets the flagged gauge for one channel.
+func (m *Metrics) SetChannelUnacknowledgedFlagged(channelID string, channelType string, flagged bool) {
+	if m == nil {
+		return
+	}
+	val := 0.0
+	if flagged {
+		val = 1.0
+	}
+	m.channelUnackFlagged.WithLabelValues(channelID, channelType).Set(val)
+}
+
+// SetChannelUnacknowledgedRate sets the unacknowledged delivery rate gauge for one channel.
+func (m *Metrics) SetChannelUnacknowledgedRate(channelID string, channelType string, rate float64) {
+	if m == nil {
+		return
+	}
+	m.channelUnackRate.WithLabelValues(channelID, channelType).Set(rate)
 }
 
 // statusRecorder captures the status code a handler wrote, for the HTTP
@@ -252,15 +797,114 @@ func (m *Metrics) Middleware(next http.Handler) http.Handler {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
 		route := r.URL.Path
-		if p := RoutePattern(r); p != "" {
-			route = p
+		if RoutePattern != nil {
+			if p := RoutePattern(r); p != "" {
+				route = p
+			}
 		}
 		m.httpDuration.WithLabelValues(route, r.Method, strconv.Itoa(rec.status)).
 			Observe(time.Since(start).Seconds())
+		if rec.status == http.StatusNotModified {
+			m.RecordNotModified(route)
+		}
 	})
+}
+
+// RecordNotModified increments the sorobeacon_http_not_modified_total counter for route.
+func (m *Metrics) RecordNotModified(route string) {
+	if m == nil || m.httpNotModifiedTotal == nil {
+		return
+	}
+	if route == "" {
+		route = "unknown"
+	}
+	m.httpNotModifiedTotal.WithLabelValues(route).Inc()
 }
 
 // RoutePattern extracts the matched route pattern from the request
 // context. Implemented via the RoutePatternProvider interface so this
 // package does not import chi; the wire-up lives in cmd/sorobeacon.
 var RoutePattern func(*http.Request) string
+
+// RecordBodyRejection increments the counter for a rejected request body or field limit.
+func (m *Metrics) RecordBodyRejection(limit string) {
+	if m == nil || m.requestBodyRejectionsTotal == nil {
+		return
+	}
+	m.requestBodyRejectionsTotal.WithLabelValues(limit).Inc()
+}
+
+// SetDatabaseDegraded updates the gauge indicating whether the service is in degraded mode.
+func (m *Metrics) SetDatabaseDegraded(degraded bool) {
+	if m == nil || m.databaseDegraded == nil {
+		return
+	}
+	if degraded {
+		m.databaseDegraded.Set(1)
+	} else {
+		m.databaseDegraded.Set(0)
+	}
+}
+
+// RecordDatabaseUnavailable increments the count of database unavailable events.
+func (m *Metrics) RecordDatabaseUnavailable() {
+	if m == nil || m.databaseUnavailableTotal == nil {
+		return
+	}
+	m.databaseUnavailableTotal.Inc()
+}
+
+// ExportedMetricNames returns the canonical list of base Prometheus metric
+// names exported by SoroBeacon. Histogram metrics also emit _bucket, _sum,
+// and _count suffixes when scraped.
+func ExportedMetricNames() []string {
+	return []string{
+		"sorobeacon_polls_total",
+		"sorobeacon_poll_duration_seconds",
+		"sorobeacon_poll_lag_ledgers",
+		"sorobeacon_upstream_lag_ledgers",
+		"sorobeacon_upstream_consecutive_failures",
+		"sorobeacon_poll_priority_contracts",
+		"sorobeacon_poll_lag_ledgers_by_priority",
+		"sorobeacon_reorgs_total",
+		"sorobeacon_last_reorg_ledger",
+		"sorobeacon_events_scanned_total",
+		"sorobeacon_events_matched_total",
+		"sorobeacon_rule_evaluations_total",
+		"sorobeacon_rule_evals_total",
+		"sorobeacon_rule_matches_total",
+		"sorobeacon_rule_errors_total",
+		"sorobeacon_rule_duration_seconds",
+		"sorobeacon_alerts_fired_total",
+		"sorobeacon_alert_deliveries_total",
+		"sorobeacon_alert_throttles_total",
+		"sorobeacon_delivery_budget_exhausted_total",
+		"sorobeacon_channel_breaker_state",
+		"sorobeacon_http_request_duration_seconds",
+		"sorobeacon_seconds_since_last_poll",
+		"sorobeacon_poll_panics_total",
+		"sorobeacon_store_reads_total",
+		"sorobeacon_store_replica_fallbacks_total",
+		"sorobeacon_store_replica_enabled",
+		"sorobeacon_store_replica_lag_seconds",
+		"sorobeacon_dead_letters_total",
+		"sorobeacon_dead_letters",
+		"sorobeacon_alerts_stream_dropped_total",
+		"sorobeacon_request_body_rejections_total",
+		"sorobeacon_database_degraded",
+		"sorobeacon_database_unavailable_total",
+		"sorobeacon_channel_unacknowledged_flagged",
+		"sorobeacon_channel_unacknowledged_delivery_rate",
+		"sorobeacon_workspace_alerts_raised_total",
+		"sorobeacon_workspace_rule_evaluations_total",
+		"sorobeacon_workspace_notifications_total",
+		"sorobeacon_workspace_api_requests_total",
+		"sorobeacon_workspace_stored_rows",
+		"sorobeacon_alert_partition_runway_months",
+		"sorobeacon_alert_partition_errors_total",
+		"sorobeacon_alert_partitions_created_total",
+		"sorobeacon_alert_partitions_dropped_total",
+		"sorobeacon_alert_pruner_deleted_total",
+		"sorobeacon_workspace_retention_seconds",
+	}
+}

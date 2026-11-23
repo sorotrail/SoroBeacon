@@ -1,0 +1,53 @@
+{{define "content"}}
+<h1>Maintenance windows</h1>
+<p class="muted">An alert raised inside a window is still recorded and visible on the
+alerts page — it is marked suppressed and not delivered, so detection keeps
+running while people are spared the noise.</p>
+
+{{if .Windows}}
+<table>
+  <tr><th>Status</th><th>Scope</th><th>Reason</th><th>Starts</th><th>Ends</th><th></th></tr>
+  {{range .Windows}}
+  <tr>
+    <td>{{if .Active}}<span class="pill off">active</span>{{else}}<span class="pill">upcoming</span>{{end}}</td>
+    <td>
+      {{.Scope}}{{if .MonitorID}} · monitor #{{.MonitorID}}{{end}}{{if .ContractID}} · <code>{{.ContractID}}</code>{{end}}
+    </td>
+    <td>{{.Reason}}</td>
+    <td>{{formatTime .StartAt $.Timezone}}</td>
+    <td>{{formatTime .EndAt $.Timezone}}</td>
+    <td>
+      <form class="inline" method="post" action="/maintenance/{{.ID}}/delete"
+            onsubmit="return confirm('Delete this maintenance window?')"><button>Delete</button></form>
+    </td>
+  </tr>
+  {{end}}
+</table>
+{{else}}<p class="muted">No active or upcoming windows.</p>{{end}}
+
+<fieldset>
+  <legend>New window</legend>
+  <form method="post" action="/maintenance">
+    <label for="reason">Reason</label>
+    <input type="text" id="reason" name="reason" required placeholder="planned upgrade">
+    <label for="scope">Scope</label>
+    <select id="scope" name="scope">
+      <option value="global">global (every monitor)</option>
+      <option value="monitor">monitor</option>
+      <option value="contract">contract</option>
+    </select>
+    <label for="monitor_id">Monitor (monitor scope only)</label>
+    <select id="monitor_id" name="monitor_id">
+      <option value="">—</option>
+      {{range .Monitors}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
+    </select>
+    <label for="contract_id">Contract ID (contract scope only)</label>
+    <input type="text" id="contract_id" name="contract_id" placeholder="C...">
+    <label for="start_at">Starts (UTC)</label>
+    <input type="text" id="start_at" name="start_at" required placeholder="2026-09-23T22:00">
+    <label for="end_at">Ends (UTC — required; an open-ended window is rejected)</label>
+    <input type="text" id="end_at" name="end_at" required placeholder="2026-09-24T02:00">
+    <p><button>Create</button></p>
+  </form>
+</fieldset>
+{{end}}

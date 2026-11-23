@@ -1,6 +1,7 @@
 package web
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -83,10 +84,16 @@ func (s *Server) deleteSearch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) setDefaultSearch(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil {
-		http.NotFound(w, r)
+		// A non-numeric path segment is a bad request, not a missing search:
+		// the URL is malformed before the store is ever consulted.
+		http.Error(w, "invalid search id", http.StatusBadRequest)
 		return
 	}
 	if err := s.store.SetDefaultSearch(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
 		s.fail(w, err)
 		return
 	}
@@ -96,10 +103,14 @@ func (s *Server) setDefaultSearch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) clearDefaultSearch(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil {
-		http.NotFound(w, r)
+		http.Error(w, "invalid search id", http.StatusBadRequest)
 		return
 	}
 	if err := s.store.ClearDefaultSearch(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
 		s.fail(w, err)
 		return
 	}

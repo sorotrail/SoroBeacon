@@ -4,21 +4,40 @@ package poller
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
+	"math/rand"
+	"sort"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/sorotrail/sorobeacon/internal/alerts"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/metrics"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/rules"
 	"github.com/sorotrail/sorobeacon/internal/stellar"
 	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/telemetry"
+	"github.com/sorotrail/sorobeacon/internal/usage"
 )
 
 // Position is a race-free snapshot of how far the poller has got relative
 // to the chain. A zero LastSuccessfulPoll means no successful poll has
 // completed yet — callers must not treat the ledger fields as "in sync".
 type Position struct {
+	// Network is the chain this snapshot describes, "" for an instance that
+	// was never scoped to one. Lag is only comparable within one network:
+	// each chain produces ledgers on its own schedule, so a public-network
+	// lag of 5 and a futurenet lag of 40 are different amounts of lateness.
+	Network             string
 	LastProcessedLedger uint32
 	LatestChainLedger   uint32
 	LastSuccessfulPoll  time.Time
@@ -34,18 +53,33 @@ func (p Position) Lag() int64 {
 }
 
 // Store is the slice of the store the poller needs.
+//
+// The ingest and reorg-window methods take this poller's network. Each chain
+// keeps its own cursor and its own ledger-hash window, so two pollers running
+// concurrently cannot rewind each other, and a reorg on one chain cannot
+// retract the other chain's alerts.
 type Store interface {
 	ListMonitors(ctx context.Context, enabledOnly bool) ([]store.Monitor, error)
 	ListRules(ctx context.Context, monitorID int64, enabledOnly bool) ([]store.Rule, error)
 	CreateAlert(ctx context.Context, a *store.Alert) (store.AlertOutcome, error)
-	GetIngestState(ctx context.Context) (store.IngestState, error)
-	SetIngestState(ctx context.Context, s store.IngestState) error
+	GroupAlerts(ctx context.Context, key string, windowStart time.Time) (shouldDeliver bool, currentCount int64, err error)
+	CreateAlertGroup(ctx context.Context, key string, windowStart time.Time) (int64, error)
+	GetIngestState(ctx context.Context, network string) (store.IngestState, error)
+	SetIngestState(ctx context.Context, network string, s store.IngestState) error
+	ListContractCursors(ctx context.Context, network string) ([]store.ContractCursor, error)
+	InitializeContractCursor(ctx context.Context, network, contractID string, lastLedger uint32) error
+	AdvanceContractCursor(ctx context.Context, network, contractID string, lastLedger uint32) error
+	RewindContractCursors(ctx context.Context, network string, lastLedger uint32) error
+	// The absence-of-event rules need a clock that outlives the process: see
+	// SweepAbsence.
+	ListAbsenceState(ctx context.Context) ([]store.AbsenceState, error)
+	RecordAbsenceSeen(ctx context.Context, ruleID int64, eventName string, at time.Time) error
 	// The ledger-hash window backing reorg detection, and the retraction
 	// write that marks alerts orphaned by a reorg.
-	RecordLedgerHashes(ctx context.Context, hashes []store.LedgerHash) error
-	LedgerHashes(ctx context.Context, from, to uint32) ([]store.LedgerHash, error)
-	PruneLedgerHashes(ctx context.Context, before uint32) error
-	RetractAlertsFromLedger(ctx context.Context, ledger uint32, at time.Time) (int64, error)
+	RecordLedgerHashes(ctx context.Context, network string, hashes []store.LedgerHash) error
+	LedgerHashes(ctx context.Context, network string, from, to uint32) ([]store.LedgerHash, error)
+	PruneLedgerHashes(ctx context.Context, network string, before uint32) error
+	RetractAlertsFromLedger(ctx context.Context, network string, ledger uint32, at time.Time) (int64, error)
 }
 
 // Dispatcher receives every newly created alert. Implemented by
@@ -54,22 +88,57 @@ type Dispatcher interface {
 	Dispatch(ctx context.Context, a notify.Alert)
 }
 
+// RetentionGapRecorder is implemented by stores that persist retention gaps
+// (store.RetentionGaps). It is asserted rather than a method on Store so a
+// store that predates the feature — or a test fake with nothing to record —
+// keeps compiling; both real backends implement it, which is what makes a
+// detected gap survive a restart instead of living only in a log line.
+type RetentionGapRecorder interface {
+	RecordRetentionGap(ctx context.Context, network string, fromLedger, toLedger uint32, detectedAt time.Time) error
+}
+
 // Poller runs the ingest loop: getEvents from the last checkpoint, decode,
 // match rules, create + dispatch alerts, advance the checkpoint.
 type Poller struct {
 	source   EventSource
 	store    Store
 	registry *rules.Registry
-	interval time.Duration
+	// interval is how long the loop waits between cycles, stored as atomic
+	// nanoseconds rather than a plain Duration. A SIGHUP configuration
+	// reload changes POLL_INTERVAL while Run is sleeping, so the loop's
+	// reads and a reload's write must not race; Interval and SetInterval
+	// are the only accessors.
+	interval atomic.Int64
 	log      *slog.Logger
+	// network is the chain this poller reads, and the key its ingest row,
+	// ledger hashes and metrics are written under. Empty is the legacy
+	// single-network mode every pre-NETWORKS deployment still runs in.
+	network string
+	// dispatch receives every newly created alert.
+	dispatch Dispatcher
 	// ing evaluates events and records alerts; shared with the backfill job
 	// so a historical replay and live ingestion match identically.
 	ing *Ingestor
+	// live is the in-process fan-out that serves the SSE endpoint. When set,
+	// every created alert is published the moment it is persisted, so a
+	// connected dashboard sees it without a database round-trip.
+	live *broadcast.Broadcaster
 	// metrics is optional instrumentation; nil-safe, see internal/metrics.
 	metrics *metrics.Metrics
-	// scanned/matched accumulate per-cycle counts for metrics.
-	scanned int
-	matched int
+	// now is the clock the absence rules are measured against, both when an
+	// event re-arms one and when the sweep checks for silence. It is a field
+	// rather than a direct time.Now() call so a test can step time instead of
+	// sleeping through a real window; production leaves it at New's default.
+	now func() time.Time
+	// telemetry is optional tracing; nil-safe like metrics. When set, every
+	// poll cycle becomes one trace: fetch, decode, rule evaluation, the
+	// alert write and each channel delivery hang off the same root span.
+	telemetry *telemetry.Provider
+	// scanned/matched/evaluations accumulate per-cycle counts for metrics.
+	// They are only touched from the single Run goroutine.
+	scanned     int
+	matched     int
+	evaluations int
 	// pos is the last successful poll snapshot, stored as Position.
 	// atomic.Value so HTTP handlers can read it without a mutex.
 	pos atomic.Value
@@ -83,6 +152,17 @@ type Poller struct {
 	// confirmDepth is how many ledgers behind the tip an event must be before
 	// it may alert. Zero alerts immediately, which is the historical default.
 	confirmDepth uint32
+	// knownNetworks, set only on the supervisor's reporting unit, is every
+	// network this instance polls. Non-nil enables the one-shot warning about
+	// monitors on a chain no unit polls.
+	knownNetworks []string
+	// warnedOrphans latches that warning so it cannot repeat.
+	warnedOrphans bool
+	// slowRuleThreshold is the duration after which a rule evaluation is
+	// considered slow and logged. Zero disables slow rule logging.
+	slowRuleThreshold   time.Duration
+	workspaceEvalBudget time.Duration
+	usageMeter          *usage.Meter
 }
 
 // Position returns the last successful poll snapshot. Safe to call from
@@ -95,8 +175,24 @@ func (p *Poller) Position() Position {
 	return Position{}
 }
 
+// Interval returns the configured poll interval. Safe to call from another goroutine.
+func (p *Poller) Interval() time.Duration {
+	return time.Duration(p.interval.Load())
+}
+
+// SetInterval changes the wait between poll cycles on a running poller. It
+// is how a SIGHUP configuration reload applies a new POLL_INTERVAL without a
+// restart — and therefore without dropping the checkpoint the loop would
+// otherwise have to rebuild. Run re-reads the interval after every cycle, so
+// the new value takes effect on the next tick: not mid-wait, and not
+// retroactively in a backoff already under way.
+func (p *Poller) SetInterval(d time.Duration) {
+	p.interval.Store(int64(d))
+}
+
 func (p *Poller) recordPosition(processed, latest uint32, at time.Time) {
 	p.pos.Store(Position{
+		Network:             p.network,
 		LastProcessedLedger: processed,
 		LatestChainLedger:   latest,
 		LastSuccessfulPoll:  at.UTC(),
@@ -112,23 +208,96 @@ func (p *Poller) recordBackoff(backingOff bool) {
 // New wires a Poller. src is where events come from: NewRPCSource for a
 // Stellar RPC node, or the SoroTrail source for upstream mode.
 func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval time.Duration, log *slog.Logger) *Poller {
-	return &Poller{
-		source:   src,
-		store:    st,
-		registry: reg,
-		interval: interval,
-		log:      log,
-		ing:      NewIngestor(st, reg, d, log),
-		sched:    NewScheduler(),
+	p := &Poller{
+		source:              src,
+		store:               st,
+		registry:            reg,
+		log:                 log,
+		now:                 time.Now,
+		dispatch:            d,
+		ing:                 NewIngestor(st, reg, d, log),
+		sched:               NewScheduler(),
+		workspaceEvalBudget: rules.DefaultWorkspaceEvalBudget,
 	}
+	// Written through the same atomic SetInterval uses, so construction and
+	// a later reload can never disagree about which value is live.
+	p.interval.Store(int64(interval))
+	p.bindRegistryHooks()
+	return p
 }
 
-// WithMetrics attaches Prometheus instrumentation to the poll loop.
+// WithMetrics attaches Prometheus instrumentation to the poll loop, labelled
+// with this poller's network when one was set first.
 func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
 	p.metrics = m
 	p.ing = p.ing.WithMetrics(m)
 	return p
 }
+
+// WithUsageMeter attaches per-workspace usage metering to the poller and its
+// shared Ingestor.
+func (p *Poller) WithUsageMeter(um *usage.Meter) *Poller {
+	p.usageMeter = um
+	p.ing = p.ing.WithUsageMeter(um)
+	return p
+}
+
+// WithPublisher attaches the live fan-out that serves the SSE endpoint. The
+// same Broadcaster is handed to internal/api: the shared Ingestor publishes
+// into it as alerts are created and /alerts/stream reads out of it, so no
+// database round-trip is needed to see an alert appear on a connected
+// dashboard.
+func (p *Poller) WithPublisher(b *broadcast.Broadcaster) *Poller {
+	p.live = b
+	return p
+}
+
+// WithEnricher attaches an alert enricher to the poller's ingest pipeline,
+// used to fetch operator-supplied context for each created alert.
+func (p *Poller) WithEnricher(e *alerts.Enricher) *Poller {
+	p.ing.WithEnricher(e)
+	return p
+}
+
+// WithTelemetry attaches tracing to the ingest pipeline. The provider's
+// own disabled state decides whether anything is exported; a nil provider
+// means no spans at all.
+func (p *Poller) WithTelemetry(t *telemetry.Provider) *Poller {
+	p.telemetry = t
+	return p
+}
+
+// WithNetwork restricts a Poller to one Stellar network: it watches only that
+// network's monitors, advances only that network's checkpoint, and retracts
+// only that network's alerts on a reorg. Not calling it leaves the poller in
+// the pre-multi-network mode — every monitor, the single legacy ingest row —
+// which is what an instance that configures one network through the legacy
+// fields still gets.
+func (p *Poller) WithNetwork(network string) *Poller {
+	p.network = network
+	// Every line this poller emits is about one chain, so an operator reading
+	// a two-network log can tell them apart. Metrics are labelled the same
+	// way, whichever of the two With-methods runs first.
+	if p.log != nil && network != "" {
+		p.log = p.log.With("network", network)
+	}
+	p.metrics = forNetwork(p.metrics, network)
+	return p
+}
+
+// forNetwork returns m labelled for network, or m unchanged when there is no
+// network to label with. metrics is nil-safe, so a nil m is expected here.
+func forNetwork(m *metrics.Metrics, network string) *metrics.Metrics {
+	if m == nil || network == "" {
+		return m
+	}
+	return m.WithNetwork(network)
+}
+
+// Network reports the network this poller ingests, "" for the legacy
+// all-networks mode. The supervisor and the health endpoint key their
+// per-network reporting on it.
+func (p *Poller) Network() string { return p.network }
 
 // WithReorg enables reorg detection over a window of `window` recent ledgers
 // and holds alerts until they are `depth` ledgers behind the tip. window 0
@@ -141,11 +310,77 @@ func (p *Poller) WithReorg(window, depth uint32) *Poller {
 	return p
 }
 
+// WithSlowRuleThreshold sets the duration after which a rule evaluation is
+// considered slow and logged at warn level. Zero disables slow rule logging.
+func (p *Poller) WithSlowRuleThreshold(d time.Duration) *Poller {
+	p.slowRuleThreshold = d
+	return p
+}
+
+// WithRuleTimeout configures the per-rule evaluation timeout (excluding
+// attributed database I/O). Zero disables the timeout.
+func (p *Poller) WithRuleTimeout(d time.Duration) *Poller {
+	if p.registry != nil {
+		p.registry.WithEvalTimeout(d)
+	}
+	return p
+}
+
+// WithRuleQuarantineThreshold configures how many consecutive rule-attributed
+// evaluation failures (timeouts, panics, or runtime errors) quarantine a rule.
+// Zero disables automatic quarantine.
+func (p *Poller) WithRuleQuarantineThreshold(threshold int) *Poller {
+	if p.registry != nil {
+		p.registry.WithQuarantineThreshold(threshold)
+	}
+	return p
+}
+
+// WithWorkspaceEvalBudget bounds how much total rule-evaluation time a single
+// workspace may consume on one event before its remaining rules are skipped
+// for that event. Zero disables the per-workspace budget.
+func (p *Poller) WithWorkspaceEvalBudget(d time.Duration) *Poller {
+	p.workspaceEvalBudget = d
+	if p.ing != nil {
+		p.ing.WithWorkspaceEvalBudget(d)
+	}
+	return p
+}
+
+// ReenableRule clears any quarantine and failure strikes for ruleID and resets
+// its stateful evaluator state so a fixed rule can resume evaluation cleanly.
+func (p *Poller) ReenableRule(ctx context.Context, ruleID int64) bool {
+	if p == nil || p.registry == nil {
+		return false
+	}
+	return p.registry.ReenableRule(ctx, ruleID)
+}
+
+// QuarantinedRules returns a snapshot of all currently quarantined rules.
+func (p *Poller) QuarantinedRules() []rules.RuleQuarantineState {
+	if p == nil || p.registry == nil {
+		return nil
+	}
+	return p.registry.QuarantinedRules()
+}
+
+func (p *Poller) bindRegistryHooks() {
+	if p == nil || p.registry == nil {
+		return
+	}
+	p.registry.WithQuarantineHook(func(ctx context.Context, state rules.RuleQuarantineState) {
+		handleQuarantineTransition(ctx, p.log, p.metrics, p.store, p.registry, state)
+	})
+	p.registry.WithEvalObserver(func(_ context.Context, obs rules.EvalObservation) {
+		handleEvalObservation(p.log, p.metrics, p.slowRuleThreshold, obs)
+	})
+}
+
 // Run polls until ctx is cancelled. RPC errors back off exponentially
 // (capped at 10x the poll interval) instead of hammering the node.
 func (p *Poller) Run(ctx context.Context) {
-	p.log.Info("poller started", "interval", p.interval)
-	delay := p.interval
+	p.log.Info("poller started", "interval", p.Interval())
+	delay := p.Interval()
 	for {
 		select {
 		case <-ctx.Done():
@@ -154,31 +389,116 @@ func (p *Poller) Run(ctx context.Context) {
 		case <-time.After(delay):
 		}
 
-		p.scanned, p.matched = 0, 0
+		p.scanned, p.matched, p.evaluations = 0, 0, 0
 		start := time.Now()
 		err := p.Poll(ctx)
-		p.metrics.RecordPoll(err == nil, time.Since(start))
-		p.metrics.RecordEvents(p.scanned, p.matched)
+		p.recordCycle(err == nil, time.Since(start))
 		if err != nil {
 			if ctx.Err() != nil {
 				continue
 			}
-			delay = min(delay*2, 10*p.interval)
+			baseDelay := min(delay*2, 10*p.Interval())
+			delay = baseDelay
+			if half := baseDelay / 2; half > 0 {
+				delay = half + time.Duration(rand.Int63n(int64(half))) // #nosec G404 -- retry backoff jitter is not security-sensitive; credentials use crypto/rand
+			}
 			p.recordBackoff(true)
 			p.log.Error("poll failed", "err", err, "retry_in", delay)
 			continue
 		}
-		delay = p.interval
+		delay = p.Interval()
 		p.recordBackoff(false)
+
+		// The absence sweep rides the same tick, but only after a cycle that
+		// actually succeeded: a failed cycle means "we could not look", not
+		// "nothing happened", and alerting on silence during an outage of the
+		// very thing we watch through would be a false alarm about the one
+		// situation we cannot currently observe.
+		if err := p.SweepAbsence(ctx, p.now()); err != nil {
+			p.log.Error("absence sweep failed", "err", err)
+		}
 	}
 }
 
-// Poll runs one ingest cycle. Exported so tests (and one-shot tools) can
-// drive the poller without the timing loop.
+// recordCycle publishes the counters a completed cycle accumulated. Split out
+// from Run so the instrumentation can be asserted without driving the timing
+// loop, which is the only thing Run adds over Poll.
+func (p *Poller) recordCycle(ok bool, took time.Duration) {
+	p.metrics.RecordPoll(ok, took)
+	p.metrics.RecordEvents(p.scanned, p.matched)
+	p.metrics.RecordRuleEvaluations(p.evaluations)
+	p.recordUpstreamMetrics()
+}
+
+// Poll runs one ingest cycle as a single trace. The root span
+// (poller.poll) covers the whole cycle; fetch, rule evaluation, the alert
+// write and — via the context the alert's span rides in — every channel
+// delivery hang underneath it, so one late alert is one timeline answering
+// which stage was slow. Exported so tests (and one-shot tools) can drive
+// the poller without the timing loop.
 func (p *Poller) Poll(ctx context.Context) error {
+	if degraded, ok := p.store.(store.DegradationReporter); ok && degraded.Degraded() {
+		return store.ErrUnavailable
+	}
+
+	if p.telemetry != nil {
+		var span trace.Span
+		ctx, span = p.telemetry.WithRequestID(ctx, "poller.poll")
+		defer func() {
+			telemetry.SetAttrs(span,
+				telemetry.AttrEventsScanned, p.scanned,
+				telemetry.AttrEventsMatched, p.matched,
+			)
+			span.End()
+		}()
+	}
+
 	monitors, err := p.store.ListMonitors(ctx, true)
 	if err != nil {
 		return err
+	}
+	// One poller per network, so every other network's monitors are not just
+	// uninteresting here, they are wrong: the same contract id on two chains
+	// names two different things. The filter happens after the read rather
+	// than in it because ListMonitors is the shared, unfiltered listing the
+	// rest of the ingest path uses; a monitor whose network is still empty
+	// belongs to no chain yet, so no named poller claims it — startup's
+	// AssignLegacyNetwork is what labels those rows.
+	if p.network != "" {
+		own := make([]store.Monitor, 0, len(monitors))
+		var orphans []string
+		polled := make(map[string]bool, len(p.knownNetworks))
+		for _, n := range p.knownNetworks {
+			polled[n] = true
+		}
+		for _, m := range monitors {
+			if m.Network == p.network {
+				own = append(own, m)
+				continue
+			}
+			// knownNetworks is non-nil only on the supervisor's reporting
+			// unit, so this neither runs per poller nor cries wolf about a
+			// chain a sibling unit does poll. A monitor outside that set is
+			// watched by nobody and will never alert.
+			if p.knownNetworks != nil && !polled[m.Network] {
+				label := m.Network
+				if label == "" {
+					// Rows startup's AssignLegacyNetwork missed: no chain at
+					// all, which is the more common half of this mistake.
+					label = "<none>"
+				}
+				orphans = append(orphans, fmt.Sprintf("%d=%s", m.ID, label))
+			}
+		}
+		if len(orphans) > 0 && !p.warnedOrphans {
+			// Warn once per process: the set rarely changes, and a line every
+			// cycle would bury everything else the poller reports.
+			p.warnedOrphans = true
+			p.log.Warn("monitors belong to no polled network",
+				"monitors", strings.Join(orphans, ","),
+				"polling", strings.Join(p.knownNetworks, ","))
+		}
+		monitors = own
 	}
 
 	// Map each contract to the monitors watching it; dedupe contracts. Along
@@ -253,21 +573,21 @@ func (p *Poller) Poll(ctx context.Context) error {
 		p.metrics.SetPriorityContracts(string(pr), tierCounts[pr])
 	}
 
-	state, err := p.store.GetIngestState(ctx)
+	state, err := p.store.GetIngestState(ctx, p.network)
 	if err != nil {
 		return err
 	}
-	startLedger := state.LastLedger + 1
-	if state.LastLedger == 0 {
-		// Cold start against an RPC source: the node only retains ~1-7
-		// days of events, so begin at the current tip. Upstream sources
-		// (SoroTrail) hold durable history and answer the same query.
+	coldStart := state.LastLedger == 0
+	coldStartLedger := uint32(0)
+	if coldStart {
+		// Cold start against an RPC source begins at the node's tip, preserving
+		// the existing behavior for contracts that have no global checkpoint.
 		latest, err := p.source.LatestLedger(ctx)
 		if err != nil {
 			return err
 		}
-		startLedger = latest
-		p.log.Info("cold start", "start_ledger", startLedger)
+		coldStartLedger = latest
+		p.log.Info("cold start", "start_ledger", latest)
 	}
 
 	// Detect a reorganisation before ingesting, so alerts derived from the
@@ -276,15 +596,77 @@ func (p *Poller) Poll(ctx context.Context) error {
 	// new chain is re-read even though the old one had advanced past it.
 	if divergence, err := p.detectReorg(ctx); err != nil {
 		p.log.Warn("reorg check failed", "err", err)
-	} else if divergence != 0 && divergence-1 < state.LastLedger {
-		state.LastLedger = divergence - 1
-		state.LastCursor = ""
-		if err := p.store.SetIngestState(ctx, state); err != nil {
+	} else if divergence != 0 {
+		if divergence-1 < state.LastLedger {
+			state.LastLedger = divergence - 1
+			state.LastCursor = ""
+			if err := p.store.SetIngestState(ctx, p.network, state); err != nil {
+				return err
+			}
+			p.log.Warn("rewinding checkpoint after reorg", "start_ledger", state.LastLedger+1)
+		}
+		if err := p.store.RewindContractCursors(ctx, p.network, divergence-1); err != nil {
 			return err
 		}
-		startLedger = state.LastLedger + 1
-		p.log.Warn("rewinding checkpoint after reorg", "start_ledger", startLedger)
 	}
+
+	// A checkpoint older than the source's retention window can never be
+	// read: getEvents errors, or silently returns from oldestLedger, and
+	// the events in between are unrecoverably gone either way. Jumping to
+	// the oldest retained ledger turns an erroring loop into a resume, and
+	// recording the hole turns silent data loss into a visible one. A
+	// resume inside the window records nothing and changes nothing.
+	oldestRetained, retentionErr := p.checkRetention(ctx, &state)
+	if retentionErr != nil {
+		// Not being able to ask is not a reason to fail the cycle: the
+		// fetch below surfaces a real outage on its own, and a source
+		// that cannot answer has nothing to clamp to.
+		p.log.Warn("retention check failed", "err", retentionErr)
+	}
+
+	storedCursors, err := p.store.ListContractCursors(ctx, p.network)
+	if err != nil {
+		return err
+	}
+	cursorByContract := make(map[string]uint32, len(storedCursors))
+	for _, cursor := range storedCursors {
+		cursorByContract[cursor.ContractID] = cursor.LastLedger
+	}
+	contractsByStart := make(map[uint32][]string)
+	contractSetByStart := make(map[uint32]map[string]bool)
+	watchByStart := make(map[uint32][]Watch)
+	starts := make([]uint32, 0)
+	for _, w := range watch {
+		lastLedger, exists := cursorByContract[w.ContractID]
+		if !exists {
+			lastLedger = state.LastLedger
+			if coldStart && state.LastLedger == 0 && coldStartLedger > 0 {
+				lastLedger = coldStartLedger - 1
+			}
+			if err := p.store.InitializeContractCursor(ctx, p.network, w.ContractID, lastLedger); err != nil {
+				return err
+			}
+		}
+		// A contract cursor that fell behind retention would start this
+		// cycle at ledgers the source has forgotten, exactly like the
+		// checkpoint checkRetention clamped above. AdvanceContractCursor
+		// ignores stale writes, so an already-current cursor is untouched.
+		if oldestRetained > 1 && lastLedger+1 < oldestRetained {
+			lastLedger = oldestRetained - 1
+			if err := p.store.AdvanceContractCursor(ctx, p.network, w.ContractID, lastLedger); err != nil {
+				return err
+			}
+		}
+		contractStart := lastLedger + 1
+		if _, ok := contractSetByStart[contractStart]; !ok {
+			contractSetByStart[contractStart] = make(map[string]bool)
+			starts = append(starts, contractStart)
+		}
+		contractSetByStart[contractStart][w.ContractID] = true
+		contractsByStart[contractStart] = append(contractsByStart[contractStart], w.ContractID)
+		watchByStart[contractStart] = append(watchByStart[contractStart], w)
+	}
+	sort.Slice(starts, func(i, j int) bool { return starts[i] < starts[j] })
 
 	// Confirmation depth: hold events until they are `confirmDepth` ledgers
 	// behind the tip. Unconfirmed events are simply not evaluated now; the
@@ -301,47 +683,123 @@ func (p *Poller) Poll(ctx context.Context) error {
 		}
 	}
 
-	// Page the source until it reports no more events for the cycle. The
-	// cursor is opaque; batching (the RPC caps filters per request) is the
-	// source's concern, encoded in its cursors.
+	// Page each compatible start position independently. The source still
+	// batches contracts that share a boundary, while one stalled contract
+	// cannot hold another contract's durable cursor back.
 	checkpoint := uint32(0) // min latestLedger across pages
 	tip := uint32(0)        // max latestLedger across pages
 	// tierLedger records the highest ledger at which an event was seen for
 	// each tier, so per-tier lag reflects how stale the newest data that tier
 	// has produced is. A tier with no events falls back to the checkpoint.
 	tierLedger := map[store.Priority]uint32{}
-	cursor := ""
-	for {
-		page, err := p.source.FetchEvents(ctx, startLedger, watch, cursor, stellar.DefaultEventsLimit)
-		if err != nil {
-			return err
+	for _, groupStart := range starts {
+		groupCheckpoint := uint32(0)
+		failedLedger := make(map[string]uint32)
+		cursor := ""
+		if len(starts) == 1 && state.LastCursor != "" {
+			cursor = state.LastCursor
 		}
-		if page.LatestLedger > 0 && (checkpoint == 0 || page.LatestLedger < checkpoint) {
-			checkpoint = page.LatestLedger
-		}
-		if page.LatestLedger > tip {
-			tip = page.LatestLedger
-		}
-		p.scanned += len(page.Events)
-		for _, ev := range page.Events {
-			if confirmActive && ev.Ledger > confirmedThrough {
-				continue // not yet buried deep enough; re-read once it is
+		reanchoredCursor := false
+		for {
+			fetchCtx := ctx
+			fetchSpan := telemetry.NoopSpan()
+			if p.telemetry != nil {
+				fetchCtx, fetchSpan = p.telemetry.WithRequestID(ctx, "poller.fetch_events",
+					trace.WithAttributes(
+						attribute.Int(telemetry.AttrStartLedger, int(groupStart)),
+						attribute.Int(telemetry.AttrContractsWatched, len(watchByStart[groupStart])),
+					),
+				)
 			}
-			if pr, ok := prioByContract[ev.ContractID]; ok && ev.Ledger > tierLedger[pr] {
-				tierLedger[pr] = ev.Ledger
+			page, err := p.source.FetchEvents(fetchCtx, groupStart, watchByStart[groupStart], cursor, stellar.DefaultEventsLimit)
+			if err != nil {
+				telemetry.RecordError(fetchSpan, err)
+				fetchSpan.End()
+				if cursor != "" && !reanchoredCursor && errors.Is(err, ErrInvalidCursor) {
+					reanchoredCursor = true
+					p.log.Warn("upstream rejected cursor; re-anchoring from checkpoint",
+						"cursor", cursor, "start_ledger", groupStart, "err", err)
+					cursor = ""
+					if state.LastCursor != "" {
+						state.LastCursor = ""
+						_ = p.store.SetIngestState(ctx, p.network, state)
+					}
+					continue
+				}
+				p.recordUpstreamMetrics()
+				return err
 			}
-			p.handleEvent(ctx, ev, byContract)
+			fetchSpan.End()
+
+			if err := p.reconcileUpstreamRetractions(ctx, &state, monitors); err != nil {
+				p.log.Warn("upstream retraction reconciliation failed", "err", err)
+			}
+
+			if page.LatestLedger > 0 && (groupCheckpoint == 0 || page.LatestLedger < groupCheckpoint) {
+				groupCheckpoint = page.LatestLedger
+			}
+			if page.NextCursor == "" && page.LatestLedger > groupCheckpoint {
+				if _, isUpstream := p.source.(UpstreamStatusSource); isUpstream {
+					groupCheckpoint = page.LatestLedger
+				}
+			}
+			if page.LatestLedger > 0 && (checkpoint == 0 || page.LatestLedger < checkpoint) {
+				checkpoint = page.LatestLedger
+			}
+			if page.NextCursor == "" && len(starts) == 1 && groupCheckpoint > checkpoint {
+				checkpoint = groupCheckpoint
+			}
+			if page.LatestLedger > tip {
+				tip = page.LatestLedger
+			}
+			p.scanned += len(page.Events)
+			for _, ev := range page.Events {
+				if !contractSetByStart[groupStart][ev.ContractID] || (confirmActive && ev.Ledger > confirmedThrough) {
+					continue
+				}
+				if pr, ok := prioByContract[ev.ContractID]; ok && ev.Ledger > tierLedger[pr] {
+					tierLedger[pr] = ev.Ledger
+				}
+				if !p.handleEvent(ctx, ev, byContract) {
+					if prior, ok := failedLedger[ev.ContractID]; !ok || ev.Ledger < prior {
+						failedLedger[ev.ContractID] = ev.Ledger
+					}
+				}
+			}
+			if page.NextCursor == "" {
+				break
+			}
+			cursor = page.NextCursor
 		}
-		if page.NextCursor == "" {
-			break
+
+		if confirmActive && groupCheckpoint > confirmedThrough {
+			groupCheckpoint = confirmedThrough
 		}
-		cursor = page.NextCursor
+		for _, contractID := range contractsByStart[groupStart] {
+			processed := groupCheckpoint
+			if processed == 0 {
+				continue
+			}
+			if failed, ok := failedLedger[contractID]; ok && failed <= processed {
+				processed = failed - 1
+				p.log.Warn("holding contract cursor before failed event",
+					"contract_id", contractID, "ledger", failed)
+			}
+			if err := p.store.AdvanceContractCursor(ctx, p.network, contractID, processed); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Lag: how far the checkpoint we reached trails the node's own tip.
 	// Grows when a batch's page-through takes longer than ledger cadence.
 	if confirmActive && checkpoint > confirmedThrough {
 		checkpoint = confirmedThrough
+	}
+	chainHead := p.recordUpstreamMetrics()
+	chainTip := tip
+	if chainHead > chainTip {
+		chainTip = chainHead
 	}
 	p.metrics.SetPollLag(int64(tip) - int64(checkpoint))
 	for _, pr := range prioritiesInServiceOrder {
@@ -357,7 +815,7 @@ func (p *Poller) Poll(ctx context.Context) error {
 	if checkpoint > state.LastLedger {
 		state.LastLedger = checkpoint
 		state.LastCursor = ""
-		if err := p.store.SetIngestState(ctx, state); err != nil {
+		if err := p.store.SetIngestState(ctx, p.network, state); err != nil {
 			return err
 		}
 	}
@@ -365,17 +823,502 @@ func (p *Poller) Poll(ctx context.Context) error {
 	if processed == 0 {
 		processed = state.LastLedger
 	}
-	p.recordPosition(processed, tip, time.Now())
+	p.recordPosition(processed, chainTip, time.Now())
 	return nil
 }
 
+// checkRetention compares the resume point against the oldest ledger the
+// source still serves and, when the checkpoint has fallen behind, records
+// the gap and advances state (persisting it) so the cycle that follows
+// starts at the oldest retained ledger. It returns that ledger — 0 when the
+// source does not report one, when the store has no checkpoint yet, or when
+// the checkpoint is inside the window — so the caller can clamp each
+// contract cursor to the same boundary.
+//
+// A resume inside the retention window records nothing and changes nothing:
+// the comparison is the whole feature. When a source cannot answer, or the
+// store cannot persist the record, the jump still happens if the numbers
+// are known — a visible warning beats an erroring loop either way.
+func (p *Poller) checkRetention(ctx context.Context, state *store.IngestState) (uint32, error) {
+	rep, ok := p.source.(RetentionReporter)
+	if !ok || state.LastLedger == 0 {
+		return 0, nil
+	}
+	oldest, err := rep.OldestLedger(ctx)
+	if err != nil {
+		return 0, err
+	}
+	// Oldest is the first retained ledger, so the first unreadable one is
+	// oldest-1; oldest < 2 means "unknown" or an unusable window, and there
+	// is nothing sensible to jump to.
+	if oldest < 2 || state.LastLedger+1 >= oldest {
+		return oldest, nil
+	}
+	from, to := state.LastLedger+1, oldest-1
+	p.log.Warn("checkpoint fell outside source retention; jumping to the oldest retained ledger",
+		"gap_from_ledger", from,
+		"gap_to_ledger", to,
+		"ledgers_missed", to-from+1)
+	rec, ok := p.store.(RetentionGapRecorder)
+	if !ok {
+		// The hole is real either way; say so loudly even where this store
+		// cannot keep the record.
+		p.log.Warn("store cannot persist retention gaps; this record lives only in the log")
+	} else if err := rec.RecordRetentionGap(ctx, p.network, from, to, p.now()); err != nil {
+		// Detection still proceeds: refusing to jump because the record
+		// failed would trade a visible gap for an erroring poller.
+		p.log.Error("record retention gap", "err", err)
+	}
+	state.LastLedger = to
+	state.LastCursor = ""
+	if err := p.store.SetIngestState(ctx, p.network, *state); err != nil {
+		return 0, err
+	}
+	return oldest, nil
+}
+
+// handleEvent runs every enabled rule of every monitor watching the
+// event's contract. Events arrive already decoded from the source;
+// per-event failures are logged, not fatal: one bad event must not stall
+// ingestion. Rule evaluation spans come from the registry, one per rule,
+// each a child of the cycle span, on the same trace as the fetch page that
+// produced the event.
 // handleEvent runs every enabled rule of every monitor watching the event's
 // contract. Events arrive already decoded from the source; the shared
 // Ingestor owns evaluation, alert persistence and dispatch.
-func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent, byContract map[string][]store.Monitor) {
+func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent, byContract map[string][]store.Monitor) bool {
 	monitors, watched := byContract[decoded.ContractID]
 	if !watched {
+		return true
+	}
+
+	orderedMonitors := orderMonitorsByWorkspaceFairness(monitors)
+	workspaceElapsed := make(map[string]time.Duration)
+	processed := true
+	for _, m := range orderedMonitors {
+		ruleList, err := p.listRulesForCycle(ctx, byContract, m.ID)
+		if err != nil {
+			p.log.Error("list rules", "monitor_id", m.ID, "err", err)
+			processed = false
+			continue
+		}
+		var evals int64
+		for _, rule := range ruleList {
+			// An absence rule is re-armed by a matching event and fired by
+			// the sweep; evaluating it here would be asking the wrong
+			// question (and, for a rule with no event to see, always "no").
+			if abs, ok := p.registry.Absence(rule.Type); ok {
+				if !p.observeAbsence(ctx, rule, abs, decoded) {
+					processed = false
+				}
+				continue
+			}
+			if p.workspaceEvalBudget > 0 && workspaceElapsed[m.WorkspaceID] >= p.workspaceEvalBudget {
+				p.metrics.RecordWorkspaceRuleBudgetExhausted(m.WorkspaceID)
+				if p.log != nil {
+					p.log.Warn("workspace rule evaluation budget exceeded; skipping rule for event",
+						"workspace_id", m.WorkspaceID,
+						"monitor_id", m.ID,
+						"rule_id", rule.ID,
+						"rule_type", rule.Type,
+						"event_id", decoded.ID,
+						"budget", p.workspaceEvalBudget,
+						"elapsed", workspaceElapsed[m.WorkspaceID],
+					)
+				}
+				continue
+			}
+			// The rule id rides in the context so a stateful evaluator (the
+			// frequency rule) can key its per-rule state.
+			p.evaluations++
+			evals++
+			ruleCtx := rules.WithRuleVersion(rules.WithRuleID(ctx, rule.ID), rule.Version)
+			start := time.Now()
+			matched, err := p.registry.Evaluate(ruleCtx, rule.Type, decoded, rule.Params)
+			duration := time.Since(start)
+			workspaceElapsed[m.WorkspaceID] += duration
+			if p.metrics != nil {
+				p.metrics.RecordRuleEval(rule.Type, matched, err, duration)
+			}
+			if err != nil {
+				if rules.IsRuleIsolatedFailure(err) {
+					logIsolatedRuleFailure(p.log, m, rule, decoded.ID, err)
+					continue
+				}
+				if p.log != nil {
+					p.log.Warn("rule evaluation failed due to storage error",
+						"rule_id", rule.ID, "monitor_id", m.ID, "event_id", decoded.ID, "err", err)
+				}
+				processed = false
+				continue
+			}
+			if matched {
+				p.matched++
+				p.metrics.RecordAlert()
+				// An evaluator may override the dedup key (the frequency rule
+				// stores every crossing in one episode under the window start).
+				eventID := decoded.ID
+				if id := p.registry.AlertEventID(ruleCtx, rule.Type, decoded, rule.Params); id != "" {
+					eventID = id
+				}
+				if !p.fireAlert(ctx, m, rule, decoded, eventID) {
+					processed = false
+				}
+			}
+		}
+		if evals > 0 {
+			p.recordWorkspaceRuleEvaluations(ctx, m.WorkspaceID, evals)
+		}
+	}
+	return processed
+}
+
+// fireAlert persists a deduped, cooldown-gated alert and hands it to the
+// dispatcher. The store owns both gates so they hold across poller instances
+// and restarts; this function only reports the outcome.
+//
+// The alert runs in its own span (poller.create_alert) under the poll
+// cycle; Dispatch is called with that span's context, so every delivery
+// span becomes a child of this alert's span — never a root. That parent
+// chain is what ties one alert's full path into one timeline, and the
+// poller test pins it.
+func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule, ev *stellar.DecodedEvent, eventID string) bool {
+	if p.telemetry != nil {
+		var span trace.Span
+		ctx, span = p.telemetry.WithRequestID(ctx, "poller.create_alert",
+			trace.WithAttributes(
+				attribute.Int64(telemetry.AttrMonitorID, m.ID),
+				attribute.Int64(telemetry.AttrRuleID, rule.ID),
+				attribute.String(telemetry.AttrEventID, eventID),
+			),
+		)
+		defer span.End()
+	}
+
+	body := map[string]any{
+		"contract_id":      ev.ContractID,
+		"event_name":       ev.EventName(),
+		"ledger":           ev.Ledger,
+		"ledger_closed_at": ev.LedgerClosedAt,
+		"tx_hash":          ev.TxHash,
+		"topics":           ev.Topics,
+		"value":            ev.Value,
+	}
+	// Named fields are only present when the contract's spec was available;
+	// without one the payload is byte-for-byte what it has always been.
+	if ev.Fields != nil {
+		body["fields"] = ev.Fields
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		p.log.Error("marshal alert payload", "event_id", ev.ID, "err", err)
+		return false
+	}
+
+	runbookURL, responseGuidance := store.ResolveAlertGuidance(&rule, &m, "", "")
+	payload = store.WithGuidance(payload, runbookURL, responseGuidance)
+
+	alert := &store.Alert{
+		MonitorID:        m.ID,
+		RuleID:           rule.ID,
+		EventID:          eventID,
+		Payload:          payload,
+		Ledger:           ev.Ledger,
+		LedgerClosedAt:   ev.LedgerClosedAt,
+		Cooldown:         ruleCooldown(rule),
+		Severity:         rule.Severity,
+		RuleVersion:      rule.Version,
+		RunbookURL:       runbookURL,
+		ResponseGuidance: responseGuidance,
+	}
+	outcome, err := p.store.CreateAlert(ctx, alert)
+	if err != nil {
+		p.log.Error("create alert", "rule_id", rule.ID, "event_id", ev.ID, "err", err)
+		return false
+	}
+	switch outcome {
+	case store.AlertDuplicate:
+		return true // dedup: this rule already fired for this event
+	case store.AlertSuppressed:
+		// Counted by the store; logged so an operator can see the rule is
+		// firing far more often than it is alerting.
+		p.log.Info("alert suppressed by cooldown",
+			"rule_id", rule.ID, "event_id", ev.ID, "cooldown", alert.Cooldown)
+		return true
+	}
+	p.recordWorkspaceAlertRaised(ctx, m.WorkspaceID)
+	logAttrs := []any{"alert_id", alert.ID, "monitor", m.Name, "rule_id", rule.ID, "event_id", ev.ID}
+	if alert.SuppressedSinceLast > 0 {
+		logAttrs = append(logAttrs, "suppressed_since_last", alert.SuppressedSinceLast)
+	}
+	p.log.Info("alert created", logAttrs...)
+
+	// Publish before dispatching: a live dashboard should see the alert the
+	// moment it exists, not after the (possibly retried) channel fan-out.
+	// Only created alerts reach here — duplicates and cooldown-suppressed
+	// matches returned above — so the stream mirrors the alert table exactly.
+	if p.live != nil {
+		p.live.Publish(broadcast.Alert{
+			ID:          alert.ID,
+			MonitorID:   m.ID,
+			MonitorName: m.Name,
+			RuleID:      rule.ID,
+			EventID:     eventID,
+			Payload:     alert.Payload,
+			CreatedAt:   alert.CreatedAt,
+		})
+	}
+
+	p.dispatch.Dispatch(ctx, notify.Alert{
+		ID:          alert.ID,
+		MonitorID:   m.ID,
+		MonitorName: m.Name,
+		RuleID:      rule.ID,
+		RuleType:    rule.Type,
+		EventID:     eventID,
+		ContractID:  ev.ContractID,
+		EventName:   ev.EventName(),
+		Ledger:      ev.Ledger,
+		TxHash:      ev.TxHash,
+		// The store folds the suppressed count into the payload, so the
+		// notification reports it too.
+		Payload:   alert.Payload,
+		CreatedAt: alert.CreatedAt,
+		// GroupCount is 1 for the first alert in a window (the one
+		// we are delivering now) and 0 when grouping is disabled.
+		GroupCount:       1,
+		WindowStart:      time.Time{},
+		WindowEnd:        time.Time{},
+		RunbookURL:       alert.RunbookURL,
+		ResponseGuidance: alert.ResponseGuidance,
+	})
+	return true
+}
+
+// --- absence-of-event rules ---
+
+// stateKey identifies one absence rule's clock: the rule plus the event
+// pattern it waits for. Keying on the pattern as well as the rule means
+// editing a rule from "heartbeat" to "ping" starts a fresh clock instead of
+// measuring ping's silence from heartbeat's last appearance.
+type stateKey struct {
+	ruleID    int64
+	eventName string
+}
+
+// SweepAbsence fires the absence rules whose window has elapsed. It is the
+// other half of the rules engine: where handleEvent reacts to events that
+// arrived, this reacts to the ones that did not, which is why it runs on a
+// timer instead of on arrival.
+//
+// now is passed in (rather than read here) so the caller's clock and the
+// rearm clock in observeAbsence are the same one; Run passes the poller's.
+// The window id comes from the stored last-seen instant, so every sweep
+// inside one silent window produces the same synthetic event id and the
+// existing (rule_id, event_id) unique index turns the repeat into a no-op.
+func (p *Poller) SweepAbsence(ctx context.Context, now time.Time) error {
+	monitors, err := p.store.ListMonitors(ctx, true)
+	if err != nil {
+		return err
+	}
+	if len(monitors) == 0 {
+		return nil
+	}
+
+	// One read for every clock: the table holds at most one row per absence
+	// rule, and looking each rule up individually would mean a query per rule
+	// on every tick.
+	states, err := p.store.ListAbsenceState(ctx)
+	if err != nil {
+		return err
+	}
+	stored := make(map[stateKey]time.Time, len(states))
+	for _, s := range states {
+		stored[stateKey{ruleID: s.RuleID, eventName: s.EventName}] = s.LastSeen
+	}
+
+	for _, m := range monitors {
+		ruleList, err := p.store.ListRules(ctx, m.ID, true)
+		if err != nil {
+			p.log.Error("absence sweep: list rules", "monitor_id", m.ID, "err", err)
+			continue
+		}
+		for _, rule := range ruleList {
+			abs, ok := p.registry.Absence(rule.Type)
+			if !ok {
+				continue // an event-driven rule: not this sweep's business
+			}
+			spec, err := abs.Spec(rule.Params)
+			if err != nil {
+				// Stored params predate this rule's validation, or were
+				// written straight into the database. Skip rather than guess: a
+				// window we cannot read is one we cannot measure.
+				p.log.Warn("absence sweep: unusable params", "rule_id", rule.ID, "err", err)
+				continue
+			}
+
+			key := stateKey{ruleID: rule.ID, eventName: spec.EventName}
+			lastSeen, armed := stored[key]
+			if !armed {
+				// Never observed this rule before: arm it now instead of firing.
+				// Without this a brand-new rule would either fire immediately
+				// (nothing has been seen yet, so any window "has elapsed") or
+				// never fire at all; either way the operator would get an alert
+				// about silence that started before the rule existed. The
+				// baseline is persisted, so the next restart resumes from it.
+				if err := p.store.RecordAbsenceSeen(ctx, rule.ID, spec.EventName, now); err != nil {
+					p.log.Error("absence sweep: arm rule", "rule_id", rule.ID, "err", err)
+				}
+				continue
+			}
+
+			silent := now.Sub(lastSeen)
+			if silent < spec.Window {
+				continue
+			}
+			p.fireAbsence(ctx, m, rule, spec, lastSeen, silent)
+		}
+	}
+	return nil
+}
+
+// observeAbsence advances a rule's clock when the event it is waiting for
+// arrives. The clock is wall-clock time, not the event's ledger close time:
+// the sweep compares it with wall clock, and upstream mode (SOURCE_MODE=
+// sorotrail) never populates LedgerClosedAt, so the measurement must not
+// depend on which event source is wired.
+func (p *Poller) observeAbsence(ctx context.Context, rule store.Rule, abs rules.AbsenceEvaluator, ev *stellar.DecodedEvent) bool {
+	spec, err := abs.Spec(rule.Params)
+	if err != nil {
+		p.log.Warn("absence rule has unusable params", "rule_id", rule.ID, "err", err)
+		return false
+	}
+	if !abs.Matches(ev, spec) {
+		return true
+	}
+	if err := p.store.RecordAbsenceSeen(ctx, rule.ID, spec.EventName, p.now()); err != nil {
+		p.log.Error("record absence seen", "rule_id", rule.ID, "event_name", spec.EventName, "err", err)
+		return false
+	}
+	return true
+}
+
+// fireAbsence persists one absence alert and hands it to the dispatcher.
+//
+// LedgerClosedAt is deliberately left zero: that field means "the ledger close
+// time of the event that matched", and there is no such event here. Leaving it
+// zero keeps monitors.last_matched_at honest (the dashboard reads it as chain
+// time), instead of inventing a wall-clock match time for a monitor that, by
+// definition, matched nothing.
+func (p *Poller) fireAbsence(ctx context.Context, m store.Monitor, rule store.Rule, spec rules.AbsenceSpec, lastSeen time.Time, silent time.Duration) {
+	payload, err := json.Marshal(map[string]any{
+		// Every contract the monitor watches: the rule is monitor-scoped, so
+		// silence is "none of them emitted this", not "one contract went
+		// quiet".
+		"contract_ids":       m.ContractIDs,
+		"event_name":         spec.EventName,
+		"window_seconds":     int64(spec.Window.Seconds()),
+		"last_seen_at":       lastSeen.UTC().Format(time.RFC3339),
+		"silent_for_seconds": int64(silent.Seconds()),
+	})
+	if err != nil {
+		p.log.Error("marshal absence payload", "rule_id", rule.ID, "err", err)
 		return
 	}
-	p.matched += p.ing.Handle(ctx, decoded, monitors, HandleOptions{Deliver: true}).Matched
+
+	runbookURL, responseGuidance := store.ResolveAlertGuidance(&rule, &m, "", "")
+	payload = store.WithGuidance(payload, runbookURL, responseGuidance)
+
+	alert := &store.Alert{
+		MonitorID:        m.ID,
+		RuleID:           rule.ID,
+		EventID:          AbsenceEventID(lastSeen),
+		Payload:          payload,
+		RuleVersion:      rule.Version,
+		RunbookURL:       runbookURL,
+		ResponseGuidance: responseGuidance,
+	}
+	outcome, err := p.store.CreateAlert(ctx, alert)
+	if err != nil {
+		p.log.Error("create alert", "rule_id", rule.ID, "event_id", alert.EventID, "err", err)
+		return
+	}
+	switch outcome {
+	case store.AlertDuplicate:
+		return // dedup: this silent window has already alerted
+	case store.AlertSuppressed:
+		// The rule's cooldown covers absence rules too, so a short window on
+		// a long cooldown reports the silence once per cooldown rather than
+		// once per sweep.
+		p.log.Info("absence alert suppressed by cooldown",
+			"rule_id", rule.ID, "event_id", alert.EventID, "cooldown", alert.Cooldown)
+		return
+	}
+	p.metrics.RecordAlert()
+	p.recordWorkspaceAlertRaised(ctx, m.WorkspaceID)
+	p.log.Info("absence alert created",
+		"alert_id", alert.ID, "monitor", m.Name, "rule_id", rule.ID,
+		"event_name", spec.EventName, "silent_for", silent)
+
+	p.dispatch.Dispatch(ctx, notify.Alert{
+		ID:               alert.ID,
+		MonitorID:        m.ID,
+		MonitorName:      m.Name,
+		RuleID:           rule.ID,
+		RuleType:         rule.Type,
+		EventID:          alert.EventID,
+		EventName:        spec.EventName,
+		Silence:          silent,
+		Payload:          alert.Payload,
+		CreatedAt:        alert.CreatedAt,
+		RunbookURL:       alert.RunbookURL,
+		ResponseGuidance: alert.ResponseGuidance,
+	})
+}
+
+// AbsenceEventID is the synthetic event id for one silent window: derived from
+// the instant silence started (the stored last-seen time), never from a TOID,
+// because there is no event to take one from.
+//
+// Deriving it from the window rather than from the sweep means the alert's own
+// dedup guard does the de-duplication: every sweep in the same window writes
+// the same id and inserts nothing, and once the awaited event returns the next
+// window starts from a new clock and so produces a new id — which is what
+// re-arms the rule. It is also stable across a restart, since the clock it is
+// built from lives in the database.
+func AbsenceEventID(lastSeen time.Time) string {
+	return "absence-" + strconv.FormatInt(lastSeen.UTC().UnixNano(), 10)
+}
+
+func (p *Poller) recordWorkspaceRuleEvaluations(ctx context.Context, workspaceID string, n int64) {
+	if n <= 0 {
+		return
+	}
+	if p.usageMeter != nil {
+		p.usageMeter.RecordRuleEvaluations(workspaceID, n)
+		return
+	}
+	if p.metrics != nil {
+		p.metrics.RecordWorkspaceRuleEvaluations(workspaceID, n)
+	}
+	if uStore, ok := p.store.(store.Usage); ok {
+		_ = store.SafeRecordWorkspaceUsageBatch(ctx, uStore, []store.WorkspaceUsageDelta{
+			{WorkspaceID: workspaceID, RuleEvaluations: n},
+		})
+	}
+}
+
+func (p *Poller) recordWorkspaceAlertRaised(ctx context.Context, workspaceID string) {
+	if p.usageMeter != nil {
+		p.usageMeter.RecordAlertRaised(workspaceID, 1)
+		return
+	}
+	if p.metrics != nil {
+		p.metrics.RecordWorkspaceAlertRaised(workspaceID, 1)
+	}
+	if uStore, ok := p.store.(store.Usage); ok {
+		_ = store.SafeRecordWorkspaceUsageBatch(ctx, uStore, []store.WorkspaceUsageDelta{
+			{WorkspaceID: workspaceID, AlertsRaised: 1},
+		})
+	}
 }

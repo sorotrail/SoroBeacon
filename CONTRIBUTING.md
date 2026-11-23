@@ -1,4 +1,4 @@
-# Contributing to SoroBeacon
+#Contributing to SoroBeacon
 
 Thanks for helping build monitoring infrastructure for the Soroban
 ecosystem! SoroBeacon's MVP is intentionally small; most features are meant
@@ -22,7 +22,8 @@ Go 1.25+ is required (the Stellar SDK dependency sets the floor).
 |-------------------------|------------------------|------------------------------------------------|
 | a notification channel  | `notify.Notifier`      | `DefaultFactory` in `internal/notify/notify.go`|
 | a rule type             | `rules.RuleEvaluator`  | `NewRegistry` in `internal/rules/rules.go`     |
-| a different event source| `stellar.Client`       | wiring in `cmd/sorobeacon/main.go`             |
+| a timer-driven rule type| `rules.AbsenceEvaluator` | `NewRegistry` via `RegisterAbsence`          |
+| a different event source| `poller.EventSource`   | wiring in `cmd/sorobeacon/main.go`             |
 | a decoder (e.g. spec-aware) | `stellar.Decoder`  | wiring in `cmd/sorobeacon/main.go`             |
 | another database        | `store.Store` (or a sub-interface) | wiring in `cmd/sorobeacon/main.go` |
 
@@ -49,10 +50,17 @@ The README has worked examples for channels and rules.
 
 ## Good first issues
 
-- New rule types: absence-of-event ("no heartbeat for N minutes"),
-  frequency ("more than N matches in M minutes").
+- New rule types: frequency ("more than N matches in M minutes"),
+  and richer absence triggers (topic filters on the awaited event,
+  per-contract windows).
 - New channels: Matrix, PagerDuty, ntfy.sh.
+- Contract-spec-aware decoding: fetch the contract spec and decode events
+  into named fields behind `stellar.Decoder`.
 - Dashboard improvements (kept deliberately minimal in the MVP).
+
+## Code of Conduct
+
+[Contributor Convenant v2.1](CODE_OF_CONDUCT.md) governs this project's community interactions.
 
 ## Pull requests
 

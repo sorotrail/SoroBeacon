@@ -1,0 +1,209 @@
+groups:
+  - name: sorobeacon.slo.recording
+    interval: 30s
+    rules:
+      # -----------------------------------------------------------------------
+      # SLI 1: Evaluation Freshness (Target: 99% within K=10 ledgers of tip)
+      # Excludes mode="backfill" so historical catch-up does not burn budget.
+      # -----------------------------------------------------------------------
+      - record: sorobeacon:sli_evaluation_freshness:good
+        expr: clamp_max(clamp_min(1 - ((max by (network) (sorobeacon_poll_lag_ledgers{mode!="backfill"}) > bool 10) or vector(0)), 0), 1)
+        labels:
+          slo: evaluation_freshness
+
+      - record: sorobeacon:sli_evaluation_freshness:error_ratio5m
+        expr: avg_over_time((clamp_min(max by (network) (sorobeacon_poll_lag_ledgers{mode!="backfill"}) > bool 10, 0))[5m:30s]) or vector(0)
+        labels:
+          slo: evaluation_freshness
+
+      - record: sorobeacon:sli_evaluation_freshness:error_ratio30m
+        expr: avg_over_time((clamp_min(max by (network) (sorobeacon_poll_lag_ledgers{mode!="backfill"}) > bool 10, 0))[30m:30s]) or vector(0)
+        labels:
+          slo: evaluation_freshness
+
+      - record: sorobeacon:sli_evaluation_freshness:error_ratio1h
+        expr: avg_over_time((clamp_min(max by (network) (sorobeacon_poll_lag_ledgers{mode!="backfill"}) > bool 10, 0))[1h:1m]) or vector(0)
+        labels:
+          slo: evaluation_freshness
+
+      - record: sorobeacon:sli_evaluation_freshness:error_ratio6h
+        expr: avg_over_time((clamp_min(max by (network) (sorobeacon_poll_lag_ledgers{mode!="backfill"}) > bool 10, 0))[6h:5m]) or vector(0)
+        labels:
+          slo: evaluation_freshness
+
+      - record: sorobeacon:sli_evaluation_freshness:error_ratio30d
+        expr: avg_over_time((clamp_min(max by (network) (sorobeacon_poll_lag_ledgers{mode!="backfill"}) > bool 10, 0))[30d:15m]) or vector(0)
+        labels:
+          slo: evaluation_freshness
+
+      # -----------------------------------------------------------------------
+      # SLI 2: Delivery Success (Target: 99.5% successful deliveries)
+      # Error budget: 0.005 (0.5%)
+      # -----------------------------------------------------------------------
+      - record: sorobeacon:sli_delivery_success:error_ratio5m
+        expr: |
+          (
+            sum(rate(sorobeacon_alert_deliveries_total{outcome="error"}[5m]))
+            /
+            clamp_min(sum(rate(sorobeacon_alert_deliveries_total[5m])), 1e-12)
+          ) and (sum(rate(sorobeacon_alert_deliveries_total[5m])) > 0) or vector(0)
+        labels:
+          slo: delivery_success
+
+      - record: sorobeacon:sli_delivery_success:error_ratio30m
+        expr: |
+          (
+            sum(rate(sorobeacon_alert_deliveries_total{outcome="error"}[30m]))
+            /
+            clamp_min(sum(rate(sorobeacon_alert_deliveries_total[30m])), 1e-12)
+          ) and (sum(rate(sorobeacon_alert_deliveries_total[30m])) > 0) or vector(0)
+        labels:
+          slo: delivery_success
+
+      - record: sorobeacon:sli_delivery_success:error_ratio1h
+        expr: |
+          (
+            sum(rate(sorobeacon_alert_deliveries_total{outcome="error"}[1h]))
+            /
+            clamp_min(sum(rate(sorobeacon_alert_deliveries_total[1h])), 1e-12)
+          ) and (sum(rate(sorobeacon_alert_deliveries_total[1h])) > 0) or vector(0)
+        labels:
+          slo: delivery_success
+
+      - record: sorobeacon:sli_delivery_success:error_ratio6h
+        expr: |
+          (
+            sum(rate(sorobeacon_alert_deliveries_total{outcome="error"}[6h]))
+            /
+            clamp_min(sum(rate(sorobeacon_alert_deliveries_total[6h])), 1e-12)
+          ) and (sum(rate(sorobeacon_alert_deliveries_total[6h])) > 0) or vector(0)
+        labels:
+          slo: delivery_success
+
+      - record: sorobeacon:sli_delivery_success:error_ratio30d
+        expr: |
+          (
+            sum(rate(sorobeacon_alert_deliveries_total{outcome="error"}[30d]))
+            /
+            clamp_min(sum(rate(sorobeacon_alert_deliveries_total[30d])), 1e-12)
+          ) and (sum(rate(sorobeacon_alert_deliveries_total[30d])) > 0) or vector(0)
+        labels:
+          slo: delivery_success
+
+      # -----------------------------------------------------------------------
+      # SLI 3: Delivery Latency (Target: 99% within 10s poll+dispatch cycle)
+      # Error budget: 0.01 (1.0%)
+      # -----------------------------------------------------------------------
+      - record: sorobeacon:sli_delivery_latency:error_ratio5m
+        expr: |
+          (
+            1 - (
+              sum(rate(sorobeacon_poll_duration_seconds_bucket{le="10"}[5m]))
+              /
+              clamp_min(sum(rate(sorobeacon_poll_duration_seconds_count[5m])), 1e-12)
+            )
+          ) and (sum(rate(sorobeacon_poll_duration_seconds_count[5m])) > 0) or vector(0)
+        labels:
+          slo: delivery_latency
+
+      - record: sorobeacon:sli_delivery_latency:error_ratio30m
+        expr: |
+          (
+            1 - (
+              sum(rate(sorobeacon_poll_duration_seconds_bucket{le="10"}[30m]))
+              /
+              clamp_min(sum(rate(sorobeacon_poll_duration_seconds_count[30m])), 1e-12)
+            )
+          ) and (sum(rate(sorobeacon_poll_duration_seconds_count[30m])) > 0) or vector(0)
+        labels:
+          slo: delivery_latency
+
+      - record: sorobeacon:sli_delivery_latency:error_ratio1h
+        expr: |
+          (
+            1 - (
+              sum(rate(sorobeacon_poll_duration_seconds_bucket{le="10"}[1h]))
+              /
+              clamp_min(sum(rate(sorobeacon_poll_duration_seconds_count[1h])), 1e-12)
+            )
+          ) and (sum(rate(sorobeacon_poll_duration_seconds_count[1h])) > 0) or vector(0)
+        labels:
+          slo: delivery_latency
+
+      - record: sorobeacon:sli_delivery_latency:error_ratio6h
+        expr: |
+          (
+            1 - (
+              sum(rate(sorobeacon_poll_duration_seconds_bucket{le="10"}[6h]))
+              /
+              clamp_min(sum(rate(sorobeacon_poll_duration_seconds_count[6h])), 1e-12)
+            )
+          ) and (sum(rate(sorobeacon_poll_duration_seconds_count[6h])) > 0) or vector(0)
+        labels:
+          slo: delivery_latency
+
+      - record: sorobeacon:sli_delivery_latency:error_ratio30d
+        expr: |
+          (
+            1 - (
+              sum(rate(sorobeacon_poll_duration_seconds_bucket{le="10"}[30d]))
+              /
+              clamp_min(sum(rate(sorobeacon_poll_duration_seconds_count[30d])), 1e-12)
+            )
+          ) and (sum(rate(sorobeacon_poll_duration_seconds_count[30d])) > 0) or vector(0)
+        labels:
+          slo: delivery_latency
+
+      # -----------------------------------------------------------------------
+      # SLI 4: HTTP Read Availability (Target: 99.9% non-5xx on GET requests)
+      # Error budget: 0.001 (0.1%)
+      # -----------------------------------------------------------------------
+      - record: sorobeacon:sli_http_read_availability:error_ratio5m
+        expr: |
+          (
+            sum(rate(sorobeacon_http_request_duration_seconds_count{method="GET",status=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(sorobeacon_http_request_duration_seconds_count{method="GET"}[5m])), 1e-12)
+          ) and (sum(rate(sorobeacon_http_request_duration_seconds_count{method="GET"}[5m])) > 0) or vector(0)
+        labels:
+          slo: http_read_availability
+
+      - record: sorobeacon:sli_http_read_availability:error_ratio30m
+        expr: |
+          (
+            sum(rate(sorobeacon_http_request_duration_seconds_count{method="GET",status=~"5.."}[30m]))
+            /
+            clamp_min(sum(rate(sorobeacon_http_request_duration_seconds_count{method="GET"}[30m])), 1e-12)
+          ) and (sum(rate(sorobeacon_http_request_duration_seconds_count{method="GET"}[30m])) > 0) or vector(0)
+        labels:
+          slo: http_read_availability
+
+      - record: sorobeacon:sli_http_read_availability:error_ratio1h
+        expr: |
+          (
+            sum(rate(sorobeacon_http_request_duration_seconds_count{method="GET",status=~"5.."}[1h]))
+            /
+            clamp_min(sum(rate(sorobeacon_http_request_duration_seconds_count{method="GET"}[1h])), 1e-12)
+          ) and (sum(rate(sorobeacon_http_request_duration_seconds_count{method="GET"}[1h])) > 0) or vector(0)
+        labels:
+          slo: http_read_availability
+
+      - record: sorobeacon:sli_http_read_availability:error_ratio6h
+        expr: |
+          (
+            sum(rate(sorobeacon_http_request_duration_seconds_count{method="GET",status=~"5.."}[6h]))
+            /
+            clamp_min(sum(rate(sorobeacon_http_request_duration_seconds_count{method="GET"}[6h])), 1e-12)
+          ) and (sum(rate(sorobeacon_http_request_duration_seconds_count{method="GET"}[6h])) > 0) or vector(0)
+        labels:
+          slo: http_read_availability
+
+      - record: sorobeacon:sli_http_read_availability:error_ratio30d
+        expr: |
+          (
+            sum(rate(sorobeacon_http_request_duration_seconds_count{method="GET",status=~"5.."}[30d]))
+            /
+            clamp_min(sum(rate(sorobeacon_http_request_duration_seconds_count{method="GET"}[30d])), 1e-12)
+          ) and (sum(rate(sorobeacon_http_request_duration_seconds_count{method="GET"}[30d])) > 0) or vector(0)
+        labels:
+          slo: http_read_availability

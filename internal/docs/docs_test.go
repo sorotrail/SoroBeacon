@@ -2,25 +2,38 @@ package docs
 
 import (
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/sorotrail/sorobeacon/internal/auth"
 )
 
 // repoRoot is the repository root relative to this package's directory, so
 // the tests read the real documentation files on disk wherever they run.
 const repoRoot = "../.."
 
-// pagesAddedHere are the four documentation pages this branch introduces.
-// Each must exist and be linked from docs/SUMMARY.md — the "done" condition
-// every one of the issues specifies — and they are the pages whose internal
-// links the link checker below walks.
+// pagesAddedHere are the documentation pages pinned by this guard: the set
+// introduced by the docs branches, each of which must exist and be linked from
+// docs/SUMMARY.md — the "done" condition every one of the issues specifies —
+// and they are the pages whose internal links the link checker below walks.
 var pagesAddedHere = []string{
 	"docs/operations/security.md",
 	"docs/operations/upgrading.md",
 	"docs/guides/writing-rules.md",
 	"docs/contributing/testing.md",
+	"docs/guides/escalation.md",
+	"docs/reference/authorization.md",
+	"docs/rules/numeric-range.md",
+	"docs/rules/contract-allowlist.md",
+	"docs/rules/event-name-glob.md",
+	"docs/rules/token-supply-change.md",
+	"docs/operations/backup-restore.md",
+	"docs/operations/retention.md",
+	"docs/channels/email.md",
+	"docs/channels/federation.md",
 }
 
 // markdownLink matches [text](target) links in prose. Code fences and inline
@@ -76,15 +89,19 @@ func TestSummaryLinksEveryNewPage(t *testing.T) {
 			t.Errorf("%s must exist: %v", page, err)
 			continue
 		}
-		base := filepath.Base(page)
-		if !strings.Contains(summary, "("+strings.TrimPrefix(filepath.Dir(page), "docs/")+"/"+base+")") {
+		// SUMMARY.md links are slash-separated and relative to docs/, so the
+		// entry is built with path, not filepath. filepath.Dir returns
+		// "docs\operations" on Windows, which no longer carries the "docs/"
+		// prefix being trimmed, and every page then looked unlinked.
+		base := path.Base(page)
+		if !strings.Contains(summary, "("+strings.TrimPrefix(path.Dir(page), "docs/")+"/"+base+")") {
 			t.Errorf("docs/SUMMARY.md does not link %s", page)
 		}
 	}
 }
 
-// TestNewPagesLinksResolve walks every relative link in the four new pages
-// and fails for a target that does not exist, or a #fragment that matches no
+// TestNewPagesLinksResolve walks every relative link in the new pages and
+// fails for a target that does not exist, or a #fragment that matches no
 // heading in the target document. Dead cross-references between the guides
 // and the reference pages they deliberately link out to would otherwise go
 // unnoticed until a reader hit them.
@@ -132,5 +149,31 @@ func TestNewPagesLinksResolve(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestAuthorizationReferenceCoversVocabulary keeps the reference honest in the
+// direction that matters when the code grows: a scope or role added to the
+// vocabulary without a line in the page fails here instead of shipping
+// undocumented. The reverse direction (a name in the page that no longer
+// exists in code) is prose review; route patterns and shorthands make a simple
+// text-based check of every backticked value too noisy.
+func TestAuthorizationReferenceCoversVocabulary(t *testing.T) {
+	doc := readRepoFile(t, "docs/reference/authorization.md")
+	for _, scope := range auth.AllScopes {
+		if !strings.Contains(doc, string(scope)) {
+			t.Errorf("docs/reference/authorization.md does not mention scope %q", scope)
+		}
+	}
+	for _, role := range []string{"viewer", "editor", "admin"} {
+		if _, ok := auth.ParseRole(role); !ok {
+			t.Fatalf("ParseRole(%q) rejected a documented role", role)
+		}
+		if !strings.Contains(doc, role) {
+			t.Errorf("docs/reference/authorization.md does not mention role %q", role)
+		}
+	}
+	if !strings.Contains(doc, string(auth.ScopeNone)) {
+		t.Errorf("docs/reference/authorization.md does not mention scope %q", auth.ScopeNone)
 	}
 }

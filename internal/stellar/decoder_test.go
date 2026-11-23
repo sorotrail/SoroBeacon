@@ -3,6 +3,7 @@ package stellar
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"math/big"
 	"testing"
 
@@ -110,22 +111,50 @@ func TestCanon(t *testing.T) {
 	assert.Equal(t, Canon(big.NewInt(7)), Canon(float64(7)))
 }
 
-func TestToBigFloat(t *testing.T) {
-	f, ok := ToBigFloat(big.NewInt(10))
-	require.True(t, ok)
-	assert.Equal(t, 0, f.Cmp(big.NewFloat(10)))
-
-	f, ok = ToBigFloat("123.5")
-	require.True(t, ok)
-	assert.Equal(t, 0, f.Cmp(big.NewFloat(123.5)))
-
-	_, ok = ToBigFloat("not a number")
-	assert.False(t, ok)
-	_, ok = ToBigFloat([]any{})
-	assert.False(t, ok)
+func TestPartsToBig(t *testing.T) {
+	tests := []struct {
+		hi     *big.Int
+		rest   []uint64
+		want   *big.Int
+		name   string
+	}{
+		// Zero with no rest
+		{big.NewInt(0), nil, big.NewInt(0), "zero-no-rest"},
+		// One with no rest
+		{big.NewInt(1), nil, big.NewInt(1), "one-no-rest"},
+		// MaxInt64 as high part
+		{big.NewInt(math.MaxInt64), nil, big.NewInt(math.MaxInt64), "maxint64-no-rest"},
+		// MinInt64 as high part
+		{big.NewInt(math.MinInt64), nil, big.NewInt(math.MinInt64), "minint64-no-rest"},
+		// Single rest part: 1 → 0.Lsh(64)+1 = 1
+		{big.NewInt(0), []uint64{1}, big.NewInt(1), "single-rest-1"},
+		// Single rest part: 42
+		{big.NewInt(0), []uint64{42}, big.NewInt(42), "single-rest-42"},
+		// Two rest parts: 1 then 2 → (0.Lsh(64)+1).Lsh(64)+2 = 2^64 + 2
+		// Manually compute: partsToBig(0, 1, 2)
+		//   out = 0; out.Lsh(64)+1 = 1; out.Lsh(64)+2 = 2^64+2
+		{big.NewInt(0), []uint64{1, 2}, func() *big.Int {
+			out := new(big.Int)
+			out.Lsh(big.NewInt(0), 64)
+			out.Add(out, big.NewInt(1))
+			out.Lsh(out, 64)
+			out.Add(out, big.NewInt(2))
+			return out
+		}(), "two-rest-1-2"},
+		// Amount 1000000
+		{big.NewInt(0), []uint64{1000000}, big.NewInt(1000000), "amount-1m"},
+		// I256: all parts zero
+		{big.NewInt(0), []uint64{0, 0, 0}, big.NewInt(0), "i256-all-zero"},
+		// Negative one
+		{big.NewInt(-1), nil, big.NewInt(-1), "neg-one"},
+	}
+	for _, tt := range tests {
+		got := partsToBig(tt.hi, tt.rest...)
+		assert.Equal(t, tt.want, got, tt.name)
+	}
 }
 
-func TestLookup(t *testing.T) {
+func TestToBigFloat(t *testing.T) {
 	v := map[string]any{
 		"amount": big.NewInt(5),
 		"nested": map[string]any{"deep": []any{"zero", "one"}},

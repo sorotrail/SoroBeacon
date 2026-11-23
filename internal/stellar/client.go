@@ -134,6 +134,7 @@ func (c *HTTPClient) GetLedgers(ctx context.Context, req GetLedgersRequest) (*Ge
 	return &res, nil
 }
 
+// GetLatestLedger fetches the most recent ledger known to the Stellar RPC node.
 func (c *HTTPClient) GetLatestLedger(ctx context.Context) (*LatestLedger, error) {
 	var res LatestLedger
 	if err := c.call(ctx, "getLatestLedger", struct{}{}, &res); err != nil {

@@ -48,3 +48,7 @@ The rolling window lives in memory, keyed per rule, and is **rebuilt from the
 `alerts` table** the first time the rule is evaluated after a restart — the
 count and the "already fired" state survive the process instead of silently
 resetting.
+
+## Escalation
+
+A frequency alert is a good candidate for an [escalation policy](../guides/escalation.md): the first channel may be a chat room that is easy to miss during a storm, and a later step can reach a pager. The policy replaces the monitor's flat fan-out, so include every channel you still want told in its steps.

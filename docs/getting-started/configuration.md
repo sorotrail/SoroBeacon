@@ -1,12 +1,36 @@
 # Configuration
 
-All configuration comes from environment variables. `.env.example` in the repo is a ready-to-copy template. The complete operator table (types, required vs optional, secrets, `SOURCE_MODE`-only variables) is [Environment variable reference](../configuration.md).
+All configuration is loaded in layers: `CONFIG_FILE` is read first, then the process environment overrides it, and both sit above the built-in defaults. This keeps a checked-in YAML file convenient for a long-lived deployment while preserving emergency overrides via `systemd Environment=`, `docker -e`, or a shell export. `.env.example` in the repo is still a ready-to-copy template for environment-only deployments.
+
+SoroBeacon reads YAML from `CONFIG_FILE` and accepts the same keys as the environment variables documented in [Environment variable reference](../configuration.md). The file format is intentionally simple: top-level keys map to the same variable names, for example `DATABASE_URL`, `HTTP_ADDR`, `POLL_INTERVAL`, and `API_TOKEN`.
+
+For example, save non-secret settings in `/etc/sorobeacon/config.yaml`:
+
+```yaml
+DATABASE_URL: sqlite:///var/lib/sorobeacon/sorobeacon.db
+NETWORK: testnet
+HTTP_ADDR: ":8080"
+POLL_INTERVAL: 5s
+```
+
+Point SoroBeacon at it with `CONFIG_FILE=/etc/sorobeacon/config.yaml`. Environment variables can override any value in the file.
+
+Precedence is explicit:
+
+1. environment variables
+2. `CONFIG_FILE`
+3. built-in defaults
+
+This order means a file can be committed with sane defaults, while one-off emergency overrides in the environment still win.
+
+The file is a convenience for operators; do not put secrets in it unless you have to. Settings that are credentials or tokens — especially `DATABASE_URL`, `API_TOKEN`, `CONFIG_ENCRYPTION_KEY`, and any webhook, SMTP, or Slack credentials that end up inside a channel `config` — should remain in a secret manager or a strict-mode `0600` file, not in a committed YAML document. Parse errors must not echo a secret value to logs.
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `SOURCE_MODE` | `rpc` | `rpc` (standalone: poll the RPC) or `sorotrail` (upstream: read a SoroTrail indexer). |
 | `SOROTRAIL_URL` | — | SoroTrail indexer base URL. Required when `SOURCE_MODE=sorotrail`. |
 | `NETWORK` | `testnet` | `testnet` \| `mainnet` \| `futurenet` \| `custom`. Selects the network preset (RPC endpoint + passphrase). |
+| `NETWORKS` | — (only `NETWORK`) | Comma-separated chains to poll from one instance, primary first. Later chains read suffixed variables (`RPC_URLS_MAINNET`, `NETWORK_PASSPHRASE_MAINNET`). Monitors belong to one chain, fixed at creation. See [Polling several networks](../configuration.md#polling-several-networks). |
 | `RPC_URL` | per `NETWORK` | Stellar RPC endpoint (JSON-RPC 2.0). Overrides the preset. |
 | `RPC_URLS` | — (uses `RPC_URL`) | Ordered, comma-separated RPC endpoints to fail over between. Takes priority over `RPC_URL` when set. Every endpoint must be on the configured network or startup fails. |
 | `NETWORK_PASSPHRASE` | per `NETWORK` | Overrides the preset passphrase. Required with `NETWORK=custom`. |
@@ -15,14 +39,28 @@ All configuration comes from environment variables. `.env.example` in the repo i
 | `DATABASE_MIN_CONNS` | pgx default | Minimum connections in the pool. `0` or unset leaves the driver default. Rejected when greater than `DATABASE_MAX_CONNS` if both are set. |
 | `DATABASE_MAX_CONN_LIFETIME` | pgx default | How long a connection may be reused. Go duration (`1h`, `30m`). `0` or unset leaves the driver default. |
 | `DATABASE_MAX_CONN_IDLE_TIME` | pgx default | How long an idle connection is kept. Go duration. `0` or unset leaves the driver default. |
+| `REPLICA_DATABASE_URL` | unset (reads go to the primary) | Postgres connection string of a read replica serving the read-only dashboard queries (monitor list, alert search, stats, alert counts by day). Must be a `postgres`/`postgresql` URL other than `DATABASE_URL`; both are validated at startup, and a `sqlite` `DATABASE_URL` with this set is rejected. A replica that cannot be reached at boot fails startup; one that goes away later degrades to the primary. |
 | `API_TOKEN` | unset (authentication off) | Comma-separated static bearer token(s) for `/api/v1`, and the credential the dashboard's sign-in page accepts. Unset leaves both open and logs one warning at startup. `GET /health`, `/livez` and `/readyz` are exempt. See [API authentication](../configuration.md#api-authentication). |
+| `WORKSPACE_TOKENS` | unset (single workspace) | Comma-separated `workspace=token` pairs. Each token authenticates like `API_TOKEN`'s and scopes the request to that workspace's rows; ids are 1–40 chars of `[a-z0-9_-]`, split on the first `=`. `API_TOKEN` values and pre-existing rows belong to `default`. See [Workspaces](../configuration.md#workspaces). |
+| `OIDC_ISSUER` | unset (single sign-on off) | The provider's base URL. Set it and `/login` also offers an authorization-code-with-PKCE sign-in against that provider, read from its `/.well-known/openid-configuration` **at startup** — so a wrong issuer fails the deploy, not someone's first login. Local token login keeps working beside it. See [Single sign-on](../configuration.md#single-sign-on-oidc). |
+| `OIDC_CLIENT_ID` | — | This instance's registration at the provider. Required with `OIDC_ISSUER`; the ID token's audience is checked against it. |
+| `OIDC_CLIENT_SECRET` | unset | The provider's client secret, sent only to its token endpoint. Never logged or rendered. |
+| `OIDC_REDIRECT_URL` | — | This instance's absolute callback URL (`https://beacon.example.com/login/oidc/callback`), which must match a redirect URI registered at the provider. Required with `OIDC_ISSUER`; not derived from the `Host` header, so it stays correct behind a proxy. |
+| `OIDC_SCOPES` | `openid profile email` | Scopes to request. `openid` is always included. Space- or comma-separated. |
+| `OIDC_WORKSPACE` | `default` | Which workspace a signed-in user lands in. Like the token-based workspaces, the browser cannot choose it. |
+| `OIDC_WORKSPACE_CLAIM` | unset (no claim mapping) | Read the workspace from this verified ID-token claim instead, for several teams on one instance. An unmapped or invalid value falls back to `OIDC_WORKSPACE`. |
+| `OIDC_ALLOWED_DOMAINS` | unset (every account the provider admits) | Comma- or space-separated e-mail domain allow-list, compared case-insensitively. A refused account starts no session and sees the same generic failure as a bad token. |
+| `OIDC_LOGIN_STATE_TTL` | `10m` | How long an unfinished login (browser off at the provider) stays completable. Must be greater than 0. |
 | `CONFIG_ENCRYPTION_KEY` | unset (encryption off) | Base64 AES-GCM key that encrypts each channel's `config` at rest. Must decode to 16, 24 or 32 bytes (32 recommended); validated at startup. Generate with `openssl rand -base64 32`. Unset keeps plaintext and logs one startup warning. |
 | `POLL_INTERVAL` | `5s` | How often the poller calls `getEvents`. Minimum `1s`. |
 | `HTTP_ADDR` | `:8080` | Listen address (`host:port`) for the API and dashboard. Empty host means all interfaces. Validated at load. |
 | `MONITOR_SILENT_AFTER` | `24h` | How long since `last_matched_at` (event ledger close time) before the monitors list marks a monitor silent. |
+| `SHUTDOWN_GRACE_PERIOD` | `30s` | How long to wait for in-flight alert deliveries to finish once the process is asked to stop, before they are persisted as retries. Must be greater than 0. |
 | `HTTP_ADDR` | `:8080` | Listen address for the API and dashboard. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` (structured JSON via `log/slog`). |
 | `READYZ_LAG_THRESHOLD` | `0` (disabled) | Fail `/readyz` when poller ledger lag (chain tip minus last processed ledger) exceeds this. Unset or `0` leaves existing probes unchanged. |
+| `HEARTBEAT_URL` | unset (off) | External dead-man's switch: while ingest is demonstrably healthy the leader pings this URL (once per `HEARTBEAT_INTERVAL`, default `1m`); the external service alerts when the pings stop. The URL is a credential and is never logged. Must be longer than `POLL_INTERVAL`. |
+| `HEARTBEAT_FAILURE_SUFFIX` | unset (success pings only) | When set (e.g. `/fail`), one failure ping per outage goes to `HEARTBEAT_URL` plus this suffix. Requires `HEARTBEAT_URL`. |
 | `ALERT_RETENTION` | unset (keep forever) | Age after which alerts are deleted in batches of 1000 (`90d`, `24h`, …). `delivery_attempts` follow via `ON DELETE CASCADE`. Unset preserves current behaviour: nothing is pruned. |
 
 ## Where secrets live

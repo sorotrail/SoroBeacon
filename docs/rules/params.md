@@ -5,13 +5,18 @@ validators in `internal/rules` (the `Validate` and `parse*` functions there
 are the authority). Each rule also has a page of its own with matching
 semantics and more examples — [event\_emitted](event-emitted.md),
 [value\_threshold](value-threshold.md), [token\_event](token-event.md),
-[frequency\_threshold](frequency-threshold.md), and the cross-cutting
-[cooldown](cooldown.md).
+[frequency\_threshold](frequency-threshold.md), [topic\_regex](topic-regex.md),
+[address\_watchlist](address-watchlist.md), [topic\_position](topic-position.md),
+[contract\_allowlist](contract-allowlist.md),
+[event\_name\_glob](event-name-glob.md), [composite](composite.md), and the
+cross-cutting [cooldown](cooldown.md).
 
 ## Conventions that apply to every rule type
 
 * **The monitor scopes the contract.** No rule param names a contract ID;
-  the rule only ever sees events from the monitor it belongs to.
+  the rule only ever sees events from the monitor it belongs to. The one
+  exception is [`contract_allowlist`](#contract_allowlist), whose whole
+  purpose is to tell apart the contracts a monitor watches.
 * **Unknown params are ignored** by evaluators (that is how `cooldown` rides
   along), but a malformed JSON body is rejected.
 * **Cooldown applies to all types.** The optional `cooldown` param is
@@ -91,6 +96,32 @@ Complete, valid params document:
 }
 ```
 
+## numeric\_range
+
+Inclusive (or exclusive) band around the event's integer value. See the
+[rule page](numeric-range.md) for the `inclusive`/`outside` boundary table.
+
+| Param | JSON type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `min` | string or integer | one of the two | unset (open) | Lower bound. Decimal integer string, or a JSON integer within the safe range. |
+| `max` | string or integer | one of the two | unset (open) | Upper bound. Same forms as `min`; `min` must not exceed `max`. |
+| `inclusive` | boolean | no | `true` | Whether a value equal to a bound counts as **inside** the band. |
+| `outside` | boolean | no | `false` | Invert the match: fire when the value is outside the band. |
+| `event_name` | string | no | unset (all events) | Only consider events with this name (first topic). |
+| `value_path` | string | no | unset (the value itself) | Dot path into the value, resolved against the SEP-0048 named fields first, then the raw positional value. |
+
+Complete, valid params document:
+
+```json
+{
+  "event_name": "transfer",
+  "value_path": "amount",
+  "min": "1000000",
+  "max": "10000000",
+  "outside": true
+}
+```
+
 ## token\_event
 
 SEP-41 token events, with the interface's topic layout built in.
@@ -118,6 +149,119 @@ Complete, valid params document:
 }
 ```
 
+## token_supply_change
+
+Matches SEP-41 `mint` and `burn` events, optionally filtered by direction and by a minimum i128 amount.
+
+| Param | JSON type | Required | Default | Meaning |
+|---|---|---|---|---|
+| `direction` | string | no | `any` | Filter events by direction: `mint`, `burn`, or `any` (default `any`) |
+| `min_amount` | string | no | unset (no bound) | Inclusive lower bound on the i128 amount, as a decimal string. |
+
+All filters combine with AND. Omitted filters don't constrain. Amount params
+must be decimal integers (a leading `-` is accepted by the parser, though
+real token amounts are non-negative). `set_admin` — which carries no
+value — rejects them outright.
+
+Complete, valid params document:
+
+```json
+{
+  "direction": "any",
+  "min_amount": "1000000"
+}
+```
+
+## topic\_regex
+
+RE2 pattern match against a decoded topic — at a position, or any topic.
+See the [rule page](topic-regex.md) for matching semantics.
+
+| Param | JSON type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `pattern` | string | yes | — | Go/RE2 regular expression, matched unanchored within a topic's string value. At most 512 bytes. |
+| `position` | number | no | unset (any topic) | Topic index to match; `0` is the event name, user topics start at `1`. A position outside the event's topic list simply doesn't match. |
+
+Complete, valid params document:
+
+```json
+{
+  "pattern": "^swap_",
+  "position": 0
+}
+```
+
+## event\_name\_glob
+
+Glob match against the event's **name** (the first topic). See the
+[rule page](event-name-glob.md) for the glob syntax and the
+"glob or regex?" comparison.
+
+| Param | JSON type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `patterns` | array of string | yes | — | Non-empty list of glob patterns (`path.Match` syntax). The rule matches when **any** pattern matches the whole event name. |
+
+Matching is anchored at both ends and case-sensitive: `swap_*` matches
+`swap_exact_in`, `swap` does not. An event with no name is a non-match,
+never an error.
+
+Complete, valid params document:
+
+```json
+{
+  "patterns": ["swap_*", "pool_deposit"]
+}
+```
+
+## address\_watchlist
+
+SEP-41 events whose from or to address appears on a configured watchlist.
+See the [rule page](address-watchlist.md) for matching semantics.
+
+| Param | JSON type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `addresses` | array of string | yes | — | Non-empty list of Stellar addresses (account `G...` or contract `C...` strkeys). At most 1024 entries. |
+| `match` | string | no | `either` | Which slot(s) to watch: `from`, `to`, or `either`. |
+| `event` | string | no | unset (all SEP-41 events) | Restrict to one SEP-41 event: `transfer`, `mint`, `burn`, `clawback`, `set_admin`, or `*`. |
+
+Matching is exact and case-sensitive — no partial or prefix matching. The
+address set is built once and memoised, so a long watchlist does not scan
+linearly per event.
+
+Complete, valid params document:
+
+```json
+{
+  "addresses": ["GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"],
+  "match": "either",
+  "event": "transfer"
+}
+```
+
+## contract\_allowlist
+
+Matches the **contract** the event came from, against a list of contract
+IDs. See the [rule page](contract-allowlist.md) for the composite examples.
+
+| Param | JSON type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `contract_ids` | array of string | yes | — | Non-empty list of Stellar contract IDs (`C...` strkeys). Each entry is validated as a contract strkey. |
+| `exclude` | boolean | no | `false` | Invert the rule into a denylist: match when the contract is **not** in the list. |
+
+Matching is exact and case-sensitive. The set is built once and memoised, so
+a long list does not scan linearly per event. This is the only rule type
+that names a contract: it exists to tell apart the contracts one monitor
+watches.
+
+Complete, valid params document:
+
+```json
+{
+  "contract_ids": ["CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"],
+  "exclude": false
+}
+```
+
 ## frequency\_threshold
 
 Rolling-window aggregate: "more than N matching events within M minutes".
@@ -139,6 +283,63 @@ Complete, valid params document:
 }
 ```
 
+## composite
+
+Combines child rules with a boolean operator. Children are full rules
+(`type` + `params`) validated recursively through the registry; nesting is
+capped at five levels.
+
+| Param | JSON type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `op` | string | yes | — | One of `and`, `or`, `not`. |
+| `rules` | array | yes | — | Child rules, each `{"type": ..., "params": {...}}`. `and`/`or` need at least one; `not` needs exactly one. |
+
+Complete, valid params document:
+
+```json
+{
+  "op": "and",
+  "rules": [
+    {"type": "token_event", "params": {"event": "transfer", "min_amount": "1000000"}},
+    {"type": "event_emitted", "params": {"topic_equals": {"1": "GDW6AUTBXTOC7FIKUO5BOO3OGLK4SF7ZPOBLMQHMZDI45J2Z6VXRB5NR"}}}
+  ]
+}
+```
+
+A child error is reported with the path to it, for example
+`rules[1].params.comparison`, so a malformed grandchild names its exact
+location.
+
+## topic\_position
+
+Matches when the decoded topic at a fixed position exactly equals a configured
+value — the question custom (non-SEP-41) contracts raise with their
+positioned topics (a pool ID, a market symbol, an account), which
+`event_emitted` (first topic only) and `token_event` (SEP-41 slots only)
+cannot ask.
+
+| Param | JSON type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `position` | number | yes | — | Topic index to compare; `0` is the event-name topic. |
+| `equals` | string | yes | — | Exact value the decoded topic must equal. |
+| `event` | string | no | — | Also require this event name (first topic). |
+
+The comparison is exact string equality against the topic's **decoded string
+form**: string topics compare as themselves, numeric topics by their decimal
+rendering (`{"i128": "1000000"}` and `42` both compare as `"1000000"`-style
+decimal strings), addresses by their strkey. Matching is case-sensitive; a
+position beyond the event's topic count is a non-match, never an error.
+
+Complete, valid params document:
+
+```json
+{
+  "position": 2,
+  "equals": "POOL_USDC_XLM",
+  "event": "deposit"
+}
+```
+
 ## What validation failure looks like
 
 Rules are validated at create (`POST /api/v1/monitors/{id}/rules`) and
@@ -151,7 +352,7 @@ update time; the registry calls the evaluator's `Validate` and then checks
 * `details` lists **every** problem, each as a `field`/`reason` pair, with
   the field path prefixed under `params` (and `rules[i].params.…` in a bulk
   request);
-* `code` is the HTTP status text and `request_id` echoes the
+* `code` is the machine-readable error code (such as `INVALID_ARGUMENT`) and `request_id` echoes the
   `X-Request-ID` header, so a reported error maps to one log line.
 
 For example, a `frequency_threshold` with a bad `window` and no `count`:
@@ -159,7 +360,7 @@ For example, a `frequency_threshold` with a bad `window` and no `count`:
 ```json
 {
   "error": "validation failed",
-  "code": "Bad Request",
+  "code": "INVALID_ARGUMENT",
   "request_id": "b1c8f5a2-…",
   "details": [
     {"field": "params.count",  "reason": "frequency_threshold: count must be a positive integer"},
@@ -173,11 +374,11 @@ An unknown rule type reports on `type` instead (one detail, and the top-level
 
 ```json
 {
-  "error": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold token_event frequency_threshold])",
-  "code": "Bad Request",
+  "error": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold contract_allowlist event_name_glob numeric_range token_supply_change token_event self_transfer time_window frequency_threshold composite topic_regex address_watchlist topic_position absence_of_event])",
+  "code": "INVALID_ARGUMENT",
   "request_id": "…",
   "details": [
-    {"field": "type", "reason": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold token_event frequency_threshold])"}
+    {"field": "type", "reason": "unknown rule type \"cooldown\" (registered: [event_emitted value_threshold contract_allowlist event_name_glob numeric_range token_supply_change token_event self_transfer time_window frequency_threshold composite topic_regex address_watchlist topic_position absence_of_event])"}
   ]
 }
 ```

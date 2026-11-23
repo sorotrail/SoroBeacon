@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/reqid"
@@ -16,7 +18,7 @@ import (
 )
 
 // parseAlertFilter reads the shared alert listing query params
-// (monitor_id, rule_id, contract_id, from, to as RFC 3339, sort, limit,
+// (monitor_id, rule_id, contract_id, q, from, to as RFC 3339, sort, limit,
 // cursor). GET /alerts and GET /alerts.csv both call it so the two
 // endpoints cannot drift on which params exist or how bad values are
 // reported. On failure it has already written the error envelope.
@@ -30,6 +32,14 @@ func parseAlertFilter(w http.ResponseWriter, r *http.Request) (store.AlertFilter
 			writeErr(w, r, http.StatusBadRequest, "invalid monitor_id")
 			return f, false
 		}
+		// Zero is the store's "no filter" value, so a request for monitor 0
+		// would otherwise be answered with every alert rather than with the
+		// mistake it is. There is no monitor 0, and a federated alert belongs
+		// to no monitor at all.
+		if id <= 0 {
+			writeErr(w, r, http.StatusBadRequest, "invalid monitor_id")
+			return f, false
+		}
 		f.MonitorID = id
 	}
 	if v := q.Get("rule_id"); v != "" {
@@ -38,9 +48,29 @@ func parseAlertFilter(w http.ResponseWriter, r *http.Request) (store.AlertFilter
 			writeErr(w, r, http.StatusBadRequest, "invalid rule_id")
 			return f, false
 		}
+		if id <= 0 {
+			writeErr(w, r, http.StatusBadRequest, "invalid rule_id")
+			return f, false
+		}
 		f.RuleID = id
 	}
 	f.ContractID = q.Get("contract_id")
+	// Network narrows the listing to one chain, read the same way the monitor
+	// and channel listings read it (see parseListFilter). Unset means every
+	// network the instance polls, which is what a caller that predates
+	// multi-network sees.
+	f.Network = strings.ToLower(strings.TrimSpace(q.Get("network")))
+	// The term is trimmed here rather than left for the store because the cap
+	// is about the text actually searched: a term padded with spaces to one
+	// character over the limit is a short search whose padding is not part of
+	// it, so measuring the raw value would reject on the spaces.
+	if term := store.NormalizeAlertSearch(q.Get("q")); term != "" {
+		if utf8.RuneCountInString(term) > store.MaxAlertSearchLen {
+			writeErr(w, r, http.StatusBadRequest, fmt.Sprintf("invalid q (max %d characters)", store.MaxAlertSearchLen))
+			return f, false
+		}
+		f.Query = term
+	}
 	if v := q.Get("sort"); v != "" {
 		switch v {
 		case "created_at_desc", "created_at_asc":
@@ -76,11 +106,20 @@ func parseAlertFilter(w http.ResponseWriter, r *http.Request) (store.AlertFilter
 		}
 		f.AfterID = id
 	}
+	if v := q.Get("severity"); v != "" {
+		if parsed, ok := store.ParseSeverity(v); ok {
+			f.Severity = parsed
+		} else {
+			writeErr(w, r, http.StatusBadRequest, `invalid severity (must be "info", "warning", or "critical")`)
+			return f, false
+		}
+	}
 	return f, true
 }
 
 // listAlerts serves GET /alerts with query filters:
-// monitor_id, rule_id, contract_id, from, to (RFC 3339), sort
+// monitor_id, rule_id, contract_id, q (case-insensitive substring of the
+// source event id or the payload text), from, to (RFC 3339), sort
 // (created_at_desc default, created_at_asc), limit, cursor (last seen
 // alert id; comparison follows sort).
 func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
@@ -89,9 +128,15 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	alerts, err := s.store.ListAlerts(r.Context(), f)
+	include, ok := parseIncludeArchived(w, r)
+	if !ok {
+		return
+	}
+	alerts, tr, err := s.queryAlerts(r.Context(), f, include, nil)
 	if err != nil {
-		s.fail(w, r, err)
+		if !s.failArchive(w, r, err) {
+			s.fail(w, r, err)
+		}
 		return
 	}
 	if alerts == nil {
@@ -109,10 +154,26 @@ func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
 		effectiveLimit = 50
 	}
 	next := ""
-	if len(alerts) == effectiveLimit {
+	if len(alerts) == effectiveLimit || (tr.capped && len(alerts) > 0) {
 		next = strconv.FormatInt(alerts[len(alerts)-1].ID, 10)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"alerts": alerts, "next_cursor": next})
+	prunedBefore, policySource := s.workspaceRetentionHorizon(r.Context())
+	setRetentionHorizonHeaders(w, prunedBefore, policySource)
+	setTruncationHeaders(w, tr)
+	resp := map[string]any{
+		"alerts":                  alerts,
+		"next_cursor":             next,
+		"retention_policy_source": policySource,
+		"truncated":               tr.Truncated,
+	}
+	if tr.Truncated {
+		resp["truncation_boundary"] = tr.Boundary.UTC().Format(time.RFC3339)
+		resp["truncation_reason"] = tr.Reason
+	}
+	if prunedBefore != nil {
+		resp["pruned_before"] = prunedBefore.UTC().Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // maxAlertExportRows is the documented ceiling on a single CSV export when
@@ -131,8 +192,11 @@ const alertExportPageSize = 500
 // part of the endpoint's contract: spreadsheet templates and importers key
 // off column position, so new columns are appended, never inserted.
 var alertCSVHeader = []string{
-	"id", "monitor_name", "rule_id", "contract_id",
+	"id", "monitor_name", "rule_id", "severity", "contract_id",
 	"event_name", "event_id", "ledger", "created_at", "payload",
+	// Appended, never inserted: an importer keyed on column position keeps
+	// working, and a single-network instance simply exports it empty.
+	"network",
 }
 
 // exportAlertsCSV serves GET /alerts.csv. It shares parseAlertFilter with
@@ -145,10 +209,16 @@ func (s *Server) exportAlertsCSV(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	include, ok := parseIncludeArchived(w, r)
+	if !ok {
+		return
+	}
 	remaining := f.Limit
 	if remaining <= 0 || remaining > maxAlertExportRows {
 		remaining = maxAlertExportRows
 	}
+	budget := store.DefaultArchiveMaxChunks
+	var tr alertTruncation
 
 	// monitor_name needs a lookup that the alert rows do not carry. Fetch it
 	// once up front rather than re-querying every monitor for every page; a
@@ -164,6 +234,10 @@ func (s *Server) exportAlertsCSV(w http.ResponseWriter, r *http.Request) {
 		names[m.ID] = m.Name
 	}
 
+	prunedBefore, policySource := s.workspaceRetentionHorizon(r.Context())
+	setRetentionHorizonHeaders(w, prunedBefore, policySource)
+	trailers := s.beginTruncationReport(r.Context(), w, f, include)
+	defer func() { endTruncationReport(w, trailers, tr) }()
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+alertExportFilename(f)+`"`)
 	w.Header().Set("Cache-Control", "no-store")
@@ -179,7 +253,10 @@ func (s *Server) exportAlertsCSV(w http.ResponseWriter, r *http.Request) {
 		if f.Limit > alertExportPageSize {
 			f.Limit = alertExportPageSize
 		}
-		page, err := s.store.ListAlerts(r.Context(), f)
+		page, ptr, err := s.queryAlerts(r.Context(), f, include, &budget)
+		if ptr.Truncated {
+			tr = ptr
+		}
 		if err != nil {
 			// Headers and rows are already on the wire, so a JSON error
 			// envelope would corrupt the CSV. Log with the request id so the
@@ -220,16 +297,35 @@ func alertCSVRow(a store.Alert, monitorName string) []string {
 		Ledger     uint32 `json:"ledger"`
 	}
 	_ = json.Unmarshal(a.Payload, &p)
+	sev := string(a.Severity)
+	if sev == "" {
+		sev = "warning"
+	}
+	// A federated alert belongs to no local monitor, so the monitor column
+	// names the instance it came from instead of being empty: an export that
+	// cannot tell a local alert from a forwarded one is not much use.
+	if a.Federated {
+		monitorName = "federated:" + a.FederationOrigin
+	}
+	ruleID := strconv.FormatInt(a.RuleID, 10)
+	if a.Federated {
+		// The rule id is the sender's, not a local one.
+		ruleID = strconv.FormatInt(a.SourceRuleID, 10)
+	}
 	return []string{
 		strconv.FormatInt(a.ID, 10),
 		csvSafe(monitorName),
-		strconv.FormatInt(a.RuleID, 10),
+		ruleID,
+		csvSafe(sev),
 		csvSafe(p.ContractID),
 		csvSafe(p.EventName),
 		csvSafe(a.EventID),
 		strconv.FormatUint(uint64(p.Ledger), 10),
 		a.CreatedAt.UTC().Format(time.RFC3339),
 		csvSafe(string(a.Payload)),
+		// Which chain's node produced the row — on a multi-network instance
+		// the same contract id in two exports means two different contracts.
+		csvSafe(a.Network),
 	}
 }
 
@@ -277,6 +373,10 @@ func (s *Server) listDeliveries(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, r, http.StatusBadRequest, "invalid status")
 		return
 	}
+	if _, err := s.store.GetAlert(r.Context(), id); err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	list, err := s.store.ListDeliveryAttempts(r.Context(), id, status)
 	if err != nil {
 		s.fail(w, r, err)
@@ -284,6 +384,9 @@ func (s *Server) listDeliveries(w http.ResponseWriter, r *http.Request) {
 	}
 	if list == nil {
 		list = []store.DeliveryAttempt{}
+	}
+	if len(list) > 500 {
+		list = list[:500]
 	}
 	writeJSON(w, http.StatusOK, list)
 }
@@ -347,29 +450,58 @@ func writeRetryGate(w http.ResponseWriter, r *http.Request, err error) {
 
 func notifyAlertFromStore(ctx context.Context, st store.Store, a store.Alert) notify.Alert {
 	na := notify.Alert{
-		ID:        a.ID,
-		MonitorID: a.MonitorID,
-		RuleID:    a.RuleID,
-		EventID:   a.EventID,
-		Payload:   a.Payload,
-		CreatedAt: a.CreatedAt,
+		ID:         a.ID,
+		MonitorID:  a.MonitorID,
+		RuleID:     a.RuleID,
+		EventID:    a.EventID,
+		Payload:    a.Payload,
+		Enrichment: a.Enrichment,
+		CreatedAt:  a.CreatedAt,
+		Severity:   string(a.Severity),
+		// A federated alert has no local rule, so the channels that key on
+		// the rule need the instance it came from to tell two peers' alerts
+		// apart.
+		FederationOrigin: a.FederationOrigin,
+		RunbookURL:       a.RunbookURL,
+		ResponseGuidance: a.ResponseGuidance,
 	}
 	var p struct {
-		ContractID string `json:"contract_id"`
-		EventName  string `json:"event_name"`
-		Ledger     uint32 `json:"ledger"`
-		TxHash     string `json:"tx_hash"`
+		ContractID       string `json:"contract_id"`
+		EventName        string `json:"event_name"`
+		Ledger           uint32 `json:"ledger"`
+		TxHash           string `json:"tx_hash"`
+		RunbookURL       string `json:"runbook_url"`
+		ResponseGuidance string `json:"response_guidance"`
 	}
 	_ = json.Unmarshal(a.Payload, &p)
 	na.ContractID = p.ContractID
 	na.EventName = p.EventName
 	na.Ledger = p.Ledger
 	na.TxHash = p.TxHash
+	if na.RunbookURL == "" {
+		na.RunbookURL = p.RunbookURL
+	}
+	if na.ResponseGuidance == "" {
+		na.ResponseGuidance = p.ResponseGuidance
+	}
+	var mon *store.Monitor
 	if m, err := st.GetMonitor(ctx, a.MonitorID); err == nil && m != nil {
 		na.MonitorName = m.Name
+		mon = m
 	}
+	var rl *store.Rule
 	if rule, err := st.GetRule(ctx, a.RuleID); err == nil && rule != nil {
 		na.RuleType = rule.Type
+		rl = rule
+	}
+	if na.RunbookURL == "" || na.ResponseGuidance == "" {
+		rURL, rGuidance := store.ResolveAlertGuidance(rl, mon, "", "")
+		if na.RunbookURL == "" {
+			na.RunbookURL = rURL
+		}
+		if na.ResponseGuidance == "" {
+			na.ResponseGuidance = rGuidance
+		}
 	}
 	return na
 }

@@ -3,3 +3,7 @@ bin/
 *.test
 coverage.out
 .claude/
+# This repository is Go-only; no npm packages belong in it. Ignore the
+# directory so a local `npm install` is never committed by accident.
+node_modules/
+/sorobeacon

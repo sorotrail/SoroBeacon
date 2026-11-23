@@ -75,6 +75,79 @@ func (EventEmitted) Evaluate(_ context.Context, ev *stellar.DecodedEvent, params
 	return true, nil
 }
 
+// Explain returns a detailed explanation of why the event matched or didn't match.
+func (EventEmitted) Explain(ctx context.Context, ev *stellar.DecodedEvent, params json.RawMessage) (*RuleExplanation, error) {
+	p, err := parseEventEmitted(params)
+	if err != nil {
+		return &RuleExplanation{Error: err.Error()}, err
+	}
+
+	var conditions []ConditionExplanation
+	matched := true
+
+	// Check event name
+	if p.EventName != "" {
+		actual := ev.EventName()
+		passed := actual == p.EventName
+		if !passed {
+			matched = false
+		}
+		conditions = append(conditions, ConditionExplanation{
+			Name:     "event_name",
+			Expected: p.EventName,
+			Actual:   actual,
+			Passed:   passed,
+			Reason:   fmt.Sprintf("event name %q %s expected %q", actual, ternary(passed, "matches", "does not match"), p.EventName),
+		})
+	}
+
+	// Check topic equals
+	for key, expected := range p.TopicEquals {
+		idx, err := strconv.Atoi(key)
+		if err != nil {
+			conditions = append(conditions, ConditionExplanation{
+				Name:     "topic_equals." + key,
+				Expected: expected,
+				Actual:   nil,
+				Passed:   false,
+				Reason:   fmt.Sprintf("topic_equals key %q is not a valid topic index", key),
+			})
+			matched = false
+			continue
+		}
+		if idx < 0 || idx >= len(ev.Topics) {
+			conditions = append(conditions, ConditionExplanation{
+				Name:     "topic_equals." + key,
+				Expected: expected,
+				Actual:   nil,
+				Passed:   false,
+				Reason:   fmt.Sprintf("topic index %d is out of range (event has %d topics)", idx, len(ev.Topics)),
+			})
+			matched = false
+			continue
+		}
+		actual := ev.Topics[idx]
+		canonExpected := stellar.Canon(expected)
+		canonActual := stellar.Canon(actual)
+		passed := canonActual == canonExpected
+		if !passed {
+			matched = false
+		}
+		conditions = append(conditions, ConditionExplanation{
+			Name:     "topic_equals." + key,
+			Expected: expected,
+			Actual:   actual,
+			Passed:   passed,
+			Reason:   fmt.Sprintf("topic[%d] canonical form %s expected %s", idx, ternary(passed, "matches", "does not match"), canonExpected),
+		})
+	}
+
+	return &RuleExplanation{
+		Matched:    matched,
+		Conditions: conditions,
+	}, nil
+}
+
 // EventNames reports the event name this rule is scoped to. A rule with no
 // event_name matches any event (perhaps via topic_equals), so it cannot name
 // them and callers must not narrow a server-side filter.

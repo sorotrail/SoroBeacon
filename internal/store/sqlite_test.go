@@ -36,27 +36,45 @@ func newTestSQLite(t *testing.T) conformanceStore {
 // the same fixed-format helpers the store itself uses so the tests set exactly
 // what a real write would.
 func (s *SQLite) resetConformance(ctx context.Context) error {
+	s.alertRetention.Store(0)
 	if _, err := s.db.ExecContext(ctx,
 		`DELETE FROM delivery_attempts;
+		 DELETE FROM contract_ingest_cursors;
+		 DELETE FROM api_tokens;
+		 DELETE FROM audit_log;
+		 DELETE FROM pending_digests;
 		 DELETE FROM alerts;
+		 DELETE FROM alert_stat_rollups;
+		 DELETE FROM maintenance_windows;
 		 DELETE FROM monitor_channels;
 		 DELETE FROM rules;
 		 DELETE FROM channels;
 		 DELETE FROM monitors;
 		 DELETE FROM saved_searches;
 		 DELETE FROM monitor_templates;
+		 DELETE FROM ledger_hashes;
+		 DELETE FROM network_ledger_hashes;
+		 DELETE FROM network_ingest_state;
+		 DELETE FROM retention_gaps;
+		 DELETE FROM event_archive;
+		 DELETE FROM workspace_retention_policies;
 		 UPDATE ingest_state SET last_ledger = 0, last_cursor = '' WHERE id = 1`); err != nil {
 		return err
 	}
 	// sqlite_sequence only exists once a table with AUTOINCREMENT has been
 	// written to; before that its absence is not an error.
 	_, _ = s.db.ExecContext(ctx,
-		`DELETE FROM sqlite_sequence WHERE name IN ('monitors','rules','channels','alerts','delivery_attempts','saved_searches','monitor_templates')`)
+		`DELETE FROM sqlite_sequence WHERE name IN ('monitors','rules','channels','alerts','delivery_attempts','saved_searches','monitor_templates','retention_gaps','event_archive')`)
 	return nil
 }
 
 func (s *SQLite) setAlertCreatedAt(ctx context.Context, id int64, at time.Time) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE alerts SET created_at = ? WHERE id = ?`, sqliteTimeString(at), id)
+	return err
+}
+
+func (s *SQLite) setDeliveryAttemptAt(ctx context.Context, id int64, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE delivery_attempts SET attempted_at = ? WHERE id = ?`, sqliteTimeString(at), id)
 	return err
 }
 
@@ -74,6 +92,12 @@ func (s *SQLite) rawChannelConfig(ctx context.Context, id int64) ([]byte, error)
 
 func (s *SQLite) setCipher(c ConfigCipher) { s.cipher = c }
 
+func (s *SQLite) setEventArchiveIngestedAt(ctx context.Context, eventID string, at time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE event_archive SET ingested_at = ? WHERE event_id = ?`, sqliteTimeString(at), eventID)
+	return err
+}
+
 // --- SQLite-specific behaviour ---
 
 func TestSQLiteFilePath(t *testing.T) {
@@ -85,6 +109,14 @@ func TestSQLiteFilePath(t *testing.T) {
 		{name: "absolute", url: "sqlite:///var/lib/sorobeacon/sorobeacon.db", want: "/var/lib/sorobeacon/sorobeacon.db"},
 		{name: "relative host form", url: "sqlite://relative/path.db", want: "relative/path.db"},
 		{name: "opaque", url: "sqlite:./data/sorobeacon.db", want: "./data/sorobeacon.db"},
+		// Windows paths, asserted on every platform: url.Parse reads the "C:"
+		// as a host with an invalid port and fails, so these went nowhere near
+		// the path extraction below until sqliteWindowsPath caught them. They
+		// are literals rather than t.TempDir() so Linux CI guards them too.
+		{name: "windows drive, backslashes", url: `sqlite://C:\srv\sorobeacon.db`, want: `C:\srv\sorobeacon.db`},
+		{name: "windows drive, forward slashes", url: "sqlite://C:/srv/sorobeacon.db", want: "C:/srv/sorobeacon.db"},
+		{name: "windows drive, no double slash", url: `sqlite:D:\data\sorobeacon.db`, want: `D:\data\sorobeacon.db`},
+		{name: "windows drive, lowercase", url: `sqlite://d:\data\sorobeacon.db`, want: `d:\data\sorobeacon.db`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -143,7 +175,7 @@ func TestSQLiteMigrateIdempotent(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(st.Close)
 
-	state, err := st.GetIngestState(context.Background())
+	state, err := st.GetIngestState(context.Background(), "")
 	require.NoError(t, err)
 	assert.Zero(t, state.LastLedger)
 }
@@ -169,8 +201,15 @@ func TestBackendSelection(t *testing.T) {
 	assert.Equal(t, "postgres", BackendName("postgresql://localhost/db"))
 	assert.Equal(t, "sqlite", BackendName("sqlite:///var/lib/sorobeacon/sorobeacon.db"))
 	assert.Equal(t, "unknown", BackendName("mysql://localhost/db"))
+	// A Windows path must still name its backend. Reporting "unknown" here
+	// made a misconfigured-backend error out of a perfectly good DATABASE_URL.
+	assert.Equal(t, "sqlite", BackendName(`sqlite://C:\srv\sorobeacon.db`))
 
 	scheme, err := Scheme("sqlite:///tmp/x.db")
+	require.NoError(t, err)
+	assert.Equal(t, "sqlite", scheme)
+
+	scheme, err = Scheme(`sqlite://C:\srv\sorobeacon.db`)
 	require.NoError(t, err)
 	assert.Equal(t, "sqlite", scheme)
 

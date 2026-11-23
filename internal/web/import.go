@@ -2,6 +2,7 @@ package web
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -72,9 +73,16 @@ func (s *Server) importContractsWeb(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	network := s.networkChoice(r.FormValue("network"))
+
 	existing, _ := s.store.ListMonitors(r.Context(), false)
 	existingContracts := make(map[string]bool)
 	for _, m := range existing {
+		// A contract ID means a different contract on another chain, so an
+		// existing watch only blocks a re-import on its own network.
+		if m.Network != network {
+			continue
+		}
 		for _, cid := range m.ContractIDs {
 			existingContracts[cid] = true
 		}
@@ -93,6 +101,7 @@ func (s *Server) importContractsWeb(w http.ResponseWriter, r *http.Request) {
 			Name:        fmt.Sprintf("%s-%s", name, suffix),
 			ContractIDs: []string{cid},
 			Enabled:     true,
+			Network:     network,
 		}
 		if err := s.store.CreateMonitor(r.Context(), &m); err != nil {
 			s.log.Error("web_import", "contract_id", cid, "err", err)
@@ -106,7 +115,15 @@ func (s *Server) importContractsWeb(w http.ResponseWriter, r *http.Request) {
 }
 
 func parseWebCSV(r io.Reader) ([]string, error) {
-	reader := csv.NewReader(bufio.NewReader(r))
+	// A spreadsheet exported as CSV carries a UTF-8 BOM, and the BOM would
+	// otherwise glue itself to the first contract ID and make an otherwise
+	// valid file fail validation on row 1. Peek three bytes and drop it
+	// before the CSV reader ever sees it.
+	buf := bufio.NewReader(r)
+	if bom, err := buf.Peek(3); err == nil && bytes.Equal(bom, []byte{0xEF, 0xBB, 0xBF}) {
+		_, _ = buf.Discard(3)
+	}
+	reader := csv.NewReader(buf)
 	reader.FieldsPerRecord = -1
 	var ids []string
 	for {
