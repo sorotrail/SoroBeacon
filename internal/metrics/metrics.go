@@ -572,37 +572,4 @@ func (m *Metrics) Middleware(next http.Handler) http.Handler {
 // package does not import chi; the wire-up lives in cmd/sorobeacon.
 var RoutePattern func(*http.Request) string
 
-// ExportedMetricNames returns the canonical list of base Prometheus metric
-// names exported by SoroBeacon. Histogram metrics also emit _bucket, _sum,
-// and _count suffixes when scraped.
-func ExportedMetricNames() []string {
-	return []string{
-		"sorobeacon_polls_total",
-		"sorobeacon_poll_duration_seconds",
-		"sorobeacon_poll_lag_ledgers",
-		"sorobeacon_poll_priority_contracts",
-		"sorobeacon_poll_lag_ledgers_by_priority",
-		"sorobeacon_reorgs_total",
-		"sorobeacon_last_reorg_ledger",
-		"sorobeacon_events_scanned_total",
-		"sorobeacon_events_matched_total",
-		"sorobeacon_rule_evaluations_total",
-		"sorobeacon_rule_evals_total",
-		"sorobeacon_rule_matches_total",
-		"sorobeacon_rule_errors_total",
-		"sorobeacon_rule_duration_seconds",
-		"sorobeacon_alerts_fired_total",
-		"sorobeacon_alert_deliveries_total",
-		"sorobeacon_alert_throttles_total",
-		"sorobeacon_channel_breaker_state",
-		"sorobeacon_http_request_duration_seconds",
-		"sorobeacon_seconds_since_last_poll",
-		"sorobeacon_poll_panics_total",
-		"sorobeacon_store_reads_total",
-		"sorobeacon_store_replica_fallbacks_total",
-		"sorobeacon_store_replica_enabled",
-		"sorobeacon_dead_letters_total",
-		"sorobeacon_alerts_stream_dropped_total",
-	}
-}
 
