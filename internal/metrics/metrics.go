@@ -106,6 +106,41 @@ type Metrics struct {
 // networkLabel is the Prometheus label every ingest metric carries.
 const networkLabel = "network"
 
+// ExportedMetricNames returns the canonical list of Prometheus metric family
+// names exported by SoroBeacon. Dashboards and alert rule tests consume this
+// list directly so a renamed metric fails `go test` rather than rendering a
+// blank panel in production.
+func ExportedMetricNames() []string {
+	return []string{
+		"sorobeacon_polls_total",
+		"sorobeacon_poll_duration_seconds",
+		"sorobeacon_poll_lag_ledgers",
+		"sorobeacon_poll_priority_contracts",
+		"sorobeacon_poll_lag_ledgers_by_priority",
+		"sorobeacon_reorgs_total",
+		"sorobeacon_last_reorg_ledger",
+		"sorobeacon_events_scanned_total",
+		"sorobeacon_events_matched_total",
+		"sorobeacon_rule_evaluations_total",
+		"sorobeacon_rule_evals_total",
+		"sorobeacon_rule_matches_total",
+		"sorobeacon_rule_errors_total",
+		"sorobeacon_rule_duration_seconds",
+		"sorobeacon_alerts_fired_total",
+		"sorobeacon_seconds_since_last_poll",
+		"sorobeacon_poll_panics_total",
+		"sorobeacon_alert_deliveries_total",
+		"sorobeacon_alert_throttles_total",
+		"sorobeacon_channel_breaker_state",
+		"sorobeacon_http_request_duration_seconds",
+		"sorobeacon_store_reads_total",
+		"sorobeacon_store_replica_fallbacks_total",
+		"sorobeacon_store_replica_enabled",
+		"sorobeacon_dead_letters_total",
+		"sorobeacon_alerts_stream_dropped_total",
+	}
+}
+
 // New returns a Metrics with its own registry, so multiple instances (e.g.
 // in tests) never collide on the default registry.
 func New() *Metrics {
@@ -826,85 +861,4 @@ func (m *Metrics) RecordNotModified(route string) {
 // package does not import chi; the wire-up lives in cmd/sorobeacon.
 var RoutePattern func(*http.Request) string
 
-// RecordBodyRejection increments the counter for a rejected request body or field limit.
-func (m *Metrics) RecordBodyRejection(limit string) {
-	if m == nil || m.requestBodyRejectionsTotal == nil {
-		return
-	}
-	m.requestBodyRejectionsTotal.WithLabelValues(limit).Inc()
-}
 
-// SetDatabaseDegraded updates the gauge indicating whether the service is in degraded mode.
-func (m *Metrics) SetDatabaseDegraded(degraded bool) {
-	if m == nil || m.databaseDegraded == nil {
-		return
-	}
-	if degraded {
-		m.databaseDegraded.Set(1)
-	} else {
-		m.databaseDegraded.Set(0)
-	}
-}
-
-// RecordDatabaseUnavailable increments the count of database unavailable events.
-func (m *Metrics) RecordDatabaseUnavailable() {
-	if m == nil || m.databaseUnavailableTotal == nil {
-		return
-	}
-	m.databaseUnavailableTotal.Inc()
-}
-
-// ExportedMetricNames returns the canonical list of base Prometheus metric
-// names exported by SoroBeacon. Histogram metrics also emit _bucket, _sum,
-// and _count suffixes when scraped.
-func ExportedMetricNames() []string {
-	return []string{
-		"sorobeacon_polls_total",
-		"sorobeacon_poll_duration_seconds",
-		"sorobeacon_poll_lag_ledgers",
-		"sorobeacon_upstream_lag_ledgers",
-		"sorobeacon_upstream_consecutive_failures",
-		"sorobeacon_poll_priority_contracts",
-		"sorobeacon_poll_lag_ledgers_by_priority",
-		"sorobeacon_reorgs_total",
-		"sorobeacon_last_reorg_ledger",
-		"sorobeacon_events_scanned_total",
-		"sorobeacon_events_matched_total",
-		"sorobeacon_rule_evaluations_total",
-		"sorobeacon_rule_evals_total",
-		"sorobeacon_rule_matches_total",
-		"sorobeacon_rule_errors_total",
-		"sorobeacon_rule_duration_seconds",
-		"sorobeacon_alerts_fired_total",
-		"sorobeacon_alert_deliveries_total",
-		"sorobeacon_alert_throttles_total",
-		"sorobeacon_delivery_budget_exhausted_total",
-		"sorobeacon_channel_breaker_state",
-		"sorobeacon_http_request_duration_seconds",
-		"sorobeacon_seconds_since_last_poll",
-		"sorobeacon_poll_panics_total",
-		"sorobeacon_store_reads_total",
-		"sorobeacon_store_replica_fallbacks_total",
-		"sorobeacon_store_replica_enabled",
-		"sorobeacon_store_replica_lag_seconds",
-		"sorobeacon_dead_letters_total",
-		"sorobeacon_dead_letters",
-		"sorobeacon_alerts_stream_dropped_total",
-		"sorobeacon_request_body_rejections_total",
-		"sorobeacon_database_degraded",
-		"sorobeacon_database_unavailable_total",
-		"sorobeacon_channel_unacknowledged_flagged",
-		"sorobeacon_channel_unacknowledged_delivery_rate",
-		"sorobeacon_workspace_alerts_raised_total",
-		"sorobeacon_workspace_rule_evaluations_total",
-		"sorobeacon_workspace_notifications_total",
-		"sorobeacon_workspace_api_requests_total",
-		"sorobeacon_workspace_stored_rows",
-		"sorobeacon_alert_partition_runway_months",
-		"sorobeacon_alert_partition_errors_total",
-		"sorobeacon_alert_partitions_created_total",
-		"sorobeacon_alert_partitions_dropped_total",
-		"sorobeacon_alert_pruner_deleted_total",
-		"sorobeacon_workspace_retention_seconds",
-	}
-}

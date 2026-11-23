@@ -1,0 +1,89 @@
+{
+  "uid": "sorobeacon-evaluation",
+  "title": "SoroBeacon — Poller & Rule Evaluation",
+  "description": "Diagnostic view for RPC polling, priority tier scheduling, chain reorgs, and per-rule-type evaluation latency and error rates.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "tags": ["sorobeacon", "evaluation", "poller"],
+  "links": [
+    { "title": "Overview Dashboard", "type": "link", "url": "/d/sorobeacon-overview" },
+    { "title": "Scaling & Priority Guide", "type": "link", "url": "https://github.com/sorotrail/SoroBeacon/blob/main/docs/operations/scaling.md" }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "network",
+        "type": "query",
+        "query": "label_values(sorobeacon_polls_total, network)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "selected": true, "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "RPC Poll Rate by Outcome",
+      "type": "timeseries",
+      "description": "Good: steady 'ok' poll rate matching poll interval, 'error' rate at 0. Sustained errors indicate upstream Soroban RPC instability.",
+      "targets": [
+        { "refId": "A", "expr": "sum by (network, outcome) (rate(sorobeacon_polls_total{network=~\"$network\"}[5m]))" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Poll Cycle Duration (p50 / p95)",
+      "type": "timeseries",
+      "description": "Good: p95 poll duration stays well below the configured poll interval.",
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum by (le, network) (rate(sorobeacon_poll_duration_seconds_bucket{network=~\"$network\"}[5m])))" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le, network) (rate(sorobeacon_poll_duration_seconds_bucket{network=~\"$network\"}[5m])))" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Ledger Lag by Poll Priority Tier (high / normal / low)",
+      "type": "timeseries",
+      "description": "Good: high-priority contracts stay near 0-2 ledgers behind tip even when low-priority contracts queue during bursty ledgers.",
+      "targets": [
+        { "refId": "A", "expr": "max by (network, priority) (sorobeacon_poll_lag_ledgers_by_priority{network=~\"$network\"})" },
+        { "refId": "B", "expr": "sum by (network, priority) (sorobeacon_poll_priority_contracts{network=~\"$network\"})" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Events Scanned vs Matched vs Rule Evaluations",
+      "type": "timeseries",
+      "description": "Good: rule evaluations scale proportionally with events scanned. A spike in evaluations per event indicates monitor rule fan-out.",
+      "targets": [
+        { "refId": "A", "expr": "sum by (network) (rate(sorobeacon_events_scanned_total{network=~\"$network\"}[5m]))" },
+        { "refId": "B", "expr": "sum by (network) (rate(sorobeacon_events_matched_total{network=~\"$network\"}[5m]))" },
+        { "refId": "C", "expr": "sum by (network) (rate(sorobeacon_rule_evaluations_total{network=~\"$network\"}[5m]))" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Rule Evaluation Latency & Errors by Rule Type",
+      "type": "timeseries",
+      "description": "Good: p95 rule evaluation < 10ms and error rate = 0 across all 20 rule types.",
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.95, sum by (le, rule_type) (rate(sorobeacon_rule_duration_seconds_bucket{network=~\"$network\"}[5m])))" },
+        { "refId": "B", "expr": "sum by (rule_type) (rate(sorobeacon_rule_errors_total{network=~\"$network\"}[5m]))" },
+        { "refId": "C", "expr": "sum by (rule_type) (rate(sorobeacon_rule_evals_total{network=~\"$network\"}[5m]))" },
+        { "refId": "D", "expr": "sum by (rule_type) (rate(sorobeacon_rule_matches_total{network=~\"$network\"}[5m]))" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Most Recent Reorg Ledger & Poll Panics",
+      "type": "stat",
+      "description": "Good: 0 reorgs and 0 panics. Tracks the latest ledger where chain divergence was detected.",
+      "targets": [
+        { "refId": "A", "expr": "max by (network) (sorobeacon_last_reorg_ledger{network=~\"$network\"})" },
+        { "refId": "B", "expr": "sum by (network) (sorobeacon_poll_panics_total{network=~\"$network\"})" }
+      ]
+    }
+  ]
+}

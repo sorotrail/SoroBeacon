@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: SoroBeacon
+    orgId: 1
+    folder: SoroBeacon
+    type: file
+    disableDeletion: false
+    editable: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards/sorobeacon
+      foldersFromFilesStructure: false
