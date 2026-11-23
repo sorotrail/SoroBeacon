@@ -55,6 +55,27 @@ func TestIsInvalidArgument(t *testing.T) {
 			err:  nil,
 			want: false,
 		},
+		{
+			// Empty input: the zero-value APIError carries no code and no
+			// status, so it identifies nothing.
+			name: "empty API error",
+			err:  &APIError{},
+			want: false,
+		},
+		{
+			// Invalid input: a blank code on a success status is not a
+			// validation failure, however malformed the error looks.
+			name: "blank code on a non-error status",
+			err:  &APIError{Status: http.StatusOK},
+			want: false,
+		},
+		{
+			// Boundary: the stable code decides before the status does, so an
+			// invalid-argument code still matches above the 4xx range.
+			name: "invalid argument code wins over a 5xx status",
+			err:  &APIError{Status: http.StatusInternalServerError, Code: apierr.CodeInvalidArgument},
+			want: true,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

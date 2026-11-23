@@ -20,6 +20,7 @@ type FieldSchema struct {
 // so the dashboard can render a form instead of a JSON textarea. Evaluators
 // that do not implement it fall back to the textarea.
 type SchemaProvider interface {
+	// ParamSchema describes the parameter fields supported by this evaluator.
 	ParamSchema() []FieldSchema
 }
 

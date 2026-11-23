@@ -115,6 +115,9 @@ func (a *AddressWatchlist) Validate(params json.RawMessage) error {
 	return nil
 }
 
+// Evaluate reports whether ev is a SEP-41 token event whose from or to
+// address appears in the configured watchlist, honouring the match and event
+// restrictions. Malformed params are an error, never a silent non-match.
 func (a *AddressWatchlist) Evaluate(_ context.Context, ev *stellar.DecodedEvent, params json.RawMessage) (bool, error) {
 	set, err := a.setFor(params)
 	if err != nil {

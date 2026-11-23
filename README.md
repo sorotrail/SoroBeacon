@@ -850,6 +850,31 @@ func (Cooldown) Evaluate(ctx context.Context, ev *stellar.DecodedEvent, params j
 r.Register("cooldown", Cooldown{})
 ```
 
+For a complete starting point, copy this into `internal/rules/my_rule.go` and
+add the `Register` line to `NewRegistry`:
+
+```go
+package rules
+
+import (
+	"context"
+	"encoding/json"
+
+	"github.com/sorotrail/sorobeacon/internal/stellar"
+)
+
+type MyRule struct{}
+
+func (MyRule) Validate(json.RawMessage) error { return nil }
+
+func (MyRule) Evaluate(_ context.Context, ev *stellar.DecodedEvent, _ json.RawMessage) (bool, error) {
+	return ev.EventName() == "transfer", nil
+}
+
+// in NewRegistry (internal/rules/rules.go):
+// r.Register("my_rule", MyRule{})
+```
+
 Decoded events use a small value vocabulary (`nil`, `bool`, `string`,
 `*big.Int`, `[]byte`, `[]any`, `map[string]any`); `stellar.Canon`,
 `stellar.ToBigFloat` and `stellar.Lookup` are the helpers rules build on.

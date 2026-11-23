@@ -310,3 +310,45 @@ func TestBaselineDeviation_ValidationAndConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestIsBaselineSuppressed(t *testing.T) {
+	type otherKeyType struct{}
+	tests := []struct {
+		name     string
+		ctx      context.Context
+		expected bool
+	}{
+		{
+			name:     "nil context returns false",
+			ctx:      nil,
+			expected: false,
+		},
+		{
+			name:     "empty context returns false",
+			ctx:      context.Background(),
+			expected: false,
+		},
+		{
+			name:     "context with suppressed=true returns true",
+			ctx:      WithBaselineSuppressed(context.Background(), true),
+			expected: true,
+		},
+		{
+			name:     "context with suppressed=false returns false",
+			ctx:      WithBaselineSuppressed(context.Background(), false),
+			expected: false,
+		},
+		{
+			name:     "context with different key returns false",
+			ctx:      context.WithValue(context.Background(), otherKeyType{}, true),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := IsBaselineSuppressed(tt.ctx)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
