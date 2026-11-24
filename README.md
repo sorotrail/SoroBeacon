@@ -784,6 +784,16 @@ make lint       # golangci-lint
 make up / down  # docker compose
 ```
 
+One full pass, copy-pasteable — lint, unit tests, then a local instance on
+SQLite (no Docker needed) and a probe to confirm it is up:
+
+```sh
+make lint && make test
+make build
+DATABASE_URL=sqlite:///tmp/sorobeacon.db ./bin/sorobeacon &
+curl -s localhost:8080/api/v1/health
+```
+
 Layout:
 
 ```
