@@ -600,11 +600,14 @@ type auditRecorder struct {
 	body   bytes.Buffer
 }
 
+// WriteHeader records the status code and delegates to the wrapped ResponseWriter.
 func (a *auditRecorder) WriteHeader(code int) {
 	a.status = code
 	a.ResponseWriter.WriteHeader(code)
 }
 
+// Write buffers up to auditBodyCapture bytes for response introspection and
+// delegates to the wrapped ResponseWriter.
 func (a *auditRecorder) Write(b []byte) (int, error) {
 	if remaining := auditBodyCapture - a.body.Len(); remaining > 0 {
 		if len(b) > remaining {
