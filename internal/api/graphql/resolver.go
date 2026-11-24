@@ -113,6 +113,7 @@ func (r *queryResolver) Monitor(ctx context.Context, id string) (*Monitor, error
 	return toMonitor(m), nil
 }
 
+// Monitors returns a paginated connection of monitors matching the given filters.
 func (r *queryResolver) Monitors(ctx context.Context, enabled *bool, limit *int, cursor *string, query *string, sort *MonitorSort) (*MonitorConnection, error) {
 	f := store.ListFilter{}
 	if enabled != nil {

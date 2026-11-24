@@ -205,6 +205,7 @@ type bufferedResponse struct {
 	body   bytes.Buffer
 }
 
+// Header returns the buffered response header map.
 func (b *bufferedResponse) Header() http.Header         { return b.header }
 func (b *bufferedResponse) WriteHeader(status int)      { b.status = status }
 func (b *bufferedResponse) Write(p []byte) (int, error) { return b.body.Write(p) }
