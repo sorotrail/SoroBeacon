@@ -43,6 +43,7 @@ const (
 	deadLettersName        = "sorobeacon_dead_letters_total"
 	deadLettersChannelName = "sorobeacon_dead_letters"
 	pollPanicsName         = "sorobeacon_poll_panics_total"
+	databaseDegradedName   = "sorobeacon_database_degraded"
 )
 
 func TestRecordPollTracksOutcomesAndDuration(t *testing.T) {
@@ -581,6 +582,50 @@ func TestSetChannelUnacknowledgedFlagged(t *testing.T) {
 	assert.NotPanics(t, func() {
 		nilMetrics.SetChannelUnacknowledgedFlagged("ch-1", "webhook", true)
 	})
+}
+
+// SetDatabaseDegraded is what a dashboard alert watches to spot a database
+// outage, so both directions matter: it has to read 1 while the database is
+// down and go back to 0 once it recovers, or the alert never resolves.
+func TestSetDatabaseDegraded(t *testing.T) {
+	tests := []struct {
+		name     string
+		degraded bool
+		want     float64
+	}{
+		{
+			name:     "degraded true sets gauge to 1",
+			degraded: true,
+			want:     1,
+		},
+		{
+			name:     "degraded false sets gauge to 0",
+			degraded: false,
+			want:     0,
+		},
+	}
+
+	m := New()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m.SetDatabaseDegraded(tc.degraded)
+			assert.Equal(t, tc.want, m.sampleValue(t, databaseDegradedName, nil))
+		})
+	}
+
+	// Recovering from degraded has to clear the flag, not leave it stuck at 1.
+	m.SetDatabaseDegraded(true)
+	m.SetDatabaseDegraded(false)
+	assert.Equal(t, float64(0), m.sampleValue(t, databaseDegradedName, nil))
+}
+
+// The metric is optional instrumentation: a nil receiver, or a Metrics that
+// was not built by New, must record nothing instead of panicking.
+func TestSetDatabaseDegradedIsNilSafe(t *testing.T) {
+	var nilMetrics *Metrics
+	assert.NotPanics(t, func() { nilMetrics.SetDatabaseDegraded(true) })
+
+	assert.NotPanics(t, func() { (&Metrics{}).SetDatabaseDegraded(true) })
 }
 
 func TestRecordDeliveryBudgetExhaustedCountsAndIsExported(t *testing.T) {
