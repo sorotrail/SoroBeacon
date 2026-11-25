@@ -725,6 +725,10 @@ func (j JSON) MarshalGQL(w io.Writer) {
 }
 
 // GraphQL model types
+
+// Monitor is the GraphQL representation of a SoroBeacon monitor. It carries
+// the monitor's identity, configuration, and runtime state including its
+// associated rules and notification channels.
 type Monitor struct {
 	ID             string
 	Name           string
