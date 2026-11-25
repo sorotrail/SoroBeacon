@@ -37,6 +37,19 @@ func (f *fakeProvider) callCount() int {
 	return f.calls
 }
 
+// staticProvider names its scheme, so a test can register several providers
+// and pick which one a reference resolves through.
+type staticProvider struct {
+	scheme string
+	value  string
+}
+
+func (p *staticProvider) Scheme() string { return p.scheme }
+
+func (p *staticProvider) Fetch(context.Context, string, string) (string, error) {
+	return p.value, nil
+}
+
 func TestParseReference(t *testing.T) {
 	tests := []struct {
 		in   string
@@ -265,6 +278,65 @@ func TestNewEnvProvider(t *testing.T) {
 	// An unset variable should return an error, not an empty string.
 	if _, err := r.ResolveString(context.Background(), "${secret:env:NONEXISTENT}"); err == nil {
 		t.Fatal("expected an error for an unset variable")
+	}
+}
+
+// Register is what makes a provider's scheme resolvable, and re-registering a
+// scheme replaces its provider. Both the registration and the unregistered
+// case are checked through resolution, because Schemes() alone cannot show
+// which provider a reference actually reaches.
+func TestRegister(t *testing.T) {
+	tests := []struct {
+		name      string
+		providers []Provider
+		ref       string
+		want      string
+		wantErr   string
+	}{
+		{
+			name:      "registered provider resolves through its scheme",
+			providers: []Provider{&staticProvider{scheme: "test", value: "resolved"}},
+			ref:       "${secret:test:path#key}",
+			want:      "resolved",
+		},
+		{
+			name: "re-registering a scheme replaces the provider",
+			providers: []Provider{
+				&staticProvider{scheme: "test", value: "old"},
+				&staticProvider{scheme: "test", value: "new"},
+			},
+			ref:  "${secret:test:path#key}",
+			want: "new",
+		},
+		{
+			name:      "scheme that was never registered errors",
+			providers: []Provider{&staticProvider{scheme: "test", value: "resolved"}},
+			ref:       "${secret:other:path#key}",
+			wantErr:   `unknown provider "other"`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := NewResolver()
+			for _, p := range tc.providers {
+				r.Register(p)
+			}
+
+			got, err := r.ResolveString(context.Background(), tc.ref)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("ResolveString(%q) error = %v, want one containing %q", tc.ref, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveString(%q): %v", tc.ref, err)
+			}
+			if got != tc.want {
+				t.Fatalf("ResolveString(%q) = %q, want %q", tc.ref, got, tc.want)
+			}
+		})
 	}
 }
 
