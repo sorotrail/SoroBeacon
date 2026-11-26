@@ -2,96 +2,83 @@ package archive
 
 import (
 	"context"
-	"time"
+	"io"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
-// TestNewPrunerEdgeCases covers edge cases for NewPruner:
-// - nil backend should return an error
-// - a valid backend should succeed
+// recordingArchiver captures what a Pruner writes without touching disk.
+type recordingArchiver struct {
+	keys   []string
+	bodies []string
+}
+
+func (r *recordingArchiver) Archive(_ context.Context, key string, rd io.Reader) error {
+	b, err := io.ReadAll(rd)
+	if err != nil {
+		return err
+	}
+	r.keys = append(r.keys, key)
+	r.bodies = append(r.bodies, string(b))
+	return nil
+}
+
+// TestNewPrunerEdgeCases pins the constructor's boundary behaviour: a nil
+// backend is invalid and rejected, an empty batch is a no-op, and a single
+// alert is the smallest batch that produces an archive object.
 func TestNewPrunerEdgeCases(t *testing.T) {
+	day := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
 	tests := []struct {
-		name      string
-		setupFunc func(t *testing.T) error
-		wantErr   bool
+		name         string
+		backend      Archiver
+		alerts       []store.Alert
+		wantErr      string
+		wantArchives int
 	}{
 		{
-			name: "nil backend returns error",
-			setupFunc: func(t *testing.T) error {
-				// nil backend - should error
-				var back Archiver = nil //nolint:staticcheck // we want to test nil
-				_, err := NewPruner(back)
-				assert.Error(t, err, "nil backend must return an error")
-				return err
-			},
-			wantErr: true,
+			name:    "nil backend is rejected",
+			wantErr: "archive: nil backend",
 		},
 		{
-			name: "valid backend succeeds",
-			setupFunc: func(t *testing.T) error {
-				dir := t.TempDir()
-				back, err := NewDir(dir)
-				require.NoError(t, err, "NewDir must succeed")
-				_, err = NewPruner(back)
-				require.NoError(t, err, "NewPruner with valid backend must succeed")
-				return nil
-			},
-			wantErr: false,
+			name:    "empty batch never reaches the backend",
+			backend: &recordingArchiver{},
 		},
 		{
-			name: "empty alerts is no-op",
-			setupFunc: func(t *testing.T) error {
-				back, err := NewDir(t.TempDir())
-				require.NoError(t, err, "NewDir must succeed")
-				p, err := NewPruner(back)
-				require.NoError(t, err, "NewPruner must succeed")
-				// empty alerts should be a no-op
-				err = p.Archive(context.Background(), []store.Alert{})
-				assert.NoError(t, err, "empty alerts must succeed as no-op")
-				return nil
-			},
-			wantErr: false,
-		},
-		{
-			name: "single alert boundary",
-			setupFunc: func(t *testing.T) error {
-				back, err := NewDir(t.TempDir())
-				require.NoError(t, err, "NewDir must succeed")
-				p, err := NewPruner(back)
-				require.NoError(t, err, "NewPruner must succeed")
-				// single alert - boundary value
-				singleAlert := store.Alert{
-					ID:        42,
-					MonitorID: 1,
-					RuleID:    1,
-					EventID:   "test-event",
-					CreatedAt: time.Now(),
-					Payload:   []byte(`{"key":"value"}`),
-				}
-				err = p.Archive(context.Background(), []store.Alert{singleAlert})
-				assert.NoError(t, err, "single alert must succeed")
-				// verify the key is deterministic
-				key := BatchKey([]store.Alert{singleAlert})
-				assert.Contains(t, key, "alerts/")
-				assert.Contains(t, key, ".ndjson")
-				return nil
-			},
-			wantErr: false,
+			name:         "single alert is the smallest valid batch",
+			backend:      &recordingArchiver{},
+			alerts:       []store.Alert{{ID: 7, CreatedAt: day}},
+			wantArchives: 1,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := tt.setupFunc(t)
-			if tt.wantErr {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
+			back, _ := tt.backend.(*recordingArchiver)
+
+			pruner, err := NewPruner(tt.backend)
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+				assert.Nil(t, pruner, "a rejected backend must not yield a pruner")
+				return
 			}
+			require.NoError(t, err)
+			require.NotNil(t, pruner)
+			require.NotNil(t, back)
+
+			require.NoError(t, pruner.Archive(context.Background(), tt.alerts))
+			require.Len(t, back.keys, tt.wantArchives)
+			if tt.wantArchives == 0 {
+				return
+			}
+			assert.Equal(t, BatchKey(tt.alerts), back.keys[0])
+			assert.Equal(t, 1, strings.Count(back.bodies[0], "\n"), "one NDJSON line per alert")
 		})
 	}
 }

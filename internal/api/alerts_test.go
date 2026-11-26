@@ -168,7 +168,9 @@ func retryServer(t *testing.T, st store.Store, n *scriptedNotifier) *httptest.Se
 	t.Helper()
 	f := notify.DefaultFactory()
 	f.Register("mock", func(json.RawMessage) (notify.Notifier, error) { return n, nil })
-	s := New(st, rules.NewRegistry(), f, &fakeRPC{}, discardLogger())
+	log := discardLogger()
+	d := notify.NewDispatcher(st, f, log)
+	s := New(st, rules.NewRegistry(), f, &fakeRPC{}, log).WithDispatcher(d)
 	return httptest.NewServer(s.Routes())
 }
 

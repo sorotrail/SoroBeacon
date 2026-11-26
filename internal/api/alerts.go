@@ -428,8 +428,7 @@ func (s *Server) retryDelivery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	na := notifyAlertFromStore(r.Context(), s.store, *alert)
-	d := notify.NewDispatcher(s.store, s.factory, s.log)
-	attempt := d.Retry(r.Context(), na, *ch)
+	attempt := s.dispatcher.Retry(r.Context(), na, *ch)
 	writeJSON(w, http.StatusOK, attempt)
 }
 

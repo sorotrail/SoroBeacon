@@ -113,6 +113,7 @@ func (r *queryResolver) Monitor(ctx context.Context, id string) (*Monitor, error
 	return toMonitor(m), nil
 }
 
+// Monitors returns a paginated connection of monitors matching the given filters.
 func (r *queryResolver) Monitors(ctx context.Context, enabled *bool, limit *int, cursor *string, query *string, sort *MonitorSort) (*MonitorConnection, error) {
 	f := store.ListFilter{}
 	if enabled != nil {
@@ -174,6 +175,7 @@ func (r *queryResolver) Monitors(ctx context.Context, enabled *bool, limit *int,
 	}, nil
 }
 
+// Alert returns a single alert by its unique ID.
 func (r *queryResolver) Alert(ctx context.Context, id string) (*Alert, error) {
 	alertID, err := strconv.ParseInt(id, 10, 64)
 	if err != nil {
@@ -189,6 +191,7 @@ func (r *queryResolver) Alert(ctx context.Context, id string) (*Alert, error) {
 	return toAlert(a), nil
 }
 
+// Alerts returns a paginated, optionally filtered list of alerts.
 func (r *queryResolver) Alerts(ctx context.Context, monitorID *string, ruleID *string, contractID *string, from *DateTime, to *DateTime, severity *Severity, limit *int, cursor *string, sort *AlertSort) (*AlertConnection, error) {
 	f := store.AlertFilter{}
 	if monitorID != nil && *monitorID != "" {
@@ -263,6 +266,7 @@ func (r *queryResolver) Alerts(ctx context.Context, monitorID *string, ruleID *s
 	}, nil
 }
 
+// Stats returns aggregate statistics for monitors, rules, and alerts.
 func (r *queryResolver) Stats(ctx context.Context) (*Stats, error) {
 	s, err := r.store.GetStats(ctx)
 	if err != nil {

@@ -840,14 +840,15 @@ func ValidMaintenanceScope(s string) bool {
 // [StartAt, EndAt) for its scope are persisted but not delivered.
 // MonitorID and ContractID are set only when the scope calls for them.
 type MaintenanceWindow struct {
-	ID         int64     `json:"id"`
-	Reason     string    `json:"reason"`
-	Scope      string    `json:"scope"`
-	MonitorID  *int64    `json:"monitor_id,omitempty"`
-	ContractID *string   `json:"contract_id,omitempty"`
-	StartAt    time.Time `json:"start_at"`
-	EndAt      time.Time `json:"end_at"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID          int64     `json:"id"`
+	WorkspaceID string    `json:"-"`
+	Reason      string    `json:"reason"`
+	Scope       string    `json:"scope"`
+	MonitorID   *int64    `json:"monitor_id,omitempty"`
+	ContractID  *string   `json:"contract_id,omitempty"`
+	StartAt     time.Time `json:"start_at"`
+	EndAt       time.Time `json:"end_at"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // MaintenanceWindowFilter narrows ListMaintenanceWindows. Zero values mean

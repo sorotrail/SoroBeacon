@@ -37,6 +37,9 @@ func (emptyStore) ChannelDeliveryChangeKey(context.Context, int64) (int64, int64
 func (emptyStore) GetDeliveryBudget(context.Context, int64, time.Time) (*store.DeliveryBudget, error) {
 	return nil, store.ErrNotFound
 }
+func (emptyStore) GetEscalationPolicyForMonitor(context.Context, int64) (*store.EscalationPolicy, error) {
+	return nil, store.ErrNotFound
+}
 func (emptyStore) GetMonitorStats(context.Context, int64) (store.MonitorStats, error) {
 	return store.MonitorStats{}, nil
 }

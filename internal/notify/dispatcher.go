@@ -1310,7 +1310,7 @@ func (d *Dispatcher) RedriveDeadLetter(ctx context.Context, deadLetterID int64, 
 	}
 
 	d.recordWorkspaceNotification(ctx, *ch, "ok")
-	d.record(ctx, alert.ID, ch.ID, "success", "redrive: success")
+	d.record(ctx, alert.ID, ch.ID, "success", "redrive: ok")
 	if err := d.store.DeleteDeadLetter(ctx, deadLetterID); err != nil {
 		d.log.Error("delete dead letter after successful redrive", "dead_letter_id", deadLetterID, "err", err)
 	} else if d.metrics != nil {
