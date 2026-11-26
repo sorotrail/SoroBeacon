@@ -59,6 +59,18 @@ var AuditWebRouteTable = auth.NewRouteTable(map[string]AuditWebSpec{
 	// Maintenance windows
 	"POST /maintenance":             {Action: store.AuditActionCreate, TargetType: store.AuditTargetMaintenanceWindow},
 	"POST /maintenance/{id}/delete": {Action: store.AuditActionDelete, TargetType: store.AuditTargetMaintenanceWindow},
+
+	// Inhibitions
+	"POST /inhibitions":        {Action: store.AuditActionCreate, TargetType: store.AuditTargetInhibition},
+	"POST /inhibitions/delete": {Action: store.AuditActionDelete, TargetType: store.AuditTargetInhibition},
+
+	// Monitor templates
+	"POST /monitor-templates":             {Action: store.AuditActionCreate, TargetType: store.AuditTargetTemplate},
+	"POST /monitor-templates/{id}/delete": {Action: store.AuditActionDelete, TargetType: store.AuditTargetTemplate},
+
+	// Escalation policies on monitor detail
+	"POST /monitors/{id}/escalation":        {Action: store.AuditActionUpdate, TargetType: store.AuditTargetEscalationPolicy},
+	"POST /monitors/{id}/escalation/delete": {Action: store.AuditActionDelete, TargetType: store.AuditTargetEscalationPolicy},
 })
 
 // AuditExemptWebRoutes documents mutating HTTP routes on the dashboard router

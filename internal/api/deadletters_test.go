@@ -89,7 +89,9 @@ func deadLetterServer(t *testing.T, st store.Store, n *deadLetterNotifier) *http
 	t.Helper()
 	f := notify.DefaultFactory()
 	f.Register("mock", func(json.RawMessage) (notify.Notifier, error) { return n, nil })
-	s := New(st, rules.NewRegistry(), f, &fakeRPC{}, slog.New(slog.NewTextHandler(io.Discard, nil))).WithAuth(twoWorkspaces())
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	d := notify.NewDispatcher(st, f, log)
+	s := New(st, rules.NewRegistry(), f, &fakeRPC{}, log).WithAuth(twoWorkspaces()).WithDispatcher(d)
 	srv := httptest.NewServer(s.Routes())
 	t.Cleanup(srv.Close)
 	return srv

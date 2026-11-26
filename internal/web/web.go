@@ -112,6 +112,7 @@ var templateFuncs = template.FuncMap{
 	"severityClass": severityClass,
 	"auditFields":   auditFields,
 	"receiptLabel":  notify.ReceiptCapabilityLabel,
+	"add":           func(a, b int) int { return a + b },
 }
 
 const tsLayout = "2006-01-02 15:04:05"
@@ -239,7 +240,7 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 	// Every page the dashboard can render. A page missing from this list is a
 	// nil template at request time, which is a panic rather than a 500, so the
 	// list and the templates directory have to agree.
-	for _, page := range []string{"index", "monitors", "monitor", "channels", "channel-edit", "channel-delete", "alerts", "alert", "audit", "maintenance", "login", "error", "rulebuilder", "searches", "tokens", "deadletters"} {
+	for _, page := range []string{"index", "monitors", "monitor", "channels", "channel-edit", "channel-delete", "alerts", "alert", "audit", "maintenance", "login", "error", "rulebuilder", "searches", "tokens", "deadletters", "inhibitions", "monitor-templates"} {
 		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/shortcuts.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, fmt.Errorf("parse template %s: %w", page, err)
@@ -405,6 +406,8 @@ func (s *Server) Routes() chi.Router {
 	mux.Post("/monitors/{id}/rules/{ruleID}/toggle", s.toggleRule)
 	mux.Post("/monitors/{id}/rules/{ruleID}/delete", s.deleteRule)
 	mux.Post("/monitors/{id}/channels", s.setMonitorChannels)
+	mux.Post("/monitors/{id}/escalation", s.setEscalationPolicy)
+	mux.Post("/monitors/{id}/escalation/delete", s.deleteEscalationPolicy)
 
 	mux.Get("/channels", s.channels)
 	mux.Post("/channels", s.createChannel)
@@ -447,6 +450,15 @@ func (s *Server) Routes() chi.Router {
 	mux.Get("/maintenance", s.maintenance)
 	mux.Post("/maintenance", s.createMaintenance)
 	mux.Post("/maintenance/{id}/delete", s.deleteMaintenance)
+
+	mux.Get("/inhibitions", s.inhibitions)
+	mux.Post("/inhibitions", s.createInhibition)
+	mux.Post("/inhibitions/delete", s.deleteInhibition)
+
+	mux.Get("/monitor-templates", s.monitorTemplates)
+	mux.Post("/monitor-templates", s.createMonitorTemplate)
+	mux.Post("/monitor-templates/{id}/delete", s.deleteMonitorTemplate)
+
 	mux.NotFound(s.notFound)
 	return mux
 }
@@ -457,14 +469,16 @@ func (s *Server) Routes() chi.Router {
 // intentionally maps to "" (Overview has no distinct nav highlight of its
 // own beyond the brand link).
 var navSection = map[string]string{
-	"monitors":    "monitors",
-	"monitor":     "monitors",
-	"channels":    "channels",
-	"alerts":      "alerts",
-	"alert":       "alerts",
-	"audit":       "audit",
-	"maintenance": "maintenance",
-	"searches":    "alerts",
+	"monitors":          "monitors",
+	"monitor":           "monitors",
+	"channels":          "channels",
+	"alerts":            "alerts",
+	"alert":             "alerts",
+	"audit":             "audit",
+	"maintenance":       "maintenance",
+	"searches":          "alerts",
+	"inhibitions":       "inhibitions",
+	"monitor-templates": "monitor-templates",
 }
 
 func (s *Server) render(w http.ResponseWriter, r *http.Request, page string, data any) {
@@ -1057,6 +1071,15 @@ func (s *Server) monitorPage(r *http.Request, id int64) (map[string]any, error) 
 	for _, cid := range m.ChannelIDs {
 		attached[cid] = true
 	}
+	// A monitor without an escalation policy returns ErrNotFound; that is not
+	// an error for the page — it just means the section renders the "no policy"
+	// state.
+	var escalationPolicy *store.EscalationPolicy
+	if ep, err := s.store.GetEscalationPolicyForMonitor(r.Context(), id); err == nil {
+		escalationPolicy = ep
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
 	tz := tzFromRequest(r)
 	// The panel and the last-matched cue are rendered from one value: the same
 	// monitorRow the list pages use. Two readings of "when did this fire" on
@@ -1064,6 +1087,7 @@ func (s *Server) monitorPage(r *http.Request, id int64) (map[string]any, error) 
 	row := s.monitorRow(*m, tz, time.Now())
 	return map[string]any{
 		"Title": m.Name, "Monitor": row, "Rules": ruleList,
+		"EscalationPolicy": escalationPolicy,
 		"Channels": channels, "Attached": attached, "RuleTypes": s.registry.Types(),
 		"RecentAlerts": recent,
 		// The alerts page already filters by monitor, so the panel is a summary
@@ -2317,6 +2341,190 @@ func (s *Server) alertDetail(w http.ResponseWriter, r *http.Request) {
 		"RunbookURL":       runbookURL,
 		"ResponseGuidance": responseGuidance,
 	})
+}
+
+func (s *Server) inhibitions(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.ListInhibitions(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	monitors, err := s.store.ListMonitors(r.Context(), false)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.render(w, r, "inhibitions", map[string]any{
+		"Title":       "Inhibitions",
+		"Inhibitions": list,
+		"Monitors":    monitors,
+	})
+}
+
+func (s *Server) createInhibition(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	sourceID, err := strconv.ParseInt(r.FormValue("source_rule_id"), 10, 64)
+	if err != nil || sourceID < 1 {
+		http.Error(w, "source_rule_id is required", http.StatusBadRequest)
+		return
+	}
+	targetID, err := strconv.ParseInt(r.FormValue("target_rule_id"), 10, 64)
+	if err != nil || targetID < 1 {
+		http.Error(w, "target_rule_id is required", http.StatusBadRequest)
+		return
+	}
+	in := &store.Inhibition{SourceRuleID: sourceID, TargetRuleID: targetID}
+	if v := r.FormValue("firing_window_seconds"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			in.FiringWindowSeconds = n
+		}
+	}
+	if err := s.store.CreateInhibition(r.Context(), in); err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.audit(r, store.AuditActionCreate, store.AuditTargetInhibition, in.SourceRuleID)
+	http.Redirect(w, r, "/inhibitions", http.StatusSeeOther)
+}
+
+func (s *Server) deleteInhibition(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	sourceID, err := strconv.ParseInt(r.FormValue("source_rule_id"), 10, 64)
+	if err != nil || sourceID < 1 {
+		http.Error(w, "source_rule_id is required", http.StatusBadRequest)
+		return
+	}
+	targetID, err := strconv.ParseInt(r.FormValue("target_rule_id"), 10, 64)
+	if err != nil || targetID < 1 {
+		http.Error(w, "target_rule_id is required", http.StatusBadRequest)
+		return
+	}
+	if err := s.store.DeleteInhibition(r.Context(), sourceID, targetID); err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.fail(w, err)
+		return
+	}
+	s.audit(r, store.AuditActionDelete, store.AuditTargetInhibition, sourceID)
+	http.Redirect(w, r, "/inhibitions", http.StatusSeeOther)
+}
+
+func (s *Server) setEscalationPolicy(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	raw := strings.TrimSpace(r.FormValue("steps"))
+	if raw == "" {
+		http.Error(w, "steps is required", http.StatusBadRequest)
+		return
+	}
+	var steps []store.EscalationStep
+	for pos, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			http.Error(w, "each step must be delay_seconds:channel_id,...", http.StatusBadRequest)
+			return
+		}
+		delayRaw, chRaw := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		delay, err := strconv.ParseInt(delayRaw, 10, 64)
+		if err != nil || delay < 1 {
+			http.Error(w, "delay must be a positive integer (seconds)", http.StatusBadRequest)
+			return
+		}
+		step := store.EscalationStep{Position: pos, DelaySeconds: delay}
+		for _, cid := range strings.Split(chRaw, ",") {
+			cid = strings.TrimSpace(cid)
+			if cid == "" {
+				continue
+			}
+			n, err := strconv.ParseInt(cid, 10, 64)
+			if err != nil || n < 1 {
+				http.Error(w, "channel id must be a positive integer", http.StatusBadRequest)
+				return
+			}
+			step.ChannelIDs = append(step.ChannelIDs, n)
+		}
+		steps = append(steps, step)
+	}
+	if _, err := s.store.SetEscalationPolicy(r.Context(), id, steps); err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.audit(r, store.AuditActionUpdate, store.AuditTargetEscalationPolicy, id)
+	http.Redirect(w, r, "/monitors/"+strconv.FormatInt(id, 10), http.StatusSeeOther)
+}
+
+func (s *Server) deleteEscalationPolicy(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := s.store.DeleteEscalationPolicy(r.Context(), id); err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.fail(w, err)
+		return
+	}
+	s.audit(r, store.AuditActionDelete, store.AuditTargetEscalationPolicy, id)
+	http.Redirect(w, r, "/monitors/"+strconv.FormatInt(id, 10), http.StatusSeeOther)
+}
+
+func (s *Server) monitorTemplates(w http.ResponseWriter, r *http.Request) {
+	list, err := s.store.ListMonitorTemplates(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.render(w, r, "monitor-templates", map[string]any{
+		"Title":     "Monitor templates",
+		"Templates": list,
+	})
+}
+
+func (s *Server) createMonitorTemplate(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	if name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	t := &store.MonitorTemplate{Name: name, Description: r.FormValue("description")}
+	if err := s.store.CreateMonitorTemplate(r.Context(), t); err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.audit(r, store.AuditActionCreate, store.AuditTargetTemplate, t.ID)
+	http.Redirect(w, r, "/monitor-templates", http.StatusSeeOther)
+}
+
+func (s *Server) deleteMonitorTemplate(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := s.store.DeleteMonitorTemplate(r.Context(), id); err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.audit(r, store.AuditActionDelete, store.AuditTargetTemplate, id)
+	http.Redirect(w, r, "/monitor-templates", http.StatusSeeOther)
 }
 
 // acknowledgeAlert serves POST /alerts/{id}/acknowledge, the dashboard's half

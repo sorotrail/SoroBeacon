@@ -3063,11 +3063,12 @@ func (s *SQLite) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int)
 // identical.
 
 func (s *SQLite) CreateMaintenanceWindow(ctx context.Context, w *MaintenanceWindow) error {
+	w.WorkspaceID = string(workspaceID(ctx))
 	var created string
 	if err := s.db.QueryRowContext(ctx,
-		`INSERT INTO maintenance_windows (reason, scope, monitor_id, contract_id, start_at, end_at)
-		 VALUES (?, ?, ?, ?, ?, ?) RETURNING id, created_at`,
-		w.Reason, w.Scope, w.MonitorID, w.ContractID, sqliteTimeString(w.StartAt), sqliteTimeString(w.EndAt),
+		`INSERT INTO maintenance_windows (workspace_id, reason, scope, monitor_id, contract_id, start_at, end_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id, created_at`,
+		w.WorkspaceID, w.Reason, w.Scope, w.MonitorID, w.ContractID, sqliteTimeString(w.StartAt), sqliteTimeString(w.EndAt),
 	).Scan(&w.ID, &created); err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -3081,7 +3082,7 @@ func scanSQLiteMaintenanceWindow(r rowScanner) (*MaintenanceWindow, error) {
 	var monitorID sql.NullInt64
 	var contractID sql.NullString
 	var start, end, created string
-	if err := r.Scan(&w.ID, &w.Reason, &w.Scope, &monitorID, &contractID, &start, &end, &created); err != nil {
+	if err := r.Scan(&w.ID, &w.WorkspaceID, &w.Reason, &w.Scope, &monitorID, &contractID, &start, &end, &created); err != nil {
 		return nil, mapSQLiteErr(err)
 	}
 	if monitorID.Valid {
@@ -3107,14 +3108,14 @@ func scanSQLiteMaintenanceWindow(r rowScanner) (*MaintenanceWindow, error) {
 
 func (s *SQLite) GetMaintenanceWindow(ctx context.Context, id int64) (*MaintenanceWindow, error) {
 	return scanSQLiteMaintenanceWindow(s.db.QueryRowContext(ctx,
-		`SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
-		 FROM maintenance_windows WHERE id = ?`, id))
+		`SELECT id, workspace_id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		 FROM maintenance_windows WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx)))
 }
 
 func (s *SQLite) ListMaintenanceWindows(ctx context.Context, f MaintenanceWindowFilter) ([]MaintenanceWindow, error) {
-	q := `SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
-		 FROM maintenance_windows WHERE 1 = 1`
-	args := []any{}
+	q := `SELECT id, workspace_id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		 FROM maintenance_windows WHERE workspace_id = ?`
+	args := []any{workspaceID(ctx)}
 	if f.Active || f.Upcoming {
 		at := f.At
 		if at.IsZero() {
@@ -3150,8 +3151,8 @@ func (s *SQLite) UpdateMaintenanceWindow(ctx context.Context, w *MaintenanceWind
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE maintenance_windows
 		 SET reason = ?, scope = ?, monitor_id = ?, contract_id = ?, start_at = ?, end_at = ?
-		 WHERE id = ?`,
-		w.Reason, w.Scope, w.MonitorID, w.ContractID, sqliteTimeString(w.StartAt), sqliteTimeString(w.EndAt), w.ID)
+		 WHERE id = ? AND workspace_id = ?`,
+		w.Reason, w.Scope, w.MonitorID, w.ContractID, sqliteTimeString(w.StartAt), sqliteTimeString(w.EndAt), w.ID, workspaceID(ctx))
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -3165,11 +3166,9 @@ func (s *SQLite) UpdateMaintenanceWindow(ctx context.Context, w *MaintenanceWind
 	return nil
 }
 
-// DeleteMaintenanceWindow removes one window. It does not go through
-// deleteByID, for the reason given on the Postgres method: maintenance windows
-// are instance-level under this model, so the delete is not workspace-scoped.
 func (s *SQLite) DeleteMaintenanceWindow(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM maintenance_windows WHERE id = ?`, id)
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM maintenance_windows WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx))
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -3189,15 +3188,15 @@ func (s *SQLite) DeleteMaintenanceWindow(ctx context.Context, id int64) error {
 // global) so a contract's reason is preferred over a broader one's.
 func (s *SQLite) ActiveMaintenanceWindow(ctx context.Context, monitorID int64, contractID string, at time.Time) (*MaintenanceWindow, error) {
 	w, err := scanSQLiteMaintenanceWindow(s.db.QueryRowContext(ctx,
-		`SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		`SELECT id, workspace_id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
 		 FROM maintenance_windows
-		 WHERE start_at <= ? AND end_at > ?
+		 WHERE workspace_id = ? AND start_at <= ? AND end_at > ?
 		   AND (scope = 'global'
 		        OR (scope = 'monitor' AND monitor_id = ?)
 		        OR (scope = 'contract' AND contract_id = ?))
 		 ORDER BY CASE scope WHEN 'contract' THEN 0 WHEN 'monitor' THEN 1 ELSE 2 END, start_at DESC
 		 LIMIT 1`,
-		sqliteTimeString(at), sqliteTimeString(at), monitorID, contractID))
+		workspaceID(ctx), sqliteTimeString(at), sqliteTimeString(at), monitorID, contractID))
 	if errors.Is(err, ErrNotFound) {
 		return nil, nil
 	}

@@ -474,6 +474,7 @@ func joinIDs(ids []int64) string {
 // stringList is a repeatable string flag: --contract A --contract B.
 type stringList []string
 
+// String returns the list of values joined by ", ", satisfying the flag.Value interface.
 func (s *stringList) String() string { return strings.Join(*s, ", ") }
 
 // Set appends value to the list, so each repeat of the flag adds one entry.
