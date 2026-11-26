@@ -95,6 +95,22 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://sorobeacon:sorobeacon@localhost:5432/sorobeacon?sslmode=disable
 
+  # End-to-end smoke test: builds the real binary, starts a fake Soroban RPC
+  # and an httptest webhook receiver, and asserts that polling → matching →
+  # delivery works end to end. Kept in its own job so a flaky network or slow
+  # build does not block the unit-test job.
+  test-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: E2E smoke test
+        run: make test-e2e
+
   # Builds the image without pushing it, so a broken Dockerfile fails the pull
   # request instead of whoever deploys next. It pushes nothing and uses no
   # secrets, which keeps it safe on pull requests from forks.

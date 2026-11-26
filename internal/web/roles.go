@@ -42,6 +42,8 @@ var routeRoles = auth.NewRouteTable(map[string]auth.Role{
 	"GET /dead-letters":           auth.RoleViewer,
 	"GET /maintenance":            auth.RoleViewer,
 	"GET /searches":               auth.RoleViewer,
+	"GET /inhibitions":            auth.RoleViewer,
+	"GET /monitor-templates":      auth.RoleViewer,
 
 	// Changing what the instance watches and where it sends.
 	"POST /monitors":                            auth.RoleEditor,
@@ -70,6 +72,12 @@ var routeRoles = auth.NewRouteTable(map[string]auth.Role{
 	// same store method.
 	"POST /maintenance":                              auth.RoleEditor,
 	"POST /maintenance/{id}/delete":                  auth.RoleEditor,
+	"POST /inhibitions":                              auth.RoleEditor,
+	"POST /inhibitions/delete":                       auth.RoleEditor,
+	"POST /monitor-templates":                        auth.RoleEditor,
+	"POST /monitor-templates/{id}/delete":            auth.RoleEditor,
+	"POST /monitors/{id}/escalation":                 auth.RoleEditor,
+	"POST /monitors/{id}/escalation/delete":          auth.RoleEditor,
 	"POST /alerts/{id}/deliveries/{channelID}/retry": auth.RoleEditor,
 	"POST /alerts/{id}/acknowledge":                  auth.RoleEditor,
 	"POST /dead-letters/{id}/redrive":                auth.RoleEditor,

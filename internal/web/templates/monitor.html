@@ -153,4 +153,34 @@
     {{if .Channels}}<p><button>Save</button></p>{{end}}
   </form>
 </fieldset>
+
+<h2>Escalation policy</h2>
+{{with .EscalationPolicy}}
+<p class="muted">Steps fire in order when an alert is not acknowledged within each step's delay.</p>
+<table>
+  <tr><th>Step</th><th>Delay</th><th>Channels</th></tr>
+  {{range .Steps}}
+  <tr>
+    <td>{{add .Position 1}}</td>
+    <td>{{.DelaySeconds}}s</td>
+    <td>{{range .ChannelIDs}}#{{.}} {{end}}</td>
+  </tr>
+  {{end}}
+</table>
+<form class="inline" method="post" action="/monitors/{{$.Monitor.ID}}/escalation/delete"
+      onsubmit="return confirm('Delete the escalation policy for this monitor?')">
+  <button>Delete policy</button>
+</form>
+{{else}}
+<p class="muted">No escalation policy. Add one to escalate unacknowledged alerts through additional channels.</p>
+{{end}}
+<fieldset>
+  <legend>{{if .EscalationPolicy}}Replace policy{{else}}Set policy{{end}}</legend>
+  <form method="post" action="/monitors/{{.Monitor.ID}}/escalation">
+    <p class="muted">Enter steps as <code>delay_seconds:channel_id,channel_id</code> — one per line.</p>
+    <label for="steps">Steps</label>
+    <textarea id="steps" name="steps" rows="3" placeholder="300:1&#10;1800:2,3"></textarea>
+    <p><button>Save</button></p>
+  </form>
+</fieldset>
 {{end}}
