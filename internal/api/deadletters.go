@@ -184,75 +184,7 @@ func (s *Server) bulkDiscardDeadLetters(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) redriveOne(ctx context.Context, dl store.DeadLetter) error {
-	alert, err := s.store.GetAlert(ctx, dl.AlertID)
-	if err != nil {
-		if errorsIsNotFound(err) {
-			return errAlertNotFound
-		}
-		return err
-	}
-
-	ch, err := s.store.GetChannel(ctx, dl.ChannelID)
-	if err != nil {
-		if errorsIsNotFound(err) {
-			return errChannelNotFound
-		}
-		return err
-	}
-
-	attempts, err := s.store.ListDeliveryAttempts(ctx, alert.ID, "")
-	if err != nil {
-		return err
-	}
-	for _, att := range attempts {
-		if att.ChannelID == ch.ID && att.Status == store.DeliveryStatusSuccess {
-			if deleteErr := s.store.DeleteDeadLetter(ctx, dl.ID); deleteErr != nil {
-				return deleteErr
-			}
-			return notify.ErrAlreadySucceeded
-		}
-	}
-
-	if !ch.Enabled {
-		return notify.ErrChannelDisabled
-	}
-
-	notifier, err := s.factory.New(ch.Type, ch.Config)
-	if err != nil {
-		return err
-	}
-
-	attemptCtx, cancel := context.WithTimeout(ctx, ch.TimeoutDuration())
-	defer cancel()
-
-	notifyAlert := notifyAlertFromStore(attemptCtx, s.store, *alert)
-	err = notifier.Send(attemptCtx, notifyAlert)
-	attemptStatus := store.DeliveryStatusSuccess
-	snippet := "redrive: ok"
-	if err != nil {
-		attemptStatus = store.DeliveryStatusFailed
-		snippet = "delivery failed"
-	}
-
-	_ = s.store.RecordDeliveryAttempt(attemptCtx, &store.DeliveryAttempt{
-		AlertID:         alert.ID,
-		ChannelID:       ch.ID,
-		Status:          attemptStatus,
-		ResponseSnippet: snippet,
-	})
-
-	if err != nil {
-		return errors.New(snippet)
-	}
-
-	if deleteErr := s.store.DeleteDeadLetter(attemptCtx, dl.ID); deleteErr != nil {
-		return deleteErr
-	}
-	if s.metrics != nil {
-		ws, _ := workspace.From(ctx)
-		s.metrics.ClearDeadLetterFor(string(ws), ch.Name)
-	}
-	return nil
+	return s.dispatcher.RedriveDeadLetter(ctx, dl.ID, dl)
 }
 
 // redriveDeadLetter sends one dead-lettered alert again. A successful send

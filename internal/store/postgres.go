@@ -2994,21 +2994,22 @@ func buildDeliveryAttemptsQuery(alertID int64, status string, ws workspace.ID) (
 // --- maintenance windows ---
 
 func (p *Postgres) CreateMaintenanceWindow(ctx context.Context, w *MaintenanceWindow) error {
+	w.WorkspaceID = string(workspaceID(ctx))
 	return mapErr(p.pool.QueryRow(ctx,
-		`INSERT INTO maintenance_windows (reason, scope, monitor_id, contract_id, start_at, end_at)
-		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at`,
-		w.Reason, w.Scope, w.MonitorID, w.ContractID, w.StartAt.UTC(), w.EndAt.UTC(),
+		`INSERT INTO maintenance_windows (workspace_id, reason, scope, monitor_id, contract_id, start_at, end_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, created_at`,
+		w.WorkspaceID, w.Reason, w.Scope, w.MonitorID, w.ContractID, w.StartAt.UTC(), w.EndAt.UTC(),
 	).Scan(&w.ID, &w.CreatedAt))
 }
 
 func (p *Postgres) GetMaintenanceWindow(ctx context.Context, id int64) (*MaintenanceWindow, error) {
 	return scanMaintenanceWindow(p.pool.QueryRow(ctx,
-		`SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
-		 FROM maintenance_windows WHERE id = $1`, id))
+		`SELECT id, workspace_id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		 FROM maintenance_windows WHERE id = $1 AND workspace_id = $2`, id, workspaceID(ctx)))
 }
 
 func (p *Postgres) ListMaintenanceWindows(ctx context.Context, f MaintenanceWindowFilter) ([]MaintenanceWindow, error) {
-	q := `SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+	q := `SELECT id, workspace_id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
 		 FROM maintenance_windows WHERE TRUE`
 	args := []any{}
 	n := 0
@@ -3017,6 +3018,7 @@ func (p *Postgres) ListMaintenanceWindows(ctx context.Context, f MaintenanceWind
 		args = append(args, v)
 		return fmt.Sprintf("$%d", n)
 	}
+	q += ` AND workspace_id = ` + arg(workspaceID(ctx))
 	if f.Active || f.Upcoming {
 		at := f.At
 		if at.IsZero() {
@@ -3046,8 +3048,8 @@ func (p *Postgres) UpdateMaintenanceWindow(ctx context.Context, w *MaintenanceWi
 	tag, err := p.pool.Exec(ctx,
 		`UPDATE maintenance_windows
 		 SET reason = $2, scope = $3, monitor_id = $4, contract_id = $5, start_at = $6, end_at = $7
-		 WHERE id = $1`,
-		w.ID, w.Reason, w.Scope, w.MonitorID, w.ContractID, w.StartAt.UTC(), w.EndAt.UTC())
+		 WHERE id = $1 AND workspace_id = $8`,
+		w.ID, w.Reason, w.Scope, w.MonitorID, w.ContractID, w.StartAt.UTC(), w.EndAt.UTC(), workspaceID(ctx))
 	if err != nil {
 		return mapErr(err)
 	}
@@ -3057,14 +3059,10 @@ func (p *Postgres) UpdateMaintenanceWindow(ctx context.Context, w *MaintenanceWi
 	return nil
 }
 
-// DeleteMaintenanceWindow removes one window. It does not go through
-// deleteByID: that helper scopes its delete to the caller's workspace, and
-// maintenance_windows carries no workspace_id. A window's scope is global,
-// monitor or contract — it is instance-level under this model, the same way
-// its listing and its creation are, so the delete matches them rather than
-// inventing a tenancy the rest of the feature does not have.
 func (p *Postgres) DeleteMaintenanceWindow(ctx context.Context, id int64) error {
-	tag, err := p.pool.Exec(ctx, `DELETE FROM maintenance_windows WHERE id = $1`, id)
+	tag, err := p.pool.Exec(ctx,
+		`DELETE FROM maintenance_windows WHERE id = $1 AND workspace_id = $2`,
+		id, workspaceID(ctx))
 	if err != nil {
 		return mapErr(err)
 	}
@@ -3080,14 +3078,14 @@ func (p *Postgres) DeleteMaintenanceWindow(ctx context.Context, id int64) error 
 // global) so a contract's reason is preferred over a broader one's.
 func (p *Postgres) ActiveMaintenanceWindow(ctx context.Context, monitorID int64, contractID string, at time.Time) (*MaintenanceWindow, error) {
 	w, err := scanMaintenanceWindow(p.pool.QueryRow(ctx,
-		`SELECT id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
+		`SELECT id, workspace_id, reason, scope, monitor_id, contract_id, start_at, end_at, created_at
 		 FROM maintenance_windows
-		 WHERE start_at <= $1 AND end_at > $1
+		 WHERE workspace_id = $4 AND start_at <= $1 AND end_at > $1
 		   AND (scope = 'global'
 		        OR (scope = 'monitor' AND monitor_id = $2)
 		        OR (scope = 'contract' AND contract_id = $3))
 		 ORDER BY CASE scope WHEN 'contract' THEN 0 WHEN 'monitor' THEN 1 ELSE 2 END, start_at DESC
-		 LIMIT 1`, at.UTC(), monitorID, contractID))
+		 LIMIT 1`, at.UTC(), monitorID, contractID, workspaceID(ctx)))
 	if errors.Is(err, ErrNotFound) {
 		return nil, nil
 	}
@@ -3167,7 +3165,7 @@ func (p *Postgres) DeleteInhibition(ctx context.Context, sourceRuleID, targetRul
 
 func scanMaintenanceWindow(r rowScanner) (*MaintenanceWindow, error) {
 	var w MaintenanceWindow
-	err := r.Scan(&w.ID, &w.Reason, &w.Scope, &w.MonitorID, &w.ContractID, &w.StartAt, &w.EndAt, &w.CreatedAt)
+	err := r.Scan(&w.ID, &w.WorkspaceID, &w.Reason, &w.Scope, &w.MonitorID, &w.ContractID, &w.StartAt, &w.EndAt, &w.CreatedAt)
 	if err != nil {
 		return nil, mapErr(err)
 	}

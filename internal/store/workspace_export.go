@@ -1349,7 +1349,7 @@ func (p *Postgres) exportPostgresEscalationStepChannels(ctx context.Context, ws 
 
 func (p *Postgres) exportPostgresMaintenanceWindows(ctx context.Context, ws string, emitRow func(string, any) error) error {
 	rows, err := p.pool.Query(ctx,
-		`SELECT mw.id, mw.reason, mw.scope, mw.monitor_id, mw.contract_id, mw.start_at, mw.end_at, mw.created_at
+		`SELECT mw.id, mw.workspace_id, mw.reason, mw.scope, mw.monitor_id, mw.contract_id, mw.start_at, mw.end_at, mw.created_at
 		   FROM maintenance_windows mw
 		   LEFT JOIN monitors m ON m.id = mw.monitor_id
 		  WHERE m.workspace_id = $1
@@ -2588,7 +2588,7 @@ func (s *SQLite) exportSQLiteEscalationStepChannels(ctx context.Context, ws stri
 
 func (s *SQLite) exportSQLiteMaintenanceWindows(ctx context.Context, ws string, emitRow func(string, any) error) error {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT mw.id, mw.reason, mw.scope, mw.monitor_id, mw.contract_id, mw.start_at, mw.end_at, mw.created_at
+		`SELECT mw.id, mw.workspace_id, mw.reason, mw.scope, mw.monitor_id, mw.contract_id, mw.start_at, mw.end_at, mw.created_at
 		   FROM maintenance_windows mw
 		   LEFT JOIN monitors m ON m.id = mw.monitor_id
 		  WHERE m.workspace_id = ?

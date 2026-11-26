@@ -1,0 +1,46 @@
+{{define "content"}}
+<h1>Inhibitions</h1>
+<p class="muted">An inhibition pair suppresses deliveries for the target rule while the
+source rule has fired within the configured window. Alert rows are always kept.</p>
+
+{{if .Inhibitions}}
+<table>
+  <tr><th>Source rule</th><th>Target rule</th><th>Window (s)</th><th>Created</th><th></th></tr>
+  {{range .Inhibitions}}
+  <tr>
+    <td>#{{.SourceRuleID}}</td>
+    <td>#{{.TargetRuleID}}</td>
+    <td>{{.FiringWindowSeconds}}</td>
+    <td>{{formatTime .CreatedAt $.Timezone}}</td>
+    <td>
+      <form class="inline" method="post" action="/inhibitions/delete"
+            onsubmit="return confirm('Delete this inhibition?')">
+        <input type="hidden" name="source_rule_id" value="{{.SourceRuleID}}">
+        <input type="hidden" name="target_rule_id" value="{{.TargetRuleID}}">
+        <button>Delete</button>
+      </form>
+    </td>
+  </tr>
+  {{end}}
+</table>
+{{else}}<p class="muted">No inhibitions configured.</p>{{end}}
+
+<fieldset>
+  <legend>New inhibition</legend>
+  <form method="post" action="/inhibitions">
+    <label for="source_rule_id">Source rule (suppressor)</label>
+    <select id="source_rule_id" name="source_rule_id" required>
+      <option value="">—</option>
+      {{range .Monitors}}{{range .Rules}}<option value="{{.ID}}">{{$.Name}} / rule #{{.ID}}</option>{{end}}{{end}}
+    </select>
+    <label for="target_rule_id">Target rule (suppressed)</label>
+    <select id="target_rule_id" name="target_rule_id" required>
+      <option value="">—</option>
+      {{range .Monitors}}{{range .Rules}}<option value="{{.ID}}">{{$.Name}} / rule #{{.ID}}</option>{{end}}{{end}}
+    </select>
+    <label for="firing_window_seconds">Firing window (seconds, default 300)</label>
+    <input type="number" id="firing_window_seconds" name="firing_window_seconds" min="1" placeholder="300">
+    <p><button>Create</button></p>
+  </form>
+</fieldset>
+{{end}}

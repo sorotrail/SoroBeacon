@@ -1,4 +1,4 @@
-.PHONY: build build-tf run test test-db test-race vulncheck cover lint fmt up down clean migrate-new bench verify-reproducible
+.PHONY: build build-tf run test test-db test-race test-e2e vulncheck cover lint fmt up down clean migrate-new bench verify-reproducible
 
 MIGRATIONS_DIR := internal/store/migrations
 # SQLite keeps its own DDL at the same version numbers; migrate-new scaffolds
@@ -41,6 +41,13 @@ test:
 # locally when touching anything the poller, dispatcher or HTTP servers share.
 test-race:
 	go test -race ./...
+
+# End-to-end smoke test: builds the binary, starts a fake RPC and a webhook
+# receiver, then asserts polling → matching → delivery works end to end.
+# Kept behind a build tag so `go test ./...` does not run it without a live
+# network setup; run explicitly here or in the CI e2e job.
+test-e2e:
+	go test -tags=e2e -v -timeout=120s ./e2e/...
 
 # Pinned rather than tracking latest: an unpinned scanner turns an unrelated
 # pull request red on the day the vulnerability database updates. Run through

@@ -1,0 +1,36 @@
+{{define "content"}}
+<h1>Monitor templates</h1>
+<p class="muted">A monitor template captures a reusable monitor shape — name, description,
+and a set of rule definitions — that operators can stamp out into real monitors without
+re-entering the same parameters each time.</p>
+
+{{if .Templates}}
+<table>
+  <tr><th>Name</th><th>Description</th><th>Rules</th><th></th></tr>
+  {{range .Templates}}
+  <tr>
+    <td>{{.Name}}</td>
+    <td>{{.Description}}</td>
+    <td>{{len .Rules}}</td>
+    <td>
+      <form class="inline" method="post" action="/monitor-templates/{{.ID}}/delete"
+            onsubmit="return confirm('Delete template {{.Name}}?')">
+        <button>Delete</button>
+      </form>
+    </td>
+  </tr>
+  {{end}}
+</table>
+{{else}}<p class="muted">No templates defined.</p>{{end}}
+
+<fieldset>
+  <legend>New template</legend>
+  <form method="post" action="/monitor-templates">
+    <label for="name">Name</label>
+    <input type="text" id="name" name="name" required placeholder="ERC-20 transfer monitor">
+    <label for="description">Description</label>
+    <input type="text" id="description" name="description" placeholder="Watches transfer events on any ERC-20 contract">
+    <p><button>Create</button></p>
+  </form>
+</fieldset>
+{{end}}
