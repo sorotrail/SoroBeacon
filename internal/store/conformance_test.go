@@ -56,6 +56,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("ListMonitorsPageSearchFilterSort", func(t *testing.T) { testListMonitorsPage(t, newStore) })
 	t.Run("MonitorTagsNormaliseFilterUpdateAndDuplicate", func(t *testing.T) { testMonitorTags(t, newStore) })
 	t.Run("RuleCRUDAndCascade", func(t *testing.T) { testRuleCRUD(t, newStore) })
+	t.Run("RuleSeverityRoundTrip", func(t *testing.T) { testRuleSeverityRoundTrip(t, newStore) })
 	t.Run("CreateRulesAtomic", func(t *testing.T) { testCreateRulesAtomic(t, newStore) })
 	t.Run("CreateMonitorWithRulesIsAtomic", func(t *testing.T) { testCreateMonitorWithRules(t, newStore) })
 	t.Run("ChannelsAndAttachments", func(t *testing.T) { testChannelsAndAttachments(t, newStore) })
@@ -688,6 +689,40 @@ func testRuleCRUD(t *testing.T, newStore conformanceFactory) {
 	require.NoError(t, st.DeleteMonitor(ctx, m.ID))
 	_, err = st.GetRule(ctx, r.ID)
 	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+func testRuleSeverityRoundTrip(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
+	ctx := context.Background()
+
+	m := &Monitor{Name: "severity-m", ContractIDs: []string{"C"}, Enabled: true}
+	require.NoError(t, st.CreateMonitor(ctx, m))
+
+	for _, sev := range []Severity{SeverityInfo, SeverityWarning, SeverityCritical} {
+		r := &Rule{MonitorID: m.ID, Type: "event_emitted", Params: json.RawMessage(`{}`), Enabled: true, Severity: sev}
+		require.NoError(t, st.CreateRule(ctx, r))
+
+		got, err := st.GetRule(ctx, r.ID)
+		require.NoError(t, err)
+		assert.Equal(t, sev, got.Severity, "GetRule must round-trip severity=%q", sev)
+
+		list, err := st.ListRules(ctx, m.ID, false)
+		require.NoError(t, err)
+		found := false
+		for _, lr := range list {
+			if lr.ID == r.ID {
+				assert.Equal(t, sev, lr.Severity, "ListRules must round-trip severity=%q", sev)
+				found = true
+			}
+		}
+		assert.True(t, found, "rule not found in list")
+
+		r.Severity = SeverityWarning
+		require.NoError(t, st.UpdateRule(ctx, r))
+		updated, err := st.GetRule(ctx, r.ID)
+		require.NoError(t, err)
+		assert.Equal(t, SeverityWarning, updated.Severity, "UpdateRule must persist changed severity")
+	}
 }
 
 func testCreateRulesAtomic(t *testing.T, newStore conformanceFactory) {

@@ -1093,8 +1093,8 @@ func (p *Postgres) CreateRule(ctx context.Context, r *Rule) error {
 		return err
 	}
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, version`,
-		r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled, r.RunbookURL, r.ResponseGuidance,
+		`INSERT INTO rules (monitor_id, type, params, enabled, severity, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, version`,
+		r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled, NormalizedSeverity(r.Severity), r.RunbookURL, r.ResponseGuidance,
 	).Scan(&r.ID, &r.Version); err != nil {
 		return mapErr(err)
 	}
@@ -1127,8 +1127,8 @@ func (p *Postgres) CreateRules(ctx context.Context, rules []*Rule) error {
 	}
 	for _, r := range rules {
 		if err := tx.QueryRow(ctx,
-			`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, version`,
-			r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled, r.RunbookURL, r.ResponseGuidance,
+			`INSERT INTO rules (monitor_id, type, params, enabled, severity, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, version`,
+			r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled, NormalizedSeverity(r.Severity), r.RunbookURL, r.ResponseGuidance,
 		).Scan(&r.ID, &r.Version); err != nil {
 			return mapErr(err)
 		}
@@ -1139,10 +1139,10 @@ func (p *Postgres) CreateRules(ctx context.Context, rules []*Rule) error {
 func (p *Postgres) GetRule(ctx context.Context, id int64) (*Rule, error) {
 	var r Rule
 	err := p.pool.QueryRow(ctx,
-		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version, r.runbook_url, r.response_guidance FROM rules r
+		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.severity, r.version, r.runbook_url, r.response_guidance FROM rules r
 		   JOIN monitors m ON m.id = r.monitor_id
 		  WHERE r.id = $1 AND m.workspace_id = $2`, id, workspaceID(ctx),
-	).Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled, &r.Version, &r.RunbookURL, &r.ResponseGuidance)
+	).Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled, &r.Severity, &r.Version, &r.RunbookURL, &r.ResponseGuidance)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -1156,7 +1156,7 @@ func (p *Postgres) ListRules(ctx context.Context, monitorID int64, enabledOnly b
 		// different scopes: the API (one workspace) and the poller's per-monitor
 		// rule loading, which runs under the cross-tenant system scope and would
 		// otherwise find no rules for a monitor outside the default workspace.
-		q := `SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version, r.runbook_url, r.response_guidance FROM rules r
+		q := `SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.severity, r.version, r.runbook_url, r.response_guidance FROM rules r
 		         JOIN monitors m ON m.id = r.monitor_id
 		        WHERE r.monitor_id = $1`
 		args := []any{monitorID}
@@ -1174,7 +1174,7 @@ func (p *Postgres) ListRules(ctx context.Context, monitorID int64, enabledOnly b
 		}
 		page, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Rule, error) {
 			var r Rule
-			err := row.Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled, &r.Version, &r.RunbookURL, &r.ResponseGuidance)
+			err := row.Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled, &r.Severity, &r.Version, &r.RunbookURL, &r.ResponseGuidance)
 			return r, err
 		})
 		if err != nil {
@@ -1219,21 +1219,21 @@ func (p *Postgres) UpdateRule(ctx context.Context, r *Rule) error {
 	if conditionChanged {
 		if err := tx.QueryRow(ctx,
 			`UPDATE rules
-			    SET type = $2, params = $3, enabled = $4, runbook_url = $5, response_guidance = $6, version = version + 1,
+			    SET type = $2, params = $3, enabled = $4, severity = $5, runbook_url = $6, response_guidance = $7, version = version + 1,
 			        last_alert_at = NULL, suppressed_since_last = 0
 			  WHERE id = $1
 			  RETURNING version`,
-			r.ID, r.Type, newParams, r.Enabled, r.RunbookURL, r.ResponseGuidance,
+			r.ID, r.Type, newParams, r.Enabled, NormalizedSeverity(r.Severity), r.RunbookURL, r.ResponseGuidance,
 		).Scan(&r.Version); err != nil {
 			return mapErr(err)
 		}
 	} else {
 		if err := tx.QueryRow(ctx,
 			`UPDATE rules
-			    SET type = $2, params = $3, enabled = $4, runbook_url = $5, response_guidance = $6, version = version + 1
+			    SET type = $2, params = $3, enabled = $4, severity = $5, runbook_url = $6, response_guidance = $7, version = version + 1
 			  WHERE id = $1
 			  RETURNING version`,
-			r.ID, r.Type, newParams, r.Enabled, r.RunbookURL, r.ResponseGuidance,
+			r.ID, r.Type, newParams, r.Enabled, NormalizedSeverity(r.Severity), r.RunbookURL, r.ResponseGuidance,
 		).Scan(&r.Version); err != nil {
 			return mapErr(err)
 		}

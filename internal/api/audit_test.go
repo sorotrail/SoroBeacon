@@ -598,3 +598,43 @@ func TestAllowUnauthenticatedAuditWrite_RateLimits401BurstWhileRecording403(t *t
 	assert.Equal(t, http.StatusForbidden, entries[0].StatusCode)
 	assert.Equal(t, http.StatusUnauthorized, entries[1].StatusCode)
 }
+
+// TestAuditMiddlewareRecordsWhenMountedUnderPrefix verifies that the audit
+// middleware writes an entry even when the API router is mounted under a path
+// prefix (e.g. /api/v1) the way cmd/sorobeacon/main.go mounts it. Before the
+// fix, auditRoutePattern returned the full "/api/v1/monitors" pattern which
+// never matched the unprefixed entries in AuditRouteTable, so nothing was
+// written.
+func TestAuditMiddlewareRecordsWhenMountedUnderPrefix(t *testing.T) {
+	dbURL := "sqlite://" + filepath.Join(t.TempDir(), "audit-prefix.db")
+	require.NoError(t, store.Migrate(dbURL))
+	st, err := store.NewSQLite(context.Background(), dbURL)
+	require.NoError(t, err)
+	t.Cleanup(st.Close)
+
+	const adminTok = "prefix-admin-tok"
+	authn := auth.NewBound([]auth.Binding{
+		{Workspace: workspace.Default, Token: adminTok + ":admin"},
+	}, time.Hour)
+
+	apiSrv := New(st, rules.NewRegistry(), notify.DefaultFactory(), &fakeRPC{}, discardLogger()).
+		WithAuth(authn)
+
+	// Mirror cmd/sorobeacon/main.go: mount the API router under /api/v1.
+	root := chi.NewRouter()
+	root.Mount("/api/v1", apiSrv.Routes())
+	srv := httptest.NewServer(root)
+	t.Cleanup(srv.Close)
+
+	// POST /api/v1/monitors creates a monitor and should produce one audit entry.
+	res, raw := do(t, http.MethodPost, srv.URL+"/api/v1/monitors",
+		`{"name":"prefix-mon","contract_ids":["`+validContract+`"],"enabled":true}`,
+		map[string]string{"Authorization": "Bearer " + adminTok})
+	require.Equal(t, http.StatusCreated, res.StatusCode, string(raw))
+
+	entries, err := st.ListAuditEntries(context.Background(), store.AuditFilter{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "audit middleware must record an entry when mounted under /api/v1")
+	assert.Equal(t, store.AuditActionCreate, entries[0].Action)
+	assert.Equal(t, "monitor", entries[0].TargetType)
+}
