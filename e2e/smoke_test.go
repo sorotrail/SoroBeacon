@@ -246,7 +246,7 @@ func TestSmokePollingMatchingAndDelivery(t *testing.T) {
 	// Add an event_emitted rule.
 	_, err = client.CreateRule(ctx, monitor.ID, apiclient.RuleCreate{
 		Type:   "event_emitted",
-		Params: json.RawMessage(`{"topic_filter":[{"symbol":"transfer"}]}`),
+		Params: json.RawMessage(`{"event_name":"transfer"}`),
 	})
 	require.NoError(t, err)
 
