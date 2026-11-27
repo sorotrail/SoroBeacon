@@ -1094,7 +1094,7 @@ func (p *Postgres) CreateRule(ctx context.Context, r *Rule) error {
 	}
 	if err := tx.QueryRow(ctx,
 		`INSERT INTO rules (monitor_id, type, params, enabled, severity, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, version`,
-		r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled, r.Severity, r.RunbookURL, r.ResponseGuidance,
+		r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled, NormalizedSeverity(r.Severity), r.RunbookURL, r.ResponseGuidance,
 	).Scan(&r.ID, &r.Version); err != nil {
 		return mapErr(err)
 	}
@@ -1128,7 +1128,7 @@ func (p *Postgres) CreateRules(ctx context.Context, rules []*Rule) error {
 	for _, r := range rules {
 		if err := tx.QueryRow(ctx,
 			`INSERT INTO rules (monitor_id, type, params, enabled, severity, runbook_url, response_guidance) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, version`,
-			r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled, r.Severity, r.RunbookURL, r.ResponseGuidance,
+			r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled, NormalizedSeverity(r.Severity), r.RunbookURL, r.ResponseGuidance,
 		).Scan(&r.ID, &r.Version); err != nil {
 			return mapErr(err)
 		}
@@ -1223,7 +1223,7 @@ func (p *Postgres) UpdateRule(ctx context.Context, r *Rule) error {
 			        last_alert_at = NULL, suppressed_since_last = 0
 			  WHERE id = $1
 			  RETURNING version`,
-			r.ID, r.Type, newParams, r.Enabled, r.Severity, r.RunbookURL, r.ResponseGuidance,
+			r.ID, r.Type, newParams, r.Enabled, NormalizedSeverity(r.Severity), r.RunbookURL, r.ResponseGuidance,
 		).Scan(&r.Version); err != nil {
 			return mapErr(err)
 		}
@@ -1233,7 +1233,7 @@ func (p *Postgres) UpdateRule(ctx context.Context, r *Rule) error {
 			    SET type = $2, params = $3, enabled = $4, severity = $5, runbook_url = $6, response_guidance = $7, version = version + 1
 			  WHERE id = $1
 			  RETURNING version`,
-			r.ID, r.Type, newParams, r.Enabled, r.Severity, r.RunbookURL, r.ResponseGuidance,
+			r.ID, r.Type, newParams, r.Enabled, NormalizedSeverity(r.Severity), r.RunbookURL, r.ResponseGuidance,
 		).Scan(&r.Version); err != nil {
 			return mapErr(err)
 		}

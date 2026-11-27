@@ -1152,7 +1152,7 @@ func (s *SQLite) CreateRule(ctx context.Context, r *Rule) error {
 	}
 	if err := tx.QueryRowContext(ctx,
 		`INSERT INTO rules (monitor_id, type, params, enabled, severity, runbook_url, response_guidance) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id, version`,
-		r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), string(r.Severity), r.RunbookURL, r.ResponseGuidance,
+		r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), string(NormalizedSeverity(r.Severity)), r.RunbookURL, r.ResponseGuidance,
 	).Scan(&r.ID, &r.Version); err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -1184,7 +1184,7 @@ func (s *SQLite) CreateRules(ctx context.Context, rules []*Rule) error {
 	for _, r := range rules {
 		if err := tx.QueryRowContext(ctx,
 			`INSERT INTO rules (monitor_id, type, params, enabled, severity, runbook_url, response_guidance) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id, version`,
-			r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), string(r.Severity), r.RunbookURL, r.ResponseGuidance,
+			r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), string(NormalizedSeverity(r.Severity)), r.RunbookURL, r.ResponseGuidance,
 		).Scan(&r.ID, &r.Version); err != nil {
 			return mapSQLiteErr(err)
 		}
@@ -1289,7 +1289,7 @@ func (s *SQLite) UpdateRule(ctx context.Context, r *Rule) error {
 			        last_alert_at = NULL, suppressed_since_last = 0
 			  WHERE id = ?
 			  RETURNING version`,
-			r.Type, string(newParams), boolToInt(r.Enabled), string(r.Severity), r.RunbookURL, r.ResponseGuidance, r.ID,
+			r.Type, string(newParams), boolToInt(r.Enabled), string(NormalizedSeverity(r.Severity)), r.RunbookURL, r.ResponseGuidance, r.ID,
 		).Scan(&r.Version); err != nil {
 			return mapSQLiteErr(err)
 		}
@@ -1299,7 +1299,7 @@ func (s *SQLite) UpdateRule(ctx context.Context, r *Rule) error {
 			    SET type = ?, params = ?, enabled = ?, severity = ?, runbook_url = ?, response_guidance = ?, version = version + 1
 			  WHERE id = ?
 			  RETURNING version`,
-			r.Type, string(newParams), boolToInt(r.Enabled), string(r.Severity), r.RunbookURL, r.ResponseGuidance, r.ID,
+			r.Type, string(newParams), boolToInt(r.Enabled), string(NormalizedSeverity(r.Severity)), r.RunbookURL, r.ResponseGuidance, r.ID,
 		).Scan(&r.Version); err != nil {
 			return mapSQLiteErr(err)
 		}
