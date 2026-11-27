@@ -35,7 +35,7 @@ func eventEntry(t *testing.T, prefix []string, params []xdr.ScSpecEventParamV0, 
 		prefixTopics[i] = xdr.ScSymbol(p)
 	}
 	entry, err := xdr.NewScSpecEntry(xdr.ScSpecEntryKindScSpecEntryEventV0, xdr.ScSpecEventV0{
-		Name:         xdr.ScSymbol("Transfer"),
+		Name:         "Transfer",
 		PrefixTopics: prefixTopics,
 		Params:       params,
 		DataFormat:   format,
