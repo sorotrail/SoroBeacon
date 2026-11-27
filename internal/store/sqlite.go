@@ -941,7 +941,7 @@ func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, erro
 		return nil, err
 	}
 	rules, err := querySQLiteRules(ctx, tx,
-		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version, r.runbook_url, r.response_guidance FROM rules r
+		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.severity, r.version, r.runbook_url, r.response_guidance FROM rules r
 		   JOIN monitors m ON m.id = r.monitor_id
 		  WHERE r.monitor_id = ? AND m.workspace_id = ? ORDER BY r.id`, id, ws)
 	if err != nil {
@@ -1151,8 +1151,8 @@ func (s *SQLite) CreateRule(ctx context.Context, r *Rule) error {
 		return err
 	}
 	if err := tx.QueryRowContext(ctx,
-		`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES (?, ?, ?, ?, ?, ?) RETURNING id, version`,
-		r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), r.RunbookURL, r.ResponseGuidance,
+		`INSERT INTO rules (monitor_id, type, params, enabled, severity, runbook_url, response_guidance) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id, version`,
+		r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), string(NormalizedSeverity(r.Severity)), r.RunbookURL, r.ResponseGuidance,
 	).Scan(&r.ID, &r.Version); err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -1183,8 +1183,8 @@ func (s *SQLite) CreateRules(ctx context.Context, rules []*Rule) error {
 	}
 	for _, r := range rules {
 		if err := tx.QueryRowContext(ctx,
-			`INSERT INTO rules (monitor_id, type, params, enabled, runbook_url, response_guidance) VALUES (?, ?, ?, ?, ?, ?) RETURNING id, version`,
-			r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), r.RunbookURL, r.ResponseGuidance,
+			`INSERT INTO rules (monitor_id, type, params, enabled, severity, runbook_url, response_guidance) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id, version`,
+			r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled), string(NormalizedSeverity(r.Severity)), r.RunbookURL, r.ResponseGuidance,
 		).Scan(&r.ID, &r.Version); err != nil {
 			return mapSQLiteErr(err)
 		}
@@ -1194,7 +1194,7 @@ func (s *SQLite) CreateRules(ctx context.Context, rules []*Rule) error {
 
 func (s *SQLite) GetRule(ctx context.Context, id int64) (*Rule, error) {
 	rules, err := querySQLiteRules(ctx, s.db,
-		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version, r.runbook_url, r.response_guidance FROM rules r
+		`SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.severity, r.version, r.runbook_url, r.response_guidance FROM rules r
 		   JOIN monitors m ON m.id = r.monitor_id
 		  WHERE r.id = ? AND m.workspace_id = ?`, id, workspaceID(ctx))
 	if err != nil {
@@ -1211,7 +1211,7 @@ func (s *SQLite) ListRules(ctx context.Context, monitorID int64, enabledOnly boo
 	// different scopes: the API (one workspace) and the poller's per-monitor
 	// rule loading, which runs under the cross-tenant system scope and would
 	// otherwise find no rules for a monitor outside the default workspace.
-	q := `SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.version, r.runbook_url, r.response_guidance FROM rules r
+	q := `SELECT r.id, r.monitor_id, r.type, r.params, r.enabled, r.severity, r.version, r.runbook_url, r.response_guidance FROM rules r
 	         JOIN monitors m ON m.id = r.monitor_id
 	        WHERE r.monitor_id = ?`
 	args := []any{monitorID}
@@ -1245,12 +1245,13 @@ func querySQLiteRules(ctx context.Context, q queryer, query string, args ...any)
 
 func scanSQLiteRule(r rowScanner) (Rule, error) {
 	var rule Rule
-	var params string
+	var params, severity string
 	var enabled int64
-	if err := r.Scan(&rule.ID, &rule.MonitorID, &rule.Type, &params, &enabled, &rule.Version, &rule.RunbookURL, &rule.ResponseGuidance); err != nil {
+	if err := r.Scan(&rule.ID, &rule.MonitorID, &rule.Type, &params, &enabled, &severity, &rule.Version, &rule.RunbookURL, &rule.ResponseGuidance); err != nil {
 		return rule, mapSQLiteErr(err)
 	}
 	rule.Enabled = enabled != 0
+	rule.Severity = Severity(severity)
 	rule.Params = json.RawMessage(params)
 	_ = normalizeRuleGuidance(&rule)
 	return rule, nil
@@ -1284,21 +1285,21 @@ func (s *SQLite) UpdateRule(ctx context.Context, r *Rule) error {
 	if conditionChanged {
 		if err := tx.QueryRowContext(ctx,
 			`UPDATE rules
-			    SET type = ?, params = ?, enabled = ?, runbook_url = ?, response_guidance = ?, version = version + 1,
+			    SET type = ?, params = ?, enabled = ?, severity = ?, runbook_url = ?, response_guidance = ?, version = version + 1,
 			        last_alert_at = NULL, suppressed_since_last = 0
 			  WHERE id = ?
 			  RETURNING version`,
-			r.Type, string(newParams), boolToInt(r.Enabled), r.RunbookURL, r.ResponseGuidance, r.ID,
+			r.Type, string(newParams), boolToInt(r.Enabled), string(NormalizedSeverity(r.Severity)), r.RunbookURL, r.ResponseGuidance, r.ID,
 		).Scan(&r.Version); err != nil {
 			return mapSQLiteErr(err)
 		}
 	} else {
 		if err := tx.QueryRowContext(ctx,
 			`UPDATE rules
-			    SET type = ?, params = ?, enabled = ?, runbook_url = ?, response_guidance = ?, version = version + 1
+			    SET type = ?, params = ?, enabled = ?, severity = ?, runbook_url = ?, response_guidance = ?, version = version + 1
 			  WHERE id = ?
 			  RETURNING version`,
-			r.Type, string(newParams), boolToInt(r.Enabled), r.RunbookURL, r.ResponseGuidance, r.ID,
+			r.Type, string(newParams), boolToInt(r.Enabled), string(NormalizedSeverity(r.Severity)), r.RunbookURL, r.ResponseGuidance, r.ID,
 		).Scan(&r.Version); err != nil {
 			return mapSQLiteErr(err)
 		}

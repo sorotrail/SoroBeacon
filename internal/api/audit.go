@@ -444,9 +444,21 @@ func mutatingMethod(method string) bool {
 	}
 }
 
+// apiMountPrefix is the path under which Routes() is mounted by
+// cmd/sorobeacon/main.go. auditRoutePattern strips it so the pattern
+// matches the unprefixed entries in AuditRouteTable.
+const apiMountPrefix = "/api/v1"
+
 func auditRoutePattern(r *http.Request) string {
 	if rctx := chi.RouteContext(r.Context()); rctx != nil {
-		return rctx.RoutePattern()
+		p := rctx.RoutePattern()
+		// chi includes the outer mount prefix in RoutePattern(). Strip it so
+		// the lookup against AuditRouteTable (which uses unprefixed paths like
+		// "/monitors") works regardless of where the API router is mounted.
+		if after, ok := strings.CutPrefix(p, apiMountPrefix); ok {
+			return after
+		}
+		return p
 	}
 	return ""
 }
