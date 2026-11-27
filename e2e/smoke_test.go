@@ -251,7 +251,7 @@ func TestSmokePollingMatchingAndDelivery(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create a webhook channel.
-	webhookConfig, _ := json.Marshal(map[string]string{"url": webhook.server.URL})
+	webhookConfig, _ := json.Marshal(map[string]string{"url": webhook.server.URL, "secret": "e2e-test-secret"})
 	ch, err := client.CreateChannel(ctx, apiclient.ChannelCreate{
 		Name:   "e2e-webhook",
 		Type:   "webhook",
