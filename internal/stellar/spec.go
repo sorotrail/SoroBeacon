@@ -48,7 +48,7 @@ func ParseContractSpec(entries []xdr.ScSpecEntry) *ContractSpec {
 			continue
 		}
 		es := &EventSpec{
-			Name:       string(event.Name),
+			Name:       event.Name,
 			DataFormat: event.DataFormat,
 		}
 		for _, prefix := range event.PrefixTopics {
